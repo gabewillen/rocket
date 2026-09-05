@@ -3,11 +3,13 @@ title: "Fuels"
 listing:
   contents: "*.qmd"
   type: table
-  fields: [title, description, status]
+  fields: [title, chemistry, description, status]
   field-display-names:
+    chemistry: "Chemistry"
     status: "Status"
   sort: "title"
 page-layout: full
 ---
 
 A fuel is a model and its weights. It exists whether or not an engine burns it.
+Fuels with the same chemistry burn in the same engine.

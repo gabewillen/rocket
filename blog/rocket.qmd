@@ -11,8 +11,9 @@ A rocket is a spark igniting fuel in an engine.
 | --- | --- |
 | spark | the hardware that ignites it (DGX Spark, GB10) |
 | booster | one spark, with its own memory and its own tank |
-| fuel | a model and its weights |
-| engine | compiled for one fuel on one rocket. Regenerated, not reconfigured. |
+| chemistry | a model's architecture, shapes, and weight format |
+| fuel | a model and its weights. Has a chemistry. |
+| engine | compiled for one chemistry on one rocket. Burns any fuel that matches. |
 | rocket | boosters, fuel, and an engine assembled and launchable |
 
 [Fuels](fuels/index.qmd) exist without engines. [Engines](engines/index.qmd) are
@@ -87,6 +88,19 @@ does not launch on three.
 ## Rules an engine must satisfy {#rules}
 
 Each rule follows from a measurement in the log.
+
+### Chemistry match {#chemistry}
+
+Build depends on architecture, topology, and hardware. It does not depend on
+weight values, so an engine burns any fuel whose chemistry matches: same layer
+shapes, same expert count and routing width, same weight format. A fine-tune of
+a supported fuel needs no rebuild.
+
+Launch verifies chemistry, not fuel identity, and refuses on mismatch.
+
+Expert placement is the exception. It is fit to one fuel's co-activation
+statistics, so a different fuel of the same chemistry stays correct and loses
+locality. Placement quality is a performance property, not a correctness one.
 
 ### Memory budget {#memory}
 

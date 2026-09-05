@@ -10,8 +10,9 @@ listing:
 page-layout: full
 ---
 
-An engine is compiled for one fuel on one rocket. New fuel means a new engine,
-never a flag on an existing one. Shared architecture is on the
+An engine is compiled for one chemistry on one rocket, and burns any
+[fuel](../fuels/index.qmd) that matches it. A different chemistry means a new
+engine, never a flag on an existing one. Shared architecture is on the
 [Rocket](../rocket.qmd) page.
 
 None built yet.
