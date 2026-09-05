@@ -69,5 +69,5 @@ of the question that can actually be answered with a number.
 
 ## Evidence
 
-- [`evidence/openness-check.txt`](evidence/openness-check.txt) — open kernel
-  count and the `--cuda_architectures` build flag, generated 2026-09-05.
+- [`evidence/openness-check.json`](evidence/openness-check.json) — open kernel
+  count and the `--cuda_architectures` build flag, with the queried URLs.

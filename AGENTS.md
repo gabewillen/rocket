@@ -61,7 +61,9 @@ tree.
 - ALWAYS record, under Setup, the node the work ran on, the exact commit SHA, and the literal copy-pasteable command.
 - ALWAYS report numbers with units in a table, and NEVER report a measurement in prose alone.
 - ALWAYS state run-to-run variance when a single number would be misleading.
-- ALWAYS commit the raw evidence — logs, JSON, plots — into the entry's own directory and link it from the Evidence section.
+- ALWAYS commit evidence as JSON in the entry's `evidence/` directory and link it from the Evidence section, so results are machine-readable and comparable across entries.
+- ALWAYS give every evidence file at minimum `generated_utc`, the `question` it answers, the `answer`, and the `sources` (URL, command, or file) each value came from.
+- NEVER commit an unstructured console dump as the evidence of record; a `.txt` transcript is neither renderable nor comparable. Attach large raw logs alongside the JSON only when the JSON references them.
 - ALWAYS state, in the Verdict section, what would have to change for the question to be reopened.
 - ALWAYS log a rejected result with the same care as an accepted one; rejections are what stop the next agent from repeating the work.
 

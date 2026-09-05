@@ -83,5 +83,5 @@ may well be faster on the layers it supports. Reopen this if either holds:
 
 ## Evidence
 
-- [`evidence/packaging-check.txt`](evidence/packaging-check.txt) — PyPI versus
-  NVIDIA index wheel availability, generated 2026-09-05.
+- [`evidence/packaging-check.json`](evidence/packaging-check.json) — PyPI versus
+  NVIDIA index wheel availability, with the queried URLs and counts.

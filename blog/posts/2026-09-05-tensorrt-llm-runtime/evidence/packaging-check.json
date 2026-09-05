@@ -1,0 +1,24 @@
+{
+  "generated_utc": "2026-09-05T14:57:55Z",
+  "question": "Is TensorRT-LLM installable on aarch64 / GB10?",
+  "answer": "yes, from the NVIDIA index; no, from PyPI",
+  "sources": {
+    "pypi": {
+      "url": "https://pypi.org/pypi/tensorrt-llm/json",
+      "latest_version": "1.2.1",
+      "packagetypes_for_latest": [
+        "sdist"
+      ],
+      "wheels_across_all_releases": 0
+    },
+    "nvidia_index": {
+      "url": "https://pypi.nvidia.com/tensorrt-llm/",
+      "aarch64_wheel_count": 93,
+      "latest_aarch64_wheels": [
+        "tensorrt_llm-1.3.0rc7-cp312-cp312-linux_aarch64.whl",
+        "tensorrt_llm-1.3.0rc8-cp312-cp312-linux_aarch64.whl",
+        "tensorrt_llm-1.3.0rc9-cp312-cp312-linux_aarch64.whl"
+      ]
+    }
+  }
+}
