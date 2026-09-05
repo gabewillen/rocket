@@ -23,7 +23,7 @@ website:
       - icon: github
         href: https://github.com/gabewillen/rocket
   page-footer:
-    center: "Rocket — GLM-5.3-Flash on 2x DGX Spark"
+    center: "Rocket"
 
 format:
   html:
