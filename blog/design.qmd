@@ -13,20 +13,20 @@ A rocket is a spark igniting fuel in an engine.
 | term | meaning |
 | --- | --- |
 | spark | the hardware that ignites it (DGX Spark, GB10) |
+| booster | one spark, with its own memory and its own tank |
 | fuel | a model and its weights |
-| engine | compiled for one fuel on one cluster. Regenerated, not reconfigured. |
-| rocket | sparks, fuel, and engines assembled |
+| engine | compiled for one fuel on one rocket. Regenerated, not reconfigured. |
+| rocket | boosters, fuel, and an engine assembled and launchable |
 
-A rocket has a [GLM-5.3-Flash engine](engines/glm-5.3-flash.qmd) that burns
-GLM-5.3-Flash as fuel. Fuel-specific content lives with its
-[engine](engines/index.qmd). Hardware measurements live in the log.
+Fuel-specific content lives with its [engine](engines/index.qmd). Hardware
+measurements live in the log.
 
 ## Doctrine {#doctrine}
 
 General-purpose engines pay for generality at runtime: dynamic shapes, runtime
 dtype dispatch, autotuned kernel selection, a general allocator, and a Python
-step loop on a 20-core Arm host. They reach
-[132.8 tok/s at c32](posts/baseline/2026-09-05-general-engine-baselines/) here.
+step loop on a 20-core Arm host. Their results on a spark are
+[recorded in the log](posts/baseline/2026-09-05-general-engine-baselines/).
 An engine recovers that cost by refusing to be general.
 
 One model. One cluster topology. One weight format. Every shape known ahead of
@@ -70,8 +70,9 @@ for golden-vector regression. It never appears in the serving path.
 
 ## Boosters {#boosters}
 
-One booster is one spark: 123.73 GiB, 273 GB/s, 20 cores, its own tank. A rocket
-is one or more boosters of the same kind. A Falcon Heavy is three.
+A rocket is one or more boosters of the same kind. A Falcon Heavy is three.
+Booster capacity and bandwidth are
+[measured in the log](posts/hardware/2026-09-05-spark-cluster-baseline/).
 
 | arrangement | meaning | cost |
 | --- | --- | --- |
@@ -79,8 +80,8 @@ is one or more boosters of the same kind. A Falcon Heavy is three.
 | replicated | each booster runs a full engine on the same fuel | throughput, no fabric coupling |
 | independent | boosters burn different fuel | no coupling |
 
-Capacity decides which are available, not preference. GLM-5.3-Flash is about
-164 GiB at 4-bit against 123.73 GiB per booster, so split is forced for it.
+Capacity decides which are available, not preference. Fuel that does not fit in
+one booster forces split. Fuel that fits leaves all three open.
 
 Booster count is part of a rocket's identity. The plan bakes in expert placement
 and the all-to-all schedule for one topology, so a rocket built for two boosters
