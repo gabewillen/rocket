@@ -68,6 +68,24 @@ the throughput it costs.
 A reference implementation (HF/PyTorch) is kept as an offline parity oracle and
 for golden-vector regression. It never appears in the serving path.
 
+## Boosters {#boosters}
+
+One booster is one spark: 123.73 GiB, 273 GB/s, 20 cores, its own tank. A rocket
+is one or more boosters of the same kind. A Falcon Heavy is three.
+
+| arrangement | meaning | cost |
+| --- | --- | --- |
+| split | one engine spans boosters | capacity and single-stream latency, pays fabric on every token |
+| replicated | each booster runs a full engine on the same fuel | throughput, no fabric coupling |
+| independent | boosters burn different fuel | no coupling |
+
+Capacity decides which are available, not preference. GLM-5.3-Flash is about
+164 GiB at 4-bit against 123.73 GiB per booster, so split is forced for it.
+
+Booster count is part of a rocket's identity. The plan bakes in expert placement
+and the all-to-all schedule for one topology, so a rocket built for two boosters
+does not launch on three.
+
 ## Rules an engine must satisfy {#rules}
 
 Each rule follows from a measurement in the log.
@@ -134,6 +152,18 @@ and per-rail fabric utilization.
 
 Cardinality is bounded by construction. Request IDs, prompt hashes, and expert
 IDs are never metric dimensions. Per-request detail lives on spans.
+
+## Launch {#launch}
+
+`rocket launch <name>` runs the countdown. Each phase has its own failure mode,
+and no traffic is accepted before static fire passes.
+
+| phase | what happens | fails when |
+| --- | --- | --- |
+| upright | resolve boosters, map the plan, verify the memory budget | boosters missing, topology mismatch, or requested residency exceeds usable |
+| fuel | fetch the weights, condition them to the map, cache the result | first load only; later launches fetch or find it already on the booster |
+| static fire | register host memory, bring up both rails, warm the graphs, run one token and check it | registration stalls, a rail is down, a kernel exceeds the shared-memory ceiling |
+| launch | accept traffic | |
 
 ## API {#api}
 
