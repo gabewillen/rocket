@@ -15,8 +15,8 @@ website:
         text: Experiments
       - href: design.qmd
         text: Design
-      - href: accelerants/glm-5.3-flash.qmd
-        text: Accelerant
+      - href: accelerants/index.qmd
+        text: Accelerants
     right:
       - icon: github
         href: https://github.com/gabewillen/wildfire

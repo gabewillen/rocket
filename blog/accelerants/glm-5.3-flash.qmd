@@ -1,6 +1,8 @@
 ---
-title: "Accelerant: GLM-5.3-Flash"
+title: "GLM-5.3-Flash"
 subtitle: "The chemistry of the first accelerant."
+description: "321B total, 18B active, hybrid KDA and sparse MLA, 288 experts top-8. Two sparks, 4-bit weights."
+status: designing
 date-modified: 2026-09-05
 toc-depth: 2
 ---

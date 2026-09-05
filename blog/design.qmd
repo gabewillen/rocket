@@ -16,7 +16,7 @@ A wildfire is what happens when a spark ignites an accelerant.
 | spark | the hardware that ignites it (DGX Spark, GB10) |
 | wildfire | the result of the spark igniting the accelerant |
 
-Model-specific content lives with its accelerant:
+Model-specific content lives with its [accelerant](accelerants/index.qmd).
 [GLM-5.3-Flash](accelerants/glm-5.3-flash.qmd) is the first. Hardware
 measurements live in the log.
 
