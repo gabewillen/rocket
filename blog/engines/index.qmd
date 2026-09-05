@@ -11,6 +11,6 @@ listing:
 page-layout: full
 ---
 
-An engine is compiled for one fuel on one cluster. New fuel means a new engine,
+An engine is compiled for one fuel on one rocket. New fuel means a new engine,
 never a flag on an existing one. Shared architecture is on the
 [Design](../design.qmd) page.
