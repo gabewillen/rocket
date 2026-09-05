@@ -1,6 +1,6 @@
 ---
 title: "Design"
-subtitle: "What wildfire is, what it targets, and what it refuses to be."
+subtitle: "What wildfire is, what it burns, and what it refuses to be."
 date-modified: 2026-09-05
 toc-depth: 2
 ---
@@ -11,19 +11,25 @@ change. The [log](index.qmd) is the append-only record of how each decision was
 reached; where the two disagree, the log explains and this page decides.
 :::
 
-Wildfire is a purpose-built inference engine for Flash-class sparse-MoE models
-on DGX Spark clusters. The first optimization target is **GLM-5.3-Flash** on
-**two DGX Sparks** running the **64 KiB-page kernel**.
+**A wildfire is what happens when a spark ignites an accelerant.**
 
-Wildfire is not a general-purpose serving framework and will not become one. It
-is an engine compiled for one model on one machine. Every stack benchmarked in
-[Prior art](#baselines) is a capable general engine that gives up throughput to generality:
-dynamic shapes, runtime dispatch, autotuning, a general allocator, and a Python
-step loop. Those engines also carry assumptions that are simply false on this
-hardware — that host pages are 4 KiB, that GPU memory is a pool distinct from
-host RAM, and that a layer's reusable state is fully captured by an attention KV
-cache. Wildfire trades away generality to recover both. [Doctrine](#doctrine)
-states the position; [prior art](#baselines) states the bar.
+| term | meaning |
+| --- | --- |
+| **accelerant** | an inference engine compiled for exactly one model on one cluster: specialized, disposable, regenerated rather than reconfigured |
+| **spark** | the hardware it burns on — DGX Spark, GB10 |
+| **wildfire** | the result, and the compiler that produces accelerants |
+
+**GLM-5.3-Flash gets the first accelerant.** It is what the rest of this page
+specifies. Every model after it gets its own accelerant, never a configuration
+flag on this one.
+
+Generality lives in the compiler. Specialization lives in each accelerant, and
+never leaks back. Every stack in [prior art](#baselines) is a capable general
+engine that pays for generality at runtime — dynamic shapes, runtime dispatch,
+autotuning, a general allocator, a Python step loop — and additionally assumes
+4 KiB host pages, GPU memory distinct from host RAM, and reusable state fully
+captured by an attention KV cache. All three are false on a spark.
+[Doctrine](#doctrine) states the position; [prior art](#baselines) states the bar.
 
 ---
 
@@ -59,7 +65,7 @@ stacks under ~/spark-stack.
    runner rejects the architecture outright. Wildfire owns its attention
    kernels rather than depending on a dispatch table with no sm_121 tactic.
 4. **Memory overcommit kills the OS.** One prior boot at 0.87 utilization plus
-   an 8.58 GB pinned tier OOM-killed *both* operating systems. Wildfire never
+   an 8.58 GB pinned tier OOM-killed *both* operating systems. An accelerant never
    discovers its budget by allocating until failure.
 
 ---
@@ -87,7 +93,7 @@ incoai/GLM-5.3-Flash-DFlash2 (2.2 GB drafter).
 | EXL3 4bpw | ~164 GiB | Fits, ~83 GiB cluster headroom |
 | NVFP4 (4-bit experts) | ~182 GiB | Fits, ~65 GiB headroom |
 
-Wildfire targets the **4-bit weight regime**, with ~82 GiB resident weights per
+This accelerant targets the **4-bit weight regime**, with ~82 GiB resident weights per
 node as the design point. KV, KDA state, activations, drafter, vision encoder,
 runtime and OS all share the remaining ~41 GiB per node.
 
@@ -110,31 +116,31 @@ tokens that share experts, which is what section 7.2 exploits.
 
 ## 3. Design doctrine: specialization over generality {#doctrine}
 
-Every stack measured in section 13 is a good general-purpose engine. They lose
+Every stack in [prior art](#baselines) is a good general-purpose engine. They lose
 throughput here not because they are badly built, but because generality has a
 price on this hardware: dynamic shapes, runtime dtype dispatch, autotuned kernel
 selection, a general allocator, and a Python step loop on a 20-core Arm host.
-Wildfire buys that price back by refusing to be general.
+An accelerant buys that price back by refusing to be general.
 
 **One model. One cluster topology. One weight format. Every shape known ahead of
-time.**
+time.** That binds each accelerant, not wildfire itself — a second model means a
+second accelerant, never a branch in this one.
 
-### 3.1 Structure: an offline compiler and a thin runtime
+### 3.1 Structure: a compiler and the accelerant it emits
 
-Wildfire is two programs.
-
-The **model compiler** runs offline, on the same hardware, and consumes the
-checkpoint, a hardware profile produced by M0, and an expert co-activation
-profile gathered from a representative corpus. It emits a *plan*: a
-pre-swizzled weight blob, a static memory map with literal byte offsets, an
+Wildfire proper is the **compiler**. It runs offline on the target hardware and
+consumes the model checkpoint, a hardware profile produced by M0, and an expert
+co-activation profile gathered from a representative corpus. It emits a *plan*:
+a pre-swizzled weight blob, a static memory map with literal byte offsets, an
 expert-to-node placement, a kernel selection with pinned tile parameters, the
 execution graph topology, and the KV/KDA arena geometry.
 
-The **runtime** maps that plan and executes it. It has no dynamic allocator, no
+The **accelerant** maps that plan and executes it. It has no dynamic allocator, no
 autotuner, no dtype or shape dispatch, no kernel fallback paths, and no Python
 in the step loop. Startup either maps the plan successfully or refuses to start.
 
-Changing the model is a compiler run, not a server reconfiguration.
+Changing the model is a compiler run producing a new accelerant, not a server
+reconfiguration.
 
 ### 3.2 What specialization buys
 
@@ -174,7 +180,7 @@ serving path.
 
 ## 4. The 64 KiB page regime {#pages}
 
-Wildfire **requires** the 64K-page kernel, installed on both nodes. It buys
+An accelerant **requires** the 64K-page kernel, installed on both nodes. It buys
 ~2.10 GiB per node: boot-time reserved memory drops from 6.09 GiB to 4.00 GiB,
 and MemTotal rises from 121.63 GiB to 123.73 GiB. On memory-bound boxes that is
 a ~2% capacity gain for free.
@@ -215,7 +221,7 @@ and the 64 KiB physical page.
 ### 4.3 Host registration is the dangerous operation
 
 cudaHostRegister is where the 64K regime bites. The prior stacks converged on a
-specific safe pattern, which wildfire adopts natively:
+specific safe pattern, which the accelerant adopts natively:
 
 - **Serialize across ranks.** Concurrent whole-region registration from every
   rank contends in the driver on the same pages; at 48 GiB the ioctl stalled
@@ -239,7 +245,7 @@ specific safe pattern, which wildfire adopts natively:
 ### 4.4 Both nodes run 64K, and the plan encodes it
 
 A 4K head and a 64K worker were shown to interoperate over RoCE, including
-cross-node collectives, so a mixed cluster is *possible*. Wildfire does not
+cross-node collectives, so a mixed cluster is *possible*. The accelerant does not
 support one. The page size is a compiler input baked into the plan's alignment
 constants; a node whose page size disagrees with the plan is refused at
 handshake rather than accommodated at runtime.
@@ -288,7 +294,7 @@ the storage tier held KV pages only. Restoring KV without the matching KDA state
 forces a full re-prefill, so reads never hit. One stack verified writes to NVMe
 on both nodes and still never landed a single restore.
 
-**Wildfire treats the (KV pages, KDA state) pair as one indivisible cache
+**The accelerant treats the (KV pages, KDA state) pair as one indivisible cache
 entry**, anchored at the same token boundary, written and restored atomically.
 This subsystem is what justifies building an engine instead of patching one.
 
@@ -315,7 +321,7 @@ must replay from cache with cached_tokens non-zero. The bar is **5.8x**
 KDA state dominates the concurrency ceiling far more than KV does. Prior tuning
 measured ~70 MB per request at 5 slots per request, capping concurrency at 6.
 Dropping to 4 slots per request with lazy buffering and a tuned convolution
-width lifted the same box to 32 concurrent requests. Wildfire treats **KDA slots
+width lifted the same box to 32 concurrent requests. The accelerant treats **KDA slots
 per request** as a primary, explicitly tuned scheduler parameter, not an
 implementation detail.
 
@@ -433,7 +439,7 @@ tok/s, 512-token non-streaming.
 | SGLang NVFP4 (patched, TP=2) | 13.5 | 56.9 | **132.0-132.8** | ~0.24 s |
 | vLLM EXL3 4bpw + DFlash2 k=7 | **23.7-25.4** | 59.6 | not measured | 0.28-0.35 s |
 
-Wildfire must beat the better of these at every concurrency level, on the 64K
+The accelerant must beat the better of these at every concurrency level, on the 64K
 kernel, with prefix restore actually hitting.
 
 ---
