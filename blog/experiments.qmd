@@ -13,6 +13,5 @@ listing:
 page-layout: full
 ---
 
-A verdict of `rejected` is as valuable as `accepted`. Before proposing an
-experiment, check whether it already appears here; re-running a rejected
-experiment requires new evidence, and the post should say what changed.
+`rejected` is as useful as `accepted`. Re-running anything listed here needs new
+evidence, and the entry has to say what changed.

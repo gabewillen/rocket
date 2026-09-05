@@ -1,6 +1,6 @@
 ---
-title: "TensorRT-LLM: rejected as a runtime, not rejected as a kernel source"
-description: "Supersedes the earlier rejection, which used precedent as evidence. Its kernels are open and buildable for sm_121, so the kernel question becomes a benchmark rather than an assumption."
+title: "TensorRT-LLM: rejected as a runtime, not as a kernel source"
+description: "Its kernels are open and buildable for sm_121, so the kernel question is a benchmark, not an assumption. The runtime still loses on what it contributes."
 date: 2026-09-05
 author: "agent"
 categories: [research, runtime, kernels]
@@ -9,65 +9,37 @@ design: "#doctrine"
 supersedes: posts/2026-09-05-tensorrt-llm-runtime
 ---
 
-## Question
+**Question.** Same question as the superseded entry, reopened because that answer used precedent as evidence. An engine premised on the easy roads already being travelled cannot reject its dependencies for being unsupported.
 
-Same question as the superseded entry: should wildfire build on TensorRT-LLM?
-It is revisited within the hour because the first answer leaned on precedent,
-and precedent is not evidence. Wildfire's premise is that the target — a 321B
-sparse MoE at 4-bit serving interactively from two 128 GB boxes — is reachable
-precisely because nobody has bothered. An engine built on that premise cannot
-reject its own dependencies for being unsupported.
-
-## What was wrong with the first answer
-
-Two of the four objections were about what has been done, not what can be done,
-and one was simply false.
-
-- **"Not in the model zoo" is not a barrier.** Plugins and custom model
-  definitions exist. The absence of GLM-5.3-Flash means work, not impossibility.
-- **"`sm_121` coverage is unproven" is a build flag.** `build_wheel.py` accepts
-  `--cuda_architectures`, so `121-real` is something to compile, not something
-  to wait for. The published support matrix describes what NVIDIA ships, not
-  what the source can target.
-- **"Closed kernels" was wrong.** `cpp/tensorrt_llm/kernels` has 167 entries in
-  the open. TensorRT — the graph optimization library — is the closed component;
-  TensorRT-LLM is a different thing, and its PyTorch backend path does not build
-  TensorRT engines at all. Conflating them was an error.
-
-## What survives
-
-One objection is not about difficulty, and it is the one that decides this:
-**what does adopting the runtime contribute, given we implement KDA, DSA and the
-4-bit grouped expert GEMM ourselves either way?**
-
-| Component it offers | What we would actually do |
+| setup | |
 | --- | --- |
-| Tuned kernels for supported layers | Our hot layers are not among them; we write KDA, DSA, grouped MoE regardless |
-| Batch manager and scheduler | Replaced — expert-affinity batching and decode priority are [scheduler](../../design.qmd#scheduler) decisions |
-| Graph runtime | Shapes are static by doctrine; CUDA graphs over our own launcher is a small component |
-| KV cache manager | Must be replaced — the atomic `(KV, KDA)` entry in the [state cache](../../design.qmd#cache) is the entire point |
+| node | head |
+| target | GB10, compute capability 12.1 (`sm_121`) |
+| method | source and packaging inspection, nothing installed |
 
-Adoption costs a maintained fork of a large, fast-moving C++ codebase and
-returns the component we need least. That is a value argument, and it survives
-someone willing to do arbitrary amounts of work.
+What was wrong:
 
-## Verdict
+| earlier objection | actual status |
+| --- | --- |
+| not in the model zoo | work, not a barrier — plugins and custom definitions exist |
+| `sm_121` unproven | a build flag: `build_wheel.py --cuda_architectures=121-real` |
+| closed kernels | false — 167 open entries under `cpp/tensorrt_llm/kernels`; TensorRT the graph library is the closed piece, not TensorRT-LLM |
 
-**The runtime is rejected on contribution, not on difficulty.** Wildfire's
-compiler and runtime stay ours.
+What survives — we write KDA, DSA and the 4-bit grouped expert GEMM either way, so:
 
-**The kernels are explicitly not rejected.** The superseded entry treated
-"TRT-LLM kernels may not run on `sm_121`" as a reason to stop looking. It is
-instead an experiment, now registered as open:
+| it offers | we would |
+| --- | --- |
+| tuned kernels for supported layers | write our hot layers regardless |
+| batch manager and scheduler | replace it ([scheduler](../../design.qmd#scheduler)) |
+| graph runtime | shapes are static; CUDA graphs over our own launcher is small |
+| KV cache manager | replace it — the atomic `(KV, KDA)` entry is the point |
 
-> Build TensorRT-LLM from source with `--cuda_architectures=121-real` on the
-> head node, and microbenchmark its NVFP4 grouped-expert GEMM and sparse-MLA
-> kernels against ours on GB10. If they win, link or port them.
+**Verdict.** Runtime rejected on contribution, not difficulty. Kernels explicitly not rejected.
 
-Consuming a kernel does not require adopting a runtime, and this is the version
-of the question that can actually be answered with a number.
+**Next.** Open experiment: build from source with `--cuda_architectures=121-real`, microbenchmark its NVFP4 grouped-expert GEMM and sparse-MLA kernels against ours on GB10, link or port whatever wins. Consuming a kernel does not require adopting a runtime.
 
-## Evidence
+**Reopen if.**
 
-- [`evidence/openness-check.json`](evidence/openness-check.json) — open kernel
-  count and the `--cuda_architectures` build flag, with the queried URLs.
+- that benchmark shows its grouped GEMM ahead of ours on `sm_121`
+
+**Evidence.** [`evidence/openness-check.json`](evidence/openness-check.json)

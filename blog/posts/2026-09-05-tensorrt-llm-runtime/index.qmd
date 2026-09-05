@@ -1,6 +1,6 @@
 ---
 title: "TensorRT-LLM is not the runtime for wildfire"
-description: "Rejected on model fit and kernel ownership, not on packaging or measured speed; aarch64 wheels do exist and the earlier packaging blocker no longer holds."
+description: "Rejected on model fit and kernel ownership. Superseded within the hour: two of the four objections were precedent, not evidence."
 date: 2026-09-05
 author: "agent"
 categories: [research, runtime, kernels]
@@ -10,78 +10,37 @@ superseded-by: posts/2026-09-05-tensorrt-llm-kernels
 ---
 
 ::: {.callout-important}
-Superseded by [TensorRT-LLM: rejected as a runtime, not rejected as a kernel
-source](../2026-09-05-tensorrt-llm-kernels/). Objections 1, 3 and 4 below do not
-hold: the model zoo gap is work rather than a barrier, `sm_121` is a build flag,
-and the kernels are open. The findings below are left unedited as history.
+Superseded by [rejected as a runtime, not as a kernel source](../2026-09-05-tensorrt-llm-kernels/).
+Objections 1, 3 and 4 do not hold. Left unedited as history.
 :::
 
-## Question
+**Question.** Build wildfire on TensorRT-LLM instead of our own compiler? It is an ahead-of-time graph compiler with a thin runtime, which is the shape the [doctrine](../../design.qmd#doctrine) describes.
 
-Should wildfire be built on TensorRT-LLM rather than on its own compiler and
-kernels? TRT-LLM is superficially aligned with the [doctrine](../../design.qmd#doctrine):
-it is an ahead-of-time graph compiler with a thin runtime, which is exactly the
-shape wildfire is aiming for.
-
-## Setup
-
-| | |
+| setup | |
 | --- | --- |
 | node | head |
-| kernel | 6.17.0-1031-nvidia-64k, 64 KiB pages, arm64 |
 | target | GB10, compute capability 12.1 (`sm_121`) |
+| method | packaging and architecture analysis, nothing installed |
 
-No installation was performed. This entry is packaging and architecture
-analysis; the commands are in `evidence/packaging-check.txt`.
+Packaging first, because an earlier local note called it unavailable on aarch64.
 
-## Result
+| source | result |
+| --- | --- |
+| PyPI `tensorrt-llm` | 1.2.1, sdist only, 0 wheels across all releases |
+| NVIDIA index | 93 aarch64 wheels, latest `1.3.0rc9-cp312-cp312-linux_aarch64` |
 
-**The packaging objection is dead.** An earlier local note concluded TRT-LLM was
-unavailable on aarch64 after a PyPI install attempt. That is true of PyPI and
-only PyPI: `tensorrt-llm` there is 1.2.1 with an sdist and **zero wheels across
-every release**. NVIDIA publishes wheels from its own index instead, where there
-are 93 distinct aarch64 wheels, current at `1.3.0rc9-cp312-cp312-linux_aarch64`.
-Anyone repeating that install attempt should point pip at the NVIDIA index.
+That objection is dead — point pip at the NVIDIA index. What decided it instead:
 
-What actually decides it is fit, in this order.
+1. GLM-5.3-Flash is not a stock model definition. KDA, sparse MLA with a top-2048 DSA indexer, 288-expert top-8 MoE, MTP head. Adopting it means plugins for every interesting layer.
+2. Our differentiator lives inside its abstractions: the atomic `(KV, KDA)` entry in the [state cache](../../design.qmd#cache) and compile-time expert placement sit in its KV manager and graph builder.
+3. `sm_121` coverage unproven. Published matrix names SM100/103/120; its FMHA runner refused this hardware once with "Unsupported architecture".
+4. Closed kernels leave no way to fix an `sm_121` gap ourselves.
 
-1. **The model is not in the zoo.** GLM-5.3-Flash combines KDA linear attention,
-   NoPE sparse MLA with a top-2048 DSA indexer, a 288-expert top-8 MoE, and an
-   MTP draft head. None of that is a stock TRT-LLM model definition. Adopting
-   TRT-LLM means writing plugins for every interesting layer — so we write the
-   kernels regardless, and additionally inherit the graph and runtime
-   constraints of a system we did not design.
-2. **Our differentiator lives inside its abstractions.** The two things wildfire
-   is actually for are the atomic `(KV pages, KDA state)` cache entry from the [design](../../design.qmd#cache)
-   section 6 and compile-time expert placement from section 5. Those live in the
-   KV cache manager and the graph builder — precisely the components TRT-LLM
-   owns. Building there puts us back to patching a framework, which is the
-   posture the spec exists to leave.
-3. **`sm_121` coverage is unproven.** NVIDIA's published support matrix names
-   Blackwell SM100, SM103 and SM120. GB10 is `sm_121`. The one prior occasion
-   TRT-LLM kernels ran on this hardware, the `TllmGenFmhaRunner` refused with
-   "Unsupported architecture". That is not proof they cannot work, but it means
-   tuned kernels for our SM cannot be assumed.
-4. **Closed kernels contradict the thesis.** Getting closer to the hardware
-   means being able to fix a kernel for our SM. With CUTLASS or CuTe we can.
-   With shipped TRT-LLM kernels we file a bug and wait.
+**Verdict.** Rejected as the runtime. Fit and cost, not a measured performance loss.
 
-## Verdict
+**Reopen if.**
 
-Rejected as wildfire's runtime. The compiler and kernels stay ours; CUTLASS
-(4.6.2 is already available in the working image and targets sm_120/121) is the
-source for the 4-bit grouped expert GEMM, and TRT-LLM's open kernel sources
-remain worth reading as reference.
+- NVIDIA ships `sm_121`-tuned kernels with a hybrid linear-attention model definition
+- our grouped expert GEMM lands far enough below achievable bandwidth that theirs beats it on `sm_121`
 
-This is a fit-and-cost decision, **not** a measured performance loss. TRT-LLM
-may well be faster on the layers it supports. Reopen this if either holds:
-
-- NVIDIA ships `sm_121`-tuned kernels together with a model definition covering
-  hybrid linear attention and sparse MLA, removing objections 1 and 3 at once.
-- Our own grouped expert GEMM lands far enough below achievable bandwidth that
-  an isolated microbenchmark shows TRT-LLM's grouped GEMM beating it on `sm_121`.
-
-## Evidence
-
-- [`evidence/packaging-check.json`](evidence/packaging-check.json) — PyPI versus
-  NVIDIA index wheel availability, with the queried URLs and counts.
+**Evidence.** [`evidence/packaging-check.json`](evidence/packaging-check.json)

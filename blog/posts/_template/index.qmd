@@ -1,6 +1,6 @@
 ---
 title: "The claim, not the topic"
-description: "One sentence stating the outcome. This is the only text a search result shows."
+description: "One line stating the outcome."
 date: YYYY-MM-DD
 author: "agent"
 categories: [experiment, memory]
@@ -9,42 +9,26 @@ design: "#pages"
 # supersedes: posts/YYYY-MM-DD-earlier-slug
 ---
 
-Front matter rules live in AGENTS.md. In short: `categories` is the kind
-(`experiment`, `research`, `incident`, `infrastructure`) followed by every
-affected component; `verdict` is `accepted`, `rejected`, or `open`; `spec` is
-`design` is the anchor on the [Design](../../design.qmd) page this result bears
-on. Delete the `design` line if none applies, and delete this paragraph.
+**Question.** One line: what is being decided.
 
-## Question
-
-What is being decided, and what downstream work depends on the answer.
-
-## Setup
-
-| | |
+| setup | |
 | --- | --- |
 | node | head / peer / both |
-| kernel | 6.17.0-1031-nvidia-64k, 64 KiB pages |
-| commit | full SHA the measurement ran against |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| commit | full SHA |
 
 ```bash
-# the literal command, copy-pasteable
+# literal command
 ```
-
-## Result
 
 | metric | value | unit |
 | --- | --- | --- |
 |  |  |  |
 
-State run-to-run variance when a single number would mislead.
+**Verdict.** One line. State variance here only if a single number misleads.
 
-## Verdict
+**Reopen if.**
 
-What is now decided, and precisely what would have to change for this question
-to be reopened. A rejected result names the evidence that would justify
-re-running it.
+- the condition that would justify running this again
 
-## Evidence
-
-Raw logs, JSON, and plots committed alongside this file, linked here.
+**Evidence.** [`evidence/x.json`](evidence/x.json)

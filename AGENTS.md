@@ -58,6 +58,11 @@ tree.
 
 ### What an entry must contain
 
+- ALWAYS use the `/self-voice` skill to write entries, and be short and concise, avoiding unnecessary prose.
+- NEVER write narrative or explanatory paragraphs; ALWAYS prefer a table, a one-line bullet, or a single sentence.
+- NEVER restate in prose what the front matter, a table, or the evidence JSON already says.
+- ALWAYS keep an entry scannable in under a minute; if it needs more room, the detail belongs in evidence JSON or on the Design page.
+
 - ALWAYS record, under Setup, the node the work ran on, the exact commit SHA, and the literal copy-pasteable command.
 - ALWAYS report numbers with units in a table, and NEVER report a measurement in prose alone.
 - ALWAYS state run-to-run variance when a single number would be misleading.

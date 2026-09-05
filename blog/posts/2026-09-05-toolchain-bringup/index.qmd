@@ -1,22 +1,19 @@
 ---
-title: "Toolchain bringup: gh and quarto on arm64"
-description: "Publishing toolchain installed on the head node; both binaries verified."
+title: "gh and quarto install clean on arm64"
+description: "Both install from arm64 debs and quarto check passes, so a broken render is caught locally instead of in CI."
 date: 2026-09-05
 author: "agent"
 categories: [infrastructure, tooling]
 verdict: accepted
 ---
 
-## Question
+**Question.** What does the head node need to publish this log? Neither tool was present, and the box is arm64.
 
-What is needed on the head node to publish this build log, given the box is
-arm64 and neither tool was present.
-
-## Setup
-
-- hardware: head node, `6.17.0-1031-nvidia-64k`, 64 KiB pages, arm64
-- command: install the arm64 `.deb` releases directly, since neither tool is in
-  the distribution repositories at a useful version
+| setup | |
+| --- | --- |
+| node | head |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| arch | arm64 |
 
 ```bash
 curl -sLO https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_arm64.deb
@@ -24,17 +21,21 @@ curl -sLO https://github.com/quarto-dev/quarto-cli/releases/download/v1.10.18/qu
 sudo dpkg -i gh_2.100.0_linux_arm64.deb quarto-1.10.18-linux-arm64.deb
 ```
 
-## Result
+| component | version |
+| --- | --- |
+| gh | 2.100.0 |
+| quarto | 1.10.18 |
+| pandoc (bundled) | 3.10.0 |
+| dart sass (bundled) | 1.101.0 |
+| deno (bundled) | 2.7.14 |
+| typst (bundled) | 0.15.1 |
 
-`gh` 2.100.0 and `quarto` 1.10.18 installed. `quarto check` reports its bundled
-dependencies healthy on arm64: Pandoc 3.10.0, Dart Sass 1.101.0, Deno 2.7.14,
-Typst 0.15.1. No architecture-specific failures.
+Neither is in the distro repos at a useful version, so the debs come straight from releases.
 
-## Verdict
+**Verdict.** Accepted. `quarto check` passes on arm64 with no architecture-specific failures.
 
-Accepted. Quarto renders locally on the head node, so a broken build can be
-caught before it reaches CI rather than after.
+**Reopen if.**
 
-## Evidence
+- a quarto release drops arm64 debs, or `quarto check` starts failing a bundled dependency
 
-`quarto check` output at install time; versions pinned above.
+**Evidence.** [`evidence/versions.json`](evidence/versions.json)
