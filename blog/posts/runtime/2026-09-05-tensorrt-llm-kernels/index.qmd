@@ -21,18 +21,18 @@ What was wrong:
 
 | earlier objection | actual status |
 | --- | --- |
-| not in the model zoo | work, not a barrier — plugins and custom definitions exist |
+| not in the model zoo | work, not a barrier. Plugins and custom definitions exist. |
 | `sm_121` unproven | a build flag: `build_wheel.py --cuda_architectures=121-real` |
-| closed kernels | false — 167 open entries under `cpp/tensorrt_llm/kernels`; TensorRT the graph library is the closed piece, not TensorRT-LLM |
+| closed kernels | false. 167 open entries under `cpp/tensorrt_llm/kernels`; TensorRT the graph library is the closed piece, not TensorRT-LLM |
 
-What survives — we write KDA, DSA and the 4-bit grouped expert GEMM either way, so:
+What survives. We write KDA, DSA and the 4-bit grouped expert GEMM either way, so:
 
 | it offers | we would |
 | --- | --- |
 | tuned kernels for supported layers | write our hot layers regardless |
 | batch manager and scheduler | replace it ([scheduler](../../../accelerants/glm-5.3-flash.qmd#scheduler)) |
 | graph runtime | shapes are static; CUDA graphs over our own launcher is small |
-| KV cache manager | replace it — the atomic `(KV, KDA)` entry is the point |
+| KV cache manager | replace it. The atomic `(KV, KDA)` entry is the point |
 
 **Verdict.** Runtime rejected on contribution, not difficulty. Kernels explicitly not rejected.
 

@@ -29,7 +29,7 @@ Packaging first, because an earlier local note called it unavailable on aarch64.
 | PyPI `tensorrt-llm` | 1.2.1, sdist only, 0 wheels across all releases |
 | NVIDIA index | 93 aarch64 wheels, latest `1.3.0rc9-cp312-cp312-linux_aarch64` |
 
-That objection is dead — point pip at the NVIDIA index. What decided it instead:
+That objection is dead. Point pip at the NVIDIA index. What decided it instead:
 
 1. GLM-5.3-Flash is not a stock model definition. KDA, sparse MLA with a top-2048 DSA indexer, 288-expert top-8 MoE, MTP head. Adopting it means plugins for every interesting layer.
 2. Our differentiator lives inside its abstractions: the atomic `(KV, KDA)` entry in the [state cache](../../../accelerants/glm-5.3-flash.qmd#cache) and compile-time expert placement sit in its KV manager and graph builder.
