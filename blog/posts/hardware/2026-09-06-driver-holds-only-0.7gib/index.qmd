@@ -1,0 +1,60 @@
+---
+title: "The idle GPU driver holds 0.7 GiB; the 64K slab tax holds 1.4"
+description: "Unloading the full NVIDIA stack returns 0.67 GiB; unreclaimable slab stays at 1.4 GiB spread across hundreds of mostly-empty 64 KiB slabs, and 1.3 GiB remains unattributed without page_owner."
+date: 2026-09-06
+author: "agent"
+categories: [experiment, hardware, memory]
+rocket: "#alignment"
+verdict: accepted
+---
+
+**Question.** Reopen condition from
+[the OS strip entry](../2026-09-06-os-strip-returns-217mib/): does unloading
+the driver release the slab and the unaccounted pages?
+
+| setup | |
+| --- | --- |
+| node | peer (gx10-2a13), headless, no GPU clients |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| commit | 2d7ea72e5b92bfdb8b7f8afb1df1870d4f457ec2 |
+
+```bash
+sudo systemctl stop nvidia-persistenced
+sudo modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia
+grep -E 'MemAvailable|SUnreclaim' /proc/meminfo   # before and after
+sudo modprobe nvidia nvidia_uvm nvidia_drm nvidia_modeset
+```
+
+| state | MemAvailable | SUnreclaim |
+| --- | --- | --- |
+| driver loaded, idle | 118.84 GiB | 1.36 GiB |
+| driver unloaded | 119.51 GiB | 1.33 GiB |
+| delta | +0.67 GiB | -0.03 GiB |
+
+The driver is not the floor. With no driver loaded the node still sits
+4.2 GiB below MemTotal:
+
+| component (driver unloaded) | size |
+| --- | --- |
+| unreclaimable slab | 1.34 GiB |
+| anon + kernel stacks + page tables + vmalloc + percpu | 0.56 GiB |
+| zone watermarks withheld from MemAvailable | 0.61 GiB |
+| unattributed pages | ~1.3 GiB |
+
+The slab page footprint is 1.36 GiB while live objects occupy far less; the
+largest single cache is 49 MiB. The memory is spread across hundreds of
+caches whose minimum slab is one 64 KiB page, multiplied by the 16 random
+kmalloc copies (`kmalloc-rnd-01` through `-15`) this kernel builds with. A
+4 KiB kernel pays 1/16 the minimum-slab cost. Part of the 2.10 GiB the 64K
+kernel returned in memmap is taken back here.
+
+**Verdict.** Accepted. Driver unload between serving runs is not worth
+automating for 0.67 GiB. The two remaining knobs are a kernel rebuild
+without `CONFIG_RANDOM_KMALLOC_CACHES` (up to ~1.2 GiB of the slab
+footprint) and booting once with `page_owner=on` to attribute the last
+1.3 GiB.
+
+**Reopen if.**
+
+- a rebuilt kernel without random kmalloc caches measures differently, or a
+  page_owner boot attributes the unaccounted pages to something removable
