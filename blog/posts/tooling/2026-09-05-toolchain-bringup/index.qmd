@@ -38,4 +38,3 @@ Neither is in the distro repos at a useful version, so the debs come straight fr
 
 - a quarto release drops arm64 debs, or `quarto check` starts failing a bundled dependency
 
-**Evidence.** [`evidence/versions.json`](evidence/versions.json)

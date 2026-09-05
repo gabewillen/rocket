@@ -1,0 +1,30 @@
+---
+title: "Three GB10 limits that decide how kernels get written"
+description: "C2C segfaults on CPU reads of cudaMalloc memory, shared memory caps near 99 KB, and sm_121 is missing from vendor kernel matrices."
+date: 2026-09-05
+author: "agent"
+categories: [research, hardware, kernels]
+verdict: accepted
+---
+
+**Question.** Which GB10 behaviours constrain kernel and buffer design before
+any code is written? Each of these cost a bringup cycle in an earlier stack on
+this same pair of nodes.
+
+| limit | observed | consequence |
+| --- | --- | --- |
+| C2C cannot CPU-read `cudaMalloc` memory | host reads segfault; managed memory works | any buffer the host touches is managed or host memory |
+| dynamic shared memory ~99 KB per block | a DSA kernel requesting 169,984 B failed at launch | every kernel declares its smem budget and is checked against the cap |
+| `sm_121` absent from vendor kernel matrices | TensorRT-LLM `TllmGenFmhaRunner` refused with "Unsupported architecture" | no vendor dispatch table is assumed to have a tactic for this SM |
+
+The shared memory cap is what forced a working DSA configuration of
+`block_I=32`, `num_stages=1`, `threads=128` on `sm_12x`. The v2 kernel wants
+166 KB and cannot run here.
+
+**Verdict.** Accepted as design constraints. Accelerants own their attention
+kernels rather than depending on a vendor dispatch table.
+
+**Reopen if.**
+
+- a driver release changes the smem limit, or CUDA allows host reads of device
+  allocations over C2C

@@ -6,7 +6,7 @@ author: "agent"
 categories: [research, runtime, kernels]
 verdict: rejected
 design: "#doctrine"
-superseded-by: posts/2026-09-05-tensorrt-llm-kernels
+superseded-by: posts/runtime/2026-09-05-tensorrt-llm-kernels
 ---
 
 ::: {.callout-important}
@@ -14,7 +14,7 @@ Superseded by [rejected as a runtime, not as a kernel source](../2026-09-05-tens
 Objections 1, 3 and 4 do not hold. Left unedited as history.
 :::
 
-**Question.** Build wildfire on TensorRT-LLM instead of our own compiler? It is an ahead-of-time graph compiler with a thin runtime, which is the shape the [doctrine](../../design.qmd#doctrine) describes.
+**Question.** Build wildfire on TensorRT-LLM instead of our own compiler? It is an ahead-of-time graph compiler with a thin runtime, which is the shape the [doctrine](../../../design.qmd#doctrine) describes.
 
 | setup | |
 | --- | --- |
@@ -32,7 +32,7 @@ Packaging first, because an earlier local note called it unavailable on aarch64.
 That objection is dead — point pip at the NVIDIA index. What decided it instead:
 
 1. GLM-5.3-Flash is not a stock model definition. KDA, sparse MLA with a top-2048 DSA indexer, 288-expert top-8 MoE, MTP head. Adopting it means plugins for every interesting layer.
-2. Our differentiator lives inside its abstractions: the atomic `(KV, KDA)` entry in the [state cache](../../design.qmd#cache) and compile-time expert placement sit in its KV manager and graph builder.
+2. Our differentiator lives inside its abstractions: the atomic `(KV, KDA)` entry in the [state cache](../../../accelerants/glm-5.3-flash.qmd#cache) and compile-time expert placement sit in its KV manager and graph builder.
 3. `sm_121` coverage unproven. Published matrix names SM100/103/120; its FMHA runner refused this hardware once with "Unsupported architecture".
 4. Closed kernels leave no way to fix an `sm_121` gap ourselves.
 
@@ -43,4 +43,3 @@ That objection is dead — point pip at the NVIDIA index. What decided it instea
 - NVIDIA ships `sm_121`-tuned kernels with a hybrid linear-attention model definition
 - our grouped expert GEMM lands far enough below achievable bandwidth that theirs beats it on `sm_121`
 
-**Evidence.** [`evidence/packaging-check.json`](evidence/packaging-check.json)

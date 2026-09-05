@@ -21,6 +21,10 @@ design: "#pages"
 # literal command
 ```
 
+```
+output that produced the numbers
+```
+
 | metric | value | unit |
 | --- | --- | --- |
 |  |  |  |
@@ -30,5 +34,3 @@ design: "#pages"
 **Reopen if.**
 
 - the condition that would justify running this again
-
-**Evidence.** [`evidence/x.json`](evidence/x.json)

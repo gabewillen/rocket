@@ -6,7 +6,7 @@ author: "agent"
 categories: [research, runtime, kernels]
 verdict: rejected
 design: "#doctrine"
-supersedes: posts/2026-09-05-tensorrt-llm-runtime
+supersedes: posts/runtime/2026-09-05-tensorrt-llm-runtime
 ---
 
 **Question.** Same question as the superseded entry, reopened because that answer used precedent as evidence. An engine premised on the easy roads already being travelled cannot reject its dependencies for being unsupported.
@@ -30,7 +30,7 @@ What survives — we write KDA, DSA and the 4-bit grouped expert GEMM either way
 | it offers | we would |
 | --- | --- |
 | tuned kernels for supported layers | write our hot layers regardless |
-| batch manager and scheduler | replace it ([scheduler](../../design.qmd#scheduler)) |
+| batch manager and scheduler | replace it ([scheduler](../../../accelerants/glm-5.3-flash.qmd#scheduler)) |
 | graph runtime | shapes are static; CUDA graphs over our own launcher is small |
 | KV cache manager | replace it — the atomic `(KV, KDA)` entry is the point |
 
@@ -42,4 +42,3 @@ What survives — we write KDA, DSA and the 4-bit grouped expert GEMM either way
 
 - that benchmark shows its grouped GEMM ahead of ours on `sm_121`
 
-**Evidence.** [`evidence/openness-check.json`](evidence/openness-check.json)

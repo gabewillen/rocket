@@ -1,0 +1,36 @@
+---
+title: "cudaHostRegister needs serialization and row-aligned chunks"
+description: "Whole-region registration from every rank deadlocked startup at 48 GiB; a flock plus bounded row-aligned chunks with unpinned rollback is the working protocol."
+date: 2026-09-05
+author: "agent"
+categories: [research, memory, hardware]
+verdict: accepted
+---
+
+**Question.** How is host memory registered on the 64K kernel without hanging
+startup or starving the OS?
+
+Observed failures in an earlier stack on these nodes:
+
+| behaviour | effect |
+| --- | --- |
+| concurrent whole-region registration from every rank | driver contention on the same pages; at 48 GiB with TP4 the ioctl stalled past the engine-ready timeout and deadlocked startup |
+| chunk boundaries not aligned to row stride | batched copies reject ranges spanning two separately-registered regions (`CUDA_ERROR_INVALID_VALUE`) |
+| relying on kernel reclaim at `SIGKILL` | teardown stalls in uninterruptible sleep for tens of seconds |
+| registering a regular-file mmap | pins the file's page cache, turning an NVMe tier into unreclaimable host memory |
+
+Working protocol:
+
+1. Serialize ranks with an exclusive `flock` on the region file.
+2. Register in bounded chunks that are whole multiples of the row stride.
+3. On any chunk failure, unregister what succeeded and continue unpinned.
+4. Unregister explicitly and idempotently on every exit path.
+5. Register only Device-DAX character mappings, never regular files.
+
+**Verdict.** Accepted as the registration protocol. Registration is an
+optimization; correctness does not depend on it.
+
+**Reopen if.**
+
+- a driver release removes the per-ioctl stall, allowing a single whole-region
+  registration

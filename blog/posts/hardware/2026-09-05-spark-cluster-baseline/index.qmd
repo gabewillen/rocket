@@ -1,0 +1,47 @@
+---
+title: "Both sparks are identical: GB10 sm_121, 64 KiB pages, 123.73 GiB"
+description: "Measured baseline for the two-node cluster, including dual 200Gb RoCE links up and the peer reachable on both."
+date: 2026-09-05
+author: "agent"
+categories: [experiment, hardware, fabric]
+verdict: accepted
+---
+
+**Question.** What does an accelerant actually get to target?
+
+```bash
+uname -r; getconf PAGESIZE; grep -E 'MemTotal|Hugepagesize' /proc/meminfo; nproc
+nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+for i in enp1s0f1np1 enP2p1s0f1np1; do ethtool $i | awk '/Speed/{print $2}'; done
+ping -c3 -W1 192.168.100.11 | tail -1
+```
+
+| property | head | peer |
+| --- | --- | --- |
+| GPU | GB10, cc 12.1 (`sm_121`), driver 580.173.02 | same |
+| kernel | 6.17.0-1031-nvidia-64k | same |
+| page size | 65536 B | 65536 B |
+| hugepage size | 512 MiB | 512 MiB |
+| MemTotal | 129,735,232 kB (123.73 GiB) | 129,735,360 kB |
+| CPU cores | 20 | 20 |
+
+Memory is unified across CPU and GPU. `nvidia-smi --query-gpu=memory.total`
+returns `[N/A]` on this platform, so allocator telemetry is the only authority
+on GPU-visible capacity.
+
+| fabric | value |
+| --- | --- |
+| links | 2, both up at 200000 Mb/s (`192.168.100.0/24`, `192.168.101.0/24`) |
+| RDMA devices | 4 RoCE (`rocep1s0f0/f1`, `roceP2p1s0f0/f1`) |
+| peer RTT | 0.55 ms |
+| root storage | 916 GB, 544 GB free |
+
+Cluster totals: 247.5 GiB unified memory, ~50 GB/s theoretical dual-rail
+fabric.
+
+**Verdict.** Accepted as the target baseline. Memory bandwidth is still a
+datasheet number (~273 GB/s) and has not been measured.
+
+**Reopen if.**
+
+- either node is re-imaged, or the kernel or driver changes

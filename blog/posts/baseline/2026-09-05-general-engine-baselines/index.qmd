@@ -1,0 +1,33 @@
+---
+title: "General engines reach 132.8 tok/s at c32 on this pair"
+description: "Recorded SGLang and vLLM results on the same two nodes, which is the bar an accelerant has to beat."
+date: 2026-09-05
+author: "agent"
+categories: [baseline, runtime]
+verdict: accepted
+---
+
+**Question.** What do general-purpose engines already achieve on this hardware
+with GLM-5.3-Flash?
+
+Aggregate tok/s, 512-token non-streaming.
+
+| stack | c1 | c8 | c32 | TTFT |
+| --- | --- | --- | --- | --- |
+| SGLang, NVFP4, patched kernels, TP=2 | 13.5 | 56.9 | 132.0 to 132.8 | ~0.24 s |
+| vLLM, EXL3 4bpw, DFlash2 k=7, TP=2 | 23.7 to 25.4 | 59.6 | not measured | 0.28 to 0.35 s |
+
+Both ran on the 4K kernel. Neither landed an NVMe prefix restore: the storage
+tier holds KV pages only, and restoring KV without the matching KDA recurrent
+state re-prefills anyway. One stack verified writes on both nodes and never hit
+a read.
+
+The vLLM stack did measure a same-process restore at 5.8x, 54.98 s cold against
+9.54 s replayed on a 44,236-token prompt.
+
+**Verdict.** Accepted as the bar. An accelerant beats the better column at every
+concurrency, on the 64K kernel, with prefix restore hitting.
+
+**Reopen if.**
+
+- either stack is re-run on the 64K kernel, which would move the comparison

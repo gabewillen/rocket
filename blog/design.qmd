@@ -1,469 +1,143 @@
 ---
 title: "Design"
-subtitle: "What wildfire is, what it burns, and what it refuses to be."
+subtitle: "The compiler, the accelerant it emits, and the rules both follow."
 date-modified: 2026-09-05
 toc-depth: 2
 ---
 
-::: {.callout-note}
-This page is **current state**, not history. It is revised in place as decisions
-change. The [log](index.qmd) is the append-only record of how each decision was
-reached; where the two disagree, the log explains and this page decides.
-:::
+Current state, revised in place. The [log](index.qmd) is the append-only record
+of how each decision was reached, and holds every measurement cited here.
 
-**A wildfire is what happens when a spark ignites an accelerant.**
+A wildfire is what happens when a spark ignites an accelerant.
 
 | term | meaning |
 | --- | --- |
-| **accelerant** | an inference engine compiled for exactly one model on one cluster: specialized, disposable, regenerated rather than reconfigured |
-| **spark** | the hardware that ignites it — DGX Spark, GB10 |
-| **wildfire** | the result of the spark igniting the accelerant |
+| accelerant | an inference engine compiled for one model on one cluster. Regenerated, not reconfigured. |
+| spark | the hardware that ignites it (DGX Spark, GB10) |
+| wildfire | the result of the spark igniting the accelerant |
 
-**GLM-5.3-Flash gets the first accelerant.** It is what the rest of this page
-specifies. Every model after it gets its own accelerant, never a configuration
-flag on this one.
+Model-specific content lives with its accelerant:
+[GLM-5.3-Flash](accelerants/glm-5.3-flash.qmd) is the first. Hardware
+measurements live in the log.
 
-Generality lives in the compiler. Specialization lives in each accelerant, and
-never leaks back. Every stack in [prior art](#baselines) is a capable general
-engine that pays for generality at runtime — dynamic shapes, runtime dispatch,
-autotuning, a general allocator, a Python step loop — and additionally assumes
-4 KiB host pages, GPU memory distinct from host RAM, and reusable state fully
-captured by an attention KV cache. All three are false on a spark.
-[Doctrine](#doctrine) states the position; [prior art](#baselines) states the bar.
+## Doctrine {#doctrine}
 
----
+General-purpose engines pay for generality at runtime: dynamic shapes, runtime
+dtype dispatch, autotuned kernel selection, a general allocator, and a Python
+step loop on a 20-core Arm host. They reach
+[132.8 tok/s at c32](posts/baseline/2026-09-05-general-engine-baselines/) here.
+An accelerant recovers that cost by refusing to be general.
 
-## 1. Target hardware (measured on both nodes, 2026-09-05) {#hardware}
-
-| Property | Value |
-| --- | --- |
-| SoC | NVIDIA GB10, compute capability 12.1 (sm_121), driver 580.173.02 |
-| Kernel | 6.17.0-1031-nvidia-64k |
-| Page size | **65536 B**; hugepage size 512 MiB |
-| MemTotal | 129,735,232 kB = **123.73 GiB** per node (unified CPU+GPU) |
-| Memory bandwidth | ~273 GB/s LPDDR5x (datasheet; **must be measured in M0**) |
-| CPU | 20 cores |
-| Storage | 916 GB NVMe root, ~544 GB free |
-| Interconnect | **2x 200 Gb/s RoCE** per node, both links up: 192.168.100.0/24 and 192.168.101.0/24; peer RTT ~0.55 ms |
-
-Cluster total: **247.5 GiB** unified memory, ~546 GB/s aggregate memory
-bandwidth, ~50 GB/s theoretical dual-rail fabric between nodes.
-
-### 1.1 GB10 constraints that shape the design
-
-These are load-bearing. Each has already cost a bringup cycle in the prior
-stacks under ~/spark-stack.
-
-1. **C2C cannot CPU-read cudaMalloc memory.** Reading device-allocated memory
-   from the host segfaults; managed memory works. Any buffer the CPU must touch
-   (offload staging, descriptor rings, sampling scratch) is managed or host
-   memory, never plain device memory.
-2. **Shared memory is ~99 KB per block.** Kernels asking for more fail at
-   launch; one DSA kernel requested 169,984 B and died. Every kernel declares
-   its dynamic smem budget and is validated against the ceiling.
-3. **sm_121 is outside several vendor kernel matrices.** TensorRT-LLM's FMHA
-   runner rejects the architecture outright. Accelerants own their attention
-   kernels rather than depending on a dispatch table with no sm_121 tactic.
-4. **Memory overcommit kills the OS.** One prior boot at 0.87 utilization plus
-   an 8.58 GB pinned tier OOM-killed *both* operating systems. An accelerant never
-   discovers its budget by allocating until failure.
-
----
-
-## 2. Target model — GLM-5.3-Flash {#model}
-
-| Property | Value |
-| --- | --- |
-| Parameters | ~321B total, **18B active per token** |
-| Layers | 45 text layers + 24-layer vision encoder |
-| Attention | Hybrid: **KDA linear attention** on ~34 layers, **NoPE sparse MLA / DSA** on every 4th layer (~11 layers), top-k 2048 token selection |
-| MoE | **288 routed experts, top-8 per token** |
-| Context | 1,048,576 tokens |
-| Speculation | Native **MTP draft layer**; DFlash2 external drafter also available |
-| Checkpoints | FP8 native (~306 GiB), NVFP4 expert variant, EXL3 4bpw |
-
-Cached locally today: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw (164 GB) and
-incoai/GLM-5.3-Flash-DFlash2 (2.2 GB drafter).
-
-### 2.1 Capacity budget
-
-| Weight format | Size | Verdict |
-| --- | --- | --- |
-| FP8 native | ~306 GiB | **Does not fit** in 247.5 GiB |
-| EXL3 4bpw | ~164 GiB | Fits, ~83 GiB cluster headroom |
-| NVFP4 (4-bit experts) | ~182 GiB | Fits, ~65 GiB headroom |
-
-This accelerant targets the **4-bit weight regime**, with ~82 GiB resident weights per
-node as the design point. KV, KDA state, activations, drafter, vision encoder,
-runtime and OS all share the remaining ~41 GiB per node.
-
-### 2.2 Bandwidth ceiling
-
-Decode is bandwidth-bound. 18B active parameters at ~4.25 bits is about
-**9.6 GB read per token** when every active weight is re-read.
-
-- One node: 9.6 / 273 gives a **~28 tok/s** single-stream ceiling.
-- Both nodes on the same token (TP/EP=2): ~4.8 GB each in parallel, **~57 tok/s**.
-- Pipeline parallelism does **not** raise the single-stream ceiling, because
-  its stages are serial for any one token.
-
-This is the whole reason for the parallelism choice in section 5: only a layout
-where both nodes touch the same token concurrently can beat ~28 tok/s per
-stream. Batching raises aggregate throughput by amortizing expert reads across
-tokens that share experts, which is what section 7.2 exploits.
-
----
-
-## 3. Design doctrine: specialization over generality {#doctrine}
-
-Every stack in [prior art](#baselines) is a good general-purpose engine. They lose
-throughput here not because they are badly built, but because generality has a
-price on this hardware: dynamic shapes, runtime dtype dispatch, autotuned kernel
-selection, a general allocator, and a Python step loop on a 20-core Arm host.
-An accelerant buys that price back by refusing to be general.
-
-**One model. One cluster topology. One weight format. Every shape known ahead of
-time.** That binds each accelerant, not the compiler — a second model means a
+One model. One cluster topology. One weight format. Every shape known ahead of
+time. That binds each accelerant, not the compiler. A second model means a
 second accelerant, never a branch in this one.
 
-### 3.1 Structure: a compiler and the accelerant it emits
+## Structure {#structure}
 
-The **compiler** runs offline on the target hardware and consumes the model
-checkpoint, a hardware profile produced by M0, and an expert
-co-activation profile gathered from a representative corpus. It emits a *plan*:
-a pre-swizzled weight blob, a static memory map with literal byte offsets, an
-expert-to-node placement, a kernel selection with pinned tile parameters, the
-execution graph topology, and the KV/KDA arena geometry.
+The compiler runs offline on the target hardware. It consumes the model
+checkpoint, a hardware profile, and an expert co-activation profile gathered
+from a representative corpus. It emits a plan: a pre-swizzled weight blob, a
+static memory map with literal byte offsets, an expert-to-node placement, a
+kernel selection with pinned tile parameters, the execution graph topology, and
+the cache arena geometry.
 
-The **accelerant** maps that plan and executes it. It has no dynamic allocator, no
-autotuner, no dtype or shape dispatch, no kernel fallback paths, and no Python
-in the step loop. Startup either maps the plan successfully or refuses to start.
+The accelerant maps that plan and executes it. No dynamic allocator, no
+autotuner, no dtype or shape dispatch, no kernel fallback paths, no Python in
+the step loop. Startup either maps the plan or refuses to start.
 
-Changing the model is a compiler run producing a new accelerant, not a server
-reconfiguration.
+Changing the model is a compiler run producing a new accelerant.
 
-### 3.2 What specialization buys
+## What specialization buys {#buys}
 
-1. **The memory problem becomes a compile-time assertion.** Section 4.1 exists
-   because general engines negotiate their footprint at startup against a
-   moving target. The compiler decides residency offline, down to byte offsets, and
-   validates it once. There is no utilization fraction to tune and nothing to
-   discover by allocating until failure.
-2. **Launch overhead collapses.** A 45-layer step is hundreds of kernel launches
-   per token in a general engine. With fixed shapes the entire decode step is
-   one graph launch per batch bucket. Buckets are a compiled, closed set
-   (1, 2, 4, 8, 16, 32); there is no shape wildcard.
-3. **Weight layout is ours to choose.** Experts are pre-swizzled offline into
-   exactly the layout the GEMM wants, 64 KiB aligned, so a top-8 gather becomes
-   a small set of aligned contiguous reads. No runtime transposition, no layout
-   conversion, no padding discovered at load time.
-4. **Expert placement is a compile-time decision.** With measured co-activation
-   statistics, the compiler places the 288 experts across the two nodes to
-   minimize cross-node dispatch. A general engine cannot do this because it does
-   not know the model in advance.
-5. **The weight arena is one hugepage-backed mapping.** 512 MiB pages over an
-   ~82 GiB per-node working set is the strongest available argument for the 64K
-   kernel, and section 15 flags it for measurement in M0.
+| | |
+| --- | --- |
+| memory | residency is decided offline down to byte offsets and validated once. No utilization fraction to tune, nothing discovered by allocating until failure. |
+| launch overhead | fixed shapes make the decode step one graph launch per batch bucket. Buckets are a compiled closed set (1, 2, 4, 8, 16, 32) with no shape wildcard. |
+| weight layout | experts are pre-swizzled offline into the layout the GEMM wants, 64 KiB aligned, so a top-k gather is a few aligned contiguous reads. No runtime transposition or padding discovered at load time. |
+| expert placement | the compiler places experts across nodes from measured co-activation. A general engine cannot, because it learns the model at load time. |
+| TLB coverage | the weight arena is one hugepage-backed mapping, 512 MiB pages over a per-node working set in the tens of GiB. |
 
-### 3.3 What we deliberately give up
+## What we give up {#gives-up}
 
 Arbitrary models, runtime-selectable dtypes, plugin backends, dynamic adapters,
-arbitrary parallelism degrees, and graceful degradation onto unsupported
-hardware. None of these are TODOs. They are out of scope, and any proposal to
-add one must argue against the throughput it costs.
+arbitrary parallelism degrees, and degradation onto unsupported hardware. These
+are out of scope rather than pending. A proposal to add one has to argue against
+the throughput it costs.
 
-A reference implementation (HF/PyTorch) is retained strictly as an **offline**
-parity oracle for M1 and for golden-vector regression. It never appears in the
-serving path.
+A reference implementation (HF/PyTorch) is kept as an offline parity oracle and
+for golden-vector regression. It never appears in the serving path.
 
----
+## Rules an accelerant must satisfy {#rules}
 
-## 4. The 64 KiB page regime {#pages}
+Each rule follows from a measurement in the log.
 
-An accelerant **requires** the 64K-page kernel, installed on both nodes. It buys
-~2.10 GiB per node: boot-time reserved memory drops from 6.09 GiB to 4.00 GiB,
-and MemTotal rises from 121.63 GiB to 123.73 GiB. On memory-bound boxes that is
-a ~2% capacity gain for free.
+### Memory budget {#memory}
 
-It is not free in practice, and a prior A/B **rejected** this kernel for the
-vLLM stack. The failure was not the kernel; it was framework assumptions.
-These are hard rules.
-
-### 4.1 Never size a pool from MemTotal
-
-The rejected A/B failed exactly here: the larger reported total drove the
-framework's desired pool to 100.84 GiB at utilization 0.815, while CUDA exposed
-only 97.77-98.94 GiB after transfer registration. The admission check failed
-before the model loaded. Dropping clean page cache did not close the gap.
-
-**Rule.** The memory manager takes an *absolute byte budget*, never a fraction
-of MemTotal:
+Take an absolute byte budget. Never a fraction of `MemTotal`
+([why](posts/hardware/2026-09-05-memtotal-is-not-capacity/)).
 
 ```
 usable = measured_cuda_free_after_registration
-       - registration_reserve      (probed at startup, not estimated)
-       - os_floor                  (hard minimum 5 GiB, from the OOM incidents)
+       - registration_reserve      (probed at startup)
+       - os_floor                  (hard minimum 5 GiB)
 ```
 
-Startup refuses to proceed if requested residency exceeds `usable`. MemTotal may
-appear in logs; it may never appear in an arithmetic path that sizes an
-allocation.
+Refuse to start if requested residency exceeds `usable`. `MemTotal` may appear
+in logs, never in an arithmetic path that sizes an allocation.
 
-### 4.2 64 KiB is the universal alignment quantum
+### Alignment {#alignment}
 
-Every offset, stride, chunk and block boundary is a multiple of 65536: O_DIRECT
-NVMe I/O, mmap offsets, KV block rows, offload copy descriptors, shared-region
-layout. Any constant inherited from 4K-page code is treated as wrong until
-re-derived. Note the interaction with the model: DSA forces a logical attention
-page of 64 tokens, so KV row strides must satisfy both the 64-token logical page
-and the 64 KiB physical page.
+64 KiB is the universal quantum: O_DIRECT I/O, mmap offsets, cache block rows,
+copy descriptors, shared-region layout. Constants inherited from 4K-page code
+are wrong until re-derived.
 
-### 4.3 Host registration is the dangerous operation
+### Host registration {#registration}
 
-cudaHostRegister is where the 64K regime bites. The prior stacks converged on a
-specific safe pattern, which the accelerant adopts natively:
+Serialize ranks with a file lock, register in bounded row-aligned chunks, roll
+back to unpinned on failure, unregister on every exit path, and never register a
+regular-file mapping
+([protocol](posts/memory/2026-09-05-host-registration-protocol/)).
 
-- **Serialize across ranks.** Concurrent whole-region registration from every
-  rank contends in the driver on the same pages; at 48 GiB the ioctl stalled
-  past the engine-ready timeout and deadlocked startup. Take an exclusive file
-  lock and register one rank at a time.
-- **Register in bounded, row-aligned chunks.** Chunk size is a whole multiple of
-  the row stride. A copy descriptor targets one block row, and batched copies
-  reject ranges spanning two separately-registered regions
-  (CUDA_ERROR_INVALID_VALUE).
-- **Roll back to unpinned on failure.** Registration is an optimization, not a
-  correctness requirement. On any chunk failure, unregister what succeeded and
-  continue with pageable DMA.
-- **Unregister explicitly at teardown.** Large registered buffers reclaimed by
-  the kernel during SIGKILL stall teardown in uninterruptible sleep for tens of
-  seconds. Unregistration is idempotent and runs on every exit path.
-- **Never register a regular-file mapping.** Pinning a file-backed mmap pins its
-  page cache and turns an NVMe-backed tier into unreclaimable host memory, the
-  exact opposite of the intent. Only Device-DAX character mappings get the
-  registered fast path.
+### Cluster {#cluster}
 
-### 4.4 Both nodes run 64K, and the plan encodes it
+Page size is a compiler input baked into the plan's alignment constants. A node
+whose page size disagrees is refused at handshake. Both rails are required;
+single-rail is a startup refusal, because the compiled all-to-all schedule
+assumes two.
 
-A 4K head and a 64K worker were shown to interoperate over RoCE, including
-cross-node collectives, so a mixed cluster is *possible*. The accelerant does not
-support one. The page size is a compiler input baked into the plan's alignment
-constants; a node whose page size disagrees with the plan is refused at
-handshake rather than accommodated at runtime.
+### Kernels {#kernels}
 
----
+Accelerants own their attention and expert kernels. Every kernel declares its
+dynamic shared-memory requirement and is rejected at build time above the GB10
+ceiling ([limits](posts/hardware/2026-09-05-gb10-execution-limits/)).
 
-## 5. Parallelism layout {#parallelism}
+### Reusable state {#state}
 
-**Default: attention TP=2 plus expert-parallel EP=2 (144 experts per node) over
-dual-rail RoCE.**
+Whatever a layer needs to resume a sequence is one cache entry, written and
+restored atomically at a shared token boundary. An attention KV cache alone is
+not sufficient for models with recurrent state.
 
-The fabric makes this affordable. Per MoE layer, dispatch and combine move on
-the order of 20 KB per token; across 44 MoE layers that is under 1 MB per token,
-roughly 35 us of wire time at 25 GB/s. The real cost is latency: ~88 sequential
-hops at ~10 us is ~0.9 ms per token against a ~17 ms compute budget at the
-bandwidth ceiling. About 5% overhead to double the per-token bandwidth available
-to a single stream.
+### Numerics {#numerics}
 
-Pipeline parallelism is evaluated once in M0 and then discarded: it nearly
-eliminates cross-node traffic but cannot beat the ~28 tok/s single-stream
-ceiling. It is not carried as a runtime fallback, because the plan compiles one
-layout and only one.
+Precision is fixed at compile time per layer. No runtime dtype selection, no
+mixed-precision fallback. A quality gate runs on every numerics change.
 
-**Expert placement is compiled, not hashed.** A general engine shards 288
-experts by index because it learns the model at load time. The compiler instead
-places experts using measured co-activation statistics, so experts that fire
-together in the same top-8 land on the same node and never cross the fabric.
-The placement is validated against a held-out trace; the win is measured in
-cross-node dispatch volume per token, not assumed.
+## Observability {#telemetry}
 
-Both rails must be used. Single-rail operation is not a degraded serving mode;
-it is a startup refusal, because the compiled all-to-all schedule assumes two.
+Telemetry goes through OpenTelemetry. Required signals: per-step time split
+(attention, expert, all-to-all, sampling), bytes read per token, cache hit
+rates, prefix restore latency, registration reserve against measured CUDA free,
+and per-rail fabric utilization.
 
----
+Cardinality is bounded by construction. Request IDs, prompt hashes, and expert
+IDs are never metric dimensions. Per-request detail lives on spans.
 
-## 6. Hybrid state cache — the differentiating subsystem {#cache}
+## API {#api}
 
-GLM-5.3-Flash's reusable per-sequence state has two parts:
+OpenAI-compatible `/v1/chat/completions` and `/v1/completions` with streaming,
+tool calling, and reasoning-content separation. Image input in scope, video out
+of scope.
 
-1. **Sparse-MLA KV** on ~11 layers, growing with sequence length, pageable.
-2. **KDA recurrent state** on ~34 layers, fixed size per sequence, and *not*
-   reconstructible from KV.
-
-Every prior attempt at NVMe prefix caching on this model failed for one reason:
-the storage tier held KV pages only. Restoring KV without the matching KDA state
-forces a full re-prefill, so reads never hit. One stack verified writes to NVMe
-on both nodes and still never landed a single restore.
-
-**The accelerant treats the (KV pages, KDA state) pair as one indivisible cache
-entry**, anchored at the same token boundary, written and restored atomically.
-This subsystem is what justifies building an engine instead of patching one.
-
-Requirements:
-
-- A prefix entry is valid only if both components are present and their anchor
-  token offsets agree exactly.
-- Anchors sit on 64-token DSA page boundaries so KV and KDA state truncate to a
-  common prefix.
-- Two tiers: unified-memory hot tier and NVMe cold tier. **No CPU-pinned middle
-  tier** — it is the tier most likely to OOM the OS, and a pinned tier is what
-  pushed a node over the edge before.
-- Writes are event-fenced device-to-NVMe through a fixed bounce ring in
-  **managed** memory (section 1.1, constraint 1), then fsync plus atomic rename.
-- TTL sweep on the cold tier. The arena is a fixed byte budget, never "the rest
-  of the disk".
-
-Acceptance: a cold prefill of a large prompt followed by a full engine restart
-must replay from cache with cached_tokens non-zero. The bar is **5.8x**
-(54.98 s cold to 9.54 s replayed at 44,236 tokens).
-
-### 6.1 KDA state is the concurrency limiter
-
-KDA state dominates the concurrency ceiling far more than KV does. Prior tuning
-measured ~70 MB per request at 5 slots per request, capping concurrency at 6.
-Dropping to 4 slots per request with lazy buffering and a tuned convolution
-width lifted the same box to 32 concurrent requests. The accelerant treats **KDA slots
-per request** as a primary, explicitly tuned scheduler parameter, not an
-implementation detail.
-
----
-
-## 7. Scheduler {#scheduler}
-
-### 7.1 Decode priority over cold prefill
-
-Mixed traffic is the failure mode that matters for coding-agent workloads.
-Packing large uncached prefills into the same step as active decoders collapsed
-a cached stream from 39.4 tok/s to 1.2-1.4 tok/s in a prior stack, and a static
-chunk cap did not fix it.
-
-Admission rule: standalone prefills may use the full batch; cached suffixes
-below a threshold stay eligible; large *uncached* prefill chunks are deferred
-while any peer is actively decoding. Target: under 2% degradation of an active
-decode stream when a cold prefill arrives.
-
-### 7.2 Expert-affinity batching
-
-Decode is bandwidth-bound and only 8 of 288 experts fire per token, so the
-scheduler groups tokens within a step by routed expert set. Each expert's
-weights are read once and amortized across every token needing them. This is the
-main lever for aggregate throughput above the single-stream ceiling.
-
-### 7.3 Speculative decoding
-
-The MTP draft layer is the default path, with DFlash2 as an alternative. Prior
-evidence is mixed and must be re-measured: one stack ran DFlash2 at k=7
-productively, another disabled MTP entirely because the drafter's memory cost
-would have capped concurrency near 10. Speculation depth is a runtime knob with
-an explicit memory charge in the section 4.1 budget, and the drafter gets its
-own KV group.
-
----
-
-## 8. Numerics {#numerics}
-
-Precision is fixed at compile time. There is no runtime dtype selection and no
-mixed-precision fallback path.
-
-- Experts: 4-bit, one format of record (see section 15, question 2).
-- Attention, KDA and dense paths: FP8 where the kernel supports it, BF16
-  otherwise — decided per layer by the compiler, not at runtime.
-- Router logits and normalization: BF16 minimum. With 288 experts, routing
-  precision is a correctness concern, not a performance knob.
-- KV precision is a compiler input. FP8 KV must pass the quality gate before it
-  can be selected.
-
-A quality gate (perplexity plus a coding/agentic task subset) runs on every
-numerics change. Throughput regressions are recoverable; silent quality
-regressions are not.
-
----
-
-## 9. Kernels {#kernels}
-
-We own: KDA linear attention, DSA sparse attention with the top-2048
-indexer, fused MoE grouped GEMM for 4-bit experts, and the MTP draft head.
-
-Every kernel declares its dynamic shared-memory requirement and is rejected at
-build time above the 99 KB GB10 ceiling. The prior stack's working DSA
-configuration on sm_12x — block_I=32, num_stages=1, threads=128 — is the
-starting point, not a guess.
-
----
-
-## 10. Observability {#telemetry}
-
-All runtime telemetry goes through **OpenTelemetry**. Required signals: per-step
-time split (attention / MoE / all-to-all / sampling), bytes read per token,
-expert cache hit rate, KDA slot occupancy, prefix hit rate and restore latency,
-registration reserve versus measured CUDA free, and per-rail RoCE utilization.
-
-**Cardinality is bounded by construction.** Request IDs, prompt hashes and
-expert IDs are never metric dimensions. Expert-level detail is exported as
-bounded histograms; per-request detail lives on spans, not metrics.
-
----
-
-## 11. API {#api}
-
-OpenAI-compatible /v1/chat/completions and /v1/completions with streaming, tool
-calling and reasoning-content separation, because that is what the client
-workload speaks. Multimodal image input in scope; video out of scope.
-
-The API surface is deliberately thin. Per-request knobs that would force a shape
-or a kernel choice the plan did not compile are rejected, not accommodated.
-Serving-level controls (speculation depth, cache anchor policy) are plan
-parameters, set at compile time and reported read-only over the wire.
-
----
-
-## 12. Milestones {#milestones}
-
-| Milestone | Content | Exit criterion |
-| --- | --- | --- |
-| **M0** | Hardware characterization: measured memory bandwidth, registration-reserve probe, dual-rail RoCE bandwidth and latency, 64 KiB alignment audit | Section 1 estimates replaced by measurements; budget calculator *refuses* a deliberate over-allocation instead of being OOM-killed |
-| **M1** | Model compiler v0: checkpoint to plan (static memory map, pre-swizzled weights, arena geometry). Runtime maps the plan and runs single-node forward | Logit parity against the offline oracle on a short prompt; zero dynamic allocation in the step loop |
-| **M2** | Compiled expert placement, TP=2 plus EP=2 across both nodes, dual rail, whole decode step as one graph launch per bucket | Correct output; single-stream tok/s measured against the ~57 ceiling; measured cross-node dispatch bytes per token beat index sharding |
-| **M3** | Hybrid state cache (KV + KDA) with NVMe tier | Restart-survival restore beats 5.8x replay speedup |
-| **M4** | Scheduler: decode priority, expert-affinity batching, continuous batching | c32 aggregate above 132.8 tok/s; decode degradation under cold prefill below 2% |
-| **M5** | MTP speculation, quality gates, OTEL, OpenAI surface | Full c1-c32 bench matrix plus quality gate green |
-
----
-
-## 13. Prior art and the bar to beat {#baselines}
-
-Measured on this exact hardware pair, recorded under ~/spark-stack. Aggregate
-tok/s, 512-token non-streaming.
-
-| Stack | c1 | c8 | c32 | TTFT |
-| --- | --- | --- | --- | --- |
-| SGLang NVFP4 (patched, TP=2) | 13.5 | 56.9 | **132.0-132.8** | ~0.24 s |
-| vLLM EXL3 4bpw + DFlash2 k=7 | **23.7-25.4** | 59.6 | not measured | 0.28-0.35 s |
-
-The accelerant must beat the better of these at every concurrency level, on the 64K
-kernel, with prefix restore actually hitting.
-
----
-
-## 14. Open questions {#questions}
-
-1. **Implementation language and runtime.** Rust host with CUDA/Triton kernels,
-   or C++? This decides everything downstream and should be settled first. The
-   doctrine pushes toward a language with no runtime surprises in the step loop.
-2. **Weight format of record — pick one.** Section 3.3 forbids supporting both.
-   EXL3 4bpw is on disk and proven at 164 GiB; NVFP4 is the native Blackwell
-   path with tensor-core support and likely better GEMM throughput on sm_121.
-   The tiebreaker should be a measured 4-bit grouped-GEMM microbenchmark in M0,
-   not preference.
-3. **How much does the compiler own?** Minimum viable is memory map plus weight
-   swizzle plus expert placement. The ambitious version also emits fused kernel
-   variants per layer shape. Where is the line for v0?
-4. **Expert co-activation corpus.** Placement quality is only as good as the
-   trace it is fit to. Which workload defines it — real coding-agent traffic, or
-   a general corpus? A placement overfit to one traffic shape may regress on
-   another, and that risk needs a held-out measurement.
-5. **Vision encoder scope.** Inside M1-M5, or a later phase? It is 24 layers of
-   weight residency competing with the KV and KDA arenas.
-6. **What is the real motivation for 64K pages?** The 2.10 GiB capacity gain is
-   modest against the registration complexity. TLB coverage over an ~82 GiB
-   per-node weight working set, mapped as 512 MiB hugepages, is the stronger
-   argument, and M0 should measure it rather than assume it.
+Per-request knobs that would force a shape or kernel choice the plan did not
+compile are rejected. Serving-level controls are plan parameters, set at compile
+time and reported read-only.
