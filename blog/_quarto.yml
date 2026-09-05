@@ -13,8 +13,10 @@ website:
         text: Log
       - href: experiments.qmd
         text: Experiments
-      - href: design.qmd
-        text: Design
+      - href: rocket.qmd
+        text: Rocket
+      - href: fuels/index.qmd
+        text: Fuels
       - href: engines/index.qmd
         text: Engines
     right:

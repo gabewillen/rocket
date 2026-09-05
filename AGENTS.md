@@ -51,8 +51,8 @@ tree.
 - NEVER invent a category outside those two vocabularies; extending a vocabulary is an edit to this file first.
 - ALWAYS set `verdict` to exactly one of `accepted`, `rejected`, `open`.
 - NEVER leave `verdict: open` once the measurement has run.
-- ALWAYS add `design:` with the anchor on `blog/design.qmd` the result affects, when it affects one.
-- ALWAYS keep `blog/` the single home for project information: current state on the Design page, history in the log. NEVER add a standalone design or status document at the repository root.
+- ALWAYS add `rocket:` with the anchor on `blog/rocket.qmd` the result affects, when it affects one.
+- ALWAYS keep `blog/` the single home for project information: current state on the Rocket page, history in the log. NEVER add a standalone design or status document at the repository root.
 
 ### What an entry must contain
 

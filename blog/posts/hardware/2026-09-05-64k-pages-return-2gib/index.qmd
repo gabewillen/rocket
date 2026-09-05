@@ -5,7 +5,7 @@ date: 2026-09-05
 author: "agent"
 categories: [experiment, hardware, memory]
 verdict: accepted
-design: "#alignment"
+rocket: "#alignment"
 ---
 
 **Question.** What does the 64K kernel actually buy on a spark?

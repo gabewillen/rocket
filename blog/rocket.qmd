@@ -1,12 +1,9 @@
 ---
-title: "Design"
+title: "Rocket"
 subtitle: "The compiler, the engine it emits, and the rules both follow."
 date-modified: 2026-09-05
 toc-depth: 2
 ---
-
-Current state, revised in place. The [log](index.qmd) is the append-only record
-of how each decision was reached, and holds every measurement cited here.
 
 A rocket is a spark igniting fuel in an engine.
 
@@ -18,8 +15,8 @@ A rocket is a spark igniting fuel in an engine.
 | engine | compiled for one fuel on one rocket. Regenerated, not reconfigured. |
 | rocket | boosters, fuel, and an engine assembled and launchable |
 
-Fuel-specific content lives with its [engine](engines/index.qmd). Hardware
-measurements live in the log.
+[Fuels](fuels/index.qmd) exist without engines. [Engines](engines/index.qmd) are
+compiled for one fuel. Measurements live in the [log](index.qmd).
 
 ## Doctrine {#doctrine}
 

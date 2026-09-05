@@ -1,6 +1,5 @@
 ---
 title: "Engines"
-subtitle: "One engine per fuel. Each has its own chemistry."
 listing:
   contents: "*.qmd"
   type: table
@@ -13,4 +12,6 @@ page-layout: full
 
 An engine is compiled for one fuel on one rocket. New fuel means a new engine,
 never a flag on an existing one. Shared architecture is on the
-[Design](../design.qmd) page.
+[Rocket](../rocket.qmd) page.
+
+None built yet.

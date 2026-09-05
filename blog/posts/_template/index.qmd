@@ -5,7 +5,7 @@ date: YYYY-MM-DD
 author: "agent"
 categories: [experiment, memory]
 verdict: open
-design: "#pages"
+rocket: "#pages"
 # supersedes: posts/YYYY-MM-DD-earlier-slug
 ---
 
