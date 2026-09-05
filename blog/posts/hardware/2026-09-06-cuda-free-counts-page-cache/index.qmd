@@ -1,0 +1,85 @@
+---
+title: "The 98 GiB CUDA ceiling was page cache, not a limit"
+description: "cudaMemGetInfo free drops 1:1 with clean page cache on GB10 unified memory; with caches dropped CUDA grants and device-touches 106 GiB, above the pool the serving run refused to admit."
+date: 2026-09-06
+author: "agent"
+categories: [experiment, hardware, memory, runtime]
+verdict: accepted
+rocket: "#alignment"
+supersedes: posts/hardware/2026-09-05-memtotal-is-not-capacity
+---
+
+**Question.** Is the 97.77 to 98.94 GiB CUDA-visible ceiling from the earlier
+entry a hardware limit, or an accounting artifact of the tool that reported it?
+
+| setup | |
+| --- | --- |
+| node | head (gx10-5e36) |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| commit | 74a510f7d61e8ad56108232952c9310805be9738 |
+| probe | `scripts/hardware/gpu-capacity.cu` |
+
+Allocate-until-stop, run under `MemoryMax=118G` with a host floor so the probe
+cannot OOM the node:
+
+```bash
+cd scripts/hardware && make gpu-capacity
+systemd-run --user --scope -p MemoryMax=118G -p MemorySwapMax=0 ./gpu-capacity 512 7
+```
+
+```
+cudaMemGetInfo: ok free=117.25 GiB total=123.73 GiB
+cudaMalloc achieved: 106.00 GiB in 212 x 512 MiB chunks (stopped at host floor)
+device-touched:      106.00 GiB
+after alloc:         free=7.44 GiB total=123.73 GiB
+```
+
+| quantity | value | unit |
+| --- | --- | --- |
+| ceiling reported in superseded entry | 97.77 to 98.94 | GiB |
+| desired pool that failed admission there | 100.84 | GiB |
+| cudaMalloc granted and device-touched here | 106.00 | GiB |
+| stop reason | host floor, not CUDA refusal | |
+
+A second run with a 12 GiB floor granted 101.50 GiB; both runs stopped at the
+floor, so the grant tracks host MemAvailable, not a fixed CUDA ceiling.
+
+Mechanism, measured by warming 10 GiB of file into clean page cache between two
+probe reads:
+
+```bash
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+./gpu-capacity 512 200 | head -1
+cat /test.img >/dev/null   # 10 GiB file
+./gpu-capacity 512 200 | head -1
+```
+
+```
+cudaMemGetInfo: ok free=118.10 GiB total=123.73 GiB
+cudaMemGetInfo: ok free=108.05 GiB total=123.73 GiB
+```
+
+| state | cudaMemGetInfo free | MemAvailable |
+| --- | --- | --- |
+| caches dropped | 118.10 GiB | 117.61 GiB |
+| +10 GiB clean page cache | 108.05 GiB | 117.11 GiB |
+
+On GB10 unified memory `cudaMemGetInfo` counts clean, reclaimable page cache as
+used. The superseded run sized its pool from total and compared against this
+free value after 120 model shards had passed through the page cache, so
+admission failed against memory that was reclaimable. The failure is in the
+free-memory accounting the engine reads, not in what CUDA will grant.
+
+The first version of this probe had no host floor. cudaMalloc on unified memory
+does not fail before the host is exhausted, and the run drove a global OOM that
+killed the probe and the IDE session. The committed probe stops at a
+MemAvailable floor and runs under a systemd MemoryMax scope.
+
+**Verdict.** Accepted. The 64K kernel's extra memory is CUDA-usable. Size pools
+from MemAvailable minus an OS floor, and drop or discount clean page cache
+before reading `cudaMemGetInfo`.
+
+**Reopen if.**
+
+- a driver release makes `cudaMemGetInfo` discount reclaimable cache, or an
+  admission check still fails with caches dropped
