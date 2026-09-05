@@ -27,7 +27,15 @@ website:
 
 format:
   html:
-    theme: cosmo
+    theme:
+      light: [cosmo, styles/theme-light.scss]
+      dark: [darkly, styles/theme-dark.scss]
     toc: true
     code-copy: true
     code-overflow: wrap
+    mainfont: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif
+    monofont: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace
+    fontsize: 0.95rem
+    smooth-scroll: true
+    grid:
+      body-width: 780px

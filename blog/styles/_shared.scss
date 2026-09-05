@@ -1,0 +1,132 @@
+// Shared rules for both light and dark themes.
+// Kept in one place so the two theme files stay in sync.
+
+$font-family-sans-serif: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+  Helvetica, Arial, sans-serif !default;
+$font-family-monospace: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+  Consolas, "Liberation Mono", monospace !default;
+
+$measure: 42rem;
+
+
+body {
+  font-feature-settings: "tnum" 1;
+  letter-spacing: 0;
+}
+
+.content,
+main {
+  max-width: $measure;
+}
+
+#quarto-content > * {
+  max-width: none;
+}
+
+.quarto-title-banner {
+  padding-top: 1.5rem;
+  padding-bottom: 1rem;
+}
+
+.quarto-title h1.title {
+  font-size: 1.9rem;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.25;
+}
+
+h1 { font-size: 1.6rem; }
+h2 {
+  font-size: 1.25rem;
+  margin-top: 2rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--rocket-hairline);
+}
+h3 { font-size: 1.05rem; margin-top: 1.5rem; }
+
+body { font-size: 0.95rem; line-height: 1.55; }
+
+p, ul, ol { max-width: $measure; }
+
+a { text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 1.5px; }
+
+code {
+  font-family: $font-family-monospace;
+  font-size: 0.85em;
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+}
+
+pre.sourceCode, div.sourceCode {
+  border-radius: 4px;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+pre code { padding: 0; border-radius: 0; }
+
+// Table styling: dense, monospace numerals, hairline borders, no zebra glare.
+table {
+  font-size: 0.85rem;
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1rem 0;
+}
+
+table thead th {
+  font-weight: 600;
+  text-align: left;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-bottom: 2px solid var(--rocket-hairline-strong);
+  padding: 0.4rem 0.6rem;
+}
+
+table td, table th {
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid var(--rocket-hairline);
+  vertical-align: top;
+}
+
+table td { font-variant-numeric: tabular-nums; }
+
+table tbody tr:last-child td { border-bottom: none; }
+
+.quarto-listing-category { font-size: 0.82rem; }
+
+.listing-date { font-family: $font-family-monospace; font-size: 0.8rem; }
+
+.navbar {
+  font-size: 0.9rem;
+  box-shadow: none !important;
+  border-bottom: 1px solid var(--rocket-hairline);
+}
+
+.navbar-brand { font-weight: 600; }
+
+blockquote {
+  border-left: 3px solid var(--rocket-hairline-strong);
+  padding-left: 1rem;
+  color: var(--rocket-muted);
+  max-width: $measure;
+}
+
+.callout {
+  border-radius: 4px;
+}
+
+.footer, .page-footer {
+  font-size: 0.8rem;
+  border-top: 1px solid var(--rocket-hairline);
+}
+
+::selection {
+  background: var(--rocket-selection);
+}

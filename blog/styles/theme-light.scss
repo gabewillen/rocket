@@ -1,0 +1,28 @@
+/*-- scss:defaults --*/
+
+$font-family-sans-serif: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+  Helvetica, Arial, sans-serif;
+$font-family-monospace: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+  Consolas, "Liberation Mono", monospace;
+
+$body-bg: #ffffff;
+$body-color: #1a1d21;
+$link-color: #0b5fa5;
+$code-color: #a13a5a;
+$code-bg: #f4f5f6;
+$pre-bg: #f6f7f8;
+$pre-color: #1a1d21;
+$border-color: #dfe2e5;
+$navbar-bg: #ffffff;
+$navbar-fg: #1a1d21;
+
+/*-- scss:rules --*/
+
+:root {
+  --rocket-hairline: #e6e8eb;
+  --rocket-hairline-strong: #c9cdd2;
+  --rocket-muted: #6a7178;
+  --rocket-selection: rgba(11, 95, 165, 0.15);
+}
+
+@import "_shared.scss";
