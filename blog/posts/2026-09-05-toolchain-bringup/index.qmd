@@ -3,7 +3,7 @@ title: "Toolchain bringup: gh and quarto on arm64"
 description: "Publishing toolchain installed on the head node; both binaries verified."
 date: 2026-09-05
 author: "agent"
-categories: [infrastructure]
+categories: [infrastructure, tooling]
 verdict: accepted
 ---
 

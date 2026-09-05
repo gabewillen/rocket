@@ -1,35 +1,50 @@
 ---
-title: "Short claim, not a topic"
-description: "One sentence a future agent can read to decide whether to re-run this."
+title: "The claim, not the topic"
+description: "One sentence stating the outcome. This is the only text a search result shows."
 date: YYYY-MM-DD
 author: "agent"
-categories: [experiment]
+categories: [experiment, memory]
 verdict: open
+spec: "4.1"
+# supersedes: posts/YYYY-MM-DD-earlier-slug
 ---
 
-`verdict` is one of `accepted`, `rejected`, or `open`. Categories are
-`experiment` for anything with a measured outcome, `research` for reading and
-analysis with no measurement, `incident` for something that broke.
+Front matter rules live in AGENTS.md. In short: `categories` is the kind
+(`experiment`, `research`, `incident`, `infrastructure`) followed by every
+affected component; `verdict` is `accepted`, `rejected`, or `open`; `spec` is
+the SPEC.md section this result bears on. Delete the `spec` line if none
+applies, and delete this paragraph.
 
 ## Question
 
-What was being decided, and what depends on the answer.
+What is being decided, and what downstream work depends on the answer.
 
 ## Setup
 
-- hardware: which node(s), kernel, page size
-- commit: exact SHA the measurement ran against
-- command: the literal command, copy-pasteable
+| | |
+| --- | --- |
+| node | head / peer / both |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB pages |
+| commit | full SHA the measurement ran against |
+
+```bash
+# the literal command, copy-pasteable
+```
 
 ## Result
 
-Numbers. Include the units and the run-to-run variance if it matters.
+| metric | value | unit |
+| --- | --- | --- |
+|  |  |  |
+
+State run-to-run variance when a single number would mislead.
 
 ## Verdict
 
-What is now decided, and what would have to change for it to be revisited.
-A rejected result must say what evidence would justify re-running it.
+What is now decided, and precisely what would have to change for this question
+to be reopened. A rejected result names the evidence that would justify
+re-running it.
 
 ## Evidence
 
-Paths to logs, JSON, or artifacts that back the numbers above.
+Raw logs, JSON, and plots committed alongside this file, linked here.
