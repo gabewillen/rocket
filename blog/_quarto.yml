@@ -37,5 +37,6 @@ format:
     monofont: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace
     fontsize: 0.95rem
     smooth-scroll: true
+    date-format: "YYYY-MM-DD"
     grid:
       body-width: 780px

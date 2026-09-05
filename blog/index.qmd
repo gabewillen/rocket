@@ -4,9 +4,11 @@ subtitle: "Experiments and research behind the engines"
 listing:
   contents: posts
   type: default
+  template: listing-log.ejs
   sort: "date desc"
   categories: true
   feed: true
+  date-format: "YYYY-MM-DD"
   fields: [date, title, description, categories]
 page-layout: full
 title-block-banner: false

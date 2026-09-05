@@ -9,8 +9,8 @@ $body-bg: #ffffff;
 $body-color: #1a1d21;
 $link-color: #0b5fa5;
 $code-color: #a13a5a;
-$code-bg: #f4f5f6;
-$pre-bg: #f6f7f8;
+$code-bg: #f2f3f5;
+$pre-bg: #f7f8f9;
 $pre-color: #1a1d21;
 $border-color: #dfe2e5;
 $navbar-bg: #ffffff;
@@ -19,8 +19,11 @@ $navbar-fg: #1a1d21;
 /*-- scss:rules --*/
 
 :root {
+  --rocket-fg: #1a1d21;
+  --rocket-link: #0b5fa5;
+  --rocket-navbar-fg: #1a1d21;
   --rocket-hairline: #e6e8eb;
-  --rocket-hairline-strong: #c9cdd2;
+  --rocket-hairline-strong: #ccd1d6;
   --rocket-muted: #6a7178;
   --rocket-selection: rgba(11, 95, 165, 0.15);
 }

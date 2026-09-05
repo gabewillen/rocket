@@ -7,11 +7,15 @@ $font-family-monospace: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
   Consolas, "Liberation Mono", monospace !default;
 
 $measure: 42rem;
+$mono: $font-family-monospace;
 
+// ---------------------------------------------------------------- base
 
 body {
-  font-feature-settings: "tnum" 1;
+  font-size: 0.95rem;
+  line-height: 1.55;
   letter-spacing: 0;
+  font-feature-settings: "tnum" 1;
 }
 
 .content,
@@ -23,70 +27,304 @@ main {
   max-width: none;
 }
 
-.quarto-title-banner {
-  padding-top: 1.5rem;
-  padding-bottom: 1rem;
+p, ul, ol, blockquote {
+  max-width: $measure;
 }
 
-.quarto-title h1.title {
-  font-size: 1.9rem;
-  font-weight: 600;
-  letter-spacing: 0;
+a {
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 }
+
+a:hover { text-decoration-thickness: 1.5px; }
+
+::selection { background: var(--rocket-selection); }
+
+// ---------------------------------------------------------------- headings
 
 h1, h2, h3, h4, h5, h6 {
   font-weight: 600;
   letter-spacing: 0;
-  line-height: 1.25;
+  line-height: 1.3;
 }
 
-h1 { font-size: 1.6rem; }
+h1 { font-size: 1.55rem; }
+
+// Section labels read as mono labels, not magazine headings.
+h2, h3, h4 {
+  font-family: $mono;
+  font-weight: 600;
+}
+
 h2 {
-  font-size: 1.25rem;
-  margin-top: 2rem;
-  padding-bottom: 0.3rem;
+  font-size: 1rem;
+  margin-top: 2.25rem;
+  padding-bottom: 0.35rem;
   border-bottom: 1px solid var(--rocket-hairline);
 }
-h3 { font-size: 1.05rem; margin-top: 1.5rem; }
 
-body { font-size: 0.95rem; line-height: 1.55; }
+h3 { font-size: 0.9rem; margin-top: 1.6rem; }
+h4 { font-size: 0.85rem; margin-top: 1.4rem; color: var(--rocket-muted); }
 
-p, ul, ol { max-width: $measure; }
+// ---------------------------------------------------------------- navbar
 
-a { text-decoration-thickness: 1px; text-underline-offset: 2px; }
-a:hover { text-decoration-thickness: 1.5px; }
-
-code {
-  font-family: $font-family-monospace;
-  font-size: 0.85em;
-  padding: 0.1em 0.3em;
-  border-radius: 3px;
+.navbar {
+  font-size: 0.85rem;
+  box-shadow: none !important;
+  border-bottom: 1px solid var(--rocket-hairline);
+  padding-top: 0.35rem;
+  padding-bottom: 0.35rem;
 }
 
-pre.sourceCode, div.sourceCode {
-  border-radius: 4px;
+.navbar-brand,
+.navbar .navbar-title {
+  font-family: $mono;
+  font-weight: 600;
+  font-size: 0.95rem;
+  letter-spacing: 0;
+  text-transform: lowercase;
+}
+
+.navbar-brand::before {
+  content: "$ ";
+  color: var(--rocket-muted);
+  font-weight: 400;
+}
+
+.navbar .nav-link {
+  font-family: $mono;
   font-size: 0.82rem;
+  color: var(--rocket-muted) !important;
+}
+
+.navbar .nav-link:hover,
+.navbar .nav-link.active {
+  color: var(--rocket-navbar-fg) !important;
+}
+
+// ---------------------------------------------------------------- title blocks
+
+.quarto-title-banner { padding: 1.25rem 0 0.75rem; }
+
+.quarto-title-block .quarto-title h1.title,
+.quarto-title h1.title {
+  font-size: 1.55rem;
+  font-weight: 600;
+  line-height: 1.25;
+  margin-bottom: 0.4rem;
+}
+
+.quarto-title .subtitle,
+p.subtitle {
+  font-family: $mono;
+  font-size: 0.82rem;
+  color: var(--rocket-muted);
+  margin-bottom: 0.5rem;
+}
+
+#title-block-header .description {
+  font-size: 0.92rem;
+  color: var(--rocket-muted);
+  max-width: $measure;
+  margin-bottom: 0.75rem;
+}
+
+#title-block-header .quarto-title-meta {
+  font-family: $mono;
+  font-size: 0.75rem;
+  border-top: 1px solid var(--rocket-hairline);
+  padding-top: 0.5rem;
+  margin-top: 0.25rem;
+  gap: 1.5rem;
+}
+
+#title-block-header .quarto-title-meta-heading {
+  text-transform: lowercase !important;
+  letter-spacing: 0;
+  font-weight: 400;
+  font-size: 0.72rem;
+  color: var(--rocket-muted);
+  margin-bottom: 0.1rem;
+}
+
+#title-block-header .quarto-title-meta-contents,
+#title-block-header .quarto-title-meta-contents p {
+  font-size: 0.75rem;
+  margin: 0;
+}
+
+#title-block-header { margin-bottom: 1.5rem; }
+
+// ---------------------------------------------------------------- category chips
+
+.quarto-title .quarto-categories { gap: 0.3rem; padding-bottom: 0.6rem; }
+
+.quarto-title .quarto-categories .quarto-category,
+.listing-category,
+.rocket-chip {
+  font-family: $mono;
+  font-size: 0.68rem;
+  line-height: 1.4;
+  text-transform: lowercase;
+  letter-spacing: 0;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--rocket-hairline-strong);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--rocket-muted);
+  opacity: 1;
+  white-space: nowrap;
+}
+
+.listing-category {
+  cursor: pointer;
+}
+
+.listing-category:hover,
+.quarto-title .quarto-categories .quarto-category:hover {
+  color: var(--rocket-fg);
+  border-color: var(--rocket-fg);
+}
+
+// Sidebar category index.
+.quarto-listing-category {
+  font-family: $mono;
+  font-size: 0.78rem;
+  padding-left: 0;
+}
+
+.quarto-listing-category .category {
+  padding: 0.08rem 0;
+  color: var(--rocket-muted);
+  border: none;
+}
+
+.quarto-listing-category .category:hover { color: var(--rocket-fg); }
+
+.quarto-listing-category .category.active {
+  color: var(--rocket-fg);
+  font-weight: 600;
+}
+
+.quarto-listing-category-title,
+.quarto-listing-category .quarto-category-title {
+  font-family: $mono;
+  font-size: 0.72rem;
+  text-transform: lowercase;
+  color: var(--rocket-muted);
+  font-weight: 400;
+}
+
+// ---------------------------------------------------------------- log listing
+
+.rocket-log-row {
+  display: grid;
+  grid-template-columns: 5.5rem minmax(0, 1fr) 16rem;
+  column-gap: 1.25rem;
+  align-items: baseline;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--rocket-hairline);
+}
+
+.rocket-log-row:first-child { border-top: 1px solid var(--rocket-hairline); }
+
+.rocket-log-date {
+  font-family: $mono;
+  font-size: 0.75rem;
+  color: var(--rocket-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.rocket-log-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--rocket-fg);
+  text-decoration: none;
+}
+
+.rocket-log-title:hover {
+  color: var(--rocket-link);
+  text-decoration: underline;
+}
+
+.rocket-log-desc {
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--rocket-muted);
+  margin-top: 0.15rem;
+  max-width: 46rem;
+}
+
+.rocket-log-desc a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.rocket-log-cats {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  align-content: flex-start;
+  gap: 0.25rem;
+}
+
+@media (max-width: 767px) {
+  .rocket-log-row {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 0.2rem;
+  }
+  .rocket-log-cats { justify-content: flex-start; }
+}
+
+// ---------------------------------------------------------------- code
+
+code {
+  font-family: $mono;
+  font-size: 0.85em;
+  padding: 0.1em 0.3em;
+  border-radius: 2px;
+}
+
+pre.sourceCode, div.sourceCode, div.cell-output pre {
+  border: 1px solid var(--rocket-hairline);
+  border-radius: 3px;
+  font-size: 0.8rem;
   line-height: 1.5;
 }
 
-pre code { padding: 0; border-radius: 0; }
+div.sourceCode { margin: 1rem 0; }
 
-// Table styling: dense, monospace numerals, hairline borders, no zebra glare.
+pre.sourceCode { padding: 0.6rem 0.75rem; }
+
+pre code {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.code-copy-button { border: none; }
+
+// ---------------------------------------------------------------- tables
+
 table {
   font-size: 0.85rem;
   border-collapse: collapse;
   width: 100%;
   margin: 1rem 0;
+  font-variant-numeric: tabular-nums;
 }
 
 table thead th {
+  font-family: $mono;
   font-weight: 600;
   text-align: left;
-  font-size: 0.75rem;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  border-bottom: 2px solid var(--rocket-hairline-strong);
-  padding: 0.4rem 0.6rem;
+  font-size: 0.7rem;
+  text-transform: lowercase;
+  letter-spacing: 0;
+  color: var(--rocket-muted);
+  border-bottom: 1px solid var(--rocket-hairline-strong);
+  padding: 0.35rem 0.6rem;
 }
 
 table td, table th {
@@ -95,38 +333,61 @@ table td, table th {
   vertical-align: top;
 }
 
-table td { font-variant-numeric: tabular-nums; }
-
 table tbody tr:last-child td { border-bottom: none; }
 
-.quarto-listing-category { font-size: 0.82rem; }
+.quarto-listing-table td { font-size: 0.82rem; }
 
-.listing-date { font-family: $font-family-monospace; font-size: 0.8rem; }
-
-.navbar {
-  font-size: 0.9rem;
-  box-shadow: none !important;
-  border-bottom: 1px solid var(--rocket-hairline);
+.quarto-listing-table .listing-date,
+.quarto-listing-table .listing-verdict,
+.quarto-listing-table .listing-status,
+.quarto-listing-table .listing-chemistry {
+  font-family: $mono;
+  font-size: 0.75rem;
 }
 
-.navbar-brand { font-weight: 600; }
+.quarto-listing-table .listing-date { color: var(--rocket-muted); }
+
+// Filter and sort controls above a table listing.
+.quarto-listing .input-group-text,
+.quarto-listing .form-control,
+.quarto-listing select.form-select {
+  font-family: $mono;
+  font-size: 0.78rem;
+  border-radius: 2px;
+  border-color: var(--rocket-hairline-strong);
+  background-color: transparent;
+  color: var(--rocket-muted);
+}
+
+.listing-actions-group { margin-bottom: 0.75rem; }
+
+// ---------------------------------------------------------------- misc
 
 blockquote {
-  border-left: 3px solid var(--rocket-hairline-strong);
+  border-left: 2px solid var(--rocket-hairline-strong);
   padding-left: 1rem;
   color: var(--rocket-muted);
-  max-width: $measure;
 }
 
-.callout {
-  border-radius: 4px;
+.callout { border-radius: 3px; }
+
+#quarto-margin-sidebar, .sidebar nav[role="doc-toc"] {
+  font-size: 0.78rem;
+}
+
+.sidebar nav[role="doc-toc"] > h2,
+.sidebar nav[role="doc-toc"] .h2 {
+  font-family: $mono;
+  font-size: 0.72rem;
+  text-transform: lowercase;
+  color: var(--rocket-muted);
+  border-bottom: none;
+  font-weight: 400;
 }
 
 .footer, .page-footer {
-  font-size: 0.8rem;
+  font-family: $mono;
+  font-size: 0.72rem;
+  color: var(--rocket-muted);
   border-top: 1px solid var(--rocket-hairline);
-}
-
-::selection {
-  background: var(--rocket-selection);
 }

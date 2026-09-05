@@ -1,0 +1,28 @@
+```{=html}
+<div class="list rocket-log">
+```
+
+<% for (const item of items) { %>
+
+```{=html}
+<div class="rocket-log-row" <%= metadataAttrs(item) %>>
+<div class="rocket-log-date listing-date"><%= item.date || "" %></div>
+<div class="rocket-log-main">
+<a class="rocket-log-title listing-title no-external" href="<%- item.path %>"><%= item.title %></a>
+<% if (item.description) { %>
+<div class="rocket-log-desc listing-description"><a class="no-external" href="<%- item.path %>"><%= item.description %></a></div>
+<% } %>
+</div>
+<div class="rocket-log-cats listing-categories">
+<% for (const category of (item.categories || [])) { %>
+<button class="listing-category" onclick="window.quartoListingCategory('<%= utils.b64encode(category) %>'); return false;"><%= category %></button>
+<% } %>
+</div>
+</div>
+```
+
+<% } %>
+
+```{=html}
+</div>
+```

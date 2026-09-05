@@ -5,29 +5,30 @@ $font-family-sans-serif: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
 $font-family-monospace: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
   Consolas, "Liberation Mono", monospace;
 
-$body-bg: #0f1115;
-$body-color: #d7dbe0;
+$body-bg: #0a0c0e;
+$body-color: #d5d9de;
 $link-color: #6fb3e0;
 $code-color: #e08fb0;
-$code-bg: #181b20;
-$pre-bg: #15181d;
-$pre-color: #d7dbe0;
-$border-color: #262a31;
-$navbar-bg: #0f1115;
-$navbar-fg: #d7dbe0;
+$code-bg: #14171b;
+$pre-bg: #101317;
+$pre-color: #d5d9de;
+$border-color: #23272d;
+$navbar-bg: #0a0c0e;
+$navbar-fg: #d5d9de;
 
 /*-- scss:rules --*/
 
 :root {
-  --rocket-hairline: #22262c;
-  --rocket-hairline-strong: #363c44;
-  --rocket-muted: #8b9198;
+  --rocket-fg: #e3e7ec;
+  --rocket-link: #6fb3e0;
+  --rocket-navbar-fg: #e3e7ec;
+  --rocket-hairline: #1e2228;
+  --rocket-hairline-strong: #333940;
+  --rocket-muted: #878d95;
   --rocket-selection: rgba(111, 179, 224, 0.2);
 }
 
-body {
-  background-color: $body-bg;
-}
+body { background-color: $body-bg; }
 
 pre.sourceCode, div.sourceCode, div.cell-output pre {
   background-color: $pre-bg !important;
