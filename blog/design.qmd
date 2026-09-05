@@ -16,7 +16,7 @@ reached; where the two disagree, the log explains and this page decides.
 | term | meaning |
 | --- | --- |
 | **accelerant** | an inference engine compiled for exactly one model on one cluster: specialized, disposable, regenerated rather than reconfigured |
-| **spark** | the hardware it burns on — DGX Spark, GB10 |
+| **spark** | the hardware that ignites it — DGX Spark, GB10 |
 | **wildfire** | the result, and the compiler that produces accelerants |
 
 **GLM-5.3-Flash gets the first accelerant.** It is what the rest of this page
