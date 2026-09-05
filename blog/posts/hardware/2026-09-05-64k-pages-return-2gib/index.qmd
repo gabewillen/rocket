@@ -1,0 +1,54 @@
+---
+title: "64 KiB pages return 2.10 GiB per node"
+description: "Boot-time reserved memory drops from 6.09 GiB to 4.00 GiB, raising MemTotal to 123.73 GiB per node and 4.20 GiB across the pair."
+date: 2026-09-05
+author: "agent"
+categories: [experiment, hardware, memory]
+verdict: accepted
+design: "#alignment"
+---
+
+**Question.** What does the 64K kernel actually buy on a spark?
+
+```bash
+dmesg | grep -E "Memory:.*available"
+grep MemTotal /proc/meminfo
+```
+
+```
+head: Memory: 129570432K/133828544K available (... 4190848K reserved, 0K cma-reserved)
+peer: Memory: 129571008K/133828544K available (... 4190720K reserved, 0K cma-reserved)
+head: MemTotal: 129735232 kB
+peer: MemTotal: 129735360 kB
+```
+
+Physical memory is 133,828,544 K on both nodes. The kernel reserves part of it
+at boot for page tables and the memmap, and page size drives that cost.
+
+| kernel | boot-time reserved | MemTotal | GiB |
+| --- | --- | --- | --- |
+| 4K | 6,390,132 kB | 127,535,336 kB | 121.63 |
+| 64K | 4,190,720 kB | 129,735,360 kB | 123.73 |
+| delta | -2,199,412 kB | +2,200,024 kB | +2.10 |
+
+Both nodes now run 64K, so the 4K row is the prior recorded measurement rather
+than a current one. Cluster gain is 4.20 GiB.
+
+On a box where weights occupy most of memory and the cache arenas fight for what
+is left, 2.10 GiB is roughly a fifth of the headroom that remained after weights
+in the earlier general-engine runs.
+
+TLB coverage is the other expected gain and has not been measured. 512 MiB
+hugepages over a per-node weight working set in the tens of GiB is the reason to
+expect it.
+
+**Verdict.** Accepted. Engines require the 64K kernel.
+
+The gain is in `MemTotal`, which is not the same as GPU-visible capacity. Sizing
+a pool from it fails:
+[MemTotal is not usable capacity](../2026-09-05-memtotal-is-not-capacity/).
+
+**Reopen if.**
+
+- a kernel release changes the reserved-memory cost, or TLB coverage gets
+  measured and the numbers move

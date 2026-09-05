@@ -101,7 +101,9 @@ regular-file mapping
 
 ### Cluster {#cluster}
 
-Page size is a compiler input baked into the plan's alignment constants. A node
+Engines require the 64K kernel, which returns
+[2.10 GiB per node](posts/hardware/2026-09-05-64k-pages-return-2gib/). Page size
+is a compiler input baked into the plan's alignment constants. A node
 whose page size disagrees is refused at handshake. Both rails are required;
 single-rail is a startup refusal, because the compiled all-to-all schedule
 assumes two.
