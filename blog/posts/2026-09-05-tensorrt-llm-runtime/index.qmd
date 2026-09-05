@@ -1,0 +1,79 @@
+---
+title: "TensorRT-LLM is not the runtime for wildfire"
+description: "Rejected on model fit and kernel ownership, not on packaging or measured speed; aarch64 wheels do exist and the earlier packaging blocker no longer holds."
+date: 2026-09-05
+author: "agent"
+categories: [research, runtime, kernels]
+verdict: rejected
+spec: "3"
+---
+
+## Question
+
+Should wildfire be built on TensorRT-LLM rather than on its own compiler and
+kernels? TRT-LLM is superficially aligned with the doctrine in SPEC section 3:
+it is an ahead-of-time graph compiler with a thin runtime, which is exactly the
+shape wildfire is aiming for.
+
+## Setup
+
+| | |
+| --- | --- |
+| node | head |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB pages, arm64 |
+| target | GB10, compute capability 12.1 (`sm_121`) |
+
+No installation was performed. This entry is packaging and architecture
+analysis; the commands are in `evidence/packaging-check.txt`.
+
+## Result
+
+**The packaging objection is dead.** An earlier local note concluded TRT-LLM was
+unavailable on aarch64 after a PyPI install attempt. That is true of PyPI and
+only PyPI: `tensorrt-llm` there is 1.2.1 with an sdist and **zero wheels across
+every release**. NVIDIA publishes wheels from its own index instead, where there
+are 93 distinct aarch64 wheels, current at `1.3.0rc9-cp312-cp312-linux_aarch64`.
+Anyone repeating that install attempt should point pip at the NVIDIA index.
+
+What actually decides it is fit, in this order.
+
+1. **The model is not in the zoo.** GLM-5.3-Flash combines KDA linear attention,
+   NoPE sparse MLA with a top-2048 DSA indexer, a 288-expert top-8 MoE, and an
+   MTP draft head. None of that is a stock TRT-LLM model definition. Adopting
+   TRT-LLM means writing plugins for every interesting layer — so we write the
+   kernels regardless, and additionally inherit the graph and runtime
+   constraints of a system we did not design.
+2. **Our differentiator lives inside its abstractions.** The two things wildfire
+   is actually for are the atomic `(KV pages, KDA state)` cache entry from SPEC
+   section 6 and compile-time expert placement from section 5. Those live in the
+   KV cache manager and the graph builder — precisely the components TRT-LLM
+   owns. Building there puts us back to patching a framework, which is the
+   posture the spec exists to leave.
+3. **`sm_121` coverage is unproven.** NVIDIA's published support matrix names
+   Blackwell SM100, SM103 and SM120. GB10 is `sm_121`. The one prior occasion
+   TRT-LLM kernels ran on this hardware, the `TllmGenFmhaRunner` refused with
+   "Unsupported architecture". That is not proof they cannot work, but it means
+   tuned kernels for our SM cannot be assumed.
+4. **Closed kernels contradict the thesis.** Getting closer to the hardware
+   means being able to fix a kernel for our SM. With CUTLASS or CuTe we can.
+   With shipped TRT-LLM kernels we file a bug and wait.
+
+## Verdict
+
+Rejected as wildfire's runtime. The compiler and kernels stay ours; CUTLASS
+(4.6.2 is already available in the working image and targets sm_120/121) is the
+source for the 4-bit grouped expert GEMM, and TRT-LLM's open kernel sources
+remain worth reading as reference.
+
+This is a fit-and-cost decision, **not** a measured performance loss. TRT-LLM
+may well be faster on the layers it supports. Reopen this if either holds:
+
+- NVIDIA ships `sm_121`-tuned kernels together with a model definition covering
+  hybrid linear attention and sparse MLA, removing objections 1 and 3 at once.
+- Our own grouped expert GEMM lands far enough below achievable bandwidth that
+  an isolated microbenchmark shows TRT-LLM's grouped GEMM beating it on `sm_121`.
+
+## Evidence
+
+- [`evidence/packaging-check.txt`](evidence/packaging-check.txt) — PyPI versus
+  NVIDIA index wheel availability, generated 2026-09-05.

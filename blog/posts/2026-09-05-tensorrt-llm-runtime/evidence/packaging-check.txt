@@ -1,0 +1,12 @@
+# generated 2026-09-05T14:42:53Z on 6.17.0-1031-nvidia-64k arm64
+
+$ curl -s https://pypi.org/pypi/tensorrt-llm/json | jq '.info.version, [.urls[].packagetype]'
+latest: 1.2.1
+packagetypes for latest: ['sdist']
+wheels across all releases: 0
+
+$ curl -s https://pypi.nvidia.com/tensorrt-llm/ | grep -c aarch64
+distinct aarch64 wheels: 93
+tensorrt_llm-1.3.0rc7-cp312-cp312-linux_aarch64.whl
+tensorrt_llm-1.3.0rc8-cp312-cp312-linux_aarch64.whl
+tensorrt_llm-1.3.0rc9-cp312-cp312-linux_aarch64.whl
