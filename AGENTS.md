@@ -25,7 +25,7 @@ tree.
 
 - ALWAYS write entries for a public audience, and NEVER write anything you would not want read by the maintainers of the projects being measured.
 - NEVER commit a credential of any kind (tokens, keys, cookies, `.env` files, `hosts.yml`), and NEVER paste command output that embeds one.
-- ALWAYS scan `git diff --cached` before committing evidence files, because raw logs and JSON are where a token actually hides.
+- ALWAYS scan `git diff --cached` before committing, because pasted command output is where a token actually hides.
 - NEVER remediate a leaked secret by deleting it in a later commit; ALWAYS rotate it first, then purge history, because the earlier commit stays public until you do.
 - NEVER publish material from private, embargoed, or NDA-covered sources, including internal benchmarks belonging to someone else.
 - NEVER publish personal information, including names, emails, or account handles other than your own project identity.
@@ -70,15 +70,15 @@ tree.
 - ALWAYS prefer a number to an adjective.
 - ALWAYS cut any sentence that does not carry a fact, a decision, or an instruction.
 - NEVER write narrative or explanatory paragraphs; ALWAYS prefer a table, a one-line bullet, or a single sentence.
-- NEVER restate in prose what the front matter, a table, or the evidence JSON already says.
-- ALWAYS keep an entry scannable in under a minute; if it needs more room, the detail belongs in evidence JSON or on the Design page.
+- NEVER restate in prose what the front matter or a table already says.
+- ALWAYS keep an entry scannable in under a minute; if it needs more room, the detail belongs on the Rocket page.
 
 - ALWAYS record, under Setup, the node the work ran on, the exact commit SHA, and the literal copy-pasteable command.
 - ALWAYS report numbers with units in a table, and NEVER report a measurement in prose alone.
 - ALWAYS state run-to-run variance when a single number would be misleading.
-- ALWAYS commit evidence as JSON in the entry's `evidence/` directory and link it from the Evidence section, so results are machine-readable and comparable across entries.
-- ALWAYS give every evidence file at minimum `generated_utc`, the `question` it answers, the `answer`, and the `sources` (URL, command, or file) each value came from.
-- NEVER commit an unstructured console dump as the evidence of record; a `.txt` transcript is neither renderable nor comparable. Attach large raw logs alongside the JSON only when the JSON references them.
+- ALWAYS make the entry itself the evidence. NEVER add an `evidence/` directory or attach `.json`, `.txt`, or `.log` files.
+- ALWAYS show the command that produced a number, and its output, inline in the `.qmd` as a fenced block or a table.
+- ALWAYS link the source for a number taken from outside this project, so a reader can check it.
 - ALWAYS state, in the Verdict section, what would have to change for the question to be reopened.
 - ALWAYS log a rejected result with the same care as an accepted one.
 

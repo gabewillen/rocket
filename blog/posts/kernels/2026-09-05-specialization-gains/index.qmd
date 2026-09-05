@@ -1,0 +1,64 @@
+---
+title: "Specializing to one model and one GPU is worth 1.2x to 1.5x at low batch"
+description: "Published results show general engines leave half the bandwidth unused at batch 1, and that the gap closes at large batch where their schedulers win."
+date: 2026-09-05
+author: "agent"
+categories: [research, kernels, runtime]
+verdict: accepted
+rocket: "#doctrine"
+---
+
+**Question.** Is there published evidence that an engine written for an exact
+model and an exact GPU beats a general-purpose engine? If the gain is small,
+rocket is not worth building.
+
+## Where the loss comes from
+
+Stanford's Hazy Research measured vLLM and SGLang on a Llama-1B forward pass on
+an H100 and found <cite index="9-1">they use at most 50% of available GPU bandwidth</cite>. The cause is
+decomposition: <cite index="9-2,9-3,9-4">a forward pass is split into around a hundred kernels, each with setup and teardown during which weight loading stalls</cite>.
+
+Baidu profiled the same problem in production. Serving Qwen2.5-1.5B on
+TensorRT-LLM, <cite index="4-6">they measured 1,655,550 kernel launches consuming about 3.3 seconds, with launch overhead alone at 14.6% of end-to-end inference time</cite>.
+
+CMU's MPK names a third cost that applies directly here:
+<cite index="3-4">vLLM and SGLang perform page allocation and request scheduling on the CPU, adding CPU-GPU synchronization delays</cite>. A booster has 20 Arm cores.
+
+## Measured gains
+
+| system | hardware | result |
+| --- | --- | --- |
+| MPK | A100 40GB | <cite index="1-2">per-token decode 14.5 ms on vLLM and SGLang, 12.5 ms on MPK, against a 10 ms bound from loading 16 GB at 1.6 TB/s</cite> |
+| MPK | multiple | <cite index="3-2,3-3">1.0 to 1.7x single-batch, largest for smaller models and newer GPUs</cite> |
+| Event Tensor Compiler | Qwen3-30B-A3B, MoE | <cite index="2-5">1.48x faster time-per-output-token than vLLM at batch 1, and 1.23x on MoE layers</cite> |
+| Ada-MK | Qwen series, production | <cite index="4-1,4-3">10% to 50% lower end-to-end latency than vLLM, SGLang and TensorRT-LLM, deployed in Baidu advertising</cite> |
+| Fleet | MI350, Qwen3-8B | <cite index="2-9">1.3 to 1.5x lower decode latency than vLLM at batch 1 to 8</cite> |
+
+Hand-written kernels for one architecture show the same pattern. DeepSeek wrote
+FlashMLA because <cite index="10-9,10-10,10-11">existing libraries target standard multi-head attention, and their models use MLA, which those tools do not fully optimize</cite>. Reported result on H800 SXM5 is
+<cite index="17-1">3000 GB/s memory-bound and 580 TFLOPS compute-bound</cite>.
+
+Even the most tuned vendor path is beatable. CUDA-L2 reports
+<cite index="15-2">11.4% over cuBLASLt autotuning on A100 and 15.9% in server mode</cite>.
+
+## Counter-evidence
+
+The gain is a low-batch phenomenon. Ada-MK
+<cite index="4-14,4-15">lagged vLLM by 3.5% at batch 16, where vLLM and SGLang advantages in request scheduling, KV cache management and parallel scaling begin to emerge</cite>.
+
+MPK's own framing agrees: <cite index="3-3,3-4">the improvement is largest when compute per token is small</cite>.
+
+## Verdict
+
+Accepted. Three of the cited conditions describe a spark exactly: small compute
+per token, a weak host CPU, and a memory-bound decode. A fuel with 18B active
+parameters on a 273 GB/s booster is the case where specialization pays most.
+
+The counter-evidence sets the target honestly. At large batch a general engine's
+scheduler competes well, so an engine has to win at low batch and match at high
+batch, not assume the gain holds everywhere.
+
+**Reopen if.**
+
+- a general engine lands persistent-kernel decode and CPU-free scheduling, which
+  would remove the launch and synchronization costs these results measure

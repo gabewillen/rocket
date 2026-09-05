@@ -1,0 +1,59 @@
+---
+title: "Specializing to one model and one GPU is worth 1.2x to 6.7x"
+description: "Published results where model-specific kernels and whole-model megakernels beat general engines, including a report that vLLM and SGLang use at most half of H100 bandwidth at low latency."
+date: 2026-09-05
+author: "agent"
+categories: [research, kernels, runtime]
+verdict: accepted
+rocket: "#doctrine"
+---
+
+**Question.** Does writing an engine for one model on one GPU actually pay, or
+is the gain already captured by general engines with good kernels?
+
+Method: published sources only. Nothing measured locally.
+
+| source | specialized to | result |
+| --- | --- | --- |
+| [MPK megakernel](https://zhihaojia.medium.com/compiling-llms-into-a-megakernel-a-path-to-low-latency-inference-cf7840913c17) | whole model fused into one kernel | per-token decode 14.5 ms to 12.5 ms on A100 against a 10 ms bandwidth bound, 1.2x to 6.7x end to end |
+| [Event Tensor](https://arxiv.org/pdf/2604.13327) | compiled megakernel, Qwen3-30B-A3B | 1.48x over vLLM, 1.20x over SGLang at batch 1 |
+| [FlashMLA](https://github.com/deepseek-ai/FlashMLA) | MLA and DSA attention, DeepSeek models | ~3000 GB/s on H800/B200, 640 TFLOPS prefill and 410 TFLOPS decode for sparse attention |
+| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) | a few FP8 GEMM and MoE shapes | 1550 TFLOPS on H800 |
+| [KOG single-kernel engine](https://blog.kog.ai/building-a-single-kernel-latency-optimized-llm-inference-engine-on-amd-mi300x-gpus/) | batch-1 decode on MI300X | abandons matrix cores for scalar and vector ALU dot products |
+
+Four things in that table are worth separating.
+
+The bandwidth claim is the one that matters here. The Llama-1B megakernel work
+reports that vLLM and SGLang use at most half of H100 bandwidth at low latency.
+Decode on a spark is bandwidth-bound, so that headroom is the entire argument
+for building.
+
+Kernels are not the whole gap. With the same FlashInfer kernels, one
+[H100 comparison](https://aimultiple.com/inference-engines) puts SGLang at
+16,215 tok/s against vLLM at 12,553, a 29% spread attributed to engine
+orchestration rather than math. Specialization has to reach the scheduler and
+the launch path, not just the GEMMs.
+
+Model-specific beats general even for the same operation. FlashMLA exists
+because FlashAttention and xFormers optimize standard multi-head attention and
+do not exploit latent compression. DeepGEMM is described by its own authors as
+not a general BLAS: a few well-chosen shapes hand-tuned on CuTe and CUTLASS.
+Both are the pattern this project proposes, from teams that ship at scale.
+
+Specialization changes instruction selection, not only tiling. On MI300X at
+batch 1, every matmul is a vector-matrix product, and feeding matrix-core tiles
+costs more than the arithmetic they perform, so that engine uses scalar and
+vector dot products instead. A general engine cannot make that choice because it
+must also serve batch 64.
+
+**Verdict.** Accepted. Published gains from specializing to one model and one
+GPU run from 1.2x to 6.7x, and the reported bandwidth headroom in general
+engines at low latency is roughly 2x.
+
+None of these ran on GB10, and none used a 288-expert hybrid-attention fuel. The
+numbers justify building, not any specific target for us.
+
+**Reopen if.**
+
+- a general engine publishes decode within 10% of the bandwidth bound on a
+  sparse MoE, which would remove the headroom this rests on
