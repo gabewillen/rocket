@@ -1,6 +1,6 @@
 ---
 title: "Rocket build log"
-subtitle: "Experiments and research for a single-model inference engine on 2x DGX Spark"
+subtitle: "Experiments and research behind the engines"
 listing:
   contents: posts
   type: default
