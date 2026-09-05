@@ -1,0 +1,13 @@
+---
+title: "Wildfire build log"
+subtitle: "Experiments and research for a single-model inference engine on 2x DGX Spark"
+listing:
+  contents: posts
+  type: default
+  sort: "date desc"
+  categories: true
+  feed: true
+  fields: [date, title, description, categories]
+page-layout: full
+title-block-banner: false
+---

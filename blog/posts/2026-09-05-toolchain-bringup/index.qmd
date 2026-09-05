@@ -1,0 +1,40 @@
+---
+title: "Toolchain bringup: gh and quarto on arm64"
+description: "Publishing toolchain installed on the head node; both binaries verified."
+date: 2026-09-05
+author: "agent"
+categories: [infrastructure]
+verdict: accepted
+---
+
+## Question
+
+What is needed on the head node to publish this build log, given the box is
+arm64 and neither tool was present.
+
+## Setup
+
+- hardware: head node, `6.17.0-1031-nvidia-64k`, 64 KiB pages, arm64
+- command: install the arm64 `.deb` releases directly, since neither tool is in
+  the distribution repositories at a useful version
+
+```bash
+curl -sLO https://github.com/cli/cli/releases/download/v2.100.0/gh_2.100.0_linux_arm64.deb
+curl -sLO https://github.com/quarto-dev/quarto-cli/releases/download/v1.10.18/quarto-1.10.18-linux-arm64.deb
+sudo dpkg -i gh_2.100.0_linux_arm64.deb quarto-1.10.18-linux-arm64.deb
+```
+
+## Result
+
+`gh` 2.100.0 and `quarto` 1.10.18 installed. `quarto check` reports its bundled
+dependencies healthy on arm64: Pandoc 3.10.0, Dart Sass 1.101.0, Deno 2.7.14,
+Typst 0.15.1. No architecture-specific failures.
+
+## Verdict
+
+Accepted. Quarto renders locally on the head node, so a broken build can be
+caught before it reaches CI rather than after.
+
+## Evidence
+
+`quarto check` output at install time; versions pinned above.

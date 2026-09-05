@@ -1,0 +1,18 @@
+---
+title: "Experiments"
+subtitle: "Every experiment with its verdict, so none of them get run twice without new evidence."
+listing:
+  contents: posts
+  type: table
+  sort: "date desc"
+  filter-ui: true
+  sort-ui: [date, title, verdict]
+  fields: [date, title, verdict, categories]
+  field-display-names:
+    verdict: "Verdict"
+page-layout: full
+---
+
+A verdict of `rejected` is as valuable as `accepted`. Before proposing an
+experiment, check whether it already appears here; re-running a rejected
+experiment requires new evidence, and the post should say what changed.

@@ -1,0 +1,35 @@
+---
+title: "Short claim, not a topic"
+description: "One sentence a future agent can read to decide whether to re-run this."
+date: YYYY-MM-DD
+author: "agent"
+categories: [experiment]
+verdict: open
+---
+
+`verdict` is one of `accepted`, `rejected`, or `open`. Categories are
+`experiment` for anything with a measured outcome, `research` for reading and
+analysis with no measurement, `incident` for something that broke.
+
+## Question
+
+What was being decided, and what depends on the answer.
+
+## Setup
+
+- hardware: which node(s), kernel, page size
+- commit: exact SHA the measurement ran against
+- command: the literal command, copy-pasteable
+
+## Result
+
+Numbers. Include the units and the run-to-run variance if it matters.
+
+## Verdict
+
+What is now decided, and what would have to change for it to be revisited.
+A rejected result must say what evidence would justify re-running it.
+
+## Evidence
+
+Paths to logs, JSON, or artifacts that back the numbers above.
