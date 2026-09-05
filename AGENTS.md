@@ -79,6 +79,8 @@ tree.
 - ALWAYS make the entry itself the evidence. NEVER add an `evidence/` directory or attach `.json`, `.txt`, or `.log` files.
 - ALWAYS show the command that produced a number, and its output, inline in the `.qmd` as a fenced block or a table.
 - ALWAYS link the source for a number taken from outside this project, so a reader can check it.
+- NEVER write a script to `/tmp` or any other scratch path. ALWAYS commit every script that produced a number, under `scripts/<area>/`, and cite it by repository path in the entry.
+- ALWAYS make a committed script runnable as-is, so a reader reproduces the number without reconstructing it from a fenced block.
 - ALWAYS state, in the Verdict section, what would have to change for the question to be reopened.
 - ALWAYS log a rejected result with the same care as an accepted one.
 

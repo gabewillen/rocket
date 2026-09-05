@@ -1,0 +1,261 @@
+---
+title: "A booster reads at 238 GB/s and the pair's fabric moves 23 GB/s"
+description: "Measured GB10 memory and RoCE bandwidth replace datasheet numbers, putting the NVFP4 engines at 31% of the batch-1 roofline."
+date: 2026-09-06
+author: "agent"
+categories: [experiment, hardware, memory, fabric]
+verdict: accepted
+rocket: "#boosters"
+---
+
+**Question.** Every headroom claim so far divides by 273 GB/s and ~50 GB/s, both
+datasheet. What do the parts actually deliver?
+
+| setup | |
+| --- | --- |
+| node | head (`192.168.100.10`), peer (`192.168.100.11`) |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| commit | fa32e0e2a1ee1316b5a28dddb61c6f3a30fbf56a |
+| CUDA | 13.0, V13.0.88, `-arch=sm_121` |
+| scripts | `scripts/hardware/` |
+| state | no NIM or EXL3 container running |
+
+## Memory
+
+Grid-stride `float4` kernels, best of 12, arrays allocated with `cudaMalloc`.
+The read kernel accumulates into a register and stores under a condition that
+never fires, so the loads cannot be elided.
+
+```cuda
+__global__ void kread(const float4* __restrict__ a, size_t n4, float* __restrict__ out) {
+  size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+  size_t stride = (size_t)gridDim.x * blockDim.x;
+  float acc = 0.f;
+  for (; i < n4; i += stride) { float4 v = a[i]; acc += v.x + v.y + v.z + v.w; }
+  if (acc == 1.2345e-30f) out[0] = acc;
+}
+```
+
+```bash
+cd scripts/hardware && make
+for g in 1 4 8 16; do ./mem-bw $g 12; done
+```
+
+| kernel | traffic | 1 GiB | 4 GiB | 8 GiB | 16 GiB | unit |
+| --- | --- | --- | --- | --- | --- | --- |
+| read | 1R | 239.6 | 237.4 | 236.1 | 238.2 | GB/s |
+| copy | 1R+1W | 216.1 | 215.8 | 214.8 | 212.7 | GB/s |
+| triad | 2R+1W | 219.7 | 216.9 | 214.9 | 214.5 | GB/s |
+
+Flat from 1 to 16 GiB, so no cache effect is in play. Read reaches 87% of the
+273 GB/s datasheet figure, which is ordinary STREAM efficiency. Spread between
+best and worst of 12 was under 2% except one triad outlier at 16 GiB (240.3 ms
+best, 287.9 ms worst).
+
+The other 13% is not recoverable in software. Sweeping occupancy 32x and
+per-thread ILP 8x moves the number by 2%:
+
+```bash
+./mem-bw-sweep   # unroll 1/2/4/8 x blocks-per-SM 8/16/32/64, 48 SMs
+```
+
+| unroll | 8 blk/SM | 16 | 32 | 64 | unit |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 237.2 | 236.1 | 236.5 | 236.7 | GB/s |
+| 2 | 238.1 | 237.1 | 237.2 | 237.4 | GB/s |
+| 4 | 239.8 | 239.1 | 239.3 | 239.4 | GB/s |
+| 8 | 238.1 | 237.6 | 237.7 | 238.1 | GB/s |
+
+Widening threads per block to 1024 at unroll 4 reached the best figure seen,
+241.3 GB/s, or 88% of datasheet. Nothing in the OS is taking the rest either.
+Sampling every 500 ms through a run:
+
+```bash
+nvidia-smi --query-gpu=clocks.sm,temperature.gpu,clocks_throttle_reasons.active --format=csv,noheader
+```
+
+| sample | value |
+| --- | --- |
+| SM clock under load | 2405 to 2463 MHz |
+| temperature | 43 to 45 C |
+| throttle reason mask | `0x0000000000000000` throughout |
+
+`ecc.mode.current`, `clocks.mem`, and `power.limit` all return `[N/A]` on this
+platform, so ECC state could not be read either way.
+
+Memory is unified, so host traffic is the obvious way the OS could take a cut.
+It does not. Streaming `memcpy` on host threads while the read kernel runs:
+
+```bash
+./cpu-mem-contend 20 45 &   # 20 threads, 1 GiB memcpy loops
+sleep 5; ./mem-bw-cachehint
+```
+
+| host load | GPU read, best | median |
+| --- | --- | --- |
+| idle | 239.4 GB/s | 237.6 GB/s |
+| 8 threads | 239.6 GB/s | 239.0 GB/s |
+| 20 threads | 240.0 GB/s | 239.0 GB/s |
+
+Saturating all 20 Arm cores against the same LPDDR5X changes GPU read
+bandwidth by under 0.3%, inside run-to-run spread. The GPU's ~240 GB/s looks
+like a limit on its own path to memory rather than contention for DRAM, since
+the CPU draws its traffic from the remainder without the GPU noticing.
+
+Access pattern does not move it either, at MoE granularity. Each block streams
+one randomly chosen contiguous chunk, chunk order shuffled independently of
+address order:
+
+```bash
+./mem-gather 8
+```
+
+| pattern | bandwidth |
+| --- | --- |
+| sequential | 236.1 GB/s |
+| block-gather, 64 KiB chunks (131,072) | 240.2 GB/s |
+| block-gather, 256 KiB chunks (32,768) | 239.1 GB/s |
+| block-gather, 1 MiB chunks (8,192) | 238.6 GB/s |
+| block-gather, 4 MiB chunks (2,048) | 238.2 GB/s |
+| block-gather, 16 MiB chunks (512) | 238.0 GB/s |
+
+Scattering reads across 131,072 chunks costs nothing. A top-k expert read has
+that shape, a few large contiguous blocks at unrelated addresses, so the MoE
+pattern gets full bandwidth.
+
+Sparse access is where it falls off, at one `float4` per stride:
+
+| stride | useful bandwidth | accesses |
+| --- | --- | --- |
+| 4 KiB | 52.10 GB/s | 2.1 M |
+| 64 KiB | 91.53 GB/s | 0.13 M |
+
+Those two rows do different amounts of work, so they are a floor for sparse
+access rather than a page-size comparison. Every measurement here ran on the
+64 KiB kernel.
+
+## Fabric
+
+Both rails are 200 Gb/s. `perftest` over RoCE v2, GID index 3 on each device.
+
+```bash
+scripts/hardware/fabric-bw.sh 192.168.100.11 192.168.101.11
+```
+
+| configuration | per rail | aggregate | of line rate |
+| --- | --- | --- | --- |
+| rail 1, 1 QP | 109.19 Gb/s | 13.6 GB/s | 55% |
+| rail 1, 4 QP | 111.86 Gb/s | 14.0 GB/s | 56% |
+| both rails, 4 QP each | 92.59 Gb/s | 23.1 GB/s | 46% |
+
+Going from 1 to 4 queue pairs moves the single-rail number by 2.4%, so ~110
+Gb/s per rail is the rail's ceiling and not a queue-pair artifact. The port
+runs at 200 Gb/s but is fed by a narrower host link:
+
+```bash
+lspci -s 0000:01:00.1 -vv | grep -E 'LnkCap:|LnkSta:'
+```
+
+```
+LnkCap:	Port #0, Speed 32GT/s, Width x4, ASPM not supported
+LnkSta:	Speed 32GT/s, Width x4
+```
+
+All four ConnectX-7 functions report PCIe Gen5 x4, about 126 Gb/s after
+encoding. The measured 111.86 Gb/s is 89% of that, so each rail is PCIe-bound
+rather than wire-bound. The two rails sit on separate PCI domains (`0000:` and
+`0002:`), yet running both costs each 16%, so a further limit sits above both
+root complexes. Cluster fabric is 23.1 GB/s, not the ~50 GB/s carried from the
+datasheet.
+
+Each node has four ports and two are cabled:
+
+```bash
+ip -br link | grep -E 'enp1|enP2'
+for n in enp1s0f0np0 enp1s0f1np1 enP2p1s0f0np0 enP2p1s0f1np1; do \
+  echo "$n -> $(basename $(readlink -f /sys/class/net/$n/device))"; done
+```
+
+| netdev | PCIe function | state |
+| --- | --- | --- |
+| `enp1s0f0np0` | `0000:01:00.0` | NO-CARRIER |
+| `enp1s0f1np1` | `0000:01:00.1` | up, 192.168.100.x |
+| `enP2p1s0f0np0` | `0002:01:00.0` | NO-CARRIER |
+| `enP2p1s0f1np1` | `0002:01:00.1` | up, 192.168.101.x |
+
+The two ports of each card are functions of one PCIe device and share that
+device's single Gen5 x4 link. One port already draws 111.86 Gb/s of the ~126
+Gb/s that link can carry, so cabling the idle `f0` ports adds wire capacity
+behind a host link that is already full.
+
+One setting is not at its maximum. `ibv_devinfo` reports `active_mtu: 1024`
+against `max_mtu: 4096`, because both Ethernet interfaces are at MTU 1500.
+Raising them to 9000 would let RoCE negotiate 4096 and cut per-packet overhead.
+That is untested here and would not lift the PCIe-bound peak, but it is the one
+software knob found on the fabric path.
+
+`ib_write_lat`, `t_typical`, 20,000 iterations:
+
+| message | latency |
+| --- | --- |
+| 1 KiB | 2.28 us |
+| 8 KiB | 3.30 us |
+| 16 KiB | 4.04 us |
+
+## Recomputed roofline
+
+GLM-5.3-Flash moves 9.6 GB of weights per token at 18B active and ~4.25 bits.
+Split across two boosters that is 4.8 GB each, read concurrently.
+
+| quantity | value |
+| --- | --- |
+| measured read bandwidth per booster | 238 GB/s |
+| weight traffic per booster per token | 4.8 GB |
+| batch-1 ceiling, split across the pair | 49.6 tok/s |
+
+| stack | c1 measured | of ceiling |
+| --- | --- | --- |
+| SGLang NVFP4 TP=2 | 13.5 tok/s | 27% |
+| NIM 2.1.2-variant NVFP4 TP=2 | 15.28 tok/s | 31% |
+| vLLM EXL3 4bpw + DFlash2 k=7 TP=2 | 25.4 tok/s | 51% |
+
+The fabric is not what holds batch 1 back. Estimating 90 allreduces per token
+(45 text layers, two per layer) at two exchange steps for two ranks and 3.3 us
+each gives about 0.6 ms, against a 20 ms token at the ceiling. That estimate
+rests on an inferred allreduce count and has not been traced.
+
+**Verdict.** Accepted. Divide by 238 GB/s per booster and 23.1 GB/s across the
+pair, not 273 and 50. The NVFP4 stacks run at 27% to 31% of achievable memory
+bandwidth at batch 1, so the 78% a megakernel reaches in
+[the specialization evidence](../../kernels/2026-09-05-specialization-gains/)
+would be about 39 tok/s here.
+
+Both ceilings are hardware. Memory is flat under every launch configuration
+tried, and each rail is bounded by a Gen5 x4 host link, not by the 200 Gb/s
+port. An engine budgets against these numbers rather than trying to raise them.
+
+Each lands at the same fraction of its own bus, for unrelated reasons:
+
+| path | achieved | bus theoretical | efficiency |
+| --- | --- | --- | --- |
+| memory read | 240.0 GB/s | 273 GB/s | 87.9% |
+| one rail | 111.86 Gb/s | 126.0 Gb/s, Gen5 x4 after 128b/130b | 88.8% |
+
+DRAM loses cycles to refresh, turnaround, and activate/precharge; PCIe loses to
+line encoding and TLP headers. Roughly 88% is what a saturated bus returns. The
+44% gap between a rail and its 200 Gb/s port is a different thing, wire capacity
+with no host link behind it, and the 16% each rail loses when both run is a
+third, still untraced.
+
+**Reopen if.**
+
+- a driver or firmware release changes clock or link behaviour
+- an engine's real access pattern turns out to be sparser than block-gather,
+  which is the only regime where the 4 KiB kernel would be worth booting to
+  compare
+- MTU is raised to 9000 on both nodes, which should move `active_mtu` to 4096
+  and change small-message fabric cost
+- the 16% cost of running both rails together is traced above the root
+  complexes, which would say whether replicated boosters avoid it
+- allreduce counts and sizes are traced from a running engine, replacing the
+  0.6 ms estimate

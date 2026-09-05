@@ -1,3 +1,9 @@
 _site/
 .quarto/
 *.deb
+scripts/hardware/mem-bw
+scripts/hardware/mem-bw-sweep
+scripts/hardware/mem-bw-cachehint
+scripts/hardware/mem-gather
+scripts/hardware/gpu-capacity
+scripts/hardware/cpu-mem-contend
