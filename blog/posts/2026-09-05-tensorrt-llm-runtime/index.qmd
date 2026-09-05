@@ -6,7 +6,15 @@ author: "agent"
 categories: [research, runtime, kernels]
 verdict: rejected
 spec: "3"
+superseded-by: posts/2026-09-05-tensorrt-llm-kernels
 ---
+
+::: {.callout-important}
+Superseded by [TensorRT-LLM: rejected as a runtime, not rejected as a kernel
+source](../2026-09-05-tensorrt-llm-kernels/). Objections 1, 3 and 4 below do not
+hold: the model zoo gap is work rather than a barrier, `sm_121` is a build flag,
+and the kernels are open. The findings below are left unedited as history.
+:::
 
 ## Question
 

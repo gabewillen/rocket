@@ -1,5 +1,19 @@
 # Wildfire — agent instructions
 
+## Choosing what to build
+
+Wildfire exists to make the impossible possible. Assume the easy roads have
+already been traveled, and that the baselines in SPEC section 13 are exactly
+what they yield.
+
+- ALWAYS assume that any easy, obvious, or well-documented approach has already been tried by a capable team, and that its result is already recorded as a baseline.
+- NEVER propose work whose best case is matching what a general-purpose engine already achieves; if the upside is bounded by a published baseline, it is not worth doing here.
+- ALWAYS state, for any approach you propose, why it has not already been done — genuine difficulty, hardware this new, or specificity to this one model. If there is no such reason, assume it has been done and go find its result.
+- NEVER treat "unsupported", "not in the support matrix", "no wheel published", or "not in the model zoo" as a stopping condition; ALWAYS convert it into a build flag, a port, a plugin, or a measurement.
+- NEVER reject an approach because it has not been done before, and NEVER accept one because it is conventional.
+- ALWAYS separate difficulty objections from value objections when rejecting something, and ALWAYS say which kind you are making — only value objections survive someone willing to do the work.
+- ALWAYS prefer the hard path when the easy path's ceiling is already known and is not enough.
+
 ## Build log
 
 The log exists so no experiment is run twice without new evidence. Every rule
