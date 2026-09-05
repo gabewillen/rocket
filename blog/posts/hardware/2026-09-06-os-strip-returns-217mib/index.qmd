@@ -1,0 +1,73 @@
+---
+title: "Stripping the OS returns 217 MiB; the rest is carveout and driver floor"
+description: "The missing memory is 3.55 GiB of firmware carveouts (2.55 GiB video/GSP) and a 4.1 GiB kernel+driver floor that survives a full GUI and service strip."
+date: 2026-09-06
+author: "agent"
+categories: [experiment, hardware, memory]
+rocket: "#alignment"
+verdict: rejected
+---
+
+**Question.** After the 64K kernel, 123.73 GiB MemTotal remains from the 128 GiB
+part. Where is the rest, and how much comes back by stripping the OS?
+
+| setup | |
+| --- | --- |
+| node | both (waterfall on head gx10-5e36, strip on peer gx10-2a13) |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| commit | 92ca7aa795b0262078805fb9af281f5c8dcc178c |
+| script | `scripts/hardware/mem-map.sh` |
+
+```bash
+sudo scripts/hardware/mem-map.sh
+```
+
+| stage | size | note |
+| --- | --- | --- |
+| 128 GiB part | 134,217,728 kB | |
+| invisible to kernel | 389,184 kB (0.37 GiB) | firmware, pre-boot |
+| nomap carveouts | 3,720,960 kB (3.55 GiB) | `/proc/iomem` reserved |
+| kernel image + memmap + boot | 372,352 kB (0.36 GiB) | memmap is ~128 MiB at 64K |
+| MemTotal | 129,735,232 kB (123.72 GiB) | |
+
+The single largest carveout is 2,616 MiB at `0x280000000`, the video/GSP block
+("2 GB for video" is 2.55 GiB). The other 15 regions total 1,018 MiB. All are
+firmware-owned and nomap; no kernel or OS change returns them.
+
+Strip test on the peer, GDM restored afterward:
+
+```bash
+sudo systemctl isolate multi-user.target
+sudo systemctl stop snapd cups cups-browsed bluetooth avahi-daemon \
+  ModemManager gnome-remote-desktop accounts-daemon
+```
+
+| state | MemAvailable | delta |
+| --- | --- | --- |
+| graphical.target, caches dropped | 124,547,328 kB (118.78 GiB) | |
+| multi-user + services stopped, caches dropped | 124,769,408 kB (118.99 GiB) | +217 MiB |
+
+What remains in use on the stripped node, from `/proc/meminfo`:
+
+| component | size |
+| --- | --- |
+| MemTotal - MemFree | 4,313,472 kB (4.11 GiB) |
+| SUnreclaim slab | 1,422,848 kB (1.36 GiB) |
+| unaccounted in meminfo | ~1,949,000 kB (1.86 GiB) |
+| AnonPages (656 MiB total RSS) | 260,416 kB |
+| kernel stacks, page tables, vmalloc, percpu | ~320,000 kB |
+
+The 1.36 GiB unreclaimable slab and 1.86 GiB of pages in no meminfo counter are
+present with zero GPU clients running and match the NVIDIA driver being loaded.
+MemAvailable also withholds ~620 MiB for zone watermarks.
+
+**Verdict.** Rejected. OS stripping returns 217 MiB on a worker, plus about
+1.3 GiB on the head node while the IDE and desktop run there. The 3.55 GiB
+carveout is firmware-fixed and the ~3.2 GiB driver floor persists at idle.
+Budget from measured MemAvailable; do not plan on recovering the gap.
+
+**Reopen if.**
+
+- a firmware or BIOS update exposes a carveout size control, or unloading and
+  reloading the driver between serving runs measurably releases the slab and
+  unaccounted pages
