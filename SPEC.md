@@ -6,12 +6,15 @@ Wildfire is a purpose-built inference engine for Flash-class sparse-MoE models
 on DGX Spark clusters. The first optimization target is **GLM-5.3-Flash** on
 **two DGX Sparks** running the **64 KiB-page kernel**.
 
-Wildfire is not a general-purpose serving framework. It exists because the
-general-purpose frameworks make three assumptions that are all false here: that
-host pages are 4 KiB, that GPU memory is a discrete pool distinct from host RAM,
-and that a layer's reusable state is fully captured by an attention KV cache.
-On GB10 with a hybrid linear/sparse-attention MoE, each of those costs real
-throughput. See section 12 for the measured bar to beat.
+Wildfire is not a general-purpose serving framework and will not become one. It
+is an engine compiled for one model on one machine. Every stack benchmarked in
+section 13 is a capable general engine that gives up throughput to generality:
+dynamic shapes, runtime dispatch, autotuning, a general allocator, and a Python
+step loop. Those engines also carry assumptions that are simply false on this
+hardware — that host pages are 4 KiB, that GPU memory is a pool distinct from
+host RAM, and that a layer's reusable state is fully captured by an attention KV
+cache. Wildfire trades away generality to recover both. Section 3 states the
+doctrine; section 13 states the bar.
 
 ---
 
@@ -89,14 +92,78 @@ Decode is bandwidth-bound. 18B active parameters at ~4.25 bits is about
 - Pipeline parallelism does **not** raise the single-stream ceiling, because
   its stages are serial for any one token.
 
-This is the whole reason for the parallelism choice in section 4: only a layout
+This is the whole reason for the parallelism choice in section 5: only a layout
 where both nodes touch the same token concurrently can beat ~28 tok/s per
 stream. Batching raises aggregate throughput by amortizing expert reads across
-tokens that share experts, which is what section 6.2 exploits.
+tokens that share experts, which is what section 7.2 exploits.
 
 ---
 
-## 3. The 64 KiB page regime
+## 3. Design doctrine: specialization over generality
+
+Every stack measured in section 13 is a good general-purpose engine. They lose
+throughput here not because they are badly built, but because generality has a
+price on this hardware: dynamic shapes, runtime dtype dispatch, autotuned kernel
+selection, a general allocator, and a Python step loop on a 20-core Arm host.
+Wildfire buys that price back by refusing to be general.
+
+**One model. One cluster topology. One weight format. Every shape known ahead of
+time.**
+
+### 3.1 Structure: an offline compiler and a thin runtime
+
+Wildfire is two programs.
+
+The **model compiler** runs offline, on the same hardware, and consumes the
+checkpoint, a hardware profile produced by M0, and an expert co-activation
+profile gathered from a representative corpus. It emits a *plan*: a
+pre-swizzled weight blob, a static memory map with literal byte offsets, an
+expert-to-node placement, a kernel selection with pinned tile parameters, the
+execution graph topology, and the KV/KDA arena geometry.
+
+The **runtime** maps that plan and executes it. It has no dynamic allocator, no
+autotuner, no dtype or shape dispatch, no kernel fallback paths, and no Python
+in the step loop. Startup either maps the plan successfully or refuses to start.
+
+Changing the model is a compiler run, not a server reconfiguration.
+
+### 3.2 What specialization buys
+
+1. **The memory problem becomes a compile-time assertion.** Section 4.1 exists
+   because general engines negotiate their footprint at startup against a
+   moving target. Wildfire decides residency offline, down to byte offsets, and
+   validates it once. There is no utilization fraction to tune and nothing to
+   discover by allocating until failure.
+2. **Launch overhead collapses.** A 45-layer step is hundreds of kernel launches
+   per token in a general engine. With fixed shapes the entire decode step is
+   one graph launch per batch bucket. Buckets are a compiled, closed set
+   (1, 2, 4, 8, 16, 32); there is no shape wildcard.
+3. **Weight layout is ours to choose.** Experts are pre-swizzled offline into
+   exactly the layout the GEMM wants, 64 KiB aligned, so a top-8 gather becomes
+   a small set of aligned contiguous reads. No runtime transposition, no layout
+   conversion, no padding discovered at load time.
+4. **Expert placement is a compile-time decision.** With measured co-activation
+   statistics, the compiler places the 288 experts across the two nodes to
+   minimize cross-node dispatch. A general engine cannot do this because it does
+   not know the model in advance.
+5. **The weight arena is one hugepage-backed mapping.** 512 MiB pages over an
+   ~82 GiB per-node working set is the strongest available argument for the 64K
+   kernel, and section 15 flags it for measurement in M0.
+
+### 3.3 What we deliberately give up
+
+Arbitrary models, runtime-selectable dtypes, plugin backends, dynamic adapters,
+arbitrary parallelism degrees, and graceful degradation onto unsupported
+hardware. None of these are TODOs. They are out of scope, and any proposal to
+add one must argue against the throughput it costs.
+
+A reference implementation (HF/PyTorch) is retained strictly as an **offline**
+parity oracle for M1 and for golden-vector regression. It never appears in the
+serving path.
+
+---
+
+## 4. The 64 KiB page regime
 
 Wildfire **requires** the 64K-page kernel, installed on both nodes. It buys
 ~2.10 GiB per node: boot-time reserved memory drops from 6.09 GiB to 4.00 GiB,
@@ -107,7 +174,7 @@ It is not free in practice, and a prior A/B **rejected** this kernel for the
 vLLM stack. The failure was not the kernel; it was framework assumptions.
 Wildfire encodes the following as hard rules.
 
-### 3.1 Never size a pool from MemTotal
+### 4.1 Never size a pool from MemTotal
 
 The rejected A/B failed exactly here: the larger reported total drove the
 framework's desired pool to 100.84 GiB at utilization 0.815, while CUDA exposed
@@ -127,7 +194,7 @@ Startup refuses to proceed if requested residency exceeds `usable`. MemTotal may
 appear in logs; it may never appear in an arithmetic path that sizes an
 allocation.
 
-### 3.2 64 KiB is the universal alignment quantum
+### 4.2 64 KiB is the universal alignment quantum
 
 Every offset, stride, chunk and block boundary is a multiple of 65536: O_DIRECT
 NVMe I/O, mmap offsets, KV block rows, offload copy descriptors, shared-region
@@ -136,7 +203,7 @@ re-derived. Note the interaction with the model: DSA forces a logical attention
 page of 64 tokens, so KV row strides must satisfy both the 64-token logical page
 and the 64 KiB physical page.
 
-### 3.3 Host registration is the dangerous operation
+### 4.3 Host registration is the dangerous operation
 
 cudaHostRegister is where the 64K regime bites. The prior stacks converged on a
 specific safe pattern, which wildfire adopts natively:
@@ -160,16 +227,17 @@ specific safe pattern, which wildfire adopts natively:
   exact opposite of the intent. Only Device-DAX character mappings get the
   registered fast path.
 
-### 3.4 Mixed-page clusters are supported
+### 4.4 Both nodes run 64K, and the plan encodes it
 
-A 4K head and a 64K worker interoperated correctly over RoCE, including
-cross-node collectives. Wildfire does not require both nodes to share a page
-size, but each node advertises its page size in the cluster handshake, and no
-node assumes a peer's alignment.
+A 4K head and a 64K worker were shown to interoperate over RoCE, including
+cross-node collectives, so a mixed cluster is *possible*. Wildfire does not
+support one. The page size is a compiler input baked into the plan's alignment
+constants; a node whose page size disagrees with the plan is refused at
+handshake rather than accommodated at runtime.
 
 ---
 
-## 4. Parallelism layout
+## 5. Parallelism layout
 
 **Default: attention TP=2 plus expert-parallel EP=2 (144 experts per node) over
 dual-rail RoCE.**
@@ -181,16 +249,24 @@ hops at ~10 us is ~0.9 ms per token against a ~17 ms compute budget at the
 bandwidth ceiling. About 5% overhead to double the per-token bandwidth available
 to a single stream.
 
-Pipeline parallelism is kept as a fallback since it nearly eliminates cross-node
-traffic, but it is not the default: it cannot beat the ~28 tok/s single-stream
-ceiling.
+Pipeline parallelism is evaluated once in M0 and then discarded: it nearly
+eliminates cross-node traffic but cannot beat the ~28 tok/s single-stream
+ceiling. It is not carried as a runtime fallback, because the plan compiles one
+layout and only one.
 
-Both rails must be used. Single-rail operation is a degraded mode that wildfire
-reports explicitly rather than silently absorbing.
+**Expert placement is compiled, not hashed.** A general engine shards 288
+experts by index because it learns the model at load time. The compiler instead
+places experts using measured co-activation statistics, so experts that fire
+together in the same top-8 land on the same node and never cross the fabric.
+The placement is validated against a held-out trace; the win is measured in
+cross-node dispatch volume per token, not assumed.
+
+Both rails must be used. Single-rail operation is not a degraded serving mode;
+it is a startup refusal, because the compiled all-to-all schedule assumes two.
 
 ---
 
-## 5. Hybrid state cache — the differentiating subsystem
+## 6. Hybrid state cache — the differentiating subsystem
 
 GLM-5.3-Flash's reusable per-sequence state has two parts:
 
@@ -225,7 +301,7 @@ Acceptance: a cold prefill of a large prompt followed by a full engine restart
 must replay from cache with cached_tokens non-zero. The bar is **5.8x**
 (54.98 s cold to 9.54 s replayed at 44,236 tokens).
 
-### 5.1 KDA state is the concurrency limiter
+### 6.1 KDA state is the concurrency limiter
 
 KDA state dominates the concurrency ceiling far more than KV does. Prior tuning
 measured ~70 MB per request at 5 slots per request, capping concurrency at 6.
@@ -236,9 +312,9 @@ implementation detail.
 
 ---
 
-## 6. Scheduler
+## 7. Scheduler
 
-### 6.1 Decode priority over cold prefill
+### 7.1 Decode priority over cold prefill
 
 Mixed traffic is the failure mode that matters for coding-agent workloads.
 Packing large uncached prefills into the same step as active decoders collapsed
@@ -250,33 +326,36 @@ below a threshold stay eligible; large *uncached* prefill chunks are deferred
 while any peer is actively decoding. Target: under 2% degradation of an active
 decode stream when a cold prefill arrives.
 
-### 6.2 Expert-affinity batching
+### 7.2 Expert-affinity batching
 
 Decode is bandwidth-bound and only 8 of 288 experts fire per token, so the
 scheduler groups tokens within a step by routed expert set. Each expert's
 weights are read once and amortized across every token needing them. This is the
 main lever for aggregate throughput above the single-stream ceiling.
 
-### 6.3 Speculative decoding
+### 7.3 Speculative decoding
 
 The MTP draft layer is the default path, with DFlash2 as an alternative. Prior
 evidence is mixed and must be re-measured: one stack ran DFlash2 at k=7
 productively, another disabled MTP entirely because the drafter's memory cost
 would have capped concurrency near 10. Speculation depth is a runtime knob with
-an explicit memory charge in the section 3.1 budget, and the drafter gets its
+an explicit memory charge in the section 4.1 budget, and the drafter gets its
 own KV group.
 
 ---
 
-## 7. Numerics
+## 8. Numerics
 
-- Experts: 4-bit. NVFP4 preferred on Blackwell; EXL3 4bpw supported because it
-  is the checkpoint already on disk.
-- Attention, KDA and dense paths: FP8 where kernels permit, BF16 otherwise.
+Precision is fixed at compile time. There is no runtime dtype selection and no
+mixed-precision fallback path.
+
+- Experts: 4-bit, one format of record (see section 15, question 2).
+- Attention, KDA and dense paths: FP8 where the kernel supports it, BF16
+  otherwise — decided per layer by the compiler, not at runtime.
 - Router logits and normalization: BF16 minimum. With 288 experts, routing
   precision is a correctness concern, not a performance knob.
-- KV dtype configurable. FP8 KV requires Blackwell and must pass a quality gate
-  before becoming default.
+- KV precision is a compiler input. FP8 KV must pass the quality gate before it
+  can be selected.
 
 A quality gate (perplexity plus a coding/agentic task subset) runs on every
 numerics change. Throughput regressions are recoverable; silent quality
@@ -284,7 +363,7 @@ regressions are not.
 
 ---
 
-## 8. Kernels
+## 9. Kernels
 
 Wildfire owns: KDA linear attention, DSA sparse attention with the top-2048
 indexer, fused MoE grouped GEMM for 4-bit experts, and the MTP draft head.
@@ -296,7 +375,7 @@ starting point, not a guess.
 
 ---
 
-## 9. Observability
+## 10. Observability
 
 All runtime telemetry goes through **OpenTelemetry**. Required signals: per-step
 time split (attention / MoE / all-to-all / sampling), bytes read per token,
@@ -309,29 +388,33 @@ bounded histograms; per-request detail lives on spans, not metrics.
 
 ---
 
-## 10. API
+## 11. API
 
 OpenAI-compatible /v1/chat/completions and /v1/completions with streaming, tool
-calling and reasoning-content separation. Multimodal image input in scope; video
-deferred. A native endpoint exposes wildfire-specific controls: speculation
-depth, residency hints, cache anchor policy.
+calling and reasoning-content separation, because that is what the client
+workload speaks. Multimodal image input in scope; video out of scope.
+
+The API surface is deliberately thin. Per-request knobs that would force a shape
+or a kernel choice the plan did not compile are rejected, not accommodated.
+Serving-level controls (speculation depth, cache anchor policy) are plan
+parameters, set at compile time and reported read-only over the wire.
 
 ---
 
-## 11. Milestones
+## 12. Milestones
 
 | Milestone | Content | Exit criterion |
 | --- | --- | --- |
 | **M0** | Hardware characterization: measured memory bandwidth, registration-reserve probe, dual-rail RoCE bandwidth and latency, 64 KiB alignment audit | Section 1 estimates replaced by measurements; budget calculator *refuses* a deliberate over-allocation instead of being OOM-killed |
-| **M1** | Weight loading, 4-bit expert path, single-node forward parity against reference | Logit parity within tolerance on a short prompt |
-| **M2** | TP=2 plus EP=2 across both nodes, dual rail | Correct output; single-stream tok/s measured against the ~57 ceiling |
+| **M1** | Model compiler v0: checkpoint to plan (static memory map, pre-swizzled weights, arena geometry). Runtime maps the plan and runs single-node forward | Logit parity against the offline oracle on a short prompt; zero dynamic allocation in the step loop |
+| **M2** | Compiled expert placement, TP=2 plus EP=2 across both nodes, dual rail, whole decode step as one graph launch per bucket | Correct output; single-stream tok/s measured against the ~57 ceiling; measured cross-node dispatch bytes per token beat index sharding |
 | **M3** | Hybrid state cache (KV + KDA) with NVMe tier | Restart-survival restore beats 5.8x replay speedup |
 | **M4** | Scheduler: decode priority, expert-affinity batching, continuous batching | c32 aggregate above 132.8 tok/s; decode degradation under cold prefill below 2% |
 | **M5** | MTP speculation, quality gates, OTEL, OpenAI surface | Full c1-c32 bench matrix plus quality gate green |
 
 ---
 
-## 12. Prior art and the bar to beat
+## 13. Prior art and the bar to beat
 
 Measured on this exact hardware pair, recorded under ~/spark-stack. Aggregate
 tok/s, 512-token non-streaming.
@@ -346,14 +429,26 @@ kernel, with prefix restore actually hitting.
 
 ---
 
-## 13. Open questions
+## 14. Open questions
 
 1. **Implementation language and runtime.** Rust host with CUDA/Triton kernels,
-   or C++? This decides everything downstream and should be settled first.
-2. **Weight format of record.** EXL3 4bpw is on disk and proven; NVFP4 is the
-   native Blackwell path with better kernel support. Support both, or commit?
-3. **Vision encoder scope.** Inside M1-M5, or a later phase?
-4. **What is the real motivation for 64K pages?** The 2.10 GiB capacity gain is
-   modest against the registration complexity. Reduced TLB pressure across an
-   82 GiB weight working set is likely the stronger argument, and M0 should
-   measure it rather than assume it.
+   or C++? This decides everything downstream and should be settled first. The
+   doctrine pushes toward a language with no runtime surprises in the step loop.
+2. **Weight format of record — pick one.** Section 3.3 forbids supporting both.
+   EXL3 4bpw is on disk and proven at 164 GiB; NVFP4 is the native Blackwell
+   path with tensor-core support and likely better GEMM throughput on sm_121.
+   The tiebreaker should be a measured 4-bit grouped-GEMM microbenchmark in M0,
+   not preference.
+3. **How much does the compiler own?** Minimum viable is memory map plus weight
+   swizzle plus expert placement. The ambitious version also emits fused kernel
+   variants per layer shape. Where is the line for v0?
+4. **Expert co-activation corpus.** Placement quality is only as good as the
+   trace it is fit to. Which workload defines it — real coding-agent traffic, or
+   a general corpus? A placement overfit to one traffic shape may regress on
+   another, and that risk needs a held-out measurement.
+5. **Vision encoder scope.** Inside M1-M5, or a later phase? It is 24 layers of
+   weight residency competing with the KV and KDA arenas.
+6. **What is the real motivation for 64K pages?** The 2.10 GiB capacity gain is
+   modest against the registration complexity. TLB coverage over an ~82 GiB
+   per-node weight working set, mapped as 512 MiB hugepages, is the stronger
+   argument, and M0 should measure it rather than assume it.
