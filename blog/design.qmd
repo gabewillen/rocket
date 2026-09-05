@@ -1,6 +1,15 @@
-# Wildfire — Inference Engine Specification
+---
+title: "Design"
+subtitle: "What wildfire is, what it targets, and what it refuses to be."
+date-modified: 2026-09-05
+toc-depth: 2
+---
 
-Status: draft 0.1 · 2026-09-05 · target hardware verified on both nodes
+::: {.callout-note}
+This page is **current state**, not history. It is revised in place as decisions
+change. The [log](index.qmd) is the append-only record of how each decision was
+reached; where the two disagree, the log explains and this page decides.
+:::
 
 Wildfire is a purpose-built inference engine for Flash-class sparse-MoE models
 on DGX Spark clusters. The first optimization target is **GLM-5.3-Flash** on
@@ -8,17 +17,17 @@ on DGX Spark clusters. The first optimization target is **GLM-5.3-Flash** on
 
 Wildfire is not a general-purpose serving framework and will not become one. It
 is an engine compiled for one model on one machine. Every stack benchmarked in
-section 13 is a capable general engine that gives up throughput to generality:
+[Prior art](#baselines) is a capable general engine that gives up throughput to generality:
 dynamic shapes, runtime dispatch, autotuning, a general allocator, and a Python
 step loop. Those engines also carry assumptions that are simply false on this
 hardware — that host pages are 4 KiB, that GPU memory is a pool distinct from
 host RAM, and that a layer's reusable state is fully captured by an attention KV
-cache. Wildfire trades away generality to recover both. Section 3 states the
-doctrine; section 13 states the bar.
+cache. Wildfire trades away generality to recover both. [Doctrine](#doctrine)
+states the position; [prior art](#baselines) states the bar.
 
 ---
 
-## 1. Target hardware (measured on both nodes, 2026-09-05)
+## 1. Target hardware (measured on both nodes, 2026-09-05) {#hardware}
 
 | Property | Value |
 | --- | --- |
@@ -55,7 +64,7 @@ stacks under ~/spark-stack.
 
 ---
 
-## 2. Target model — GLM-5.3-Flash
+## 2. Target model — GLM-5.3-Flash {#model}
 
 | Property | Value |
 | --- | --- |
@@ -99,7 +108,7 @@ tokens that share experts, which is what section 7.2 exploits.
 
 ---
 
-## 3. Design doctrine: specialization over generality
+## 3. Design doctrine: specialization over generality {#doctrine}
 
 Every stack measured in section 13 is a good general-purpose engine. They lose
 throughput here not because they are badly built, but because generality has a
@@ -163,7 +172,7 @@ serving path.
 
 ---
 
-## 4. The 64 KiB page regime
+## 4. The 64 KiB page regime {#pages}
 
 Wildfire **requires** the 64K-page kernel, installed on both nodes. It buys
 ~2.10 GiB per node: boot-time reserved memory drops from 6.09 GiB to 4.00 GiB,
@@ -237,7 +246,7 @@ handshake rather than accommodated at runtime.
 
 ---
 
-## 5. Parallelism layout
+## 5. Parallelism layout {#parallelism}
 
 **Default: attention TP=2 plus expert-parallel EP=2 (144 experts per node) over
 dual-rail RoCE.**
@@ -266,7 +275,7 @@ it is a startup refusal, because the compiled all-to-all schedule assumes two.
 
 ---
 
-## 6. Hybrid state cache — the differentiating subsystem
+## 6. Hybrid state cache — the differentiating subsystem {#cache}
 
 GLM-5.3-Flash's reusable per-sequence state has two parts:
 
@@ -312,7 +321,7 @@ implementation detail.
 
 ---
 
-## 7. Scheduler
+## 7. Scheduler {#scheduler}
 
 ### 7.1 Decode priority over cold prefill
 
@@ -344,7 +353,7 @@ own KV group.
 
 ---
 
-## 8. Numerics
+## 8. Numerics {#numerics}
 
 Precision is fixed at compile time. There is no runtime dtype selection and no
 mixed-precision fallback path.
@@ -363,7 +372,7 @@ regressions are not.
 
 ---
 
-## 9. Kernels
+## 9. Kernels {#kernels}
 
 Wildfire owns: KDA linear attention, DSA sparse attention with the top-2048
 indexer, fused MoE grouped GEMM for 4-bit experts, and the MTP draft head.
@@ -375,7 +384,7 @@ starting point, not a guess.
 
 ---
 
-## 10. Observability
+## 10. Observability {#telemetry}
 
 All runtime telemetry goes through **OpenTelemetry**. Required signals: per-step
 time split (attention / MoE / all-to-all / sampling), bytes read per token,
@@ -388,7 +397,7 @@ bounded histograms; per-request detail lives on spans, not metrics.
 
 ---
 
-## 11. API
+## 11. API {#api}
 
 OpenAI-compatible /v1/chat/completions and /v1/completions with streaming, tool
 calling and reasoning-content separation, because that is what the client
@@ -401,7 +410,7 @@ parameters, set at compile time and reported read-only over the wire.
 
 ---
 
-## 12. Milestones
+## 12. Milestones {#milestones}
 
 | Milestone | Content | Exit criterion |
 | --- | --- | --- |
@@ -414,7 +423,7 @@ parameters, set at compile time and reported read-only over the wire.
 
 ---
 
-## 13. Prior art and the bar to beat
+## 13. Prior art and the bar to beat {#baselines}
 
 Measured on this exact hardware pair, recorded under ~/spark-stack. Aggregate
 tok/s, 512-token non-streaming.
@@ -429,7 +438,7 @@ kernel, with prefix restore actually hitting.
 
 ---
 
-## 14. Open questions
+## 14. Open questions {#questions}
 
 1. **Implementation language and runtime.** Rust host with CUDA/Triton kernels,
    or C++? This decides everything downstream and should be settled first. The

@@ -13,6 +13,8 @@ website:
         text: Log
       - href: experiments.qmd
         text: Experiments
+      - href: design.qmd
+        text: Design
     right:
       - icon: github
         href: https://github.com/gabewillen/wildfire

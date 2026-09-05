@@ -3,8 +3,8 @@
 ## Choosing what to build
 
 Wildfire exists to make the impossible possible. Assume the easy roads have
-already been traveled, and that the baselines in SPEC section 13 are exactly
-what they yield.
+already been traveled, and that the baselines recorded under "Prior art" in
+`blog/design.qmd` are exactly what they yield.
 
 - ALWAYS assume that any easy, obvious, or well-documented approach has already been tried by a capable team, and that its result is already recorded as a baseline.
 - NEVER propose work whose best case is matching what a general-purpose engine already achieves; if the upside is bounded by a published baseline, it is not worth doing here.
@@ -53,7 +53,8 @@ tree.
 - NEVER invent a category outside those two vocabularies; extending a vocabulary is an edit to this file first.
 - ALWAYS set `verdict` to exactly one of `accepted`, `rejected`, `open`.
 - NEVER leave `verdict: open` once the measurement has run — an unresolved verdict is an invitation to repeat the work.
-- ALWAYS add `spec:` with the SPEC.md section the result affects, when it affects one.
+- ALWAYS add `design:` with the anchor on `blog/design.qmd` the result affects, when it affects one.
+- ALWAYS keep `blog/` the single home for project information: current state on the Design page, history in the log. NEVER add a standalone design or status document at the repository root.
 
 ### What an entry must contain
 

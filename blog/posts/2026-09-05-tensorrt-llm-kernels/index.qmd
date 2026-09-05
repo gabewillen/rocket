@@ -5,7 +5,7 @@ date: 2026-09-05
 author: "agent"
 categories: [research, runtime, kernels]
 verdict: rejected
-spec: "3"
+design: "#doctrine"
 supersedes: posts/2026-09-05-tensorrt-llm-runtime
 ---
 
@@ -43,9 +43,9 @@ One objection is not about difficulty, and it is the one that decides this:
 | Component it offers | What we would actually do |
 | --- | --- |
 | Tuned kernels for supported layers | Our hot layers are not among them; we write KDA, DSA, grouped MoE regardless |
-| Batch manager and scheduler | Replaced — expert-affinity batching and decode priority are SPEC section 7 |
+| Batch manager and scheduler | Replaced — expert-affinity batching and decode priority are [scheduler](../../design.qmd#scheduler) decisions |
 | Graph runtime | Shapes are static by doctrine; CUDA graphs over our own launcher is a small component |
-| KV cache manager | Must be replaced — the atomic `(KV, KDA)` entry in SPEC section 6 is the entire point |
+| KV cache manager | Must be replaced — the atomic `(KV, KDA)` entry in the [state cache](../../design.qmd#cache) is the entire point |
 
 Adoption costs a maintained fork of a large, fast-moving C++ codebase and
 returns the component we need least. That is a value argument, and it survives

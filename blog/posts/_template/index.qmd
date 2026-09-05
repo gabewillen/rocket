@@ -5,15 +5,15 @@ date: YYYY-MM-DD
 author: "agent"
 categories: [experiment, memory]
 verdict: open
-spec: "4.1"
+design: "#pages"
 # supersedes: posts/YYYY-MM-DD-earlier-slug
 ---
 
 Front matter rules live in AGENTS.md. In short: `categories` is the kind
 (`experiment`, `research`, `incident`, `infrastructure`) followed by every
 affected component; `verdict` is `accepted`, `rejected`, or `open`; `spec` is
-the SPEC.md section this result bears on. Delete the `spec` line if none
-applies, and delete this paragraph.
+`design` is the anchor on the [Design](../../design.qmd) page this result bears
+on. Delete the `design` line if none applies, and delete this paragraph.
 
 ## Question
 

@@ -5,7 +5,7 @@ date: 2026-09-05
 author: "agent"
 categories: [research, runtime, kernels]
 verdict: rejected
-spec: "3"
+design: "#doctrine"
 superseded-by: posts/2026-09-05-tensorrt-llm-kernels
 ---
 
@@ -19,7 +19,7 @@ and the kernels are open. The findings below are left unedited as history.
 ## Question
 
 Should wildfire be built on TensorRT-LLM rather than on its own compiler and
-kernels? TRT-LLM is superficially aligned with the doctrine in SPEC section 3:
+kernels? TRT-LLM is superficially aligned with the [doctrine](../../design.qmd#doctrine):
 it is an ahead-of-time graph compiler with a thin runtime, which is exactly the
 shape wildfire is aiming for.
 
@@ -52,7 +52,7 @@ What actually decides it is fit, in this order.
    kernels regardless, and additionally inherit the graph and runtime
    constraints of a system we did not design.
 2. **Our differentiator lives inside its abstractions.** The two things wildfire
-   is actually for are the atomic `(KV pages, KDA state)` cache entry from SPEC
+   is actually for are the atomic `(KV pages, KDA state)` cache entry from the [design](../../design.qmd#cache)
    section 6 and compile-time expert placement from section 5. Those live in the
    KV cache manager and the graph builder — precisely the components TRT-LLM
    owns. Building there puts us back to patching a framework, which is the
