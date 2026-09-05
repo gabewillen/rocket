@@ -17,7 +17,7 @@ reached; where the two disagree, the log explains and this page decides.
 | --- | --- |
 | **accelerant** | an inference engine compiled for exactly one model on one cluster: specialized, disposable, regenerated rather than reconfigured |
 | **spark** | the hardware that ignites it — DGX Spark, GB10 |
-| **wildfire** | the result, and the compiler that produces accelerants |
+| **wildfire** | the result of the spark igniting the accelerant |
 
 **GLM-5.3-Flash gets the first accelerant.** It is what the rest of this page
 specifies. Every model after it gets its own accelerant, never a configuration
@@ -62,7 +62,7 @@ stacks under ~/spark-stack.
    launch; one DSA kernel requested 169,984 B and died. Every kernel declares
    its dynamic smem budget and is validated against the ceiling.
 3. **sm_121 is outside several vendor kernel matrices.** TensorRT-LLM's FMHA
-   runner rejects the architecture outright. Wildfire owns its attention
+   runner rejects the architecture outright. Accelerants own their attention
    kernels rather than depending on a dispatch table with no sm_121 tactic.
 4. **Memory overcommit kills the OS.** One prior boot at 0.87 utilization plus
    an 8.58 GB pinned tier OOM-killed *both* operating systems. An accelerant never
@@ -123,13 +123,13 @@ selection, a general allocator, and a Python step loop on a 20-core Arm host.
 An accelerant buys that price back by refusing to be general.
 
 **One model. One cluster topology. One weight format. Every shape known ahead of
-time.** That binds each accelerant, not wildfire itself — a second model means a
+time.** That binds each accelerant, not the compiler — a second model means a
 second accelerant, never a branch in this one.
 
 ### 3.1 Structure: a compiler and the accelerant it emits
 
-Wildfire proper is the **compiler**. It runs offline on the target hardware and
-consumes the model checkpoint, a hardware profile produced by M0, and an expert
+The **compiler** runs offline on the target hardware and consumes the model
+checkpoint, a hardware profile produced by M0, and an expert
 co-activation profile gathered from a representative corpus. It emits a *plan*:
 a pre-swizzled weight blob, a static memory map with literal byte offsets, an
 expert-to-node placement, a kernel selection with pinned tile parameters, the
@@ -146,7 +146,7 @@ reconfiguration.
 
 1. **The memory problem becomes a compile-time assertion.** Section 4.1 exists
    because general engines negotiate their footprint at startup against a
-   moving target. Wildfire decides residency offline, down to byte offsets, and
+   moving target. The compiler decides residency offline, down to byte offsets, and
    validates it once. There is no utilization fraction to tune and nothing to
    discover by allocating until failure.
 2. **Launch overhead collapses.** A 45-layer step is hundreds of kernel launches
@@ -187,7 +187,7 @@ a ~2% capacity gain for free.
 
 It is not free in practice, and a prior A/B **rejected** this kernel for the
 vLLM stack. The failure was not the kernel; it was framework assumptions.
-Wildfire encodes the following as hard rules.
+These are hard rules.
 
 ### 4.1 Never size a pool from MemTotal
 
@@ -380,7 +380,7 @@ regressions are not.
 
 ## 9. Kernels {#kernels}
 
-Wildfire owns: KDA linear attention, DSA sparse attention with the top-2048
+We own: KDA linear attention, DSA sparse attention with the top-2048
 indexer, fused MoE grouped GEMM for 4-bit experts, and the MTP draft head.
 
 Every kernel declares its dynamic shared-memory requirement and is rejected at
