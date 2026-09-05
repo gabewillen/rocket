@@ -1,6 +1,6 @@
 ---
 title: "Design"
-subtitle: "The compiler, the accelerant it emits, and the rules both follow."
+subtitle: "The compiler, the engine it emits, and the rules both follow."
 date-modified: 2026-09-05
 toc-depth: 2
 ---
@@ -8,17 +8,18 @@ toc-depth: 2
 Current state, revised in place. The [log](index.qmd) is the append-only record
 of how each decision was reached, and holds every measurement cited here.
 
-A wildfire is what happens when a spark ignites an accelerant.
+A rocket is a spark igniting fuel in an engine.
 
 | term | meaning |
 | --- | --- |
-| accelerant | an inference engine compiled for one model on one cluster. Regenerated, not reconfigured. |
 | spark | the hardware that ignites it (DGX Spark, GB10) |
-| wildfire | the result of the spark igniting the accelerant |
+| fuel | a model and its weights |
+| engine | compiled for one fuel on one cluster. Regenerated, not reconfigured. |
+| rocket | sparks, fuel, and engines assembled |
 
-Model-specific content lives with its [accelerant](accelerants/index.qmd).
-[GLM-5.3-Flash](accelerants/glm-5.3-flash.qmd) is the first. Hardware
-measurements live in the log.
+A rocket has a [GLM-5.3-Flash engine](engines/glm-5.3-flash.qmd) that burns
+GLM-5.3-Flash as fuel. Fuel-specific content lives with its
+[engine](engines/index.qmd). Hardware measurements live in the log.
 
 ## Doctrine {#doctrine}
 
@@ -26,11 +27,11 @@ General-purpose engines pay for generality at runtime: dynamic shapes, runtime
 dtype dispatch, autotuned kernel selection, a general allocator, and a Python
 step loop on a 20-core Arm host. They reach
 [132.8 tok/s at c32](posts/baseline/2026-09-05-general-engine-baselines/) here.
-An accelerant recovers that cost by refusing to be general.
+An engine recovers that cost by refusing to be general.
 
 One model. One cluster topology. One weight format. Every shape known ahead of
-time. That binds each accelerant, not the compiler. A second model means a
-second accelerant, never a branch in this one.
+time. That binds each engine, not the compiler. A second model means a
+second engine, never a branch in this one.
 
 ## Structure {#structure}
 
@@ -41,11 +42,11 @@ static memory map with literal byte offsets, an expert-to-node placement, a
 kernel selection with pinned tile parameters, the execution graph topology, and
 the cache arena geometry.
 
-The accelerant maps that plan and executes it. No dynamic allocator, no
+The engine maps that plan and executes it. No dynamic allocator, no
 autotuner, no dtype or shape dispatch, no kernel fallback paths, no Python in
 the step loop. Startup either maps the plan or refuses to start.
 
-Changing the model is a compiler run producing a new accelerant.
+Changing the model is a compiler run producing a new engine.
 
 ## What specialization buys {#buys}
 
@@ -67,7 +68,7 @@ the throughput it costs.
 A reference implementation (HF/PyTorch) is kept as an offline parity oracle and
 for golden-vector regression. It never appears in the serving path.
 
-## Rules an accelerant must satisfy {#rules}
+## Rules an engine must satisfy {#rules}
 
 Each rule follows from a measurement in the log.
 
@@ -107,7 +108,7 @@ assumes two.
 
 ### Kernels {#kernels}
 
-Accelerants own their attention and expert kernels. Every kernel declares its
+Engines own their attention and expert kernels. Every kernel declares its
 dynamic shared-memory requirement and is rejected at build time above the GB10
 ceiling ([limits](posts/hardware/2026-09-05-gb10-execution-limits/)).
 

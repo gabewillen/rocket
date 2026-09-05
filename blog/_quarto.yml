@@ -3,10 +3,10 @@ project:
   output-dir: _site
 
 website:
-  title: "Wildfire"
+  title: "Rocket"
   description: "Build log for a single-model inference engine on DGX Spark"
-  site-url: "https://gabewillen.github.io/wildfire/"
-  repo-url: "https://github.com/gabewillen/wildfire"
+  site-url: "https://gabewillen.github.io/rocket/"
+  repo-url: "https://github.com/gabewillen/rocket"
   navbar:
     left:
       - href: index.qmd
@@ -15,13 +15,13 @@ website:
         text: Experiments
       - href: design.qmd
         text: Design
-      - href: accelerants/index.qmd
-        text: Accelerants
+      - href: engines/index.qmd
+        text: Engines
     right:
       - icon: github
-        href: https://github.com/gabewillen/wildfire
+        href: https://github.com/gabewillen/rocket
   page-footer:
-    center: "Wildfire — GLM-5.3-Flash on 2x DGX Spark"
+    center: "Rocket — GLM-5.3-Flash on 2x DGX Spark"
 
 format:
   html:

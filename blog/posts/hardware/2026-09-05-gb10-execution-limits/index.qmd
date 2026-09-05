@@ -21,7 +21,7 @@ The shared memory cap is what forced a working DSA configuration of
 `block_I=32`, `num_stages=1`, `threads=128` on `sm_12x`. The v2 kernel wants
 166 KB and cannot run here.
 
-**Verdict.** Accepted as design constraints. Accelerants own their attention
+**Verdict.** Accepted as design constraints. Engines own their attention
 kernels rather than depending on a vendor dispatch table.
 
 **Reopen if.**

@@ -30,7 +30,7 @@ What survives. We write KDA, DSA and the 4-bit grouped expert GEMM either way, s
 | it offers | we would |
 | --- | --- |
 | tuned kernels for supported layers | write our hot layers regardless |
-| batch manager and scheduler | replace it ([scheduler](../../../accelerants/glm-5.3-flash.qmd#scheduler)) |
+| batch manager and scheduler | replace it ([scheduler](../../../engines/glm-5.3-flash.qmd#scheduler)) |
 | graph runtime | shapes are static; CUDA graphs over our own launcher is small |
 | KV cache manager | replace it. The atomic `(KV, KDA)` entry is the point |
 

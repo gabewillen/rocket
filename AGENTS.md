@@ -1,4 +1,4 @@
-# Wildfire: agent instructions
+# Rocket: agent instructions
 
 ## Choosing what to build
 
@@ -84,7 +84,7 @@ tree.
 
 ### Before and after
 
-- ALWAYS search the existing log before proposing an experiment, with `rg` over `blog/posts/` or the site search at <https://gabewillen.github.io/wildfire/>.
+- ALWAYS search the existing log before proposing an experiment, with `rg` over `blog/posts/` or the site search at <https://gabewillen.github.io/rocket/>.
 - NEVER re-run an experiment that already carries a verdict unless you have new evidence.
 - ALWAYS add `supersedes:` pointing at the earlier entry's path when you do re-run one, and ALWAYS say in the post what changed.
 - NEVER edit a published entry's findings to reflect a later result; supersede it instead, because the log is append-only history and not current state.

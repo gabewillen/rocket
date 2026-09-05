@@ -7,7 +7,7 @@ categories: [experiment, hardware, fabric]
 verdict: accepted
 ---
 
-**Question.** What does an accelerant actually get to target?
+**Question.** What does an engine actually get to target?
 
 ```bash
 uname -r; getconf PAGESIZE; grep -E 'MemTotal|Hugepagesize' /proc/meminfo; nproc

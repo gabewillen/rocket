@@ -1,6 +1,6 @@
 ---
 title: "GLM-5.3-Flash"
-subtitle: "The chemistry of the first accelerant."
+subtitle: "The chemistry of the first fuel, and the engine that burns it."
 description: "321B total, 18B active, hybrid KDA and sparse MLA, 288 experts top-8. Two sparks, 4-bit weights."
 status: designing
 date-modified: 2026-09-05
@@ -8,8 +8,8 @@ toc-depth: 2
 ---
 
 ::: {.callout-note}
-Chemistry, not architecture. [Design](../design.qmd) covers wildfire itself:
-the compiler, the accelerant contract, and the spark it burns on. This page
+Chemistry, not architecture. [Design](../design.qmd) covers rocket itself:
+the compiler, the engine contract, and the spark it burns on. This page
 covers what is specific to burning GLM-5.3-Flash.
 :::
 
@@ -36,7 +36,7 @@ incoai/GLM-5.3-Flash-DFlash2 (2.2 GB drafter).
 | EXL3 4bpw | ~164 GiB | Fits, ~83 GiB cluster headroom |
 | NVFP4 (4-bit experts) | ~182 GiB | Fits, ~65 GiB headroom |
 
-This accelerant targets the **4-bit weight regime**, with ~82 GiB resident weights per
+This engine targets the **4-bit weight regime**, with ~82 GiB resident weights per
 node as the design point. KV, KDA state, activations, drafter, vision encoder,
 runtime and OS all share the remaining ~41 GiB per node.
 
@@ -99,7 +99,7 @@ the storage tier held KV pages only. Restoring KV without the matching KDA state
 forces a full re-prefill, so reads never hit. One stack verified writes to NVMe
 on both nodes and still never landed a single restore.
 
-**The accelerant treats the (KV pages, KDA state) pair as one indivisible cache
+**The engine treats the (KV pages, KDA state) pair as one indivisible cache
 entry**, anchored at the same token boundary, written and restored atomically.
 This subsystem is what justifies building an engine instead of patching one.
 
@@ -126,7 +126,7 @@ must replay from cache with cached_tokens non-zero. The bar is **5.8x**
 KDA state dominates the concurrency ceiling far more than KV does. Prior tuning
 measured ~70 MB per request at 5 slots per request, capping concurrency at 6.
 Dropping to 4 slots per request with lazy buffering and a tuned convolution
-width lifted the same box to 32 concurrent requests. The accelerant treats **KDA slots
+width lifted the same box to 32 concurrent requests. The engine treats **KDA slots
 per request** as a primary, explicitly tuned scheduler parameter, not an
 implementation detail.
 
@@ -212,7 +212,7 @@ starting point, not a guess.
    trace it is fit to. Which workload defines it, real coding-agent traffic or
    a general corpus? A placement overfit to one traffic shape may regress on
    another, and that risk needs a held-out measurement.
-5. **Vision encoder scope.** In the first accelerant or a later one? It is 24 layers of
+5. **Vision encoder scope.** In the first engine or a later one? It is 24 layers of
    weight residency competing with the KV and KDA arenas.
 6. **What is the real motivation for 64K pages?** The 2.10 GiB capacity gain is
    modest against the registration complexity. TLB coverage over an ~82 GiB
