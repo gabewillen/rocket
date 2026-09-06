@@ -1,0 +1,142 @@
+---
+title: "Head's 2.3x slowdown is a 728 MHz GPU clock ceiling, not kswapd"
+description: "The head node never boosts past 728 MHz SM clock on this workload while the peer reaches 2437 MHz; three vm.* sysctls and pausing the operator's IDE moved neither the clock nor the step time, and kswapd/kcompactd activity does not correlate with any single slow run."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, hardware, memory, baseline]
+verdict: accepted
+rocket: "#boosters"
+supersedes: posts/fabric/2026-09-07-expert-cache-is-most-of-the-split-ladder
+---
+
+**Question.** [2026-09-07-expert-cache-is-most-of-the-split-ladder](../../fabric/2026-09-07-expert-cache-is-most-of-the-split-ladder/)
+found the head 1.3x to 2.6x slower than the peer on byte-identical
+single-booster work and named `kswapd0`/`kcompactd0` activity on the head as
+the suspect. Is page-cache pressure the cause, and does a `vm.*` sysctl fix it?
+
+| setup | |
+| --- | --- |
+| nodes | gx10-5e36 (head), gx10-2a13 / 192.168.100.11 (peer), GB10, sm_121 |
+| kernel | 6.17.13-rocket64k, 64 KiB pages, identical on both |
+| driver / nvcc | 580.173.02 / 13.0.88, identical on both |
+| VBIOS | 9A.0B.25.00.00, identical on both |
+| commit | ca5d748145df78d98f6e83cf5d20d24ce9198272 |
+| workload | `rocket-static-fire --mode single --sweep 1 --expert-cache-gib 20 --skip-parity 1`, M=1, 1.121 GiB/step, 77.2% hit |
+
+```bash
+scripts/hardware/single-booster-clock-thermal.sh head-run 20
+```
+
+## Reproduced
+
+Five back-to-back runs per node, `systemd-run --user` (linger was off on the
+peer; `loginctl enable-linger glwillen` there was needed before any `--user`
+unit survived past the launching ssh session):
+
+| node | ms/step (5 runs) |
+| --- | --- |
+| head | 451, 470, 477, 452, 470 |
+| peer | 219, 226, 225, 219, 225 |
+
+Head runs 2.0x to 2.1x slower than the peer at steady state, before any idle
+gap. That already rules out a one-off: the 20-GiB-cache, M=1 case from the
+prior post reproduces on demand.
+
+## kswapd was not running during the slow runs
+
+`grep pgscan_kswapd /proc/vmstat` before and after ten back-to-back timed runs
+on the head showed zero delta: the scanner did not fire once during any of
+the runs measured for this post, fast or slow. `compact_stall`,
+`compact_fail`, and `compact_success` are 0 on both nodes over the whole
+uptime, so `kcompactd0`'s presence in the prior post's `top` was proactive
+background scanning (`vm.compaction_proactiveness`), not allocation-failure
+compaction.
+
+## The idle-gap spike did not survive a controlled retest
+
+A first pass looked promising: after a 45-second idle gap the head ran at
+1824 ms, and an immediate repeat ran at 451 ms. Setting `vm.swappiness=1`
+made two more 45-to-60-second gaps disappear (480, 456, 484, all within noise
+of the 451-477 steady state). But swappiness raises the kernel's preference
+to keep page cache, not lower it, so a fix in that direction would need
+**higher** swappiness, not lower. A revert to the stock `vm.swappiness=60`,
+`vm.min_free_kbytes=45557` (the value `/etc/sysctl.d/90-dsv4-memory.conf`
+already pins after a prior 2 GiB experiment was reverted for withholding
+memory from model serving), and `vm.compaction_proactiveness=20` (all
+defaults) was tested with the same 45-second gap and it also came back fast
+(474 ms). The idle-gap spike does not reproduce on demand at either setting.
+It is real (it happened once, unprompted, in the prior post and once here)
+but it is not tied to any `vm.*` value this post could move on command, so no
+sysctl change is being kept or committed as a fix for it.
+
+Pausing the operator's IDE (`kill -STOP` on every `orca-ide` and `Xvfb`
+process, `kill -CONT` after) did not change the steady-state time either:
+451 ms paused vs. 451-477 ms with the IDE running.
+
+## What actually is different: the GPU clock
+
+`nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu,temperature.gpu.tlimit`
+sampled once a second through the run:
+
+| node | max SM clock | power at max clock | GPU temp | GPU T.Limit |
+| --- | --- | --- | --- | --- |
+| head | 728 MHz | 4.2-7.8 W | 47-49 C | 47-49 C |
+| peer | 2437-2450 MHz | 21.5-28.7 W | 43-45 C | 51-54 C |
+
+`clocks_event_reasons.sw_power_cap` and `.sw_thermal_slowdown` read
+`Not Active` on both throughout: the head's GPU never asks for more than
+728 MHz, it is not being blocked from a higher request. This held across
+every run in this post, at 451 ms and at 1824 ms alike, so the clock ceiling
+does not explain the idle-gap spike, only the steady-state 2x-2.3x gap.
+
+Package thermal zones (`/sys/class/thermal/thermal_zone*`, all seven `acpitz`
+zones, averaged) at rest:
+
+| node | avg package temp |
+| --- | --- |
+| head | 48-49 C |
+| peer | 40-46 C |
+
+The head runs 7-8 C hotter across every thermal zone on the SoC, at idle,
+before either node runs anything. GB10 is one coherent Grace-plus-Blackwell
+package with a shared thermal and power budget; the head carries the
+operator's IDE (`orca-ide` + `Xvfb`, Electron, several renderer/GPU-process
+children) and this agent's harness as standing CPU load, and has served as
+the project's build machine. The peer is close to idle. A hotter package
+gives the GPU less headroom to request boost states, and the head's GPU
+settles at a low, stable 728 MHz while the peer's freely reaches 2437+ MHz on
+identical work, with neither hitting a counted throttle event.
+
+## Verdict
+
+Accepted: the head's steady-state 2.0x-2.3x slowdown on single-booster work
+tracks a 728 MHz vs. 2437 MHz SM clock ceiling, not `kswapd`/`kcompactd`
+activity. `vm.swappiness`, `vm.min_free_kbytes`, and
+`vm.compaction_proactiveness` were each moved and reverted with before/after
+timing on the head and none changed the ceiling or the steady-state time.
+Pausing the operator's IDE did not either. The one-off idle-gap spikes (up to
+1880 ms in the prior post, 1824 ms once here) remain unexplained; they did
+not reproduce under a controlled retest at either sysctl setting, so they are
+reported as noise rather than attributed to a cause this post could not pin
+down twice in a row.
+
+**Next.**
+
+- run the same M=1, 20 GiB single-booster case on the head with nothing else
+  on the node (no IDE, no harness, no ssh session issuing commands) to get a
+  package-temperature floor and see whether the clock ceiling lifts on its
+  own
+- if it does not lift with the node otherwise idle, treat 728 MHz as this
+  head unit's real ceiling under the current cooling and stop attributing
+  pair throughput loss to page cache
+- capture one more idle-gap spike with `nvidia-smi -l 1` and `/proc/vmstat`
+  both running continuously in the background (not started fresh per run) so
+  a future occurrence has clock and reclaim data from the same window instead
+  of a before/after snapshot
+
+**Reopen if.**
+
+- a driver or firmware release changes how GB10 shares its thermal/power
+  budget between the Grace CPU and Blackwell GPU domains
+- the head's physical cooling or chassis placement changes in a way that
+  closes the 7-8 C package-temperature gap to the peer
