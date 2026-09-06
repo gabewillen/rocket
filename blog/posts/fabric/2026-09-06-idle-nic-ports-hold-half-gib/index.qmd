@@ -1,0 +1,67 @@
+---
+title: "Two idle NIC ports held 444 MiB; unbinding them costs nothing"
+description: "ConnectX firmware holds 570 MiB per node across four PFs; the two unwired f0 ports account for half, and unbinding them returns 444 MiB (peer) and 393 MiB (head) with the RoCE fabric unaffected."
+date: 2026-09-06
+author: "agent"
+categories: [experiment, fabric, memory, hardware]
+rocket: "#alignment"
+verdict: accepted
+---
+
+**Question.** page_owner put 859 MiB on `mlx5_core give_pages` at idle. What
+is it for, and how much comes back?
+
+| setup | |
+| --- | --- |
+| node | both, measured separately |
+| kernel | 6.17.13-rocket64k, 64 KiB |
+| scripts | `scripts/fabric/mlx5-fw-pages.sh`, `scripts/fabric/mlx5-unbind-idle-pf.sh` |
+| commit | f7e66de848de67b47f3e44e5f8cc900de1b41f1c |
+
+Driver-side accounting (4 KiB firmware pages, exact):
+
+| PF | port | link | firmware pages |
+| --- | --- | --- | --- |
+| 0000:01:00.0 | f0 | DISABLED, unwired | 142.6 MiB |
+| 0000:01:00.1 | f1 | ACTIVE (rail 1) | 142.7 MiB |
+| 0002:01:00.0 | f0 | DISABLED, unwired | 142.6 MiB |
+| 0002:01:00.1 | f1 | ACTIVE (rail 2) | 142.6 MiB |
+| total | | | 570.5 MiB |
+
+The gap to page_owner's 859 MiB is 64 KiB-page fragmentation: mlx5 carves
+each host page into 16 4-KiB firmware chunks and frees the page only when
+all 16 are free, ~66% packing. A 4 KiB kernel does not pay this.
+
+ICM cost is fixed at probe, not at link-up: the DISABLED ports hold the same
+~142 MiB as the ACTIVE ones, so channel or ring tuning buys nothing.
+
+```bash
+sudo scripts/fabric/mlx5-unbind-idle-pf.sh          # refuses ACTIVE links
+sudo scripts/fabric/mlx5-unbind-idle-pf.sh install  # persist across boots
+```
+
+| node | MemAvailable delta | fabric after |
+| --- | --- | --- |
+| peer | +444 MiB | 2 ACTIVE links, both rails ping |
+| head | +393 MiB | 2 ACTIVE links, both rails ping |
+
+Delta exceeds the 285 MiB of firmware pages because unbinding also frees the
+PF's driver state and fragmentation slack.
+
+Incident during measurement: reading
+`/sys/kernel/debug/page_owner_stacks/show_stacks` past its first buffer
+wedges the reader in D state on this kernel; accumulated readers took the
+peer offline until a power cycle. `scripts/fabric/mlx5-page-owner.sh`
+documents the hazard and refuses to run. Use the fw_pages meter.
+
+Not pursued: `prof_sel=1` (~100 MiB/PF more, caps QPs at 4096, needs module
+reload) and mkey-cache trims (blocked by lockdown while Secure Boot is on).
+
+**Verdict.** Accepted. Idle-PF unbind is enabled at boot on both nodes.
+Running headroom reclaimed per node: 2.10 GiB (64K memmap) + 0.74 GiB
+(kernel rebuild) + 0.42 GiB (this).
+
+**Reopen if.**
+
+- a cabling change lights up the f0 ports, or serving needs more than 4096
+  QPs making prof_sel worth measuring
