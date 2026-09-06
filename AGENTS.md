@@ -12,6 +12,8 @@ baselines are what they yield.
 - NEVER reject an approach because it has not been done before, and NEVER accept one because it is conventional.
 - ALWAYS say whether a rejection is a difficulty objection or a value objection. Difficulty objections do not hold against someone willing to do the work.
 - ALWAYS prefer the hard path when the easy path's ceiling is already known and is not enough.
+- NEVER optimize without a profile naming the bottleneck first; a counter, a stall reason, or a roofline gap, quoted in the entry.
+- ALWAYS size the change to the iteration cost: when one attempt costs minutes of model load, make the large structural change first and bisect from it. Parameter tweaks come after the structure wins, as controls.
 
 ## Build log
 
