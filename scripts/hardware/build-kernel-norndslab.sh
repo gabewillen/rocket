@@ -6,9 +6,13 @@
 #   ./build-kernel-norndslab.sh build     # ~1.7G source + long compile
 #   ./build-kernel-norndslab.sh install   # installs debs, edits grub
 #
-# Secure Boot is enabled on these nodes. The built kernel is unsigned, so
-# before the first boot either disable Secure Boot in UEFI setup or enroll
-# a MOK and sign vmlinuz. Both need the physical console once.
+#   ./build-kernel-norndslab.sh sign      # sign vmlinuz with the node MOK
+#
+# Secure Boot is enabled on these nodes. sign creates a machine-owner key in
+# /var/lib/rocket-mok on first use and queues it for enrollment; the first
+# reboot after that shows MokManager once on the physical console (password
+# rocket64k). Enrollment persists, later reboots and later signed kernels
+# boot with no prompt. Never commit MOK.key anywhere.
 #
 # The NVIDIA prebuilt module packages (linux-modules-nvidia-580-open-*) are
 # ABI-locked and will not load; rebuild the open modules from the source in
@@ -52,6 +56,23 @@ install() {
   sudo update-grub
   echo "Reboot to the $LOCALVER kernel, then rebuild the NVIDIA open modules:"
   echo "  cd /usr/src/nvidia-580.173.02 && sudo make -j\$(nproc) modules && sudo make modules_install && sudo depmod"
+}
+
+sign() {
+  local kver
+  kver=$(ls /boot/vmlinuz-*"$LOCALVER" | sed 's|/boot/vmlinuz-||' | head -1)
+  sudo apt-get -y install sbsigntool mokutil
+  sudo mkdir -p /var/lib/rocket-mok && cd /var/lib/rocket-mok
+  [ -f MOK.key ] || sudo openssl req -new -x509 -newkey rsa:2048 -keyout MOK.key \
+    -out MOK.crt -outform PEM -nodes -days 36500 -subj "/CN=rocket kernel signing/"
+  sudo chmod 600 MOK.key
+  sudo openssl x509 -in MOK.crt -outform DER -out MOK.der
+  sudo sbsign --key MOK.key --cert MOK.crt \
+    --output "/boot/vmlinuz-$kver.signed" "/boot/vmlinuz-$kver"
+  sudo mv "/boot/vmlinuz-$kver.signed" "/boot/vmlinuz-$kver"
+  sbverify --cert MOK.crt "/boot/vmlinuz-$kver"
+  # no-op if this MOK is already enrolled
+  mokutil --test-key MOK.der || printf 'rocket64k\nrocket64k\n' | sudo mokutil --import MOK.der
 }
 
 "${1:-build}"
