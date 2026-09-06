@@ -1,0 +1,207 @@
+---
+title: "One booster decodes GLM-5.3-Flash end to end, and a token reads 21.05 GiB, not the recorded 9.6"
+description: "All 45 text layers run on a single GB10 and emit coherent text; only the routed experts are NVFP4, so a decode step reads 16.62 GiB of BF16 plus 4.43 GiB of experts, putting the two-booster roofline at 21.1 tok/s instead of 49.6."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, runtime, moe, memory, attention, numerics, baseline]
+verdict: accepted
+rocket: "#memory"
+---
+
+**Question.** Can one booster run the whole forward pass, and what does a step
+actually cost?
+
+| setup | |
+| --- | --- |
+| node | gx10-5e36, GB10, sm_121, 20 Arm cores, 123.73 GiB |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| nvcc | 13.0.88 |
+| commit | 9ca911a6442c0c083a31fe55bfad7c72493b7d47 |
+| fuel | NIM snapshot `nim-aa28e1f-nvfp4`, 182 GiB on disk |
+
+```bash
+cmake -S engines/glm5-moe-nvfp4-2b -B engines/glm5-moe-nvfp4-2b/build -DCMAKE_BUILD_TYPE=Release
+cmake --build engines/glm5-moe-nvfp4-2b/build -j8
+ctest --test-dir engines/glm5-moe-nvfp4-2b/build --output-on-failure
+engines/glm5-moe-nvfp4-2b/build/rocket-decode --tokens 20 --expert-cache-gib 56 \
+  --prompt "The capital of France is"
+```
+
+## Three things the checkpoint carries that the fuel description did not
+
+| item | recorded | on disk |
+| --- | --- | --- |
+| residual stream | plain residual | manifold-constrained hyper-connections, `hc_mult` 4, 20 Sinkhorn iterations, `hc_*_fn [24, 16384]` on all 45 layers |
+| router | top-8 | sigmoid scores, `noaux_tc`, `e_score_correction_bias`, renormalised, scaled 2.5 |
+| weight format | NVFP4 | NVFP4 on `mlp.experts.*` only; every other tensor is BF16 |
+
+`quantization_config.ignore` lists `lm_head`, the embeddings and the attention
+projections, and only `mlp.experts.*` carries a `weight_scale`. The third row is
+what moves the byte count below.
+
+Semantics for the hyper-connections, the KDA recurrence, the DSA indexer and the
+clamped SwiGLU were taken from the reference `modeling_glm5_next.py`
+(transformers, `model_type: glm5_next`), kept out of the serving path as the
+parity oracle [rocket.qmd](../../../rocket.qmd#gives-up) already calls for. The
+checkpoint ships no modeling code, and neither does the Hugging Face repo.
+
+## Output
+
+20 greedy tokens, all 45 layers, real weights.
+
+```
+The capital of France is Paris. In French, Paris is pronounced "pa-REE". It is the largest city in France
+```
+
+```
+def fibonacci(n):
+    a = 0
+    b = 1
+    if n < 0:
+```
+
+## What a token reads
+
+`scripts/runtime/active-set-bytes.py` sums the safetensors headers directly.
+
+```bash
+python3 scripts/runtime/active-set-bytes.py
+```
+
+| bucket | GiB |
+| --- | --- |
+| embed + lm_head | 2.36 |
+| KDA attention, 34 layers | 8.72 |
+| sparse-MLA attention, 11 layers | 2.56 |
+| dense MLP, 3 layers | 0.84 |
+| shared experts, 42 layers | 1.97 |
+| routers, hyper-connections, norms | 0.16 |
+| resident BF16 subtotal | 16.62 |
+| routed experts, top-8 of 288 | 4.43 |
+| per-token weight traffic | 21.05 |
+
+`fuels/glm-5.3-flash/fuel.yaml` records `single_token_active_gib: 9.6`, derived
+as 18B active parameters at 4.25 bits. The ratio is 2.19. The derivation assumed
+4 bits everywhere; 8.1B of the 16.6B active parameters are BF16 in this
+checkpoint.
+
+| ceiling | tok/s | source |
+| --- | --- | --- |
+| one booster, 238 GB/s | 10.5 | 21.05 GiB per token |
+| two boosters | 21.1 | same, split |
+| recorded in fuel.yaml | 49.6 | 9.6 GiB per token |
+| measured, vLLM EXL3 4bpw + DFlash2 k=7 TP=2 | 25.4 | [2026-09-06-measured-bandwidth](../../hardware/2026-09-06-measured-bandwidth/) |
+
+The measured EXL3 stack sits above the NVFP4 two-booster roofline. EXL3 is 4 bits
+across the whole model at 164 GiB, so it reads less per token than NVFP4 does.
+
+## Residency on one booster
+
+176.09 GiB of text weights against 123.73 GiB of booster. The split that makes
+one node work: every BF16 tensor stays resident at 16.62 GiB, and the 159.47 GiB
+of routed experts stream from the mmap'd checkpoint into a bounded device cache
+keyed by (layer, expert), evicted LRU.
+
+| quantity | value | unit |
+| --- | --- | --- |
+| resident BF16 | 16.62 | GiB |
+| expert cache | 55.99 | GiB, 4247 slots x 13.50 MiB |
+| load | 9.9 to 29.8 | s, page-cache dependent |
+| cache over one 20-token run | 4884 hits, 3180 misses | |
+| streamed | 41.92 | GiB |
+
+## Per-stage cost
+
+One instrumented step, prompt "The capital of France is", position 14. A sync per
+stage, so the sum exceeds an uninstrumented step.
+
+| stage | ms | share |
+| --- | --- | --- |
+| embed | 0.11 | 0.0% |
+| hyper-connections, 90 sites | 29.27 | 0.6% |
+| norms | 3.42 | 0.1% |
+| KDA, 34 layers | 81.09 | 1.6% |
+| sparse MLA + DSA indexer, 11 layers | 23.67 | 0.5% |
+| dense MLP, 3 layers | 6.12 | 0.1% |
+| MoE, 42 layers | 2462.79 | 49.4% |
+| of which expert streaming | 2366.39 | 47.5% |
+| lm_head + argmax | 8.43 | 0.2% |
+| sum | 4981.30 | |
+
+Expert compute is 2462.79 - 2366.39 = 96.40 ms. Subtracting the streaming term
+leaves 248.51 ms of arithmetic for the whole step, against a 21.05 GiB roofline
+of 88.4 ms. The gap is in the GEMV kernels, which use scalar BF16 loads.
+
+| decode, uninstrumented | ms/token |
+| --- | --- |
+| median | 1865.9 |
+| min | 631.9 |
+| max | 3221.6 |
+
+Variance is cache residency, not kernel time: a step whose 336 expert fetches all
+hit costs 631.9 ms, one that misses costs 3221.6 ms.
+
+## Validation
+
+No engine on this node runs this fuel, so there is no token-by-token reference.
+Three signals stand in.
+
+| signal | value | expected |
+| --- | --- | --- |
+| hidden RMS, layer 0 | 0.003 | finite, small |
+| hidden RMS, layer 22 | 0.070 | monotone growth |
+| hidden RMS, layer 44 | 0.993 | order 1 |
+| router entropy, mean over 42 MoE layers | 1.8799 nats | below ln 8 = 2.0794, above 0 |
+| greedy output | coherent English and Python | |
+
+Per component, against CPU references written from the reference arithmetic and
+not from the kernel under test (`ctest`, 4/4 pass):
+
+| component | max relative error |
+| --- | --- |
+| gemv BF16 | 1.67e-07 |
+| mHC mix logits | 8.35e-07 |
+| mHC comb, Sinkhorn projection | 3.14e-07 |
+| mHC comb doubly stochastic | 9.9e-07 row and column |
+| KDA conv + silu, state advance | 0 |
+| KDA forget gate, q/k l2norm | 0 |
+| KDA recurrent readout | 2.82e-03 |
+| MoE router top-8 indices | exact |
+| MoE router weights | 8.46e-08 |
+| clamped SwiGLU | 2.47e-03 |
+| NVFP4 GEMV against the host codec | 2.27e-03 |
+| DSA pool compression | 1.89e-03 |
+| DSA radix select, budget below candidates | exact top-k |
+
+## Gaps left open
+
+| gap | why |
+| --- | --- |
+| M streams | batch 1 only; the kernels take shapes as arguments but carry no batch axis |
+| prefill | runs the decode path once per prompt token, 864 to 3570 ms per token |
+| DSA sparsity unexercised | at 25 tokens the pool count is 6, below the 512-pool budget, so selection returns everything; the radix path is covered by unit test only |
+| MTP layer 45 | loaded by nothing, speculation off |
+| vision tower | 24 layers ignored |
+| CUDA graphs | 11 top-k read-backs and 42 router read-backs per step force host syncs |
+| CUTLASS grouped GEMM | at batch 1 every expert GEMM is a GEMV, so the bench path is not the decode path |
+| expert-parallel split | the streaming half is what two boosters replace |
+
+## Verdict
+
+Accepted. The forward pass is correct end to end on one booster and the
+per-token active set is 21.05 GiB, 2.19x the recorded figure. `fuel.yaml`
+`single_token_active_gib` and `serving_regime.single_stream_reference` are wrong
+for this checkpoint and should be corrected to 21.05 and 21.1.
+
+**Next.**
+
+- vectorise the GEMV loads and close the 248.51 ms against 88.4 ms of roofline
+- give the kernels a batch axis and measure M streams
+- overlap expert streaming with expert compute
+- exercise DSA selection at a context long enough to exceed 512 pools
+
+**Reopen if.**
+
+- a checkpoint of this chemistry quantizes the attention projections, which
+  would move the 16.62 GiB resident term
+- the reference modeling code changes the hyper-connection or KDA formulation
