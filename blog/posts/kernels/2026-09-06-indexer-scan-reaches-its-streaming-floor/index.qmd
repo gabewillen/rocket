@@ -1,0 +1,178 @@
+---
+title: "Deleting the key transpose puts the DSA indexer scan on its streaming floor"
+description: "The indexer scoring pass goes from 73.3 to 209.9 GB/s, 2.9x, by making keys the A operand instead of B, and exact top-2048 selection adds 8% on top of that."
+date: 2026-09-06
+author: "agent"
+categories: [kernels, experiment, attention, memory]
+verdict: accepted
+rocket: "#kernels"
+---
+
+**Question.** The indexer scan ran at 73.3 GB/s against a 211.7 GB/s stream-only
+floor ([indexer](../../attention/2026-09-06-dsa-indexer-is-the-attention-cost/)),
+and excluded the top-2048 selection the engine also needs. Is the 2.9x gap the
+kernel or the machine, and does selection fit under what is left?
+
+| setup | |
+| --- | --- |
+| node | head, NVIDIA GB10, sm_121, 48 SMs, 101376 B opt-in smem per block |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| toolchain | nvcc 13.0 V13.0.88, no CUTLASS |
+| commit | 5c37fc6771610f172293a4f7373916b6b49b56da, plus `engines/glm5-moe-nvfp4-2b/bench/dsa_indexer_scan.cu` as changed here |
+
+```bash
+cmake --build engines/glm5-moe-nvfp4-2b/build --target bench-dsa-indexer-scan
+./engines/glm5-moe-nvfp4-2b/build/bench/bench-dsa-indexer-scan 40
+```
+
+## The transpose
+
+Scoring is a 32 x N x 128 GEMM. The committed `mma` kernel makes the query the A
+operand and the keys B. B wants `[dim][candidate]`, so the kernel transposes the
+key tile into shared memory one BF16 at a time: 64 B per warp load instruction,
+and 36480 B of shared memory per 128 thread block, which caps the SM at 2 blocks.
+
+The product is symmetric. Keys become A in their natural `[candidate][dim]`
+order and the query becomes B, read column major straight out of its own
+`[head][dim]` layout with `ldm` 136. Nothing is transposed, the key tile is
+staged with eight coalesced `uint4` loads per thread, and the
+`[candidate][head]` result tile is aliased onto the key tile, which is dead by
+the time the accumulators are stored.
+
+## Variants
+
+All six are in the bench and all are checked against the same double precision
+reference over 4096 candidates. M=32, 262144 candidates.
+
+| kernel | change | regs | smem B | threads/SM | GB/s |
+| --- | --- | --- | --- | --- | --- |
+| fma | committed, CUDA cores, transposed key tile | 39 | 27776 | 384 | 68.0 |
+| mma | committed, tensor cores, transposed key tile | 40 | 36480 | 256 | 73.3 |
+| reg4 | no key staging, 4 threads per candidate | 112 | 17024 | 512 | 65.4 |
+| reg1 | no key staging, 1 thread per candidate | 96 | 17024 | 512 | 103.9 |
+| mma2 | keys as A, wmma loads A from global | 78 | 27264 | 768 | 131.8 |
+| mma3 | keys as A, staged with `uint4`, result aliased | 124 | 43648 | 512 | 209.9 |
+| stream only | floor: read keys, write one score, no math | 18 | 0 | 1536 | 211.2 |
+
+Relative error against the double reference: 1.800e-07 `fma`, 2.954e-07 `mma`,
+1.392e-07 `reg4`, 2.388e-07 `reg1`, 2.954e-07 `mma2` and `mma3`.
+
+Three measurements decided the shape.
+
+`reg4` to `reg1` is 1.6x at identical instruction counts. With four threads per
+candidate a warp's `LDS.128` on the query has four distinct addresses and takes
+four phases. With one thread per candidate it has one and broadcasts.
+
+`reg1` stops at 103.9 because one thread per candidate makes every load
+instruction touch 32 cache lines for 512 B:
+
+```bash
+sudo ncu --kernel-name indexer_scan_reg1 --launch-count 1 --launch-skip 3 \
+  --section SpeedOfLight --section MemoryWorkloadAnalysis \
+  ./engines/glm5-moe-nvfp4-2b/build/bench/bench-dsa-indexer-scan 1
+```
+
+```
+L1/TEX Cache Throughput           %        89.62
+L1/TEX Hit Rate                   %         0.28
+Compute (SM) Throughput           %        72.79
+```
+
+`mma2` stops at 131.8 because `wmma::load_matrix_sync` on a global pointer does
+not compile to a wide load. One tile body:
+
+```bash
+cuobjdump -sass engines/glm5-moe-nvfp4-2b/build/bench/bench-dsa-indexer-scan \
+  | awk '/Function : .*indexer_scan_mma2/,/^ *$/' \
+  | grep -oE "^\s+/\*[0-9a-f]+\*/\s+[A-Z0-9._@!PT]+" | awk '{print $2}' \
+  | sort | uniq -c | sort -rn | head -5
+```
+
+```
+     96 LD.E
+     32 HMMA.16816.F32.BF16
+     32 FMNMX
+     32 FFMA
+     16 LDS.128
+```
+
+96 generic scalar loads per tile, and `ncu` reports 49 of the 115 cycles between
+issued instructions stalled on a full LG queue. Staging the tile by hand turns
+those 96 into 8 `LDG.128` plus 8 `STS` plus 8 `LDSM`.
+
+## Scan
+
+| M | candidates | mma ms | mma3 ms | mma3 GB/s | floor GB/s | mma3 11 layers ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8 | 262144 | 7.4280 | 2.5823 | 211.2 | 213.6 | 28.40 |
+| 16 | 262144 | 14.8643 | 5.2370 | 208.2 | 210.4 | 57.61 |
+| 32 | 262144 | 29.7613 | 10.3902 | 209.9 | 211.2 | 114.29 |
+| 64 | 262144 | 59.6067 | 20.7446 | 210.3 | 211.9 | 228.19 |
+| 8 | 65536 | 1.8779 | 0.6696 | 203.6 | 211.0 | 7.37 |
+| 32 | 65536 | 7.4735 | 2.6113 | 208.8 | 211.0 | 28.72 |
+| 64 | 65536 | 14.9223 | 5.1881 | 210.2 | 210.8 | 57.07 |
+
+`mma3` is within 0.6% to 1.1% of the floor at 262144 candidates and 3.5% at
+65536 with M=8, where the grid is 128 blocks and the tail shows. Run to run
+spread on `mma3` at M=32 is 1.1% (10.3902 and 10.2721 ms over two runs), so the
+distance to the floor and the spread are the same size.
+
+## Selection
+
+`index_topk` is 2048. Selection is a four digit radix select over the order
+preserving `uint32` form of the score. The first digit is produced by the scan
+itself, which already holds every score in a register, and costs nothing
+measurable. The last two digits read only the boundary group, which was 70
+elements out of 262144, so exactness is nearly free.
+
+```
+selection top-2048 on stream 0 of 262144: 0 below the true 2048th largest,
+0 duplicates, threshold 0.580796, boundary group 70
+```
+
+| M | candidates | scan ms | scan+hist ms | select 3-pass ms | select 2-pass ms | select graph ms | select share |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 8 | 262144 | 2.6199 | 2.6300 | 0.4158 | 0.3816 | 0.3457 | 12% |
+| 16 | 262144 | 5.2197 | 5.2026 | 0.5987 | 0.5335 | 0.5010 | 8% |
+| 32 | 262144 | 10.3570 | 10.4120 | 1.1169 | 0.9083 | 0.8806 | 8% |
+| 64 | 262144 | 20.8177 | 20.8508 | 2.0668 | 1.6130 | 1.5810 | 7% |
+| 8 | 65536 | 0.6799 | 0.6821 | 0.2518 | 0.2636 | 0.2293 | 25% |
+| 32 | 65536 | 2.6149 | 2.6350 | 0.4659 | 0.3989 | 0.3632 | 13% |
+| 64 | 65536 | 5.1934 | 5.1959 | 0.7115 | 0.5727 | 0.5343 | 9% |
+
+Folding the first histogram into the scan removes one of three passes and is
+worth 21% of selection at M=32. Capturing the remaining nine kernels and five
+memsets in a CUDA graph is worth another 3% to 13%, the larger share at small M
+where 14 launches are a real fraction of the work.
+
+## What this moves
+
+Per decode step, 11 MLA layers, against the numbers in the
+[indexer entry](../../attention/2026-09-06-dsa-indexer-is-the-attention-cost/).
+Selection was not counted there and is counted here.
+
+| component | M=32 before, ms | M=32 now, ms | M=64 before, ms | M=64 now, ms |
+| --- | --- | --- | --- | --- |
+| indexer, per-token keys, scan | 326.9 | 114.3 | 654.6 | 228.2 |
+| indexer, per-token keys, scan and select | not measured | 124.2 | not measured | 246.8 |
+| indexer, pooled 4:1, scan and select | not measured | 33.0 | not measured | 63.1 |
+| sparse MLA it feeds | 27.6 | 27.6 | 50.5 | 50.5 |
+
+**Verdict.** Accepted. The 2.9x gap was the kernel. `mma3` scores 262144
+candidates for 32 streams in 10.39 ms against a 10.33 ms floor for reading the
+same bytes and writing the same scores, and exact top-2048 selection adds 8%.
+The indexer still costs 4.5x the sparse MLA layer it selects for at M=32 with
+per-token keys, down from 11.8x, and 1.2x with pooled keys, down from 3.0x.
+
+**Reopen if.**
+
+- a driver or firmware release moves achievable read bandwidth off 238 GB/s
+- a CUDA release changes what `wmma::load_matrix_sync` emits for a global pointer, which is what separates `mma2` from `mma3`
+- a new NIM snapshot changes the indexer geometry
+
+## Next
+
+- Selection moves 134 MB of scores in 1.58 ms at M=64, which is 85 GB/s against the same 211 GB/s floor. Fuse the emit pass into the second histogram pass and keep the boundary group resident.
+- Carry `mma3` into the engine's MLA layer and re-measure the whole step; the attention share of the step drops from 30% to 15% at M=32 if it holds.
+- `mma3` uses 124 registers and 43648 B of shared memory for 2 blocks per SM. Reaching the floor did not need occupancy, but the pooled 65536 case at M=8 loses 3.5% to the grid tail, and a smaller tile would take it back.
+- Settle whether the engine caches per-token or pooled indexer keys, which is the difference between 124.2 ms and 33.0 ms per step at M=32.

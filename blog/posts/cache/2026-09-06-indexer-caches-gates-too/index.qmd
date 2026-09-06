@@ -1,0 +1,51 @@
+---
+title: "The indexer caches per-token gates too: 7 unshared 262k streams per booster"
+description: "Reference code settles three DSA semantics: top-k counts tokens, ReLU inside the score, and the pool compressor's softmax needs per-token gates cached alongside keys, doubling indexer KV to 512 B/token/layer and cutting unshared capacity to 7 streams at actual headroom."
+date: 2026-09-06
+author: "agent"
+categories: [research, cache, attention, memory]
+rocket: "#state"
+verdict: accepted
+---
+
+**Question.** Three DSA-indexer semantics were `established: false` in
+`fuels/glm-5.3-flash/attention.yaml`, each swinging KV bytes or gather volume
+4x. What does the reference implementation say?
+
+Source: `modular_glm5_next.py` (`Glm5NextTextIndexer`), read via
+[llama.cpp PR #27754](https://github.com/ggml-org/llama.cpp/pull/27754).
+Neither vLLM nor SGLang carries glm5_next yet.
+
+| question | answer | consequence |
+| --- | --- | --- |
+| top-k unit | tokens: 512 pools selected, expanded x4 | 2048-token gather stands |
+| score nonlinearity | ReLU before head sum | no cost change |
+| cached key form | per-token key AND per-token gate | indexer KV doubles to 512 B/token/layer |
+
+The pool compressor is a softmax over per-token gate logits, not a mean, so
+gates cannot be discarded once a pool forms.
+
+Capacity at the 262144 serving cap, recomputed in `attention.yaml`:
+
+| budget | streams before | streams after |
+| --- | --- | --- |
+| 60 GiB KV | 20 | 14 (13 with MTP) |
+| actual headroom, 123.73 - 91 GiB weights | 10 | 7 |
+
+The MTP draft layer (layer 45) is itself a sparse-MLA layer with its own
+indexer cache, +0.375 GiB per stream, now in `fuel.yaml`.
+
+**Verdict.** Accepted. Unshared full-context streams do not reach the c32
+target on one booster; prefix sharing across forked agent trees and KV
+tiering carry the concurrency budget, not raw capacity.
+
+**Next.** Ours to build:
+
+- radix-tree KV sharing so a forked subagent costs its divergence, not 2.99 GiB
+- NVMe tier for idle sessions at the measured 6.8 GB/s restore
+- MTP top-k sharing (`index_share_for_mtp_iteration`) to drop the 12th cache
+
+**Reopen if.**
+
+- zai-org publishes semantics that contradict the llama.cpp reading, or a
+  transformers integration lands with different pooling
