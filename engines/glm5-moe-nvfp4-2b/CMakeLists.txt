@@ -52,6 +52,18 @@ set_target_properties(rocket_engine PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+# Fuel loader: reads the NVFP4 checkpoint off disk and stages it for the
+# kernel. Pure C++, no CUDA and no Python, because it runs at serving time.
+add_library(rocket_fuel STATIC
+  src/safetensors.cc
+  src/nvfp4.cc
+)
+target_include_directories(rocket_fuel PUBLIC src)
+set_target_properties(rocket_fuel PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Pinned CUTLASS checkout, shared by bench/ and tests/.
+set(ROCKET_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
+
 # Sanity target: the "test stand" of the build itself. Runs one trivial kernel
 # and reports what the engine plan has to be compiled against.
 add_executable(rocket-test-stand src/test_stand.cu)
@@ -60,4 +72,5 @@ target_link_libraries(rocket-test-stand PRIVATE rocket_engine)
 enable_testing()
 add_test(NAME test-stand COMMAND rocket-test-stand)
 
+add_subdirectory(tests)
 add_subdirectory(bench)
