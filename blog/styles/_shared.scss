@@ -12,7 +12,8 @@ $mono: $font-family-monospace;
 // ---------------------------------------------------------------- base
 
 body {
-  font-size: 0.95rem;
+  font-family: $mono;
+  font-size: 0.9rem;
   line-height: 1.55;
   letter-spacing: 0;
   font-feature-settings: "tnum" 1;
@@ -48,7 +49,10 @@ h1, h2, h3, h4, h5, h6 {
   line-height: 1.3;
 }
 
-h1 { font-size: 1.55rem; }
+h1 {
+  font-family: $mono;
+  font-size: 1.4rem;
+}
 
 // Section labels read as mono labels, not magazine headings.
 h2, h3, h4 {
@@ -89,6 +93,22 @@ h4 { font-size: 0.85rem; margin-top: 1.4rem; color: var(--rocket-muted); }
   content: "$ ";
   color: var(--rocket-muted);
   font-weight: 400;
+}
+
+.navbar-brand .navbar-title::after {
+  content: "_";
+  margin-left: 0.15rem;
+  color: var(--rocket-accent);
+  animation: rocket-cursor-blink 1.1s steps(1) infinite;
+}
+
+@keyframes rocket-cursor-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .navbar-brand .navbar-title::after { animation: none; }
 }
 
 .navbar .nav-link {
@@ -176,6 +196,14 @@ p.subtitle {
   white-space: nowrap;
 }
 
+.quarto-title .quarto-categories .quarto-category::before,
+.listing-category::before,
+.rocket-chip::before {
+  content: "#";
+  opacity: 0.55;
+  margin-right: 0.05rem;
+}
+
 .listing-category {
   cursor: pointer;
 }
@@ -219,7 +247,7 @@ p.subtitle {
 
 .rocket-log-row {
   display: grid;
-  grid-template-columns: 5.5rem minmax(0, 1fr) 16rem;
+  grid-template-columns: 5.5rem minmax(0, 1fr) 13.5rem;
   column-gap: 1.25rem;
   align-items: baseline;
   padding: 0.6rem 0;
@@ -237,7 +265,8 @@ p.subtitle {
 }
 
 .rocket-log-title {
-  font-size: 0.95rem;
+  font-family: $mono;
+  font-size: 0.88rem;
   font-weight: 600;
   color: var(--rocket-fg);
   text-decoration: none;
@@ -346,6 +375,19 @@ table tbody tr:last-child td { border-bottom: none; }
 }
 
 .quarto-listing-table .listing-date { color: var(--rocket-muted); }
+
+.quarto-listing-table .listing-verdict {
+  display: inline-block;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--rocket-hairline-strong);
+  border-radius: 2px;
+  color: var(--rocket-accent);
+}
+
+.quarto-listing-table .listing-verdict::before {
+  content: "» ";
+  opacity: 0.6;
+}
 
 // Filter and sort controls above a table listing.
 .quarto-listing .input-group-text,
