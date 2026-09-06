@@ -1,0 +1,191 @@
+---
+title: "Moving the KDA state tile out of shared memory is 4.6x at M=8"
+description: "The engine's KDA recurrent step moves state at 47 GB/s because a 67 KiB FP32 shared tile pins it to one block and 4 warps per SM; keeping the column in registers moves the same bytes at 215 GB/s, 93% of roofline at M=32, with identical arithmetic and no change to the state contract."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, kernels, attention, memory]
+verdict: accepted
+rocket: "#kernels"
+---
+
+**Question.** 34 of 45 layers are KDA, and each carries a 64x128x128 recurrent
+state per stream that is read and written every step. The state roofline at M=8
+is 0.28 ms per layer. What does the kernel the engine actually launches cost,
+and why.
+
+| setup | |
+| --- | --- |
+| node | gx10-5e36 (head), GB10, sm_121, 48 SMs, 100 KiB smem/SM, 24 MiB L2 |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| nvcc | 13.0.88 |
+| commit | e0dcfa97c206aa2c553e3b20a9b71864c8718eaa, plus this entry's bench |
+| SM clock | 721 MHz for the whole run, the head's ceiling ([2026-09-08-head-gpu-clock-not-page-reclaim](../../hardware/2026-09-08-head-gpu-clock-not-page-reclaim/)) |
+| GPU sharing | another lane held 42 GiB and ran tests throughout; see Variance |
+
+```bash
+cmake --build engines/glm5-moe-nvfp4-2b/build --target bench-kda-state-traffic
+engines/glm5-moe-nvfp4-2b/build/bench/bench-kda-state-traffic 100 7
+```
+
+`engines/glm5-moe-nvfp4-2b/bench/kda_state_traffic.cu` carries a verbatim copy
+of `src/kernels.cu` `kda_step_kernel` and `kda_conv_kernel`. It links no engine
+code, so it builds while `src/` is being changed.
+
+## The benched kernel was never the engine's kernel
+
+[2026-09-06-dsa-indexer-is-the-attention-cost](../../attention/2026-09-06-dsa-indexer-is-the-attention-cost/)
+measured 174.2 GB/s for a KDA step holding a BF16 state in a 32 KiB shared
+tile. `src/kernels.cu` holds the state in FP32 and stages an FP32 tile.
+
+| | published bench | engine `kda_step_kernel` |
+| --- | --- | --- |
+| state storage | BF16, 2 MiB/stream/layer | FP32, 4 MiB/stream/layer |
+| shared per block | 33 KiB | 67072 B |
+| blocks resident per SM | 2 | 1 |
+
+100 KiB of shared memory per SM does not fit two 67072 B blocks. At 128 threads
+per block that leaves 4 of 48 warps per SM. Nsight Compute agrees:
+`sm__warps_active.avg.pct_of_peak_sustained_active` is 8.33% for the engine
+kernel and 63.58% for the replacement, both at M=8.
+
+## Occupancy is the whole ladder
+
+Three kernels, same recurrence, same bytes moved, same one block per (head,
+stream). Only where the 128x128 column lives changes. M=8, FP32 state
+throughout, so every row moves 67.1 MB.
+
+| where the column lives | smem B/block | warps/SM | ms/layer | GB/s |
+| --- | --- | --- | --- | --- |
+| shared, FP32 (engine today) | 67072 | 4 | 1.4230 | 47.2 |
+| shared, BF16 tile (diagnostic only) | 34304 | 8 | 0.8424 | 79.7 |
+| registers (`split fp32 R4 C1`) | 3584 | 32 | 0.3118 | 215.2 |
+
+The middle row is a diagnostic, not a candidate: it keeps the global state FP32
+and only halves the tile, which separates shared capacity from any claim that
+registers are faster than shared memory. Doubling residency doubles throughput.
+
+`cudaFuncGetAttributes` reports 64 registers per thread and 0 spill bytes for
+the register variant.
+
+## Cost at M
+
+`dropin fp32` is `recurrent_step_f32`, `dropin bf16` is `recurrent_step_bf16`,
+both from `bench/kda_step_dropin.cu`. ms/layer is the recurrent step alone; the
+34-layer column adds the three conv launches the engine issues per layer.
+
+| M | kernel | ms/layer | GB/s state | 34 layers ms |
+| --- | --- | --- | --- | --- |
+| 1 | engine smem fp32 | 0.1668 | 50.3 | 6.50 |
+| 1 | dropin fp32 | 0.0348 | 240.8 | 2.02 |
+| 1 | dropin bf16 | 0.0203 | 206.7 | 1.52 |
+| 8 | engine smem fp32 | 1.4230 | 47.2 | 49.64 |
+| 8 | dropin fp32 | 0.3123 | 214.9 | 11.88 |
+| 8 | dropin bf16 | 0.1235 | 271.7 | 5.46 |
+| 16 | engine smem fp32 | 2.8555 | 47.0 | 98.96 |
+| 16 | dropin fp32 | 0.6169 | 217.6 | 22.85 |
+| 16 | dropin bf16 | 0.2944 | 227.9 | 11.88 |
+| 32 | engine smem fp32 | 6.3165 | 42.5 | 217.70 |
+| 32 | dropin fp32 | 1.3384 | 200.6 | 48.44 |
+| 32 | dropin bf16 | 0.7077 | 189.7 | 27.00 |
+
+4.56x at M=8 against the engine kernel, at the same storage width and the same
+state contract. 11.5x with BF16 storage.
+
+Two readings above the 238 GB/s roofline are L2 residency, not DRAM: the BF16
+state is 16 MiB at M=8 against a 24 MiB L2. The DRAM-clean point is M=32 FP32,
+where the state is 128 MiB and `split fp32 R8 C1` reads 224.9 GB/s, 94.5% of
+roofline.
+
+M parallelises. The grid is 64 x M blocks, so even M=1 issues 64 blocks against
+48 SMs. The engine kernel loses to latency exposure inside each block, not to
+idle SMs.
+
+## Correctness
+
+Every variant against a double-precision evaluation of the engine's own
+recurrence, at M=8 and the real dims. The initial state is rounded to BF16
+before upload so FP32 and BF16 storage start from identical values and one
+reference serves both.
+
+```
+| variant | o rel | state rel | tol o | tol state | check |
+| engine smem fp32     | 2.779e-03 | 7.913e-08 | 4.0e-03 | 1.0e-05 | pass |
+| split fp32 R4 C1     | 2.779e-03 | 7.913e-08 | 4.0e-03 | 1.0e-05 | pass |
+| split bf16 R16 C4    | 2.779e-03 | 2.593e-03 | 4.0e-03 | 4.0e-03 | pass |
+| dropin fp32 (R4 C1)  | 2.779e-03 | 7.913e-08 | 4.0e-03 | 1.0e-05 | pass |
+| dropin bf16 (R16 C4) | 2.779e-03 | 2.593e-03 | 4.0e-03 | 4.0e-03 | pass |
+```
+
+Tolerances are relative to the largest reference magnitude. BF16 carries 8
+mantissa bits, so one rounding costs at most 2^-9 = 1.95e-3 there; the
+threshold is that half-ulp with 2x slack for the FP32 accumulation underneath.
+`o` is BF16 for every variant, which is why every row reports the same 2.779e-03.
+An FP32-stored state rounds at 2^-24, and the measured 7.913e-08 is 126x inside
+its 1e-5 threshold.
+
+## What the engine lane adopts
+
+| file | contents |
+| --- | --- |
+| `bench/kda_step_dropin.cuh` | `step_split<T, HEADS, DK, R, C>`, the kernel |
+| `bench/kda_step_dropin.cu` | `recurrent_step_f32`, `recurrent_step_bf16` |
+
+Both entry points take the parameter list of `src/kernels.cu`
+`kda_recurrent_step()` in order, so adopting one is replacing that function's
+body with a single launch and deleting `kda_step_kernel`. The FP32 entry point
+is a drop-in against `e0dcfa9`. The BF16 one matches the state contract the
+storage lane is moving to, and is tuned separately: R=16 C=4 rather than
+R=4 C=1.
+
+The kernel splits the block two ways. C columns per thread sets the width of
+each state access, R slices of the key axis sets how many threads share a
+column, and state registers per thread are 128 * C / R. Both files are compiled
+and correctness-checked by this bench, so what is measured here is the artifact
+that ships.
+
+The FP32 sweep is flat in R: every configuration from R=1 to R=32 lands between
+196 and 225 GB/s at M=8 through M=32. R=4 C=1 is the fastest at M=8, which is
+the batch this bar was set at. R=8 C=1 is 4.3 GB/s faster at M=32.
+
+## Variance
+
+Spread within a single invocation reached 89% on some rows, because another
+lane held the GPU for the whole run. Best of 7 reps of 100 iterations is
+reported, which is a lower bound on the uncontended cost. The ranking is stable
+across three independent runs at M=8:
+
+| run | engine ms/layer | split fp32 R4 C1 ms/layer |
+| --- | --- | --- |
+| 1 | 1.5916 | 0.3165 |
+| 2 | 1.4141 | 0.3120 |
+| 3 | 1.4230 | 0.3118 |
+
+The head's 721 MHz ceiling depresses every absolute number here. The
+replacement still reaches 94.5% of the memory roofline at that clock, so the
+gap this entry closes is not a clock effect.
+
+**Verdict.** Accepted. The KDA recurrent step is limited by shared-memory
+capacity, at 8.33% achieved occupancy and 47 GB/s. Holding the column in
+registers instead reaches 215 GB/s at M=8 with the same arithmetic, the same
+bytes, and the same FP32 state contract, clearing the 150 GB/s bar. Adopting it
+cuts the recurrent step across 34 layers from 49.64 ms to 11.88 ms at M=8, and
+to 5.46 ms if the state moves to BF16.
+
+**Next.**
+
+- engine lane replaces `kda_recurrent_step`'s body with `recurrent_step_f32`,
+  or `recurrent_step_bf16` once the storage flip lands
+- retune (R, C) once the storage width is settled; the two widths do not pick
+  the same configuration
+- the three conv launches now cost more than the recurrent step at M=1
+  (0.0244 ms against 0.0203 ms per layer). Fuse them into one launch over
+  3 x 8192 channels and measure again
+- re-run this bench on an uncontended GPU and on the peer node, and report the
+  spread without a neighbour
+
+**Reopen if.**
+
+- a driver or firmware release changes shared memory per SM on sm_121, or the
+  100 KiB per-SM carve-out, which is what caps the current kernel at one block
+- a CUDA release changes the register file per SM or the occupancy limits this
+  configuration was chosen against

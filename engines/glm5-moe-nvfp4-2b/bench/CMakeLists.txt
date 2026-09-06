@@ -135,6 +135,22 @@ set_target_properties(bench-kda-decode-step PROPERTIES
   CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}"
 )
 
+#   kda-state-traffic the same state, but the kernel the engine actually
+#                     launches (FP32 state, FP32 tile in shared), against
+#                     register-split variants at both storage widths, M=1..32.
+#                     kda_step_dropin.cu is the replacement the engine lane
+#                     adopts; it is compiled and checked here, not pasted into
+#                     a post.
+#                     Declared without rocket_add_bench because it uses no
+#                     engine symbols: it carries its own copy of the kernels
+#                     under test, so it builds and runs while src/ is being
+#                     changed.
+add_executable(bench-kda-state-traffic kda_state_traffic.cu kda_step_dropin.cu)
+set_target_properties(bench-kda-state-traffic PROPERTIES
+  CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bench"
+)
+
 #   sparse-mla-decode gather top-k KV from a 262k paged pool and run the MLA
 #                     math in absorbed form, against dense 8k.
 rocket_add_bench(sparse-mla-decode sparse_mla_decode.cu)
