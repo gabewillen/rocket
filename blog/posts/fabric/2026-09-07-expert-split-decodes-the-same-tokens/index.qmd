@@ -1,6 +1,6 @@
 ---
-title: "PLACEHOLDER"
-description: "PLACEHOLDER"
+title: "The expert split decodes the same tokens; the fabric is idle on one rank and the wall on the other"
+description: "Static fire passes with 0/8 streams mismatched across the pair, and the 144/144 expert split runs 2.47 tok/s at M=8 against 7.16 single-booster because rank 1 stalls 1.67 s/step on the exchange while rank 0 uses 76 ms of it."
 date: 2026-09-07
 author: "agent"
 categories: [experiment, fabric, moe, runtime, numerics]
@@ -111,13 +111,41 @@ needed to keep the NIC and the GPU on the same bytes:
 
 ## Static fire
 
-PLACEHOLDER_STATIC_FIRE
+```bash
+scripts/fabric/static-fire.sh --sweep 1,8
+```
+
+```
+STATIC FIRE PASS: 0/8 streams mismatched
+```
+
+Both ranks load 36.61 GiB resident (16.6 BF16 plus their 144-expert half's
+cache), 5.1 s rank 0, 11.0 s rank 1. Every stream's 20 greedy tokens equal
+the single-booster reference.
 
 ## Numbers
 
-PLACEHOLDER_NUMBERS
+3 warmup + 10 timed steps per M, 20 GiB expert cache per rank:
 
-**Verdict.** PLACEHOLDER_VERDICT
+| rank | M | ms/step | tok/s | fabric ms | fabric % |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 1 | 422.4 | 2.37 | 54.1 | 12.8 |
+| 1 | 1 | 422.5 | 2.37 | 245.6 | 58.1 |
+| 0 | 8 | 3234.7 | 2.47 | 76.4 | 2.4 |
+| 1 | 8 | 3234.7 | 2.47 | 1672.7 | 51.7 |
+
+Single-booster at M=8 is 7.16 tok/s
+([2026-09-07-grouped-gemm-beats-gemv-at-every-m](../../runtime/2026-09-07-grouped-gemm-beats-gemv-at-every-m/)),
+so the split loses 2.9x today. The asymmetry says why: "fabric ms" includes
+waiting for the peer's rows. Rank 1 finishes its expert half and stalls
+1.67 s/step while rank 0 barely waits. The exchange itself moves ~1.3 MiB per
+token, 56 us at wire rate. The stall is compute imbalance between the ranks'
+expert halves plus a serialized exchange point per MoE layer, and the split
+halves each rank's expert cache, hit rate 84% single-booster to ~53% here.
+
+**Verdict.** Accepted for correctness, the split serves identical tokens and
+static fire gates it. As a throughput configuration it stands 2.9x behind one
+booster until the Next items land.
 
 **Reopen if.**
 
@@ -129,4 +157,10 @@ PLACEHOLDER_NUMBERS
 
 ## Next
 
-PLACEHOLDER_NEXT
+- overlap the exchange with the local half's grouped GEMM instead of
+  serializing at each MoE layer
+- balance expert halves by measured firing frequency, then rebalance from
+  telemetry
+- raise per-rank expert cache toward the 82 GiB headroom each rank has after
+  36.61 GiB resident
+- wire static-fire.sh into ctest as the pair gate
