@@ -67,13 +67,13 @@ int main() {
     }
 
     if (failures != 0) {
-      std::fprintf(stderr, "static fire FAILED (%d)\n", failures);
+      std::fprintf(stderr, "test stand FAILED (%d)\n", failures);
       return EXIT_FAILURE;
     }
-    std::printf("static fire        ok\n");
+    std::printf("test stand        ok\n");
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "static fire FAILED: %s\n", error.what());
+    std::fprintf(stderr, "test stand FAILED: %s\n", error.what());
     return EXIT_FAILURE;
   }
 }

@@ -52,12 +52,12 @@ set_target_properties(rocket_engine PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-# Sanity target: the "static fire" of the build itself. Runs one trivial kernel
+# Sanity target: the "test stand" of the build itself. Runs one trivial kernel
 # and reports what the engine plan has to be compiled against.
-add_executable(rocket-static-fire src/static_fire.cu)
-target_link_libraries(rocket-static-fire PRIVATE rocket_engine)
+add_executable(rocket-test-stand src/test_stand.cu)
+target_link_libraries(rocket-test-stand PRIVATE rocket_engine)
 
 enable_testing()
-add_test(NAME static-fire COMMAND rocket-static-fire)
+add_test(NAME test-stand COMMAND rocket-test-stand)
 
 add_subdirectory(bench)
