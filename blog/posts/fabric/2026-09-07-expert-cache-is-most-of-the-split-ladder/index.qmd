@@ -1,0 +1,178 @@
+---
+title: "The pair is 6.1x one booster, not 2.9x behind it, and the expert cache is most of the ladder"
+description: "The 7.16 tok/s single-booster baseline fed every stream the same token; re-measured with distinct streams the pair runs 2.25 tok/s against one booster's 0.37, and balancing, overlap and an 80 GiB per-rank expert cache take it to 5.60 at M=8 and 7.50 at M=32 with static fire green at every step."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, fabric, cache, memory, moe, runtime, baseline]
+verdict: accepted
+rocket: "#boosters"
+supersedes: posts/fabric/2026-09-07-expert-split-decodes-the-same-tokens
+---
+
+**Question.** [2026-09-07-expert-split-decodes-the-same-tokens](../2026-09-07-expert-split-decodes-the-same-tokens/)
+left four Next items and a claim that the split stands 2.9x behind one
+booster. Do the four items pay, and is the 2.9x real?
+
+| setup | |
+| --- | --- |
+| nodes | gx10-5e36 (rank 0), gx10-2a13 (rank 1), GB10, sm_121 |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| nvcc | 13.0.88, driver 580.173.02 |
+| base commit | acd4e15bd5574fc838a32f750cbd4ce081aa801d |
+| fuel | NIM snapshot `nim-aa28e1f-nvfp4`, present on both nodes |
+| timing | 3 warmup + 10 timed steps per M, median |
+
+## The 2.9x was a same-token baseline
+
+The 7.16 tok/s came from `tests/test_moe_grouped.cu::time_steps`, which builds
+`std::vector<int> tokens(M, 5)` and never advances it. Every stream decodes the
+same token, so a layer fires 8 distinct experts instead of about 50 and the
+expert cache stops missing. `static_fire.cu::time_steps` feeds
+`tokens[i] = 100 + i * 997` instead, which is the concurrent-agent workload this
+engine targets.
+
+```bash
+engines/glm5-moe-nvfp4-2b/build/rocket-static-fire --mode single --sweep 1,8 \
+  --expert-cache-gib 20 --skip-parity 1
+```
+
+Same 20 GiB cache, same M=8, distinct tokens per stream:
+
+| arrangement | ms/step | tok/s | cache hit | GiB streamed/step |
+| --- | --- | --- | --- | --- |
+| one booster, all 288 experts | 21683.9 | 0.37 | 0.0% | 29.07 |
+| pair, id split 144/144 | 3553.8 | 2.25 | 53.8% | 6.62 |
+
+One booster at M=8 misses every expert fetch and streams 29 GiB per step. The
+split is 6.1x ahead of it, not 2.9x behind.
+
+## The ladder
+
+Pair, M=8, 40 GiB expert cache per rank, so only the change named in each row
+differs. Static fire passed 0/8 mismatched on every row.
+
+| # | change | tok/s | vs previous |
+| --- | --- | --- | --- |
+| 0 | id split 144/144, exchange as recorded | 2.49 | |
+| 1 | compact-row exchange, any expert set | 2.32 | -6.8% |
+| 2 | partition balanced by firing histogram | 2.73 | +17.7% |
+| 3 | exchange overlapped with the shared-expert FFN | 2.98 | +9.2% |
+| 4 | expert cache 40 GiB to 80 GiB per rank | 5.60 | +87.9% |
+
+Row 1 is the cost of generalising the exchange and it loses 6.8%. Rank
+ownership was a contiguous id range, so the peer's rows were one prefix and one
+suffix of the output block and the transfer was two `cudaMemcpyAsync` calls. An
+arbitrary expert set makes owned rows interleave, so `model.cu::run_moe_grouped`
+now keeps two row spaces: true rows, expert-ascending, which is still the order
+`moe_scatter_add` accumulates in, and compact rows, this rank's own, which is
+what the grouped GEMM consumes. One `moe_gather_rows` into the staging region
+and one `moe_scatter_rows` out of it replace the two memcpys. The accumulation
+order never changes, which is why parity survives.
+
+## Firing frequency was not the imbalance
+
+`--expert-histogram-out` writes the 288 counts of the parity decode from
+`model.h::expert_fire_counts`, and `--expert-histogram-in` packs them
+(`src/fabric/expert_balance.cc`, equal-cardinality greedy longest-processing-time).
+
+```
+expert partition from /tmp/rocket-expert-histogram.txt: predicted load 38980 / 38972 rows,
+imbalance 1.000x (id split: 39408 / 38544, 1.022x)
+```
+
+The id split was already balanced to 1.022x, so the 17.7% row 2 buys is not
+bought by evening out firing counts. Per-expert counts over the parity decode
+run 133 to 520 with a median of 265 and no expert idle.
+
+## What the stall actually was
+
+Rank 1 spends its fabric time blocked on rank 0. That time tracks rank 0's
+expert streaming, not rank 0's expert count:
+
+| expert cache per rank | rank 0 wait ms | rank 1 wait ms | step ms | cache hit |
+| --- | --- | --- | --- | --- |
+| 20 GiB | 32.6 | 1997.6 | 3243 | 52.5% |
+| 80 GiB | 86.3 | 574.3 | 1429 | 98.3% |
+
+The same binary on the same single-booster workload, M=1, 20 GiB, 1.121
+GiB streamed per step and 77.2% hit rate on every row:
+
+| node | ms/step |
+| --- | --- |
+| gx10-2a13 (peer) | 709.4 |
+| gx10-5e36 (head) | 905.5 |
+| gx10-5e36 (head, repeat) | 1880.2 |
+
+The head is 1.3x to 2.6x slower than the peer at identical work, with
+`kswapd0` and `kcompactd0` active on the head and idle on the peer
+(`pgscan_kswapd` 150156473). The pair runs at the slower rank, so a node this
+much slower shows up as an expert-half imbalance that expert accounting cannot
+find.
+
+## Expert cache against the 82 GiB of headroom
+
+Balanced partition, overlap on. Resident is 16.6 GiB of BF16 plus the cache.
+
+| cache per rank | tok/s M=8 | cache hit | GiB streamed/step |
+| --- | --- | --- | --- |
+| 20 GiB | 2.47 | 52.5% | 7.02 |
+| 40 GiB | 2.98 | 82.9% | 2.53 |
+| 60 GiB | 3.72 | 93.0% | 1.03 |
+| 80 GiB | 5.60 | 98.3% | 0.25 |
+
+A rank's 144 experts are 91 GiB, so 80 GiB holds 88% of them and the miss rate
+falls to 1.7%.
+
+## M sweep and CUDA graphs
+
+```bash
+scripts/fabric/static-fire.sh --sweep 1,8,16,32 --expert-cache-gib 80 \
+  --expert-histogram-in /tmp/rocket-expert-histogram.txt --overlap 1
+```
+
+| M | ms/step | tok/s | fabric % | cache hit |
+| --- | --- | --- | --- | --- |
+| 1 | 314.8 | 3.18 | 13.6 | 97.8% |
+| 8 | 1534.8 | 5.21 | 5.2 | 98.3% |
+| 16 | 2199.7 | 7.27 | 0.8 | 99.3% |
+| 32 | 4265.1 | 7.50 | 0.1 | 99.1% |
+
+Context cap stayed at the default 512 tokens per stream at every M. The
+in-tree CUDA graph capture (`--cuda-graph 1`, `model.cu::ensure_graphs_built`)
+buys nothing the split can use:
+
+| M | graph off | graph on |
+| --- | --- | --- |
+| 1 | 3.18, 3.21 | 3.31 |
+| 8 | 5.21, 5.60, 5.67 | 5.10 |
+
+Overlap is off inside the graph path by construction: `run_moe_post_stage`, the
+shared-expert FFN the exchange hides behind, sits in the next captured segment
+and cannot be launched before `acc_` holds the routed half.
+
+**Verdict.** Accepted. M=8 goes 2.25 to 5.60 tok/s and M=32 reaches 7.50, with
+static fire 0/8 mismatched at every configuration above, including the balanced
+non-contiguous partition and the overlapped exchange. Three M=8 runs at 80 GiB
+gave 5.21, 5.60 and 5.67 tok/s, so read that row as 5.6 plus or minus 0.25;
+the head node's own spread is wider than any single ladder row below row 4.
+
+**Reopen if.**
+
+- a driver or firmware release changes GB10 memory reclaim, which is what
+  separates the two nodes at identical work
+- MTU is raised to 9000 on both nodes, moving `active_mtu` to 4096
+- CUTLASS changes the grouped GEMM's row ordering or accumulation, which is
+  what makes the merged accumulator bit-identical
+
+## Next
+
+- find why `kswapd0` runs on the head and not the peer at the same residency,
+  and whether pinning or a reclaim watermark closes the 1.3x to 2.6x gap
+- weight the partition by measured per-rank throughput instead of by firing
+  count, so the slower node owns fewer experts
+- take the cache past 80 GiB by shrinking the 16.6 GiB resident half, which the
+  FP8 plan already targets
+- commit the 288-count histogram as a checked-in artifact so a run does not
+  have to produce one first
+- measure the GEMV path under the split at M=1, where the grouped path's
+  fixed cost is largest and the fabric share is 13.6%

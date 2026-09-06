@@ -31,6 +31,11 @@ output that produced the numbers
 
 **Verdict.** One line. State variance here only if a single number misleads.
 
+**Next.**
+
+- work this project can do itself goes here, and gets done
+
 **Reopen if.**
 
-- the condition that would justify running this again
+- external change only: firmware, upstream releases, hardware. Never a thing
+  this project can control, change, or test itself

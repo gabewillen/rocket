@@ -14,7 +14,8 @@ unified_memory_gib: 247.5                # [base]
 # and is not what the parts deliver [bw].
 fabric:
   rails_per_booster: 2
-  aggregate_gb_s: 23.1                   # both rails, 4 QP each [bw]
+  aggregate_gb_s: 24.5                   # both rails, MTU 9000 [posts/fabric/2026-09-08-mtu-9000-moves-the-fabric-roofline]
+  ruled_out_aggregate_gb_s: 23.1         # MTU 1500 [bw]
   per_rail_gb_s: 14.0                    # one rail alone, 4 QP [bw]
   per_rail_gb_s_both_active: 11.6        # 92.59 Gb/s each, 16% cost [bw]
   bound_by: pcie_gen5_x4_host_link       # not the 200 Gb/s port [bw]

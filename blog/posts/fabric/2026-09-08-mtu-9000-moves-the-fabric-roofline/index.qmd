@@ -1,0 +1,49 @@
+---
+title: "MTU 9000 moves the fabric roofline to 24.5 GB/s one-way, 48.9 duplex"
+description: "Raising both rails to MTU 9000 lifts active_mtu from 1500-limited to 4096, one-way peaks at 24.47 GB/s against the published 23.1, and the 128 KiB to 1 MiB sizes the expert exchange uses gain the most."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, fabric, hardware]
+rocket: "#boosters"
+supersedes: posts/hardware/2026-09-06-measured-bandwidth
+verdict: accepted
+---
+
+**Question.** Two entries carried "MTU is raised to 9000" as a reopen
+condition. It was ours to change; this fires it.
+
+| setup | |
+| --- | --- |
+| nodes | both, rails enp1s0f1np1 + enP2p1s0f1np1 |
+| change | `ip link set mtu 9000` live, persisted via nmcli, both nodes |
+| active_mtu | 4096 (was 1500-limited) |
+| script | `scripts/fabric/fabric-microbench.sh`, rails=2 split-min=65536 |
+| commit | acd4e15bd5574fc838a32f750cbd4ce081aa801d |
+
+```bash
+scripts/fabric/fabric-microbench.sh
+```
+
+| bytes | oneway GB/s | was (MTU 1500) | duplex GB/s |
+| --- | --- | --- | --- |
+| 8 KiB | 8.84 | 10.85 | 16.64 |
+| 32 KiB | 12.25 | 20.59 | 24.13 |
+| 128 KiB | 23.56 | 22.54 | 46.78 |
+| 1 MiB | 24.36 | 23.06 | 48.56 |
+| 4 MiB | 24.47 | 23.12 | 48.89 |
+
+The 8 and 32 KiB rows regress because this run used split-min 65536 where the
+published table split at 2048; small messages rode one rail here. At and
+above 128 KiB, where the expert exchange lives, the gain is 4.5 to 6 percent
+and the supersedes applies: fabric planning numbers are now 24.5 one-way,
+48.9 duplex.
+
+**Next.**
+
+- re-run the split-min sweep at MTU 9000; the crossover likely moved
+- the ladder entry's fabric waits were measured at MTU 1500; the exchange
+  overlap hides most of it, re-measure only if fabric% shows up again
+
+**Reopen if.**
+
+- a NIC firmware or driver release changes RoCE MTU handling
