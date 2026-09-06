@@ -408,6 +408,160 @@ void test_nvfp4_gemv() {
   check("nvfp4 gemv vs host codec", rel_err(as_float(to_host(dy, N)), ref), 1e-2);
 }
 
+// ------------------------------------------------------------ MoE grouped
+// The stage-2 grouped-GEMM glue kernels: NVFP4 activation quantization with
+// the CUTLASS SFA swizzle, the fused-w13 SwiGLU, and the gather/scatter that
+// sit around the GEMMs (kernels.h, moe_grouped.h). The GEMM itself is
+// CUTLASS's own and is checked in tests/test_loader_swizzle.cu and
+// tests/test_moe_grouped.cu (real weights); this test is the parts rocket
+// owns, against the same host codecs nvfp4.cc uses for the loader.
+void test_moe_grouped_kernels() {
+  using rocket::fuel::e2m1_to_float;
+  using rocket::fuel::e4m3_to_float;
+  using rocket::fuel::float_to_e2m1;
+  using rocket::fuel::float_to_e4m3;
+  using rocket::fuel::sf_layout;
+
+  // --- nvfp4_quantize_rows: two groups, one of them (130 rows) spanning the
+  // 128-row swizzle-atom boundary, so the test exercises mn_tile > 0. -------
+  const int k = 64;  // 4 blocks of 16
+  const std::vector<int> group_m = {1, 130};
+  int rows = 0;
+  for (int m : group_m) rows += m;
+  std::vector<int> row_in_group(rows), group_of_row(rows);
+  std::vector<long long> group_sf_base(group_m.size());
+  {
+    int row = 0;
+    long long sf_off = 0;
+    for (std::size_t g = 0; g < group_m.size(); ++g) {
+      group_sf_base[g] = sf_off;
+      const long long mn_tiles = (group_m[g] + 127) / 128;
+      sf_off += mn_tiles * 1 * 512;  // k_tiles(k=64)=1
+      for (int li = 0; li < group_m[g]; ++li, ++row) {
+        row_in_group[row] = li;
+        group_of_row[row] = static_cast<int>(g);
+      }
+    }
+  }
+  const std::vector<float> x = randn(static_cast<std::size_t>(rows) * k, 2.0f);
+
+  auto dx = to_dev(as_bf16(x));
+  auto d_row_in_group = to_dev(row_in_group);
+  auto d_group_of_row = to_dev(group_of_row);
+  auto d_sf_base = to_dev(group_sf_base);
+  std::uint8_t* dpacked = nullptr;
+  std::uint8_t* dsf = nullptr;
+  const long long sf_bytes = group_sf_base.back() + ((group_m.back() + 127) / 128) * 512;
+  cudaMalloc(&dpacked, static_cast<std::size_t>(rows) * (k / 2));
+  cudaMalloc(&dsf, static_cast<std::size_t>(sf_bytes));
+  cudaMemset(dsf, 0, static_cast<std::size_t>(sf_bytes));
+  rocket::engine::nvfp4_quantize_rows(dpacked, dsf, dx, d_row_in_group, d_group_of_row, d_sf_base,
+                                      rows, k, nullptr);
+  cudaDeviceSynchronize();
+  const auto packed = to_host(dpacked, static_cast<std::size_t>(rows) * (k / 2));
+  const auto sf = to_host(dsf, static_cast<std::size_t>(sf_bytes));
+
+  int mismatches = 0;
+  for (int row = 0; row < rows; ++row) {
+    const int g = group_of_row[row];
+    const auto layout = sf_layout(group_m[g], k, 16);
+    for (int blk = 0; blk < k / 16; ++blk) {
+      float amax = 0.0f;
+      for (int j = 0; j < 16; ++j)
+        amax = std::max(amax, std::fabs(x[static_cast<std::size_t>(row) * k + blk * 16 + j]));
+      const std::uint8_t sbyte = amax > 0.0f ? float_to_e4m3(amax / 6.0f) : 0;
+      const float sdeq = amax > 0.0f ? e4m3_to_float(sbyte) : 0.0f;
+      const std::size_t sf_idx =
+          static_cast<std::size_t>(group_sf_base[g]) + layout.offset(row_in_group[row], blk);
+      if (sf[sf_idx] != sbyte) ++mismatches;
+      for (int j = 0; j < 8; ++j) {
+        const float v0 = x[static_cast<std::size_t>(row) * k + blk * 16 + 2 * j];
+        const float v1 = x[static_cast<std::size_t>(row) * k + blk * 16 + 2 * j + 1];
+        const std::uint8_t lo = sdeq > 0.0f ? float_to_e2m1(v0 / sdeq) : 0;
+        const std::uint8_t hi = sdeq > 0.0f ? float_to_e2m1(v1 / sdeq) : 0;
+        const std::uint8_t want = static_cast<std::uint8_t>(lo | (hi << 4));
+        const std::size_t pidx = static_cast<std::size_t>(row) * (k / 2) + blk * 8 + j;
+        if (packed[pidx] != want) ++mismatches;
+      }
+    }
+  }
+  std::printf("  %-34s %s (%d mismatch(es) of %d bytes)\n", "nvfp4_quantize_rows vs host codec",
+             mismatches == 0 ? "ok" : "FAIL", mismatches,
+             rows * (k / 2) + static_cast<int>(sf_bytes));
+  if (mismatches != 0) ++failures;
+
+  // --- moe_gather_rows -----------------------------------------------------
+  const int n = 17, gr_rows = 5;
+  const std::vector<int> row_of = {3, 0, 3, 2, 1};
+  const std::vector<float> xs = randn(4 * n, 3.0f);
+  auto d_xs = to_dev(as_bf16(xs));
+  auto d_row_of = to_dev(row_of);
+  bf16* d_gathered = nullptr;
+  cudaMalloc(&d_gathered, static_cast<std::size_t>(gr_rows) * n * sizeof(bf16));
+  rocket::engine::moe_gather_rows(d_gathered, d_xs, d_row_of, gr_rows, n, nullptr);
+  cudaDeviceSynchronize();
+  const auto gathered = as_float(to_host(d_gathered, static_cast<std::size_t>(gr_rows) * n));
+  std::vector<float> gather_ref(static_cast<std::size_t>(gr_rows) * n);
+  for (int r = 0; r < gr_rows; ++r)
+    for (int c = 0; c < n; ++c)
+      gather_ref[static_cast<std::size_t>(r) * n + c] = bf(xs[static_cast<std::size_t>(row_of[r]) * n + c]);
+  check("moe_gather_rows", rel_err(gathered, gather_ref), 0.0);
+
+  // --- moe_scatter_add: two gathered rows land on the same accumulator row,
+  // added in ascending i order (kernels.h::moe_scatter_add). --------------
+  const int batch = 3;
+  const std::vector<int> sc_row_of = {1, 0, 1};
+  const std::vector<float> weight_of = {0.5f, 2.0f, -0.25f};
+  const std::vector<float> y = randn(3 * n, 1.5f);
+  const std::vector<float> acc0 = randn(batch * n, 0.5f);
+  auto d_y = to_dev(as_bf16(y));
+  auto d_weight_of = to_dev(weight_of);
+  auto d_sc_row_of = to_dev(sc_row_of);
+  bf16* d_acc = to_dev(as_bf16(acc0));
+  rocket::engine::moe_scatter_add(d_acc, d_y, d_sc_row_of, d_weight_of, 3, batch, n, nullptr);
+  cudaDeviceSynchronize();
+  const auto acc_got = as_float(to_host(d_acc, static_cast<std::size_t>(batch) * n));
+  std::vector<float> acc_ref(static_cast<std::size_t>(batch) * n);
+  for (int m = 0; m < batch; ++m)
+    for (int c = 0; c < n; ++c) {
+      double sum = bf(acc0[static_cast<std::size_t>(m) * n + c]);
+      for (int i = 0; i < 3; ++i)
+        if (sc_row_of[i] == m) sum += weight_of[i] * bf(y[static_cast<std::size_t>(i) * n + c]);
+      acc_ref[static_cast<std::size_t>(m) * n + c] = static_cast<float>(sum);
+    }
+  check("moe_scatter_add (shared accumulator row)", rel_err(acc_got, acc_ref), 5e-3);
+
+  // --- swiglu_grouped: two groups, distinct gate/up globals ---------------
+  const int inter = 33, sg_rows = 4;
+  const std::vector<int> sg_group_of_row = {0, 1, 0, 1};
+  const std::vector<float> gate_global = {1.3f, 0.4f};
+  const std::vector<float> up_global = {0.7f, 2.1f};
+  const float limit = 6.0f;
+  const std::vector<float> gu = randn(static_cast<std::size_t>(sg_rows) * 2 * inter, 4.0f);
+  auto d_gu = to_dev(as_bf16(gu));
+  auto d_gate_g = to_dev(gate_global);
+  auto d_up_g = to_dev(up_global);
+  auto d_sg_group = to_dev(sg_group_of_row);
+  bf16* d_sg_out = nullptr;
+  cudaMalloc(&d_sg_out, static_cast<std::size_t>(sg_rows) * inter * sizeof(bf16));
+  rocket::engine::swiglu_grouped(d_sg_out, d_gu, d_gate_g, d_up_g, d_sg_group, sg_rows, inter, limit,
+                                 nullptr);
+  cudaDeviceSynchronize();
+  const auto sg_got = as_float(to_host(d_sg_out, static_cast<std::size_t>(sg_rows) * inter));
+  std::vector<float> sg_ref(static_cast<std::size_t>(sg_rows) * inter);
+  for (int r = 0; r < sg_rows; ++r) {
+    const int g = sg_group_of_row[r];
+    for (int c = 0; c < inter; ++c) {
+      const float gate = std::min(bf(gu[static_cast<std::size_t>(r) * 2 * inter + c]) * gate_global[g], limit);
+      const float up = std::min(
+          std::max(bf(gu[static_cast<std::size_t>(r) * 2 * inter + inter + c]) * up_global[g], -limit),
+          limit);
+      sg_ref[static_cast<std::size_t>(r) * inter + c] = gate * sigmoidf_h(gate) * up;
+    }
+  }
+  check("swiglu_grouped (per-group globals)", rel_err(sg_got, sg_ref), 5e-3);
+}
+
 // ------------------------------------------------------------- DSA indexer
 // Pool compression is a per-channel softmax over the kpool members, and the
 // selection must return the true top-k when the candidate set is larger than
@@ -525,6 +679,7 @@ int main() {
   std::printf("moe router\n");      test_router();
   std::printf("swiglu\n");          test_swiglu();
   std::printf("nvfp4 gemv\n");      test_nvfp4_gemv();
+  std::printf("moe grouped kernels\n"); test_moe_grouped_kernels();
   std::printf("dsa indexer\n");     test_indexer();
   std::printf("\n%s: %d failure(s)\n", failures == 0 ? "PASS" : "FAIL", failures);
   return failures == 0 ? 0 : 1;

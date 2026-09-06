@@ -54,3 +54,23 @@ set_tests_properties(loader-swizzle PROPERTIES
   SKIP_RETURN_CODE 77
   TIMEOUT 600
 )
+
+# Stage 2 batching arc: grouped-GEMM vs GEMV logits agreement at M=1, plus the
+# M-sweep that finds the crossover model.cu::kGroupedMoeMinBatch encodes.
+# Real weights, one engine load; see test_moe_grouped.cu's header comment for
+# why it stays a single binary.
+add_executable(test-moe-grouped test_moe_grouped.cu)
+target_link_libraries(test-moe-grouped PRIVATE rocket_engine rocket_fuel)
+set_target_properties(test-moe-grouped PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME moe-grouped COMMAND test-moe-grouped)
+set_tests_properties(moe-grouped PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# Synthetic-input properties the grouped path relies on (row invariance,
+# fused-w13 concatenation, determinism): no checkpoint, seconds not minutes.
+add_executable(test-moe-grouped-invariance test_moe_grouped_invariance.cu)
+target_link_libraries(test-moe-grouped-invariance PRIVATE rocket_engine)
+set_target_properties(test-moe-grouped-invariance PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME moe-grouped-invariance COMMAND test-moe-grouped-invariance)
+set_tests_properties(moe-grouped-invariance PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)

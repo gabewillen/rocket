@@ -94,16 +94,37 @@ struct LayerW {
 };
 
 // One routed expert, resident in the device cache.
+//
+// Two representations of each projection's block scales are kept side by
+// side: the GEMV fallback (kernels.h::gemv_nvfp4) reads the checkpoint's own
+// row-major layout linearly, and the grouped GEMM (stage 2) needs the
+// CUTLASS SFA/SFB swizzle (nvfp4.h::SfLayout). Re-deriving one from the other
+// at decode time would mean an extra pass per streamed expert on whichever
+// path is cold, so weights.cu writes both once, at cache-fill time, and pays
+// the (small: block scales are 1/32 of packed data) extra bytes per slot.
+//
+// gate_packed and up_packed sit back to back in the slot (see
+// WeightStore::WeightStore), so gate_packed doubles as the B operand of the
+// fused w13 grouped GEMM: [2*moe_intermediate_size, hidden] row-major, gate
+// rows first. w13_scale is the matching fused, swizzled SFB: gate's own
+// swizzle followed by up's own swizzle, which is bit-identical to swizzling
+// the fused matrix directly because moe_intermediate_size is a multiple of
+// SfLayout's 128-row atom (nvfp4.h) and the atom index is purely additive in
+// the row-tile number.
 struct ExpertDev {
   const std::uint8_t* gate_packed = nullptr;
-  const std::uint8_t* gate_scale = nullptr;
+  const std::uint8_t* gate_scale = nullptr;  // linear, GEMV
   float gate_global = 0.0f;
   const std::uint8_t* up_packed = nullptr;
-  const std::uint8_t* up_scale = nullptr;
+  const std::uint8_t* up_scale = nullptr;  // linear, GEMV
   float up_global = 0.0f;
   const std::uint8_t* down_packed = nullptr;
-  const std::uint8_t* down_scale = nullptr;
+  const std::uint8_t* down_scale = nullptr;  // linear, GEMV
   float down_global = 0.0f;
+
+  // Grouped-GEMM (stage 2) operands.
+  const std::uint8_t* w13_scale = nullptr;            // fused gate+up SFB, swizzled
+  const std::uint8_t* down_scale_swizzled = nullptr;  // down SFB, swizzled
 };
 
 class WeightStore {

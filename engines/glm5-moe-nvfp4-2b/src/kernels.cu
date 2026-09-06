@@ -701,6 +701,166 @@ __global__ void swiglu_kernel(bf16* __restrict__ out, const bf16* __restrict__ g
 __constant__ float kE2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f,  3.0f,  4.0f,  6.0f,
                                 -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
+// --------------------------------------------------- NVFP4 grouped-GEMM glue
+//
+// Device-side mirrors of nvfp4.cc's host codecs and CUTLASS SFA/SFB swizzle
+// (nvfp4.h::SfLayout::offset), so activation quantization for the grouped
+// GEMM path (nvfp4_quantize_rows) matches the loader's weight quantization
+// bit-for-bit under test, without a host round trip per decode step. Kept as
+// a plain 127-code linear search, same as nvfp4.cc::float_to_e4m3: rows here
+// are gathered activations, at most a few hundred per step, so the search
+// cost is nothing next to the GEMM it feeds.
+
+__device__ __forceinline__ float e4m3_to_float_dev(std::uint8_t bits) {
+  const std::uint32_t sign = (bits & 0x80u) ? 0x80000000u : 0u;
+  const std::uint32_t exp = (bits >> 3) & 0x0Fu;
+  const std::uint32_t mant = bits & 0x07u;
+  if (exp == 0) {
+    if (mant == 0) return __uint_as_float(sign);
+    const float v = static_cast<float>(mant) * (1.0f / 8.0f) * 0.015625f;
+    return (sign != 0u) ? -v : v;
+  }
+  return __uint_as_float(sign | ((exp + 120u) << 23) | (mant << 20));
+}
+
+__device__ __forceinline__ std::uint8_t float_to_e4m3_dev(float v) {
+  const std::uint8_t sign = (v < 0.0f) ? 0x80 : 0x00;
+  const float a = fabsf(v);
+  if (a >= 464.0f) return static_cast<std::uint8_t>(sign | 0x7E);
+  std::uint8_t best = sign;
+  float best_err = a;
+  for (unsigned bits = 0; bits <= 0x7Eu; ++bits) {
+    const float c = e4m3_to_float_dev(static_cast<std::uint8_t>(bits));
+    const float err = fabsf(a - c);
+    if (err < best_err || (err == best_err && (bits & 1u) == 0u)) {
+      best_err = err;
+      best = static_cast<std::uint8_t>(sign | bits);
+    }
+  }
+  return best;
+}
+
+__device__ __forceinline__ std::uint8_t float_to_e2m1_dev(float v) {
+  const std::uint8_t sign = (v < 0.0f) ? 0x08 : 0x00;
+  const float a = fabsf(v);
+  int best = 0;
+  float best_err = a;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float mag = kE2M1[i];
+    const float err = fabsf(a - mag);
+    if (err < best_err || (err == best_err && (i & 1) == 0)) {
+      best_err = err;
+      best = i;
+    }
+  }
+  return static_cast<std::uint8_t>(sign | best);
+}
+
+// nvfp4.h::SfLayout::offset, device side. Blk_MN=128, Blk_SF=4, 512 B/atom.
+__device__ __forceinline__ std::size_t sf_swizzle_offset(long long mn_idx, long long sf_idx,
+                                                         long long k_tiles) {
+  constexpr int kBlkMN = 128, kBlkSF = 4, kAtomBytes = 512;
+  const long long mn_tile = mn_idx / kBlkMN;
+  const long long mn_in = mn_idx % kBlkMN;
+  const long long k_tile = sf_idx / kBlkSF;
+  const long long ssub = sf_idx % kBlkSF;
+  const long long atom = mn_tile * k_tiles + k_tile;
+  return static_cast<std::size_t>(atom) * kAtomBytes +
+         static_cast<std::size_t>((mn_in % 32) * 16 + (mn_in / 32) * 4 + ssub);
+}
+
+__global__ void nvfp4_quantize_rows_kernel(std::uint8_t* __restrict__ packed,
+                                           std::uint8_t* __restrict__ sf_swizzled,
+                                           const bf16* __restrict__ x,
+                                           const int* __restrict__ row_in_group,
+                                           const int* __restrict__ group_of_row,
+                                           const long long* __restrict__ group_sf_base, int k) {
+  const long long row = blockIdx.x;
+  const long long k_sf = k / 16;
+  const long long k_tiles = (k_sf + 3) / 4;
+  const long long mn_idx = row_in_group[row];
+  const long long sf_base = group_sf_base[group_of_row[row]];
+  const bf16* xr = x + row * k;
+  std::uint8_t* pr = packed + row * (k / 2);
+  for (long long blk = threadIdx.x; blk < k_sf; blk += blockDim.x) {
+    const long long base = blk * 16;
+    float vals[16];
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      vals[j] = f(xr[base + j]);
+      amax = fmaxf(amax, fabsf(vals[j]));
+    }
+    std::uint8_t sbyte = 0;
+    float sdeq = 0.0f;
+    if (amax > 0.0f) {
+      sbyte = float_to_e4m3_dev(amax * (1.0f / 6.0f));
+      sdeq = e4m3_to_float_dev(sbyte);
+    }
+    sf_swizzled[sf_base + sf_swizzle_offset(mn_idx, blk, k_tiles)] = sbyte;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      std::uint8_t lo = 0, hi = 0;
+      if (sdeq > 0.0f) {
+        lo = float_to_e2m1_dev(vals[2 * j] / sdeq);
+        hi = float_to_e2m1_dev(vals[2 * j + 1] / sdeq);
+      }
+      pr[blk * 8 + j] = static_cast<std::uint8_t>(lo | (hi << 4));
+    }
+  }
+}
+
+__global__ void swiglu_grouped_kernel(bf16* __restrict__ out, const bf16* __restrict__ gu,
+                                      const float* __restrict__ gate_global,
+                                      const float* __restrict__ up_global,
+                                      const int* __restrict__ group_of_row, int inter,
+                                      float limit) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= inter) return;
+  const long long row = blockIdx.y;
+  const int g = group_of_row[row];
+  const bf16* gr = gu + row * (2LL * inter);
+  const float gate = fminf(f(gr[i]) * gate_global[g], limit);
+  const float up = fminf(fmaxf(f(gr[inter + i]) * up_global[g], -limit), limit);
+  out[row * inter + i] = b(siluf(gate) * up);
+}
+
+__global__ void moe_gather_rows_kernel(bf16* __restrict__ out, const bf16* __restrict__ x,
+                                       const int* __restrict__ row_of, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const long long r = blockIdx.y;
+  const long long src = row_of[r];
+  out[r * n + i] = x[src * n + i];
+}
+
+// See kernels.h: the sum for a given accumulator row must not depend on
+// thread scheduling, so this assigns one block per accumulator row (not per
+// gathered row) and has it scan every gathered row itself, in ascending i.
+// rows is at most a few hundred (max_batch * top_k), so the scan is cheap
+// next to the column width it runs per row_of match.
+__global__ void moe_scatter_add_kernel(bf16* __restrict__ acc, const bf16* __restrict__ y,
+                                       const int* __restrict__ row_of,
+                                       const float* __restrict__ weight_of, int rows, int n) {
+  extern __shared__ unsigned char smem[];
+  int* s_row = reinterpret_cast<int*>(smem);
+  float* s_w = reinterpret_cast<float*>(s_row + rows);
+  for (int i = threadIdx.x; i < rows; i += blockDim.x) {
+    s_row[i] = row_of[i];
+    s_w[i] = weight_of[i];
+  }
+  __syncthreads();
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= n) return;
+  const int m = blockIdx.y;
+  float sum = f(acc[static_cast<long long>(m) * n + col]);
+  for (int i = 0; i < rows; ++i)
+    if (s_row[i] == m) sum += s_w[i] * f(y[static_cast<long long>(i) * n + col]);
+  acc[static_cast<long long>(m) * n + col] = b(sum);
+}
+
+
 __global__ void gemv_nvfp4_kernel(bf16* __restrict__ y, const std::uint8_t* __restrict__ packed,
                                   const std::uint8_t* __restrict__ block_scale, float global_scale,
                                   const bf16* __restrict__ x, int k) {
@@ -958,6 +1118,30 @@ void swiglu_clamped(bf16* out, const bf16* gate, const bf16* up, int n, float li
 void gemv_nvfp4(bf16* y, const std::uint8_t* packed, const std::uint8_t* block_scale,
                 float global_scale, const bf16* x, int n_rows, int k, cudaStream_t s) {
   gemv_nvfp4_kernel<<<n_rows, 256, 0, s>>>(y, packed, block_scale, global_scale, x, k);
+}
+void nvfp4_quantize_rows(std::uint8_t* packed, std::uint8_t* sf_swizzled, const bf16* x,
+                         const int* row_in_group, const int* group_of_row,
+                         const long long* group_sf_base, int rows, int k, cudaStream_t s) {
+  if (rows <= 0) return;
+  nvfp4_quantize_rows_kernel<<<rows, 256, 0, s>>>(packed, sf_swizzled, x, row_in_group,
+                                                  group_of_row, group_sf_base, k);
+}
+void swiglu_grouped(bf16* out, const bf16* gu, const float* gate_global, const float* up_global,
+                    const int* group_of_row, int rows, int inter, float limit, cudaStream_t s) {
+  if (rows <= 0) return;
+  swiglu_grouped_kernel<<<dim3((inter + 255) / 256, rows), 256, 0, s>>>(
+      out, gu, gate_global, up_global, group_of_row, inter, limit);
+}
+void moe_gather_rows(bf16* out, const bf16* x, const int* row_of, int rows, int n, cudaStream_t s) {
+  if (rows <= 0) return;
+  moe_gather_rows_kernel<<<dim3((n + 255) / 256, rows), 256, 0, s>>>(out, x, row_of, n);
+}
+void moe_scatter_add(bf16* acc, const bf16* y, const int* row_of, const float* weight_of, int rows,
+                     int batch, int n, cudaStream_t s) {
+  if (rows <= 0) return;
+  const std::size_t shmem = static_cast<std::size_t>(rows) * (sizeof(int) + sizeof(float));
+  moe_scatter_add_kernel<<<dim3((n + 255) / 256, batch), 256, shmem, s>>>(acc, y, row_of, weight_of,
+                                                                          rows, n);
 }
 void axpy_bf16(bf16* acc, const bf16* v, const float* w, int widx, int w_stride, int batch, int n,
               cudaStream_t s) {

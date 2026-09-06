@@ -1,5 +1,7 @@
 #include "weights.h"
 
+#include "nvfp4.h"
+
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -193,11 +195,22 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
   }
 
   // --- streamed expert cache ----------------------------------------------
+  // Layout, in order: gate_packed and up_packed sit back to back so the pair
+  // doubles as the fused w13 grouped-GEMM B operand (weights.h::ExpertDev);
+  // gate_scale/up_scale are the checkpoint's own linear layout for the GEMV
+  // fallback; w13_scale is the fused, swizzled SFB for the grouped path;
+  // down_packed/down_scale are the GEMV layout for down_proj; down_scale
+  // gets a second, swizzled copy for the grouped path's w2 GEMM.
   const std::size_t gate_packed = static_cast<std::size_t>(cfg_.moe_intermediate_size) * H / 2;
   const std::size_t gate_scale = static_cast<std::size_t>(cfg_.moe_intermediate_size) * H / 16;
   const std::size_t down_packed = static_cast<std::size_t>(H) * cfg_.moe_intermediate_size / 2;
   const std::size_t down_scale = static_cast<std::size_t>(H) * cfg_.moe_intermediate_size / 16;
-  slot_bytes_ = align_up(2 * (gate_packed + gate_scale) + down_packed + down_scale, 512);
+  // Swizzled scale bytes equal linear scale bytes for these dims: both
+  // moe_intermediate_size and hidden_size divide the SfLayout 128-row atom
+  // exactly (nvfp4.h::SfLayout), so there is no tile padding to pay for.
+  const std::size_t w13_scale_sw = 2 * gate_scale;  // fused gate+up SFB
+  slot_bytes_ =
+      align_up(2 * (gate_packed + gate_scale) + w13_scale_sw + down_packed + 2 * down_scale, 512);
 
   std::size_t n_slots = expert_cache_bytes / slot_bytes_;
   if (n_slots < static_cast<std::size_t>(cfg_.num_experts_per_tok))
@@ -211,11 +224,13 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
     ExpertDev& v = slot_view_[i];
     std::size_t off = 0;
     v.gate_packed = base + off; off += gate_packed;
+    v.up_packed = base + off;   off += gate_packed;  // contiguous: fused w13 B
     v.gate_scale = base + off;  off += gate_scale;
-    v.up_packed = base + off;   off += gate_packed;
     v.up_scale = base + off;    off += gate_scale;
+    v.w13_scale = base + off;   off += w13_scale_sw;
     v.down_packed = base + off; off += down_packed;
-    v.down_scale = base + off;
+    v.down_scale = base + off;  off += down_scale;
+    v.down_scale_swizzled = base + off; off += down_scale;
     lru_.push_front(static_cast<int>(i));
     lru_pos_[i] = lru_.begin();
   }
@@ -243,34 +258,56 @@ const ExpertDev& WeightStore::expert(int layer, int expert_id, cudaStream_t s) {
 
   const std::string p = layer_prefix(layer) + "mlp.experts." + std::to_string(expert_id) + ".";
   ExpertDev& v = slot_view_[slot];
+  const int MI = cfg_.moe_intermediate_size, H = cfg_.hidden_size;
   struct Piece {
     const char* proj;
     const std::uint8_t* dst_packed;
-    const std::uint8_t* dst_scale;
+    const std::uint8_t* dst_scale;     // linear, GEMV
+    const std::uint8_t* dst_scale_sw;  // swizzled, grouped GEMM
     float* global;
+    std::int64_t n, k;  // this projection's [out_features, in_features]
   };
   const Piece pieces[3] = {
-      {"gate_proj", v.gate_packed, v.gate_scale, &v.gate_global},
-      {"up_proj", v.up_packed, v.up_scale, &v.up_global},
-      {"down_proj", v.down_packed, v.down_scale, &v.down_global},
+      {"gate_proj", v.gate_packed, v.gate_scale, v.w13_scale, &v.gate_global, MI, H},
+      {"up_proj", v.up_packed, v.up_scale, v.w13_scale, &v.up_global, MI, H},
+      {"down_proj", v.down_packed, v.down_scale, v.down_scale_swizzled, &v.down_global, H, MI},
   };
-  for (const Piece& pc : pieces) {
+  for (int pi = 0; pi < 3; ++pi) {
+    const Piece& pc = pieces[pi];
     const fuel::TensorView& packed = ckpt_.tensor(p + pc.proj + ".weight");
     const fuel::TensorView& scale = ckpt_.tensor(p + pc.proj + ".weight_scale");
     const fuel::TensorView& g2 = ckpt_.tensor(p + pc.proj + ".weight_scale_2");
+    const fuel::SfLayout layout = fuel::sf_layout(pc.n, pc.k, 16);
+    if (layout.bytes() != scale.nbytes)
+      fail(p + pc.proj + ": swizzled scale size does not match the linear checkpoint size");
     // Staged through pinned memory: the source is a page in the mmap'd
-    // checkpoint, so this is the disk-or-page-cache read plus one DMA.
+    // checkpoint, so this is the disk-or-page-cache read plus one DMA. The
+    // swizzle is a host-side byte permutation (nvfp4.cc::swizzle_block_scales)
+    // between the linear and swizzled copies, both staged in the same pinned
+    // buffer; test-loader-swizzle measures it at ~1 GB/s of scale bytes,
+    // which hides under the NVMe read of the packed weight it swizzles for.
     std::memcpy(pinned_, packed.data, packed.nbytes);
     std::memcpy(pinned_ + packed.nbytes, scale.data, scale.nbytes);
+    std::vector<std::uint8_t> swizzled(layout.bytes());
+    fuel::swizzle_block_scales(pinned_ + packed.nbytes, layout, swizzled.data());
+    std::memcpy(pinned_ + packed.nbytes + scale.nbytes, swizzled.data(), swizzled.size());
+
     cuda_check(cudaMemcpyAsync(const_cast<std::uint8_t*>(pc.dst_packed), pinned_, packed.nbytes,
                                cudaMemcpyHostToDevice, s),
                "expert packed H2D");
     cuda_check(cudaMemcpyAsync(const_cast<std::uint8_t*>(pc.dst_scale), pinned_ + packed.nbytes,
                                scale.nbytes, cudaMemcpyHostToDevice, s),
                "expert scale H2D");
+    // up_proj's swizzled half lands after gate's in the fused w13_scale slab
+    // (weights.h::ExpertDev), which is exactly one gate-sized swizzle.
+    const std::uint8_t* dst_sw = (pi == 1) ? v.w13_scale + swizzled.size() : pc.dst_scale_sw;
+    cuda_check(cudaMemcpyAsync(const_cast<std::uint8_t*>(dst_sw),
+                               pinned_ + packed.nbytes + scale.nbytes, swizzled.size(),
+                               cudaMemcpyHostToDevice, s),
+               "expert scale (swizzled) H2D");
     cuda_check(cudaStreamSynchronize(s), "expert stage sync");
     std::memcpy(pc.global, g2.data, sizeof(float));
-    streamed_bytes_ += packed.nbytes + scale.nbytes;
+    streamed_bytes_ += packed.nbytes + scale.nbytes + swizzled.size();
   }
 
   slots_[slot].key = key;

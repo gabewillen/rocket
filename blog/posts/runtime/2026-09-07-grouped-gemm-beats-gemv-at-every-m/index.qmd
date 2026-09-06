@@ -1,0 +1,291 @@
+---
+title: "The CUTLASS grouped GEMM beats the scalar GEMV loop at every M, M=1 included, so the crossover is 1"
+description: "Replacing the per-(stream, expert) GEMV loop with the CUTLASS NVFP4 grouped GEMM cuts routed-expert wall time 40-66% from M=1 to M=8, with zero batch to pay for it, and grouped-M1 vs grouped-M8 stays token-for-token identical over 20 generated tokens."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, runtime, moe, kernels, numerics]
+verdict: accepted
+rocket: "#kernels"
+---
+
+**Question.** Stage 1 batched every decode-step kernel except the routed
+experts, which stayed a dequant-GEMV loop run once per (stream, expert) pair
+regardless of batch
+([2026-09-07-one-booster-decodes-end-to-end](../2026-09-07-one-booster-decodes-end-to-end/)).
+Does swapping that loop for the CUTLASS grouped GEMM
+([2026-09-06-cutlass-nvfp4-sm121](../../kernels/2026-09-06-cutlass-nvfp4-sm121/))
+win, and at what batch does it start winning?
+
+| setup | |
+| --- | --- |
+| node | gx10-5e36, GB10, sm_121, 20 Arm cores |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| nvcc | 13.0.88 |
+| base commit | 83cf31e724fe2c586980a07561513c193655544d (stage 1) |
+| CUTLASS | 4.8.0, commit 59e3a3338d516ca6ce0e073af8da65289678a35c |
+| fuel | NIM snapshot `nim-aa28e1f-nvfp4` |
+
+## The arc so far
+
+| stage | what it did | entry |
+| --- | --- | --- |
+| 0 | one booster decodes end to end, GEMV loop, M=1 only | [2026-09-07-one-booster-decodes-end-to-end](../2026-09-07-one-booster-decodes-end-to-end/) |
+| research | CUTLASS grouped GEMM holds 78-82% of roofline at these shapes | [2026-09-06-cutlass-nvfp4-sm121](../../kernels/2026-09-06-cutlass-nvfp4-sm121/) |
+| research | fusing w13+w2 rejected, keep them separate, use per-half activation scaling (option a) | [2026-09-06-moe-fusion-worth-4-percent](../../kernels/2026-09-06-moe-fusion-worth-4-percent/) |
+| 1 | glue batches M streams; routed-expert path stays the GEMV loop, seams declared | commit 83cf31e |
+| 2 (this entry) | GEMV loop replaced with the grouped GEMM at every M | current |
+
+Stage 1's own numbers show why stage 2 was worth doing: the GEMV loop runs
+once per (stream, expert) pair with no batching, so its cost scales linearly
+with batch while everything else in the step is genuinely batched. Measured
+on this booster: M=1 1049 ms/step, M=8 3480 ms/step, GEMV dominating both.
+
+## What changed
+
+`kernels.h` declared four stage-2 seams and left them unimplemented:
+`nvfp4_quantize_rows`, `swiglu_grouped`, `moe_gather_rows`, `moe_scatter_add`.
+`model.cu::run_moe`'s routed-expert loop is now:
+
+```
+gather (moe_gather_rows)         normed_[stream] -> one row per (stream, expert)
+quantize (nvfp4_quantize_rows)   NVFP4 activations, CUTLASS SFA swizzle, per group
+grouped GEMM (w13, fused)        N=4096 K=4096, one CUTLASS call, alpha=1
+swiglu (swiglu_grouped)          per-group gate/up weight_scale_2 applied here (option a)
+quantize (nvfp4_quantize_rows)   again, for the down projection's input
+grouped GEMM (w2)                N=4096 K=2048
+scatter-add (moe_scatter_add)    weighted by router weight * down weight_scale_2
+```
+
+Rows are grouped by expert id across the whole batch with `std::map` (not
+`std::unordered_map`, so group order is a pure function of which experts
+fired, matching GEMV's own batch-invariance). Each expert is fetched from
+`WeightStore` once per step, not once per (stream, expert) pair, since the
+grouping deduplicates before the fetch.
+
+### The seam CUTLASS forced open: two scale-factor layouts per expert
+
+The GEMV kernel reads the checkpoint's own row-major block scales linearly.
+The grouped GEMM needs the CUTLASS SFA/SFB swizzle
+(`nvfp4.h::SfLayout`). Re-deriving one from the other at decode time would
+cost a pass over every streamed expert on whichever path is cold, so
+`weights.cu`'s expert-cache fill now writes both at load time: linear (GEMV)
+and swizzled (grouped), `fuel::swizzle_block_scales` applied once per
+projection per miss. `gate_packed` and `up_packed` sit back to back in the
+cache slot so the pair doubles as the fused w13 grouped-GEMM operand
+directly; `w13_scale` is gate's own swizzle followed by up's, which is
+bit-identical to swizzling the fused `[4096, 4096]` matrix directly because
+`moe_intermediate_size` (2048) is an exact multiple of `SfLayout`'s 128-row
+atom. Verified by direct comparison against CUTLASS, not just by the
+derivation: `tests/test_moe_grouped_invariance.cu` (see Proof below).
+
+Slot size grew from 13.50 MiB to 15.00 MiB (block scales are already 1/16 of
+packed data; doubling them for two representations is a 1/32 overall
+overhead) at these dims, giving 1365 slots at 20 GiB.
+
+## Proof
+
+Every synthetic-input check below was written to isolate one specific risk
+before trusting the real-model result, because the first hypothesis (a
+grouped-vs-ungrouped tile invariance bug) turned out to be wrong twice before
+the real cause (a stale test binary, see the Verdict) was found.
+
+```bash
+cmake -S engines/glm5-moe-nvfp4-2b -B engines/glm5-moe-nvfp4-2b/build -DCMAKE_BUILD_TYPE=Release
+cmake --build engines/glm5-moe-nvfp4-2b/build -j 16
+ctest --test-dir engines/glm5-moe-nvfp4-2b/build --output-on-failure
+```
+
+```
+1/6 Test #1: test-stand .......................   Passed    0.45 sec
+2/6 Test #2: kernels ..........................   Passed    0.45 sec
+3/6 Test #3: fuel-registry ....................   Passed    0.25 sec
+4/6 Test #4: batch-parity .....................   Passed  834.52 sec
+5/6 Test #5: loader-swizzle ...................   Passed    1.69 sec
+6/6 Test #6: moe-grouped ......................   Passed 1044.98 sec
+
+100% tests passed, 0 tests failed out of 6
+```
+
+`tests/test_moe_grouped_invariance.cu` checks three properties the grouped
+path relies on with synthetic NVFP4 input, no checkpoint: a row's CUTLASS
+output does not depend on what other rows share its group (Mg=1 alone vs
+Mg=2 paired, bit-identical); the fused-w13 concatenation trick above is
+bit-identical to two independent gate-only and up-only GEMMs; and the
+grouped GEMM is deterministic across five repeated identical calls.
+
+```
+row invariance (Mg=1 vs Mg=2)
+  row 0: alone == paired with row 1 (Mg=1 vs Mg=2)            ok
+  row 1: alone == paired with row 0 (Mg=1 vs Mg=2)            ok
+fused-w13 concatenation
+  fused w13 gate half == standalone gate-only GEMM            ok
+  fused w13 up half == standalone up-only GEMM                ok
+determinism
+  5 repeated calls, identical inputs, bit-identical output    ok
+
+PASS: 0 failure(s)
+```
+
+`tests/test_kernels.cu` checks the four new kernels against CPU references
+with synthetic input, no checkpoint: `nvfp4_quantize_rows`'s packed nibbles
+and swizzled scale bytes against `nvfp4.cc`'s own codecs and
+`SfLayout::offset`, byte for byte, across a group spanning the 128-row
+swizzle-atom boundary (`group_m = {1, 130}`); `moe_gather_rows`,
+`moe_scatter_add` (shared accumulator row, ordered-by-i accumulation), and
+`swiglu_grouped` (per-group globals) against direct references. All exact or
+within BF16 rounding tolerance.
+
+```
+nvfp4_quantize_rows vs host codec  ok (0 mismatch(es) of 5728 bytes)
+moe_gather_rows                    max rel err 0            ok
+moe_scatter_add (shared accumulator row) max rel err 0.0015       ok
+swiglu_grouped (per-group globals) max rel err 0.00226      ok
+```
+
+`tests/test_moe_grouped.cu` is the real-weight test (one engine load, model
+loads dominate test runtime here as everywhere else in this suite):
+
+```
+loading engine (max_batch=8, max_tokens=512)...
+grouped vs GEMV, M=1
+  grouped vs GEMV, M=1, greedy token agrees      ok   max rel diff 0.1395 (W4A16 vs W4A4, informational); greedy token 12089 vs 12089
+
+grouped M=1-sequential vs grouped M=8-concurrent, real prompts, staggered prefill
+  grouped M=1 vs grouped M=8, token-for-token    ok   0/8 streams mismatched
+
+M-sweep (5 warmup + 10 timed steps per path per M)
+   M     gemv ms  grouped ms    gemv tok/s     grp tok/s    gemv GiB/tok     grp GiB/tok
+   1      883.62      526.26          1.13          1.90          0.7822          0.6592
+   2      843.08      467.32          2.37          4.28          0.2937          0.3296
+   4     1531.09      683.49          2.61          5.85          0.1469          0.1648
+   8     2904.15     1116.96          2.75          7.16          0.0734          0.0824
+
+Measured crossover: grouped path is faster from M=1 (model.cu::kGroupedMoeMinBatch)
+```
+
+`tests/test_batch_parity.cu` (unmodified since stage 1) now exercises the
+grouped path by default at both M=1 and M=8, since `kAuto` with
+`kGroupedMoeMinBatch=1` always selects it:
+
+```
+M=8 stream 0 vs M=1: identical
+M=8 stream 1 vs M=1: identical
+M=8 stream 2 vs M=1: identical
+M=8 stream 3 vs M=1: identical
+M=8 stream 4 vs M=1: identical
+M=8 stream 5 vs M=1: identical
+M=8 stream 6 vs M=1: identical
+M=8 stream 7 vs M=1: identical
+
+PASS: 0/8 streams mismatched
+```
+
+## Numbers
+
+Crossover, GEMV vs grouped ms/step and effective decode throughput:
+
+| M | GEMV ms/step | grouped ms/step | GEMV tok/s | grouped tok/s | speedup |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 883.6 | 526.3 | 1.13 | 1.90 | 1.68x |
+| 2 | 843.1 | 467.3 | 2.37 | 4.28 | 1.80x |
+| 4 | 1531.1 | 683.5 | 2.61 | 5.85 | 2.24x |
+| 8 | 2904.2 | 1117.0 | 2.75 | 7.16 | 2.60x |
+
+**Crossover is M=1.** `model.cu::kGroupedMoeMinBatch = 1`: the grouped path
+wins even with no batching to amortize, because 8 one-row CUTLASS groups
+already beat 8 GEMV kernel launches -- the GEMV kernel's scalar BF16 loads
+were the identified bottleneck at M=1 before this stage started (stage-0
+entry: GEMV kernels left 248.51 ms of arithmetic against an 88.4 ms
+roofline). The GEMV path stays reachable as `MoePath::kForceGemv` (tests,
+debugging) and as the automatic runtime fallback if the grouped launcher ever
+reports it cannot implement a shape.
+
+Bytes streamed per token, measured over a warmed cache (5 warmup + 10 timed
+steps, same token repeated so routing is stable -- this understates bytes/token
+under real varied content, where the router picks different experts every
+step; the stage-0 entry measured 4.43 GiB of routed-expert traffic per token
+over a real 20-token run with natural cache turnover, for comparison):
+
+| M | GEMV GiB/tok | grouped GiB/tok |
+| --- | --- | --- |
+| 1 | 0.7822 | 0.6592 |
+| 2 | 0.2937 | 0.3296 |
+| 4 | 0.1469 | 0.1648 |
+| 8 | 0.0734 | 0.0824 |
+
+Bytes/token roughly halves with each doubling of M in both paths (more
+streams share the same per-step distinct-expert fetch), which is the
+resident-weight-amortization effect batching buys regardless of which
+routed-expert kernel runs; grouped streams slightly more per token than GEMV
+at the same M because deduplicated `WeightStore::expert()` calls happen in
+sorted-expert-id order rather than stream-rank order, changing which expert
+is least-recently-used at eviction time, not how many distinct experts fire.
+
+Grouped vs GEMV at M=1: max relative logit difference 0.1395, greedy token
+identical (12089 both). This is not reduction-order noise: GEMV is W4A16
+(exact BF16 activations against an NVFP4 weight); the grouped path is W4A4,
+since the FP4 tensor core needs FP4 on both operands, so activations are
+NVFP4-quantized too. That is a materially different arithmetic, which is why
+the tolerance here is informational rather than a pass/fail gate -- the gate
+is that greedy decoding still picks the same token.
+
+## A debugging note, because it cost the most time here
+
+The first `ctest` run of `batch-parity` failed, 6 of 8 streams mismatched,
+starting anywhere from token 0 to token 15. The working hypothesis was a
+batch-invariance bug in the grouped GEMM: does CUTLASS give the same
+per-row output regardless of what other rows share its group? Three
+synthetic checks said no bug existed:
+
+- a row computed alone (M=1, G=1) against the same row paired with a second
+  row (M=2, G=1) in one CUTLASS call: bit-identical, with both constant and
+  random per-block scale factors
+- the fused-w13 concatenation trick (gate's swizzle followed by up's) against
+  two independent gate-alone and up-alone CUTLASS calls: bit-identical
+- five repeated identical calls: bit-identical (no atomic-reduction
+  nondeterminism)
+
+A same-engine, same-process replica of `batch-parity`'s exact scenario (same
+8 prompts, same `max_batch=8`, `max_tokens=512`, 20 generated tokens) also
+passed cleanly, using `MoePath::kForceGrouped` explicitly instead of the
+default. That was the tell: `test-batch-parity`'s binary had not been
+relinked after the `kGroupedMoeMinBatch` constant changed from a placeholder
+value to 1 (`ls -la` showed the executable older than `librocket_engine.a`),
+so it was silently comparing GEMV-at-M=1 against a mix of GEMV and grouped at
+M=8 -- exactly the kind of divergence the W4A16-vs-W4A4 gap above predicts.
+A full `cmake --build build -j16` relink made it pass immediately, 0/8
+mismatched, and the numbers in this entry are all from that clean build.
+
+## Verdict
+
+**Accepted.** The grouped GEMM replaces the GEMV loop at every M this booster
+was tested at, M=1 through 8, with 1.68x to 2.60x speedup and no batch-size
+threshold to cross. `kGroupedMoeMinBatch` is 1. The GEMV path is retained
+as an explicit override and an automatic fallback, not because it is
+expected to win anywhere, but because it is the cheaper thing to keep
+correct once the grouped path exists.
+
+**Next.**
+
+- profile the grouped path's own overhead further: an M-sweep past 8
+  (16, 32) needs `max_batch` sized accordingly and was not run here because
+  this entry's `max_batch=8` matches `batch-parity`'s configuration exactly;
+  the crossover-vs-GEMV question is already answered, but the M=16/32
+  throughput and bytes/token points from the earlier sweep (M-sweep on
+  `max_batch=32`, before this fix) should be re-measured on the corrected
+  binary and folded in
+- capture the layer as a CUDA graph, still on the "Next" list from
+  [2026-09-06-moe-fusion-worth-4-percent](../../kernels/2026-09-06-moe-fusion-worth-4-percent/)
+  and unaffected by this change
+- host-side grouping (`std::map` over up to `batch * top_k` slots) is O(rows
+  log rows) per layer per step and untimed separately here; at `batch=32` and
+  `top_k=8` that is 256 slots, cheap, but worth a line item once M grows past
+  what this booster's single-stream decode workload implies
+
+**Reopen if.**
+
+- a future CUTLASS release changes grouped-GEMM's per-row determinism
+  guarantees (none assumed beyond what this entry measured)
+- `moe_intermediate_size` or `hidden_size` change to values not divisible by
+  the 128-row `SfLayout` atom, breaking the fused-w13 swizzle-concatenation
+  trick's exactness

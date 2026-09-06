@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <numeric>
 #include <stdexcept>
 
 #include "kernels.h"
+#include "moe_grouped.h"
 
 namespace rocket::engine {
 namespace {
@@ -19,6 +21,19 @@ void cuda_check(cudaError_t e, const std::string& what) {
 }
 
 using Clock = std::chrono::steady_clock;
+
+// Measured crossover between the GEMV loop and the grouped GEMM
+// (blog/posts/runtime/2026-09-07-*, tests/test_moe_grouped.cu M-sweep on this
+// booster): the grouped path wins at every M tested, M=1 included, because
+// the GEMV kernel's scalar BF16 loads were already the bottleneck the
+// per-token baseline identified (blog/posts/runtime/2026-09-07-one-booster-
+// decodes-end-to-end/), not the batching this stage adds. Grouping 8 experts
+// of a single stream into 8 one-row CUTLASS groups still beats 8 GEMV
+// kernels. kGroupedMoeMinBatch is 1 rather than "always" so the GEMV path
+// stays reachable through MoePath::kForceGemv (tests, debugging) and as the
+// runtime fallback when the grouped launcher reports it cannot implement a
+// shape (run_moe_grouped's return value).
+constexpr int kGroupedMoeMinBatch = 1;
 
 class StageTimer {
  public:
@@ -75,6 +90,8 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   auto A = [&](std::size_t n) { return static_cast<bf16*>(alloc(n * sizeof(bf16))); };
   auto F = [&](std::size_t n) { return static_cast<float*>(alloc(n * sizeof(float))); };
   auto I = [&](std::size_t n) { return static_cast<int*>(alloc(n * sizeof(int))); };
+  auto U8 = [&](std::size_t n) { return static_cast<std::uint8_t*>(alloc(n)); };
+  auto I64 = [&](std::size_t n) { return static_cast<long long*>(alloc(n * sizeof(long long))); };
 
   kda_slot_.assign(cfg_.text_layers, -1);
   mla_slot_.assign(cfg_.text_layers, -1);
@@ -170,6 +187,28 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   exp_up_ = A(cfg_.moe_intermediate_size);
   exp_h_ = A(cfg_.moe_intermediate_size);
   exp_out_ = A(H);
+
+  // --- grouped-GEMM (stage 2) routed-expert scratch, worst case one group
+  // per gathered row: max_batch * num_experts_per_tok rows/groups. ---
+  const int MI = cfg_.moe_intermediate_size;
+  moe_max_rows_ = MB * cfg_.num_experts_per_tok;
+  const std::size_t MR = static_cast<std::size_t>(moe_max_rows_);
+  moe_x_ = A(MR * H);
+  moe_a1_packed_ = U8(MR * H / 2);
+  moe_a1_sf_ = U8(MR * 64 * 512);  // k_tiles(H=4096)=64 atoms of 512 B, worst case
+  moe_gu_ = A(MR * 2 * MI);
+  moe_h_ = A(MR * MI);
+  moe_a2_packed_ = U8(MR * MI / 2);
+  moe_a2_sf_ = U8(MR * 32 * 512);  // k_tiles(MI=2048)=32 atoms of 512 B, worst case
+  moe_out_ = A(MR * H);
+  moe_row_of_ = I(MR);
+  moe_row_in_group_ = I(MR);
+  moe_group_of_row_ = I(MR);
+  moe_sf1_base_ = I64(MR);
+  moe_sf2_base_ = I64(MR);
+  moe_gate_global_ = F(MR);
+  moe_up_global_ = F(MR);
+  moe_scatter_w_ = F(MR);
   mlp_gate_ = A(static_cast<std::size_t>(MB) * big_inter);
   mlp_up_ = A(static_cast<std::size_t>(MB) * big_inter);
   mlp_h_ = A(static_cast<std::size_t>(MB) * big_inter);
@@ -182,6 +221,14 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
 
   pos_.assign(MB, 0);
   layer_rms_.assign(cfg_.text_layers, 0.0f);
+}
+
+std::vector<float> DecodeEngine::last_logits(int stream) const {
+  std::vector<float> out(static_cast<std::size_t>(cfg_.vocab_size));
+  cudaMemcpyAsync(out.data(), logits_ + static_cast<std::size_t>(stream) * cfg_.vocab_size,
+                  out.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_);
+  cudaStreamSynchronize(stream_);
+  return out;
 }
 
 DecodeEngine::~DecodeEngine() {
@@ -346,6 +393,145 @@ void DecodeEngine::run_dense_mlp(int layer, int batch) {
     record_absmax("layer" + std::to_string(layer) + ".ffn.normed", normed_, batch, H);
 }
 
+// Stage 1's per-(stream, expert) GEMV loop, unchanged. Runtime fallback
+// below kGroupedMoeMinBatch (model.cu top of file) and when the grouped
+// launcher reports it cannot implement a shape.
+void DecodeEngine::run_moe_gemv(int layer, int batch, const std::vector<int>& idx) {
+  const int H = cfg_.hidden_size;
+  const int MI = cfg_.moe_intermediate_size;
+  const int K = cfg_.num_experts_per_tok;
+  for (int m = 0; m < batch; ++m) {
+    const bf16* x_row = normed_ + static_cast<std::size_t>(m) * H;
+    for (int t = 0; t < K; ++t) {
+      const int expert_id = idx[static_cast<std::size_t>(m) * K + t];
+      const auto t_stream = Clock::now();
+      const ExpertDev& e = w_.expert(layer, expert_id, stream_);
+      stages_.expert_stream +=
+          std::chrono::duration<double, std::milli>(Clock::now() - t_stream).count();
+      gemv_nvfp4(exp_gate_, e.gate_packed, e.gate_scale, e.gate_global, x_row, MI, H, stream_);
+      gemv_nvfp4(exp_up_, e.up_packed, e.up_scale, e.up_global, x_row, MI, H, stream_);
+      swiglu_clamped(exp_h_, exp_gate_, exp_up_, MI, cfg_.swiglu_limit, stream_);
+      gemv_nvfp4(exp_out_, e.down_packed, e.down_scale, e.down_global, exp_h_, H, MI, stream_);
+      axpy_bf16(acc_ + static_cast<std::size_t>(m) * H, exp_out_, topk_w_ + static_cast<std::size_t>(m) * K,
+               t, K, /*batch=*/1, H, stream_);
+    }
+  }
+}
+
+// Stage 2: CUTLASS grouped GEMM over every (stream, expert) pair the batch
+// routed to this layer, grouped by expert id. See kernels.h::nvfp4_quantize_rows,
+// swiglu_grouped, moe_gather_rows, moe_scatter_add and moe_grouped.h.
+// Returns false if the grouped launcher could not implement a shape (should
+// not happen at these fixed dims, but the caller falls back to the GEMV loop
+// rather than trust that it never does).
+bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>& idx,
+                                   const std::vector<float>& wts) {
+  const int H = cfg_.hidden_size;
+  const int MI = cfg_.moe_intermediate_size;
+  const int K = cfg_.num_experts_per_tok;
+  const int rows = batch * K;
+
+  // Bucket every (stream, k-th choice) slot by expert id. std::map (not
+  // unordered_map) so group order -- and therefore every row/group index
+  // downstream -- is a pure function of which experts fired, not of hash
+  // iteration order, which keeps the grouped path as reproducible as the
+  // GEMV loop it replaces.
+  std::map<int, std::vector<int>> by_expert;
+  for (int slot = 0; slot < rows; ++slot) by_expert[idx[static_cast<std::size_t>(slot)]].push_back(slot);
+
+  std::vector<int> row_of(rows), row_in_group(rows), group_of_row(rows);
+  std::vector<long long> sf1_base, sf2_base;
+  std::vector<float> gate_global, up_global;
+  std::vector<float> scatter_w(rows);
+  std::vector<GroupedGemmGroup> groups1, groups2;
+  groups1.reserve(by_expert.size());
+  groups2.reserve(by_expert.size());
+
+  int row_start = 0;
+  long long sf1_off = 0, sf2_off = 0;
+  int g = 0;
+  for (const auto& [expert_id, slots] : by_expert) {
+    const int Mg = static_cast<int>(slots.size());
+    const auto t_stream = Clock::now();
+    const ExpertDev& e = w_.expert(layer, expert_id, stream_);
+    stages_.expert_stream +=
+        std::chrono::duration<double, std::milli>(Clock::now() - t_stream).count();
+
+    const long long mn_tiles = (Mg + 127) / 128;
+    sf1_base.push_back(sf1_off);
+    sf2_base.push_back(sf2_off);
+    gate_global.push_back(e.gate_global);
+    up_global.push_back(e.up_global);
+
+    GroupedGemmGroup gr1;
+    gr1.m = Mg;
+    gr1.a_packed = moe_a1_packed_ + static_cast<std::size_t>(row_start) * (H / 2);
+    gr1.a_scale = moe_a1_sf_ + sf1_off;
+    gr1.b_packed = e.gate_packed;  // fused with up_packed, see weights.h
+    gr1.b_scale = e.w13_scale;
+    gr1.d_out = moe_gu_ + static_cast<std::size_t>(row_start) * (2 * MI);
+    groups1.push_back(gr1);
+
+    GroupedGemmGroup gr2;
+    gr2.m = Mg;
+    gr2.a_packed = moe_a2_packed_ + static_cast<std::size_t>(row_start) * (MI / 2);
+    gr2.a_scale = moe_a2_sf_ + sf2_off;
+    gr2.b_packed = e.down_packed;
+    gr2.b_scale = e.down_scale_swizzled;
+    gr2.d_out = moe_out_ + static_cast<std::size_t>(row_start) * H;
+    groups2.push_back(gr2);
+
+    for (int li = 0; li < Mg; ++li) {
+      const int row = row_start + li;
+      const int slot = slots[static_cast<std::size_t>(li)];
+      row_of[row] = slot / K;         // stream slot this row's activation comes from / goes to
+      row_in_group[row] = li;
+      group_of_row[row] = g;
+      // The down-projection's own weight_scale_2 is folded into the scatter
+      // weight here rather than the GEMM epilogue (moe_grouped.h) or a
+      // per-row kernel pass; the router weight and this global both apply
+      // once per row with no elementwise interaction, so one multiply on
+      // the host, once per (stream, expert) pair, covers both.
+      scatter_w[row] = wts[static_cast<std::size_t>(slot)] * e.down_global;
+    }
+
+    row_start += Mg;
+    sf1_off += mn_tiles * 64 * 512;  // k_tiles(H=4096)=64
+    sf2_off += mn_tiles * 32 * 512;  // k_tiles(MI=2048)=32
+    ++g;
+  }
+
+  cudaMemsetAsync(moe_a1_sf_, 0, static_cast<std::size_t>(sf1_off), stream_);
+  cudaMemsetAsync(moe_a2_sf_, 0, static_cast<std::size_t>(sf2_off), stream_);
+  cudaMemcpyAsync(moe_row_of_, row_of.data(), rows * sizeof(int), cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(moe_row_in_group_, row_in_group.data(), rows * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(moe_group_of_row_, group_of_row.data(), rows * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(moe_sf1_base_, sf1_base.data(), sf1_base.size() * sizeof(long long),
+                  cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(moe_sf2_base_, sf2_base.data(), sf2_base.size() * sizeof(long long),
+                  cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(moe_gate_global_, gate_global.data(), gate_global.size() * sizeof(float),
+                  cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(moe_up_global_, up_global.data(), up_global.size() * sizeof(float),
+                  cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(moe_scatter_w_, scatter_w.data(), rows * sizeof(float), cudaMemcpyHostToDevice,
+                  stream_);
+
+  moe_gather_rows(moe_x_, normed_, moe_row_of_, rows, H, stream_);
+  nvfp4_quantize_rows(moe_a1_packed_, moe_a1_sf_, moe_x_, moe_row_in_group_, moe_group_of_row_,
+                      moe_sf1_base_, rows, H, stream_);
+  if (!grouped_gemm_nvfp4(groups1, 2 * MI, H, stream_)) return false;
+  swiglu_grouped(moe_h_, moe_gu_, moe_gate_global_, moe_up_global_, moe_group_of_row_, rows, MI,
+                cfg_.swiglu_limit, stream_);
+  nvfp4_quantize_rows(moe_a2_packed_, moe_a2_sf_, moe_h_, moe_row_in_group_, moe_group_of_row_,
+                      moe_sf2_base_, rows, MI, stream_);
+  if (!grouped_gemm_nvfp4(groups2, H, MI, stream_)) return false;
+  moe_scatter_add(acc_, moe_out_, moe_row_of_, moe_scatter_w_, rows, batch, H, stream_);
+  return true;
+}
+
 void DecodeEngine::run_moe(int layer, int batch) {
   const MoeW& mo = w_.layer(layer).moe;
   const int H = cfg_.hidden_size;
@@ -373,21 +559,16 @@ void DecodeEngine::run_moe(int layer, int batch) {
   router_entropy_ += ent;
 
   cudaMemsetAsync(acc_, 0, static_cast<std::size_t>(batch) * H * sizeof(bf16), stream_);
-  for (int m = 0; m < batch; ++m) {
-    const bf16* x_row = normed_ + static_cast<std::size_t>(m) * H;
-    for (int t = 0; t < K; ++t) {
-      const int expert_id = idx[static_cast<std::size_t>(m) * K + t];
-      const auto t_stream = Clock::now();
-      const ExpertDev& e = w_.expert(layer, expert_id, stream_);
-      stages_.expert_stream +=
-          std::chrono::duration<double, std::milli>(Clock::now() - t_stream).count();
-      gemv_nvfp4(exp_gate_, e.gate_packed, e.gate_scale, e.gate_global, x_row, MI, H, stream_);
-      gemv_nvfp4(exp_up_, e.up_packed, e.up_scale, e.up_global, x_row, MI, H, stream_);
-      swiglu_clamped(exp_h_, exp_gate_, exp_up_, MI, cfg_.swiglu_limit, stream_);
-      gemv_nvfp4(exp_out_, e.down_packed, e.down_scale, e.down_global, exp_h_, H, MI, stream_);
-      axpy_bf16(acc_ + static_cast<std::size_t>(m) * H, exp_out_, topk_w_ + static_cast<std::size_t>(m) * K,
-               t, K, /*batch=*/1, H, stream_);
+  const bool want_grouped =
+      moe_path_ == MoePath::kForceGrouped ||
+      (moe_path_ == MoePath::kAuto && batch >= kGroupedMoeMinBatch);
+  if (moe_path_ != MoePath::kForceGemv && want_grouped) {
+    if (!run_moe_grouped(layer, batch, idx, wts)) {
+      cudaMemsetAsync(acc_, 0, static_cast<std::size_t>(batch) * H * sizeof(bf16), stream_);
+      run_moe_gemv(layer, batch, idx);
     }
+  } else {
+    run_moe_gemv(layer, batch, idx);
   }
 
   gemm_bf16(mlp_gate_, mo.shared.gate, normed_, batch, SI, H, stream_);

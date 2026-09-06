@@ -56,6 +56,37 @@ set_target_properties(rocket_engine PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+# Stage 2's grouped-GEMM launcher (model.cu::run_moe -> moe_grouped.h) needs
+# CUTLASS's block-scaled FP4 tensor core op, which needs the sm_121a variant
+# of this SM (CUDA_ARCHITECTURES "121a"), while the rest of rocket_engine
+# builds at plain sm_121 above. Kept as its own static library so only this
+# one translation unit pays the "a" arch and the CUTLASS include path; see
+# tests/CMakeLists.txt's test-loader-swizzle for the same split, and
+# moe_grouped.h for why no CUTLASS type crosses into model.cu or kernels.cu.
+set(ROCKET_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
+if(EXISTS "${ROCKET_CUTLASS_DIR}/include/cutlass/cutlass.h")
+  add_library(rocket_moe_grouped STATIC src/moe_grouped.cu)
+  target_include_directories(rocket_moe_grouped PUBLIC src)
+  target_include_directories(rocket_moe_grouped PRIVATE
+    "${ROCKET_CUTLASS_DIR}/include"
+    "${ROCKET_CUTLASS_DIR}/tools/util/include"
+  )
+  target_compile_options(rocket_moe_grouped PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  )
+  set_target_properties(rocket_moe_grouped PROPERTIES
+    CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}a"
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_link_libraries(rocket_engine PUBLIC rocket_moe_grouped)
+else()
+  message(STATUS
+    "rocket_moe_grouped skipped: no CUTLASS at ${ROCKET_CUTLASS_DIR}. "
+    "run_moe's grouped-GEMM path (model.cu) will fail to link; fetch CUTLASS with "
+    "engines/glm5-moe-nvfp4-2b/bench/fetch-cutlass.sh")
+endif()
+
 # Fuel loader: reads the NVFP4 checkpoint off disk and stages it for the
 # kernel. Pure C++, no CUDA and no Python, because it runs at serving time.
 add_library(rocket_fuel STATIC
@@ -71,8 +102,8 @@ target_compile_definitions(rocket_fuel PUBLIC
   ROCKET_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set_target_properties(rocket_fuel PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Pinned CUTLASS checkout, shared by bench/ and tests/.
-set(ROCKET_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
+# ROCKET_CUTLASS_DIR is set above, before rocket_engine's own moe_grouped
+# target; bench/ and tests/ reuse the same variable.
 
 # Sanity target: the "test stand" of the build itself. Runs one trivial kernel
 # and reports what the engine plan has to be compiled against.

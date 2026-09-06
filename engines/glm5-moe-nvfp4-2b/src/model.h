@@ -9,13 +9,20 @@
 // per call, run once per prompt token; the KDA recurrence is sequential, so a
 // chunked prefill would be a second implementation of it.
 //
-// Only the batched decode-step glue is stage 1 (embeddings, norms,
-// hyper-connections, router, dense MLP, shared expert, lm_head, and the
-// per-stream paged MLA/indexer KV). The routed-expert path stays the
-// dequant-GEMV looped over (stream, selected expert) pairs; stage 2 replaces
-// that loop with a CUTLASS grouped GEMM (see kernels.h: nvfp4_quantize_rows,
-// swiglu_grouped, moe_gather_rows, moe_scatter_add, all declared and
-// unimplemented on purpose -- that is stage 2's seam).
+// Stage 1 batched the decode-step glue (embeddings, norms, hyper-connections,
+// router, dense MLP, shared expert, lm_head, and the per-stream paged
+// MLA/indexer KV). The routed-expert path stayed a dequant-GEMV loop over
+// (stream, selected expert) pairs, run once per pair regardless of batch.
+//
+// Stage 2 (blog/posts/runtime/2026-09-07-*) replaces that loop above a
+// measured crossover batch (kGroupedMoeMinBatch, model.cu) with a CUTLASS
+// grouped GEMM: gather every (stream, expert) row across the whole batch,
+// quantize to NVFP4, one grouped GEMM per stage (w13 fused gate+up, w2
+// down), swiglu across the fused w13 halves, scatter-add into the batch
+// accumulator. Below the crossover the GEMV loop stays the runtime path: at
+// M=1 there is only one group per expert and no batching to win back the
+// fixed cost of the grouped path's host-side bookkeeping. MoePath lets a test
+// force either path at any batch to compare them directly.
 //
 // Layer 45 (the MTP draft layer) is loaded by nothing here and speculation is
 // off; the vision tower is ignored.
@@ -45,6 +52,8 @@ struct StageMs {
            moe_experts + moe_shared + expert_stream + lm_head;
   }
 };
+
+enum class MoePath { kAuto, kForceGemv, kForceGrouped };
 
 class DecodeEngine {
  public:
@@ -89,6 +98,17 @@ class DecodeEngine {
   // step when on.
   void set_telemetry(bool on) { telemetry_ = on; }
   bool telemetry() const { return telemetry_; }
+
+  // Test-only override of the GEMV/grouped-GEMM crossover (model.cu). kAuto
+  // (default) picks by batch size against the measured kGroupedMoeMinBatch.
+  void set_moe_path(MoePath p) { moe_path_ = p; }
+  MoePath moe_path() const { return moe_path_; }
+
+  // Test-only: the raw lm_head logits row for one stream slot from the last
+  // step() call, copied to host. Used to compare the grouped and GEMV MoE
+  // paths directly (tests/test_moe_grouped.cu) rather than only through the
+  // greedy token they produce.
+  std::vector<float> last_logits(int stream) const;
   const std::unordered_map<std::string, float>& telemetry_absmax() const {
     return telemetry_absmax_;
   }
@@ -98,6 +118,9 @@ class DecodeEngine {
   void run_mla(int layer, int slot, int batch, const int* n_tokens_dev, int n_pools_max);
   void run_dense_mlp(int layer, int batch);
   void run_moe(int layer, int batch);
+  void run_moe_gemv(int layer, int batch, const std::vector<int>& idx);
+  bool run_moe_grouped(int layer, int batch, const std::vector<int>& idx,
+                       const std::vector<float>& wts);
   float sync_rms_slot0(const bf16* x, int n);
   void record_absmax(const std::string& name, const bf16* x, int batch, int n);
 
@@ -146,6 +169,27 @@ class DecodeEngine {
   int* topk_idx_ = nullptr;
   // single-row scratch for the unbatched routed-expert GEMV loop
   bf16 *exp_gate_ = nullptr, *exp_up_ = nullptr, *exp_h_ = nullptr, *exp_out_ = nullptr;
+
+  // --- grouped-GEMM (stage 2) routed-expert scratch, sized to the worst
+  // case of one group per gathered row: max_batch * num_experts_per_tok. ---
+  int moe_max_rows_ = 0;
+  bf16* moe_x_ = nullptr;              // [rows, H] gathered stream residuals
+  std::uint8_t* moe_a1_packed_ = nullptr;  // [rows, H/2] NVFP4 activations, w13
+  std::uint8_t* moe_a1_sf_ = nullptr;      // swizzled SFA slabs, w13
+  bf16* moe_gu_ = nullptr;             // [rows, 2*MI] fused w13 raw output
+  bf16* moe_h_ = nullptr;              // [rows, MI] post-swiglu
+  std::uint8_t* moe_a2_packed_ = nullptr;  // [rows, MI/2] NVFP4 activations, w2
+  std::uint8_t* moe_a2_sf_ = nullptr;      // swizzled SFA slabs, w2
+  bf16* moe_out_ = nullptr;            // [rows, H] w2 raw output
+  int* moe_row_of_ = nullptr;          // [rows] source/dest stream slot
+  int* moe_row_in_group_ = nullptr;    // [rows] row index within its group
+  int* moe_group_of_row_ = nullptr;    // [rows] which group (active expert)
+  long long* moe_sf1_base_ = nullptr;  // [rows] per-group SFA byte offset, w13
+  long long* moe_sf2_base_ = nullptr;  // [rows] per-group SFA byte offset, w2
+  float* moe_gate_global_ = nullptr;   // [rows] per-group gate weight_scale_2
+  float* moe_up_global_ = nullptr;     // [rows] per-group up weight_scale_2
+  float* moe_scatter_w_ = nullptr;     // [rows] topk_w * down weight_scale_2
+  MoePath moe_path_ = MoePath::kAuto;
   bf16 *mlp_gate_ = nullptr, *mlp_up_ = nullptr, *mlp_h_ = nullptr, *mlp_out_ = nullptr;
   bf16* acc_ = nullptr;
   float *logits_ = nullptr, *scratch_f_ = nullptr;

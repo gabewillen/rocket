@@ -184,8 +184,20 @@ void gemv_nvfp4(bf16* y, const std::uint8_t* packed, const std::uint8_t* block_s
 // block scale per 16 contiguous columns, written in the CUTLASS SFA swizzle,
 // and nibble-packed data. The per-tensor A scale is 1, so the block scale
 // alone carries the row's range.
-void nvfp4_quantize_rows(std::uint8_t* packed, std::uint8_t* sf_swizzled, const bf16* x, int rows,
-                         int k, cudaStream_t s);
+//
+// `rows` activations are already sorted into groups (one group per active
+// expert this step; see model.cu::run_moe). Packed data is globally
+// contiguous in call order, row `i` at `packed + i*(k/2)`, since it carries
+// no swizzle. Scale factors are swizzled *within a group*, because CUTLASS's
+// SFA layout is sized to that group's own M (nvfp4.h::SfLayout): row `i`
+// belongs to group `group_of_row[i]`, is the `row_in_group[i]`-th row of
+// that group, and its group's swizzled scale slab starts at byte
+// `group_sf_base[group_of_row[i]]` of `sf_swizzled`. The caller owns slab
+// sizing and zeroing (a group's tail padding above its own M must be zero,
+// same as fuel::swizzle_block_scales).
+void nvfp4_quantize_rows(std::uint8_t* packed, std::uint8_t* sf_swizzled, const bf16* x,
+                         const int* row_in_group, const int* group_of_row,
+                         const long long* group_sf_base, int rows, int k, cudaStream_t s);
 
 // acc[row] += w[row*k_stride + widx] * v[row], elementwise.
 void axpy_bf16(bf16* acc, const bf16* v, const float* w, int widx, int w_stride, int batch, int n,
