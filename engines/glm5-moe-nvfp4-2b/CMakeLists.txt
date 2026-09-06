@@ -38,12 +38,16 @@ set(ROCKET_PAGE_BYTES 65536 CACHE STRING "Host page size the plan is aligned to"
 
 add_library(rocket_engine STATIC
   src/engine.cu
+  src/kernels.cu
+  src/weights.cu
+  src/model.cu
 )
 target_include_directories(rocket_engine PUBLIC src)
 target_compile_definitions(rocket_engine PUBLIC
   ROCKET_PAGE_BYTES=${ROCKET_PAGE_BYTES}
   ROCKET_CUDA_ARCH=${ROCKET_CUDA_ARCH}
 )
+target_link_libraries(rocket_engine PUBLIC rocket_fuel)
 target_compile_options(rocket_engine PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>
 )
@@ -57,8 +61,14 @@ set_target_properties(rocket_engine PROPERTIES
 add_library(rocket_fuel STATIC
   src/safetensors.cc
   src/nvfp4.cc
+  src/model_config.cc
+  src/tokenizer.cc
 )
 target_include_directories(rocket_fuel PUBLIC src)
+# The layer registry is read from the repository's own fuel description rather
+# than compiled in, so the loader needs to know where the repository is.
+target_compile_definitions(rocket_fuel PUBLIC
+  ROCKET_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set_target_properties(rocket_fuel PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Pinned CUTLASS checkout, shared by bench/ and tests/.
@@ -68,6 +78,10 @@ set(ROCKET_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
 # and reports what the engine plan has to be compiled against.
 add_executable(rocket-test-stand src/test_stand.cu)
 target_link_libraries(rocket-test-stand PRIVATE rocket_engine)
+
+# The forward pass: load the fuel, run the step, print tokens and per-stage ms.
+add_executable(rocket-decode src/decode_main.cu)
+target_link_libraries(rocket-decode PRIVATE rocket_engine rocket_fuel)
 
 enable_testing()
 add_test(NAME test-stand COMMAND rocket-test-stand)

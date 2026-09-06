@@ -100,8 +100,14 @@ minimum_boosters: 2                      # no format fits one booster [fuel]
 serving_regime:
   concurrency_first: true
   weight_traffic:
-    single_token_active_gib: 9.6         # 18B active at ~4.25 bits [fuel][bw]
-    single_token_per_booster_gib: 4.8    # split across two [bw]
+    # Measured off safetensors headers 2026-09-07, scripts/runtime/active-set-bytes.py:
+    # only mlp.experts.* is NVFP4; attention, dense MLP, shared expert, router,
+    # hyper-connections, embeddings, lm_head are BF16.
+    single_token_active_gib: 21.05       # 16.62 BF16 + 4.43 nvfp4 experts [rt]
+    single_token_per_booster_gib: 10.5   # split across two [rt] derived: true
+    ruled_out:
+      single_token_active_gib: 9.6       # assumed ~4.25 bits everywhere; the
+      # checkpoint is mixed precision, see [rt] blog/posts/runtime/2026-09-07-one-booster-decodes-end-to-end/
     # Only 8 of 288 experts fire per token, so tokens that share experts
     # amortize the read [fuel]. As concurrent streams rise, the union of
     # experts fired per step approaches all 288 and per-step weight traffic
@@ -111,5 +117,6 @@ serving_regime:
   # Recorded because published stacks are measured there, not because it is
   # what this engine optimizes.
   single_stream_reference:
-    ceiling_tok_s: 49.6                  # 238 GB/s per booster, split pair [bw]
+    ceiling_tok_s: 21.1                  # 238 GB/s per booster, split pair, 21.05 GiB/token [rt]
+    ruled_out_ceiling_tok_s: 49.6        # from the 9.6 GiB figure above [bw]
     measured_best_stack_tok_s: 25.4      # vLLM EXL3 4bpw + DFlash2 k=7 TP=2 [bw]

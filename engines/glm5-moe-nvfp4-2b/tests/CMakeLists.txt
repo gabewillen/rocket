@@ -1,5 +1,21 @@
-# Correctness tests. Each one runs under ctest and returns 77 to skip when the
-# artifact it needs (a checkpoint, a second booster) is not on this node.
+# Correctness tests. Each one returns 77 to skip when the artifact it needs (a
+# checkpoint, a second booster) is not on this node.
+
+# Decode kernels against CPU references. Synthetic inputs, so no checkpoint.
+add_executable(test-kernels test_kernels.cu)
+target_link_libraries(test-kernels PRIVATE rocket_engine rocket_fuel)
+set_target_properties(test-kernels PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME kernels COMMAND test-kernels)
+set_tests_properties(kernels PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+# The layer registry and the tokenizer, both read off the checkpoint.
+add_executable(test-fuel-registry test_fuel_registry.cc)
+target_link_libraries(test-fuel-registry PRIVATE rocket_fuel)
+set_target_properties(test-fuel-registry PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME fuel-registry COMMAND test-fuel-registry)
+set_tests_properties(fuel-registry PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 
 if(NOT EXISTS "${ROCKET_CUTLASS_DIR}/include/cutlass/cutlass.h")
   message(STATUS
