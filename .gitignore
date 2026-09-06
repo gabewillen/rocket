@@ -10,3 +10,4 @@ scripts/hardware/cpu-mem-contend
 
 engines/*/build/
 compile_commands.json
+engines/*/third_party/

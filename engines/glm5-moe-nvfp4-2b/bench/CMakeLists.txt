@@ -25,3 +25,31 @@ function(rocket_add_bench name)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bench"
   )
 endfunction()
+
+# CUTLASS is header-only for the kernel. Pinned checkout and exact commit:
+#   third_party/cutlass, ROCKET_PINNED_SHA
+# sm_121a is an upstream-supported arch (CUTLASS_NVCC_ARCHS_SUPPORTED, CUDA>=12.9);
+# no patch is needed to target this box.
+find_package(CUDAToolkit REQUIRED)
+
+set(ROCKET_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cutlass")
+
+if(EXISTS "${ROCKET_CUTLASS_DIR}/include/cutlass/cutlass.h")
+  rocket_add_bench(nvfp4-grouped-gemm nvfp4_grouped_gemm.cu)
+  target_include_directories(bench-nvfp4-grouped-gemm PRIVATE
+    "${ROCKET_CUTLASS_DIR}/include"
+    "${ROCKET_CUTLASS_DIR}/tools/util/include"
+  )
+  # Block-scaled FP4 MMA needs the arch-accelerated variant of this SM.
+  target_compile_options(bench-nvfp4-grouped-gemm PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  )
+  set_target_properties(bench-nvfp4-grouped-gemm PROPERTIES
+    CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}a"
+  )
+  target_link_libraries(bench-nvfp4-grouped-gemm PRIVATE CUDA::cublas)
+else()
+  message(STATUS
+    "bench-nvfp4-grouped-gemm skipped: no CUTLASS at ${ROCKET_CUTLASS_DIR}. "
+    "Fetch it with engines/glm5-moe-nvfp4-2b/bench/fetch-cutlass.sh")
+endif()

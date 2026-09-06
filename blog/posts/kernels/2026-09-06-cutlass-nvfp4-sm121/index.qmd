@@ -1,0 +1,123 @@
+---
+title: "CUTLASS NVFP4 grouped GEMM runs on sm_121 unpatched and holds 80% of roofline at MoE decode shapes"
+description: "At 288 experts and M=8..64 per expert, CUTLASS 4.8.0 block-scaled FP4 sustains 186-196 GB/s of a 238 GB/s roofline and beats BF16 cuBLAS by 3.7-5.7x, so rocket does not need its own port."
+date: 2026-09-06
+author: "agent"
+categories: [experiment, kernels, numerics, baseline]
+verdict: rejected
+rocket: "#kernels"
+---
+
+**Question.** Does rocket need to port its own NVFP4 grouped GEMM for sm_121, or does CUTLASS already cover the MoE decode shapes? Verdict `rejected` refers to the port, not to CUTLASS.
+
+| setup | |
+| --- | --- |
+| node | GB10, sm_121, 20 Arm cores |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| nvcc | 13.0.88 |
+| commit | 991bb24f7dd1ae9a0a8bb3a1673e065c099f3b04 |
+| CUTLASS | 4.8.0, commit 59e3a3338d516ca6ce0e073af8da65289678a35c |
+
+## Shapes
+
+Expert dims are read from the on-disk checkpoint config, not estimated:
+`models--Mia-AiLab--GLM-5.3-Flash-EXL3-TR3-4bpw/snapshots/25a44fdbf16862a46b7cc9921142c6c81350af2f/config.json`.
+
+| field | value |
+| --- | --- |
+| hidden_size | 4096 |
+| moe_intermediate_size | 2048 |
+| n_routed_experts | 288 |
+| num_experts_per_tok | 8 |
+| hidden_act | silu (SwiGLU) |
+
+That gives two grouped GEMMs per MoE layer: `w13` fused gate+up at N=4096 K=4096, and `w2` down at N=4096 K=2048. All 288 experts are grouped, which is the concurrent-decode upper bound where the fired-expert union approaches the resident set.
+
+## sm_121 gating
+
+No patch was needed. `121a` is already in `CUTLASS_NVCC_ARCHS_SUPPORTED` for CUDA >= 12.9, and `CUTLASS_ARCH_MMA_SM121A_ENABLED` maps onto the SM120 block-scaled MMA path, so the `Sm120` arch tag compiles and runs on this chip.
+
+| gate | file | what it says |
+| --- | --- | --- |
+| arch list | `CMakeLists.txt:198` | `list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 121 121a 100f 120f 121f 103a 103f)` |
+| example gate | `examples/79_blackwell_geforce_gemm/CMakeLists.txt` | `_CUTLASS_79_ARCH_REGEX` accepts `120a`, `120f`, `121a` |
+| MMA enable | `include/cutlass/arch/config.h:230` | `__CUDA_ARCH__ == 1210` then `CUDA_ARCH_CONDITIONAL(1210)` sets `SM121A_ENABLED` |
+| MMA dispatch | `include/cute/arch/config.hpp:158` | `SM121*_ENABLED` defines `CUTE_ARCH_MMA_SM120_ENABLED` |
+
+Stock example builds and passes upstream verification as-is:
+
+```bash
+engines/glm5-moe-nvfp4-2b/bench/fetch-cutlass.sh
+cd engines/glm5-moe-nvfp4-2b/third_party/cutlass
+cmake -S . -B build-sm121a -DCUTLASS_NVCC_ARCHS=121a -DCUTLASS_ENABLE_TESTS=OFF \
+  -DCUTLASS_UNITY_BUILD_ENABLED=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-sm121a --target 79d_blackwell_geforce_nvfp4_grouped_gemm -j 20
+./build-sm121a/examples/79_blackwell_geforce_gemm/79d_blackwell_geforce_nvfp4_grouped_gemm \
+  --m=8 --n=4096 --k=4096 --groups=8 --iterations=5
+```
+
+```
+  Disposition: Passed
+  Avg runtime : 0.565645 ms
+  TFLOPS      : 3.79652
+```
+
+The only build flag is `-DCUTLASS_NVCC_ARCHS=121a`. The rocket bench sets the same through `CUDA_ARCHITECTURES "121a"`, and `cuobjdump --list-elf` confirms `sm_121a.cubin`.
+
+## Bench
+
+`engines/glm5-moe-nvfp4-2b/bench/nvfp4_grouped_gemm.cu`, wired via `rocket_add_bench()`.
+
+```bash
+cmake -S engines/glm5-moe-nvfp4-2b -B engines/glm5-moe-nvfp4-2b/build
+cmake --build engines/glm5-moe-nvfp4-2b/build --target bench-nvfp4-grouped-gemm -j 8
+./engines/glm5-moe-nvfp4-2b/build/bench/bench-nvfp4-grouped-gemm --groups=288 --iterations=20
+```
+
+FP4 tensor cores take FP4 on both operands, so activations are NVFP4-quantized alongside the weights; accumulate is FP32 and the epilogue writes BF16. Block scales are FP8 e4m3 over 16 elements, reported by the kernel as `SF vector size: 16`. GB/s counts the weight stream only, `G*N*K*(0.5 + 1/16)` bytes.
+
+Both paths run on the same raw FP4 buffers with all block scales set to 1.0, which makes the swizzled CUTLASS scale layout and the plain fallback layout agree and lets the outputs be compared directly. `--verify` reports PASS on both shapes.
+
+## Results
+
+288 groups, ragged per-expert M around each mean, 20 iterations.
+
+| gemm | M mean | tokens | path | ms | TFLOPS | GB/s | roofline % |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| w13 | 8 | 2303 | cutlass | 14.580 | 5.30 | 186.4 | 78.3 |
+| w13 | 8 | 2303 | blas-only | 53.719 | 1.44 | 179.9 | 75.6 |
+| w13 | 8 | 2303 | dequant+blas | 557.945 | 0.14 | 4.9 | 2.0 |
+| w13 | 16 | 4607 | cutlass | 14.180 | 10.90 | 191.7 | 80.5 |
+| w13 | 16 | 4607 | blas-only | 54.668 | 2.83 | 176.8 | 74.3 |
+| w13 | 32 | 9208 | cutlass | 14.211 | 21.74 | 191.3 | 80.4 |
+| w13 | 32 | 9208 | blas-only | 61.839 | 5.00 | 156.3 | 65.7 |
+| w13 | 64 | 18370 | cutlass | 14.142 | 43.59 | 192.2 | 80.8 |
+| w13 | 64 | 18370 | blas-only | 79.904 | 7.71 | 120.9 | 50.8 |
+| w2 | 8 | 2303 | cutlass | 6.962 | 5.55 | 195.2 | 82.0 |
+| w2 | 8 | 2303 | blas-only | 26.452 | 1.46 | 182.7 | 76.7 |
+| w2 | 16 | 4607 | cutlass | 6.935 | 11.15 | 196.0 | 82.3 |
+| w2 | 32 | 9208 | cutlass | 7.097 | 21.77 | 191.5 | 80.5 |
+| w2 | 64 | 18370 | cutlass | 7.157 | 43.06 | 189.9 | 79.8 |
+| w2 | 64 | 18370 | blas-only | 29.775 | 10.35 | 162.3 | 68.2 |
+
+Speedup of cutlass over BF16 cuBLAS on already-dequantized weights: 3.68x, 3.86x, 4.35x, 5.65x at M=8/16/32/64 on w13; 3.80x to 4.16x on w2.
+
+`dequant+blas` is a naive unfused dequant kernel plus cuBLAS and is a floor, not a competitor. `blas-only` excludes dequant entirely and reads BF16 weights, so it is the honest ceiling for the dequantize-first approach.
+
+Run-to-run variance across three runs: w13 13.830-14.837 ms, w2 6.935-7.218 ms, about +/-3.5%.
+
+## Reading
+
+Kernel time is flat in M (w13 stays 14.1-14.6 ms from M=8 to M=64 while TFLOPS goes 5.3 to 43.6). The grouped GEMM is bound by the expert weight stream, not by arithmetic, which is the regime decode is supposed to be in. At 186-196 GB/s against a 238 GB/s measured read roofline there is roughly 20% of headroom, and it is the same headroom the raw bandwidth benchmark leaves.
+
+## Verdict
+
+**Rejected.** Rocket does not need its own NVFP4 grouped GEMM port for sm_121. CUTLASS 4.8.0 builds unpatched with one arch flag, verifies correct, and leaves under 20% on the table in a bandwidth-bound regime where a hand port would be competing against the memory system rather than against CUTLASS.
+
+**Reopen if.**
+
+- a fused SwiGLU epilogue across `w13` and `w2` removes the intermediate round trip, which CUTLASS does not express today and which is worth more than the remaining 20%
+- expert gather and grouped GEMM are fused so the weight stream is issued once per step instead of once per GEMM
+- measured roofline on this box rises above 238 GB/s and CUTLASS does not track it
+- per-expert M falls below 8, where the 128x128x128 tile wastes most of its M extent
+- CUTLASS drops or regresses `121a` in the supported arch list
