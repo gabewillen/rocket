@@ -1,0 +1,69 @@
+# Booster: gx10-2a13 (peer)
+#
+# One booster is one DGX Spark GB10 node (blog/rocket.qmd#boosters). Sources:
+#   [base]   blog/posts/hardware/2026-09-05-spark-cluster-baseline/
+#   [bw]     blog/posts/hardware/2026-09-06-measured-bandwidth/
+#   [cuda]   blog/posts/hardware/2026-09-06-cuda-free-counts-page-cache/
+#   [k64]    blog/posts/hardware/2026-09-06-rebuilt-kernel-returns-0.9gib/
+#   [nic]    blog/posts/fabric/2026-09-06-idle-nic-ports-hold-half-gib/
+#   [limits] blog/posts/hardware/2026-09-05-gb10-execution-limits/
+
+id: gx10-2a13
+role: peer                               # headless, no GPU clients [k64]
+
+device:                                  # [base], SM counts from static fire
+  name: NVIDIA GB10
+  compute_capability: "12.1"
+  arch: sm_121
+  driver: 580.173.02
+  sms: 48
+  max_threads_per_sm: 1536
+  max_blocks_per_sm: 24
+  # A kernel above this is rejected at build time (blog/rocket.qmd#kernels).
+  max_dynamic_shared_bytes_per_block: 101376   # ~99 KiB [limits]
+  unified_memory: true
+  # C2C segfaults on CPU reads of cudaMalloc memory; host-touched buffers are
+  # managed or host memory [limits].
+  host_readable_cudamalloc: false
+
+host:
+  cpu_cores: 20                          # [base]
+  kernel: 6.17.13-rocket64k              # [k64]
+  page_bytes: 65536                      # [base]
+  hugepage_bytes: 536870912              # 512 MiB [base]
+  mem_total_kb: 129735360                # 123.73 GiB [base]
+  # MemAvailable is the budget input, MemTotal never is (blog/rocket.qmd#memory).
+  mem_available_gib: 119.58              # caches dropped, driver loaded [k64]
+  os_floor_gib: 5                        # hard minimum (blog/rocket.qmd#memory)
+
+memory_bandwidth:                        # measured, not datasheet [bw]
+  read_gb_s: 238
+  read_best_gb_s: 241.3
+  copy_gb_s: 215
+  triad_gb_s: 215
+  datasheet_gb_s: 273
+  # Block-gather at 64 KiB chunks costs nothing versus sequential, so a top-k
+  # expert read gets full bandwidth [bw].
+  block_gather_64kib_gb_s: 240.2
+  sparse_float4_stride_64kib_gb_s: 91.53
+
+rails:                                   # [bw][nic]
+  - name: rail1
+    netdev: enp1s0f1np1
+    pci: "0000:01:00.1"
+    rdma: rocep1s0f1
+    address: 192.168.100.11
+    port_gb_s: 200                       # Gb/s wire
+    measured_gb_s_4qp: 111.86            # Gb/s, PCIe Gen5 x4 bound
+  - name: rail2
+    netdev: enP2p1s0f1np1
+    pci: "0002:01:00.1"
+    rdma: roceP2p1s0f1
+    address: 192.168.101.11
+    port_gb_s: 200
+    measured_gb_s_4qp: 111.86
+# Both rails required; single-rail is a startup refusal (blog/rocket.qmd#cluster).
+unbound_pcie_functions:                  # unwired f0 ports, unbound at boot [nic]
+  - "0000:01:00.0"
+  - "0002:01:00.0"
+mem_returned_by_unbind_mib: 444          # [nic]

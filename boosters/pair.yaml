@@ -1,0 +1,31 @@
+# The two-booster rocket. Booster count is part of a rocket's identity: a plan
+# built for two does not launch on three (blog/rocket.qmd#boosters).
+#
+# Sources:
+#   [bw]   blog/posts/hardware/2026-09-06-measured-bandwidth/
+#   [base] blog/posts/hardware/2026-09-05-spark-cluster-baseline/
+
+id: pair
+boosters: [gx10-5e36, gx10-2a13]
+arrangement: split                       # GLM-5.3-Flash fits no single booster
+unified_memory_gib: 247.5                # [base]
+
+# Measured over RoCE v2, GID index 3, perftest. Datasheet dual-rail is ~50 GB/s
+# and is not what the parts deliver [bw].
+fabric:
+  rails_per_booster: 2
+  aggregate_gb_s: 23.1                   # both rails, 4 QP each [bw]
+  per_rail_gb_s: 14.0                    # one rail alone, 4 QP [bw]
+  per_rail_gb_s_both_active: 11.6        # 92.59 Gb/s each, 16% cost [bw]
+  bound_by: pcie_gen5_x4_host_link       # not the 200 Gb/s port [bw]
+  write_latency_us:
+    1kib: 2.28
+    8kib: 3.30
+    16kib: 4.04
+  mtu: 1500                              # active_mtu 1024 of max 4096 [bw]
+
+# Refused at handshake if a booster disagrees (blog/rocket.qmd#cluster).
+handshake_requirements:
+  page_bytes: 65536
+  rails_up: 2
+  kernel: 6.17.13-rocket64k

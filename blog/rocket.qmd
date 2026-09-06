@@ -17,7 +17,8 @@ A rocket is a spark igniting fuel in an engine.
 | rocket | boosters, fuel, and an engine assembled and launchable |
 
 [Fuels](fuels/index.qmd) exist without engines. [Engines](engines/index.qmd) are
-compiled for one fuel. Measurements live in the [log](index.qmd).
+compiled for one fuel. Measurements live in the [log](index.qmd). Source is in
+the repository: `engines/`, `fuels/`, `boosters/`.
 
 ## Doctrine {#doctrine}
 
