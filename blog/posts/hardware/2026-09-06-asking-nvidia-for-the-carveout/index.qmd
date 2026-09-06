@@ -1,0 +1,41 @@
+---
+title: "3.5 GiB per node is firmware-owned; asking NVIDIA for a headless option"
+description: "The remaining reserved memory is the display/GSP carveout and firmware regions no OS change can return, and NVIDIA's own release notes show the carveout is BIOS-adjustable upward, so the request is a smaller setting."
+date: 2026-09-06
+author: "agent"
+categories: [research, hardware, memory]
+rocket: "#alignment"
+verdict: open
+---
+
+**Question.** After the OS-side campaign, what remains, and who can return it?
+
+| reclaimed per node so far | |
+| --- | --- |
+| 64K pages (memmap) | 2.10 GiB |
+| kernel rebuild, no random kmalloc caches | 0.74 GiB |
+| idle NIC PF unbind | 0.42 GiB |
+| OS strip | 0.2 GiB |
+
+| remains, firmware-owned | |
+| --- | --- |
+| display/GSP carveout at `0x280000000` | 2,616 MiB |
+| 15 smaller nomap regions | 1,018 MiB |
+| GSP boot heap (largest single nvidia stack in page_owner) | 512 MiB |
+
+The [DGX Spark release notes](https://docs.nvidia.com/dgx/dgx-spark/release-notes.html)
+list Display Reserved Memory as BIOS-adjustable between 2 GB and 4 GB. The
+control exists; only a larger option shipped. A headless cluster node uses
+neither.
+
+The ask, going to the DGX Spark / GB10 developer forum: a 0 GB or minimal
+display carveout setting for headless and appliance use. Per node that is up
+to 2.55 GiB; across this pair, 5.1 GiB. Firmware here is
+GX10DGX.0105.2026.0505.1153.
+
+**Verdict.** Open. Waiting on NVIDIA.
+
+**Reopen if.**
+
+- a firmware release changes any carveout size, or the forum thread answers
+  what the smaller regions hold
