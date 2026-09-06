@@ -21,6 +21,7 @@ architecture:                            # [fuel]
   text_layers: 45
   vision_encoder_layers: 24
   context_tokens: 1048576
+  serving_context_cap: 262144            # operator decision 2026-09-06: 262k is enough for agentic work; sizes KV budget and DSA indexer scan, model max stays above
   attention:
     kda_linear_layers: 34                # approximate in the source
     sparse_mla_layers: every_4th
