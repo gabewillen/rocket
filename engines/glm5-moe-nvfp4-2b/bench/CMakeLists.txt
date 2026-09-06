@@ -48,6 +48,64 @@ if(EXISTS "${ROCKET_CUTLASS_DIR}/include/cutlass/cutlass.h")
     CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}a"
   )
   target_link_libraries(bench-nvfp4-grouped-gemm PRIVATE CUDA::cublas)
+
+  # One MoE layer step end to end: w13 -> SwiGLU+quantize -> w2, and the
+  # fusion/overlap variants of it.
+  rocket_add_bench(moe-layer-fusion moe_layer_fusion.cu)
+  target_include_directories(bench-moe-layer-fusion PRIVATE
+    "${ROCKET_CUTLASS_DIR}/include"
+    "${ROCKET_CUTLASS_DIR}/tools/util/include"
+  )
+  target_compile_options(bench-moe-layer-fusion PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  )
+  set_target_properties(bench-moe-layer-fusion PROPERTIES
+    CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}a"
+  )
+
+  # Tile shapes below 128 in M, at per-expert M=2..8.
+  rocket_add_bench(nvfp4-tile-sweep nvfp4_tile_sweep.cu)
+  target_include_directories(bench-nvfp4-tile-sweep PRIVATE
+    "${ROCKET_CUTLASS_DIR}/include"
+    "${ROCKET_CUTLASS_DIR}/tools/util/include"
+  )
+  target_compile_options(bench-nvfp4-tile-sweep PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  )
+  set_target_properties(bench-nvfp4-tile-sweep PROPERTIES
+    CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}a"
+  )
+
+  # Does not compile, on purpose: tile M below 128 does not exist for a
+  # block-scaled NVFP4 GEMM. Excluded from ALL.
+  add_executable(bench-tile-m64-probe EXCLUDE_FROM_ALL tile_m64_probe.cu)
+  target_link_libraries(bench-tile-m64-probe PRIVATE rocket_engine)
+  target_include_directories(bench-tile-m64-probe PRIVATE
+    "${ROCKET_CUTLASS_DIR}/include"
+    "${ROCKET_CUTLASS_DIR}/tools/util/include"
+  )
+  target_compile_options(bench-tile-m64-probe PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  )
+  set_target_properties(bench-tile-m64-probe PROPERTIES
+    CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}a"
+  )
+
+  # Does not compile, on purpose: it is the record of the epilogue CUTLASS 4.8.0
+  # cannot build for a grouped GEMM. Excluded from ALL; build it to see the
+  # error quoted in blog/posts/kernels/2026-09-06-moe-layer-fusion/.
+  add_executable(bench-evt-swiglu-aux-probe EXCLUDE_FROM_ALL evt_swiglu_aux_probe.cu)
+  target_link_libraries(bench-evt-swiglu-aux-probe PRIVATE rocket_engine)
+  target_include_directories(bench-evt-swiglu-aux-probe PRIVATE
+    "${ROCKET_CUTLASS_DIR}/include"
+    "${ROCKET_CUTLASS_DIR}/tools/util/include"
+  )
+  target_compile_options(bench-evt-swiglu-aux-probe PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  )
+  set_target_properties(bench-evt-swiglu-aux-probe PROPERTIES
+    CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}a"
+  )
 else()
   message(STATUS
     "bench-nvfp4-grouped-gemm skipped: no CUTLASS at ${ROCKET_CUTLASS_DIR}. "

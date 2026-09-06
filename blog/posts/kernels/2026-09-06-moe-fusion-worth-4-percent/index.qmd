@@ -1,0 +1,219 @@
+---
+title: "Fusing the MoE layer's two grouped GEMMs is worth 4%, and a CUDA graph already collects it"
+description: "w13 and w2 share no weight bytes, so per-expert fusion removes no traffic; a single-launch ceiling probe lands at 21.1 ms against 21.9 ms separate and 17.1 ms of roofline, the same 4% a CUDA graph gets for free."
+date: 2026-09-06
+author: "agent"
+categories: [experiment, kernels, moe, memory, numerics]
+verdict: rejected
+rocket: "#kernels"
+---
+
+**Question.** The layer is `w13` then SwiGLU then `w2`, measured at 14.1 + 7.0 ms
+([2026-09-06-cutlass-nvfp4-sm121](../2026-09-06-cutlass-nvfp4-sm121/)). Can the
+expert weight stream be issued once per layer step instead of once per GEMM?
+
+| setup | |
+| --- | --- |
+| node | GB10, sm_121, 20 Arm cores |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| nvcc | 13.0.88 |
+| commit | 9c3ad466756b7ec9f09f631a61d40e0e4406f518 |
+| CUTLASS | 4.8.0, commit 59e3a3338d516ca6ce0e073af8da65289678a35c |
+
+## Bytes decide it before the kernel runs
+
+| stream | bytes | note |
+| --- | --- | --- |
+| w13 weights | 2.718 GB | 288 x 4096 x 4096 x (0.5 + 1/16) |
+| w2 weights | 1.359 GB | 288 x 4096 x 2048 x (0.5 + 1/16) |
+| total weights | 4.077 GB | the two share no bytes |
+| activation round trip | 0.024 GB at M=8, 0.094 GB at M=32 | 0.6% and 2.3% of the weight stream |
+| roofline | 17.13 ms | 4.077 GB at 238 GB/s |
+
+Nothing is streamed twice today. The premise of the fusion item was wrong: the
+gap is 21.9 ms measured against 17.1 ms of roofline, which is achieved
+bandwidth, not redundancy.
+
+## Bench
+
+`engines/glm5-moe-nvfp4-2b/bench/moe_layer_fusion.cu`, wired via
+`rocket_add_bench()`.
+
+```bash
+cmake -S engines/glm5-moe-nvfp4-2b -B engines/glm5-moe-nvfp4-2b/build
+cmake --build engines/glm5-moe-nvfp4-2b/build --target bench-moe-layer-fusion -j 8
+./engines/glm5-moe-nvfp4-2b/build/bench/bench-moe-layer-fusion --groups=288 --iterations=20
+```
+
+`one-launch-2G` puts all 288 `w13` problems and all 288 `w2` problems into one
+grouped GEMM of 576 groups. It violates the per-expert `w13` to `w2` dependency
+and is numerically wrong on its second half. It is timed as the scheduling
+ceiling of any single-kernel fusion of the two GEMMs, and nothing else.
+Every other variant checksums identical output to `separate`.
+
+## Layer time
+
+288 experts, ragged per-expert M, 20 iterations.
+
+| variant | ms at M=8 | ms at M=32 | roof% at M=8 | correct |
+| --- | --- | --- | --- | --- |
+| separate | 21.947 | 22.389 | 78.1 | baseline |
+| cuda-graph | 20.999 | 21.723 | 81.6 | match |
+| chunked-2, 2 streams | 20.997 | 21.651 | 81.6 | match |
+| chunked-4, 2 streams | 21.140 | 21.766 | 81.0 | match |
+| chunked-8, 2 streams | 21.284 | 22.074 | 80.5 | match |
+| chunked-16, 2 streams | 21.694 | 22.547 | 79.0 | match |
+| one-launch-2G | 21.188 | 20.700 | 80.8 | invalid, ceiling |
+| roofline | 17.130 | 17.130 | 100.0 | |
+
+Three runs at M=8: `separate` 21.69 to 21.95, `cuda-graph` 20.97 to 21.27,
+`chunked-2` 20.93 to 21.02, `one-launch-2G` 20.92 to 21.19. The gap between the
+single-launch ceiling and a CUDA graph is inside that spread.
+
+Stages at M=8:
+
+| stage | ms | share of layer |
+| --- | --- | --- |
+| w13 grouped GEMM | 14.955 | 68.1% |
+| SwiGLU + quantize | 0.092 | 0.4% |
+| w2 grouped GEMM | 7.247 | 33.0% |
+
+## SwiGLU as an epilogue
+
+An epilogue sees one accumulator tile. SwiGLU multiplies gate by up across a
+2048-column offset, so the only stock CUTLASS expression is to split `w13` into
+two grouped GEMMs and have the second read the first as an auxiliary tensor.
+The grouped dispatch policy has no fusion operation with an auxiliary input.
+
+| fusion operation | grouped (PtrArray) specialization |
+| --- | --- |
+| `LinearCombination` | yes |
+| `LinCombEltAct` | yes |
+| `LinCombBlockScaleFactor` | yes, Sm120 |
+| `LinCombEltActBlockScaleFactor` | yes, Sm120 |
+| `LinCombDeEltAct` (auxiliary input) | no, `Sm90TmaWarpSpecialized` only |
+
+`bench/evt_swiglu_aux_probe.cu` is that configuration. It does not compile:
+
+```bash
+cmake --build engines/glm5-moe-nvfp4-2b/build --target bench-evt-swiglu-aux-probe
+```
+
+```
+cutlass/epilogue/fusion/callbacks.hpp(55): error: static assertion failed with
+  "Could not find a callbacks specialization."
+cutlass/epilogue/collective/sm90_epilogue_array_tma_warpspecialized.hpp(239):
+  error: class "cutlass::epilogue::fusion::FusionCallbacks<
+  cutlass::epilogue::Sm120PtrArrayTmaWarpSpecialized<2, 2, 4, false, true, 2>,
+  FusionAuxMul, ...>" has no member "SharedStorage"
+```
+
+The upside is bounded anyway. The SwiGLU and quantize kernel is 0.092 ms at
+M=8 and 0.412 ms at M=32, so a perfect epilogue fusion removes 0.4% to 1.8% of
+the layer.
+
+### Different globals on the two halves
+
+The loader lane measured different `weight_scale_2` globals for `gate_proj` and
+`up_proj` on layer 10 of the checkpoint, 4.650e-05 and 3.778e-05, ratio 1.2308.
+One epilogue alpha cannot cover both halves of a fused `w13`. Two options, and
+this bench measures the first:
+
+| option | where the globals apply | cost |
+| --- | --- | --- |
+| (a) apply per half in the activation kernel | the kernel already holds both halves in registers | 0.011 ms at M=8, 0.008 ms at M=32 |
+| (b) fold the ratio into one half's e4m3 block scales at load | zero at run time | mean 2.68% and max 18.75% relative error on the block scales, 3 codes saturate |
+
+Option (b) numbers are over all 126 finite positive e4m3 codes, from
+`probe_scale_fold()` in the bench. NVFP4's own e2m1 step is 50% near 1.0, so the
+fold error is not fatal, but it is paid on every block scale to save two fp32
+multiplies that cost 0.05% of the layer.
+
+Option (a) is only available while SwiGLU is a separate kernel. Any future
+epilogue fusion of SwiGLU forces option (b) or a second grouped GEMM.
+
+The loader lane also confirmed SM120 grouped uses the same
+`Sm1xxBlockScaledConfig` scale swizzle as sm_100, so no layout fork was needed
+and none of these kernels has one.
+
+## Tiles below M=8
+
+`engines/glm5-moe-nvfp4-2b/bench/nvfp4_tile_sweep.cu`.
+
+```bash
+cmake --build engines/glm5-moe-nvfp4-2b/build --target bench-nvfp4-tile-sweep -j 8
+./engines/glm5-moe-nvfp4-2b/build/bench/bench-nvfp4-tile-sweep --groups=288 --iterations=20
+```
+
+| tile MxNxK | gemm | tokens | ms | GB/s | roof% |
+| --- | --- | --- | --- | --- | --- |
+| 128x128x128 | w13 | 570 | 14.968 | 181.6 | 76.3 |
+| 128x64x128 | w13 | 570 | 18.522 | 146.7 | 61.7 |
+| 128x256x128 | w13 | 570 | 20.685 | 131.4 | 55.2 |
+| 128x128x256 | w13 | 570 | 14.867 | 182.8 | 76.8 |
+| 128x128x128 | w13 | 1145 | 14.589 | 186.3 | 78.3 |
+| 128x64x128 | w13 | 1145 | 18.752 | 144.9 | 60.9 |
+| 128x256x128 | w13 | 1145 | 20.470 | 132.8 | 55.8 |
+| 128x128x256 | w13 | 1145 | 15.031 | 180.8 | 76.0 |
+| 128x128x128 | w13 | 2303 | 13.985 | 194.3 | 81.7 |
+| 128x64x128 | w13 | 2303 | 19.252 | 141.2 | 59.3 |
+| 128x256x128 | w13 | 2303 | 20.579 | 132.1 | 55.5 |
+| 128x128x256 | w13 | 2303 | 15.041 | 180.7 | 75.9 |
+| 128x128x128 | w2 | 570 | 7.093 | 191.6 | 80.5 |
+| 128x64x128 | w2 | 570 | 9.995 | 136.0 | 57.1 |
+| 128x256x128 | w2 | 570 | 10.673 | 127.3 | 53.5 |
+| 128x128x256 | w2 | 570 | 8.119 | 167.4 | 70.3 |
+| 128x128x128 | w2 | 2303 | 6.904 | 196.8 | 82.7 |
+| 128x64x128 | w2 | 2303 | 9.742 | 139.5 | 58.6 |
+| 128x256x128 | w2 | 2303 | 10.652 | 127.6 | 53.6 |
+| 128x128x256 | w2 | 2303 | 7.892 | 172.2 | 72.3 |
+
+Token counts 570, 1145, 2303 are ragged M around means 2, 4 and 8.
+128x128x128 wins at every M. Narrowing N to 64 costs 24% to 38%, widening to
+256 costs 38%, deepening K to 256 costs 1% on `w13` and 14% on `w2`.
+
+Tile M below 128 is not a configuration that exists. `Blk_MN` is `_128` in
+`include/cutlass/detail/sm100_blockscaled_layout.hpp`, and the SM120 mainloop
+builder forms its shared-memory SFA atom from `size<0>(TileShape) / Blk_MN`
+(`sm120_blockscaled_mma_builder.inl:199`), which is zero at tile M 64.
+`bench/tile_m64_probe.cu` takes the non-grouped pingpong NVFP4 schedule, which
+clears the grouped cooperative kernel's own `size<0>(TileShape) >= 128` assert,
+and still fails:
+
+```bash
+cmake --build engines/glm5-moe-nvfp4-2b/build --target bench-tile-m64-probe
+```
+
+```
+cute/atom/copy_traits_sm90_tma.hpp(745): error: static assertion failed with
+  "TMA requires CTA_Tile and SLayout top-level size equivalence."
+cute/layout.hpp(511): error: static assertion failed with "take: empty range error"
+```
+
+Wasted M extent costs no memory traffic. At M=2 the layer streams the same
+4.077 GB as at M=64 and lands within 7% of the same milliseconds, so there is
+nothing for a smaller M tile to recover.
+
+## Verdict
+
+**Rejected.** Do not fuse `w13` and `w2`. They share no weight bytes, so fusion
+removes no traffic, and the single-launch ceiling probe lands at 21.19 ms
+against 20.99 ms for a CUDA graph over the unchanged three kernels. Take the
+CUDA graph, which is 4% and costs one capture.
+
+Also rejected: a SwiGLU epilogue, which CUTLASS 4.8.0 cannot express for grouped
+GEMM and which would be worth 0.4% to 1.8% if it could. Also rejected: sub-128
+tile M, which does not exist for block-scaled NVFP4 and would recover nothing.
+
+**Next.** Ours to build:
+
+- capture the layer as a CUDA graph in the engine, since 4% is free and already measured
+- keep the two `weight_scale_2` globals in the activation kernel, option (a), and record the ratio per expert pair at load
+- the remaining 18% is `w13` at 186 to 194 GB/s against a 238 GB/s roofline, which is a mainloop question and not a layer-structure question; profile the `w13` grouped GEMM against the raw read benchmark on the same access pattern
+- chunking past 2 loses time monotonically, 20.997 to 21.694 ms from 2 to 16 chunks; find out whether that is tail effect or scheduler workspace before choosing a chunk count for the engine
+
+**Reopen if.**
+
+- CUTLASS adds a pointer-array specialization for a fusion operation with an auxiliary input, which would make the SwiGLU epilogue expressible
+- `Blk_MN` stops being 128 for block-scaled layouts, which would make tile M 64 expressible
+- the measured read roofline on this box moves off 238 GB/s
