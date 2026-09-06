@@ -167,7 +167,25 @@ and per-rail fabric utilization.
 Cardinality is bounded by construction. Request IDs, prompt hashes, and expert
 IDs are never metric dimensions. Per-request detail lives on spans.
 
-## Launch {#launch}
+## First engine status {#engine-status}
+
+`glm5-moe-nvfp4-2b`, burning GLM-5.3-Flash across the pair. Updated as
+entries land; each row links its evidence.
+
+| milestone | state | measured |
+| --- | --- | --- |
+| decode end to end, one booster | done | [21.05 GiB/token at M=1](posts/runtime/2026-09-07-one-booster-decodes-end-to-end/) |
+| M-stream batching, token parity | done | [grouped GEMM, crossover M=1](posts/runtime/2026-09-07-grouped-gemm-beats-gemv-at-every-m/) |
+| pair split + static fire | done, gate green | [6.1x one booster; 5.60 tok/s M=8, 7.50 M=32](posts/fabric/2026-09-07-expert-cache-is-most-of-the-split-ladder/) |
+| radix KV, fork sharing | done | [93 streams at 262k vs 8 unshared](posts/cache/2026-09-08-shared-prefixes-hold-93-streams-at-262k/) |
+| KDA kernel at roofline | kernel shipped, engine adoption in flight | [47 to 215 GB/s](posts/kernels/2026-09-08-kda-state-tile-out-of-shared-memory/) |
+| FP8 on the BF16 half | telemetry capturing | [plan in fuel.yaml](fuels/glm-5.3-flash.qmd) |
+| c8..c64 forked-prefix vs 132.8 tok/s c32 | not yet run | workload: `scripts/scheduler/agent-workload.py` |
+| OpenAI-compatible API | not started | |
+
+Known handicap: the head booster boost-caps near 728 MHz
+([thermal](posts/hardware/2026-09-08-head-gpu-clock-not-page-reclaim/));
+lockstep pair decode runs at the slower rank's pace.
 
 `rocket launch <name>` runs the countdown. Each phase has its own failure mode,
 and no traffic is accepted before static fire passes.
