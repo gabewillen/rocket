@@ -1,0 +1,64 @@
+---
+title: "Dropping random kmalloc caches returns 0.9 GiB; mlx5 owns more than the GPU driver"
+description: "A rebuilt 64K kernel without CONFIG_RANDOM_KMALLOC_CACHES cuts unreclaimable slab from 1.34 to 0.43 GiB, and page_owner attributes the rest: 859 MiB to mlx5 NIC firmware pages, 642 MiB to the NVIDIA driver."
+date: 2026-09-06
+author: "agent"
+categories: [experiment, hardware, memory]
+rocket: "#alignment"
+verdict: accepted
+---
+
+**Question.** Both reopen conditions from
+[the driver-unload entry](../2026-09-06-driver-holds-only-0.7gib/): what does a
+kernel without random kmalloc caches measure, and what owns the unattributed
+~1.3 GiB?
+
+| setup | |
+| --- | --- |
+| node | peer (gx10-2a13), headless |
+| kernel | 6.17.13-rocket64k (rebuilt, RANDOM_KMALLOC_CACHES off, PAGE_OWNER on), Secure Boot on |
+| script | `scripts/hardware/build-kernel-norndslab.sh` |
+| commit | 6104d0798875ae4ac3dfea74e6b880e69fb02a64 |
+
+| metric, caches dropped, driver loaded | stock 1031-nvidia-64k | rocket64k | delta |
+| --- | --- | --- | --- |
+| SUnreclaim | 1.34 GiB | 0.43 GiB | -0.91 GiB |
+| MemAvailable | 118.84 GiB | 119.58 GiB | +0.74 GiB |
+
+The 16 randomized kmalloc copies were the slab tax: hundreds of mostly-empty
+64 KiB minimum slabs. MemTotal is 6,080 kB lower on the rebuild (page_owner
+metadata).
+
+page_owner attribution of the tracked 2.96 GiB at idle:
+
+```bash
+sudo cat /sys/kernel/debug/page_owner_stacks/show_stacks > stacks.txt
+# aggregate nr_base_pages by owning module
+```
+
+| owner | pages |
+| --- | --- |
+| kernel core (boot, per-cpu, buffers) | 1,074 MiB |
+| mlx5_core `give_pages` (ConnectX firmware pages) | 859 MiB |
+| nvidia (largest single stack: 512 MiB GSP boot heap) | 642 MiB |
+| vmalloc-backed | 229 MiB |
+| slab | 222 MiB |
+
+The NICs hold more host memory than the GPU driver. `give_pages` feeds pages
+to ConnectX firmware on demand; whether `mlx5_core` module parameters or
+devlink resource limits can shrink it is unmeasured.
+
+Build lessons, now encoded in the script: Debian module packaging strips the
+build-time module signatures, and Secure Boot lockdown then rejects every
+module at boot (no nvme, no root, initramfs shell). Re-sign all modules with
+the build key after install. Kernel signing uses a MOK enrolled once;
+per-boot prompts were the cost of `--disable-validation`, not of MOK signing.
+
+**Verdict.** Accepted. rocket64k is now the default kernel on the peer.
+Net headroom per node so far: +2.10 GiB (64K memmap) + 0.74 GiB (this
+rebuild), with the mlx5 pool the next candidate.
+
+**Reopen if.**
+
+- an Ubuntu kernel update forces a rebase, or mlx5 firmware-page limits turn
+  out to be tunable and change the attribution
