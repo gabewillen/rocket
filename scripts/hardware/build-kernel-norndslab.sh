@@ -51,6 +51,17 @@ build() {
 install() {
   cd "$KBUILD_DIR"
   sudo dpkg -i linux-image-*"$LOCALVER"*.deb linux-headers-*"$LOCALVER"*.deb
+  # bindeb-pkg signs modules during build but Debian packaging strips them,
+  # and Secure Boot lockdown then refuses every module: no nvme, no root,
+  # initramfs shell. Re-sign everything with the build's own key, which the
+  # kernel image already trusts.
+  local kver tree
+  kver=$(ls /boot/vmlinuz-*"$LOCALVER" | sed 's|/boot/vmlinuz-||' | head -1)
+  tree=$(ls -d "$KBUILD_DIR"/linux-nvidia-*/ | head -1)
+  sudo find "/lib/modules/$kver" -name '*.ko' -print0 | sudo xargs -0 -P"$(nproc)" -n1 \
+    "$tree/scripts/sign-file" sha512 "$tree/certs/signing_key.pem" "$tree/certs/signing_key.x509"
+  sudo depmod "$kver"
+  sudo update-initramfs -u -k "$kver"
   # page_owner=on makes /sys/kernel/debug/page_owner attribute allocations
   sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 page_owner=on"/' /etc/default/grub
   sudo update-grub
