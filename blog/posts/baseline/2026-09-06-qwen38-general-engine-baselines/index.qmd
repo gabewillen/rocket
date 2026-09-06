@@ -1,0 +1,90 @@
+---
+title: "vLLM reaches 207 tok/s at c8, while the c16 weight roofline is 282 tok/s"
+description: "The exact NVIDIA Qwen3.8 checkpoint reaches 207.0 tok/s on two GB10s at c8, and its expected c16 expert union puts the non-speculative weight-read ceiling at 281.9 tok/s."
+date: 2026-09-06
+author: "agent"
+categories: [experiment, baseline, memory, numerics]
+verdict: accepted
+rocket: "#engine-status"
+---
+
+**Question.** What measured general-engine result and weight-read ceiling set the target for `nvidia/Qwen3.8-Flash-Next-NVFP4`?
+
+| setup | |
+| --- | --- |
+| node | research workstation; published measurements used two DGX Spark GB10 nodes |
+| kernel | published run not controlled by Rocket |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` |
+| checkpoint revision | `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| Rocket commit | `04c08d53dc6f8d6671dbc051e2c5b05c241a5b79` |
+| measured read bandwidth | 238 GB/s per node |
+
+```bash
+python3 scripts/numerics/qwen38-roofline.py \
+  --repo nvidia/Qwen3.8-Flash-Next-NVFP4 \
+  --revision fc694b54fb0174e0913e6adf86691ef85a4ead47 \
+  --batch 16 --route uniform --tsv
+```
+
+```text
+batch  route    unique_experts  step_GiB  batch_steps_s  aggregate_tok_s  per_stream_tok_s
+16     uniform  138.569         25.159194 17.620         281.923          17.620
+```
+
+## Measured general engine
+
+[MiaAI-Lab's published run](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks#performance-nvidiaqwen38-flash-next-nvfp4-tp2ep-mtp3-262144-ctx-gmu-0835) used TP2, expert parallelism, MTP3, FP8 KV, native 262144 context, and a reduced 65536-token MTP draft vocabulary.
+
+| concurrency | aggregate | per stream | TTFT |
+| ---: | ---: | ---: | ---: |
+| 1 | 54.4 tok/s | 54.4 tok/s | 160 ms |
+| 2 | 86.5 tok/s | 45.1 tok/s | 426 ms |
+| 4 | 128.1 tok/s | 34.2 tok/s | 471 ms |
+| 6 | 169.7 tok/s | 29.7 tok/s | 490 ms |
+| 8 | 207.0 tok/s | 26.7 tok/s | 432 ms |
+
+| MTP c1 measurement | value | unit |
+| --- | ---: | --- |
+| disabled | 24.5 | tok/s |
+| MTP3 | 52.1 | tok/s |
+| accepted drafts | 823 / 1131 | tokens |
+| acceptance | 72.8 | % |
+
+MiaAI-Lab reports no c16 run and no acceptance measurement by concurrency.
+
+## Checkpoint traffic
+
+| stored family | value | unit |
+| --- | ---: | --- |
+| all 512 routed experts | 63.282 | GiB |
+| always-active text weights, excluding LM head | 6.848 | GiB |
+| LM head | 1.184 | GiB |
+| embedding table | 1.184 | GiB |
+| PLE table | 47.684 | GiB |
+| MTP weights | 2.513 | GiB |
+
+| c16 uniform-routing quantity | value | unit |
+| --- | ---: | --- |
+| expected expert union | 138.569 | experts/layer |
+| weight traffic | 25.159 | GiB/step |
+| step ceiling | 17.620 | steps/s |
+| aggregate ceiling | 281.923 | tok/s |
+| aggregate needed for 20 tok/s per stream | 320.000 | tok/s |
+| maximum traffic at 20 steps/s | 22.165 | GiB/step |
+| traffic reduction required | 2.994 | GiB/step |
+
+The roofline assumes independent uniform top-10 routing and one accepted token per sequence per step. It excludes compute, state, KV, launch, and fabric stalls.
+
+**Verdict.** Accepted. The measured bar is 207.0 tok/s at c8. The c16 non-speculative weight-read ceiling is 281.9 tok/s under uniform routing, not a measured result. The 320 tok/s target requires at least 2.994 GiB less traffic per c16 step or additional accepted tokens from speculation.
+
+**Next.**
+
+- reproduce c1 through c16 on Rocket's pair with the same checkpoint and workload
+- capture per-layer expert-union size and MTP acceptance at every concurrency
+- rank precision and scheduling changes by measured GiB removed per quality delta
+
+**Reopen if.**
+
+- NVIDIA publishes a checkpoint revision with different tensor shapes or dtypes
+- a general engine publishes a higher exact-checkpoint result on two GB10 nodes
+- a driver or firmware release moves achievable device-read bandwidth off 238 GB/s
