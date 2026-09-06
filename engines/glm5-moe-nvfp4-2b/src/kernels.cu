@@ -1136,6 +1136,20 @@ void moe_gather_rows(bf16* out, const bf16* x, const int* row_of, int rows, int 
   if (rows <= 0) return;
   moe_gather_rows_kernel<<<dim3((n + 255) / 256, rows), 256, 0, s>>>(out, x, row_of, n);
 }
+
+__global__ void moe_scatter_rows_kernel(bf16* __restrict__ out, const bf16* __restrict__ y,
+                                        const int* __restrict__ row_of, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const long long r = blockIdx.y;
+  const long long dst = row_of[r];
+  out[dst * n + i] = y[r * n + i];
+}
+void moe_scatter_rows(bf16* out, const bf16* y, const int* row_of, int rows, int n,
+                      cudaStream_t s) {
+  if (rows <= 0) return;
+  moe_scatter_rows_kernel<<<dim3((n + 255) / 256, rows), 256, 0, s>>>(out, y, row_of, n);
+}
 void moe_scatter_add(bf16* acc, const bf16* y, const int* row_of, const float* weight_of, int rows,
                      int batch, int n, cudaStream_t s) {
   if (rows <= 0) return;

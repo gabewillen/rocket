@@ -3,6 +3,8 @@
 # one booster's. This is the integration test for the two-booster arrangement.
 #
 #   scripts/fabric/static-fire.sh [--refresh-reference] [--sweep 1,8]
+#                                 [--expert-cache-gib 20] [--expert-histogram-out PATH]
+#                                 [--expert-histogram-in PATH] [--overlap 0|1] [--cuda-graph 0|1]
 #
 # rank 0 runs here, rank 1 on the peer over ssh. Both nodes have the same $HOME
 # and the same NIM snapshot, so the binary and the fuel description are copied
@@ -19,6 +21,10 @@ SWEEP=1,8
 CACHE_GIB=${ROCKET_EXPERT_CACHE_GIB:-20}
 REFRESH=0
 SKIP_PARITY=0
+HIST_OUT=
+HIST_IN=
+OVERLAP=0
+GRAPH=0
 REF=${ROCKET_REFERENCE_TOKENS:-/tmp/rocket-static-fire-reference.txt}
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,6 +34,18 @@ while [[ $# -gt 0 ]]; do
     --peer) PEER=$2; shift 2 ;;
     --port) PORT=$2; shift 2 ;;
     --expert-cache-gib) CACHE_GIB=$2; shift 2 ;;
+    # Dumps the 288 routed-expert firing counts of the parity decode from
+    # rank 0. Both ranks run the same router on the same input, so one rank's
+    # histogram already covers every expert, owned and foreign alike.
+    --expert-histogram-out) HIST_OUT=$2; shift 2 ;;
+    # Partitions the experts by those counts instead of by id. The file is
+    # copied to the peer below, so one path names the same content on both and
+    # both ranks pack the same partition without exchanging it.
+    --expert-histogram-in) HIST_IN=$2; shift 2 ;;
+    # Overlap the routed-expert row exchange with the shared expert's FFN.
+    --overlap) OVERLAP=$2; shift 2 ;;
+    # CUDA graph capture of the decode step's non-routing work.
+    --cuda-graph) GRAPH=$2; shift 2 ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -48,6 +66,10 @@ fi
 ssh -o BatchMode=yes -n "$PEER" "mkdir -p $(dirname "$bin") $(dirname "$yaml")"
 rsync -a "$bin" "$PEER:$bin"
 rsync -a "$yaml" "$PEER:$yaml"
+if [[ -n $HIST_IN ]]; then
+  ssh -o BatchMode=yes -n "$PEER" "mkdir -p $(dirname "$HIST_IN")"
+  rsync -a "$HIST_IN" "$PEER:$HIST_IN"
+fi
 
 if [[ $REFRESH -eq 1 || ! -s $REF ]]; then
   echo "== single-booster reference (all 288 experts) =="
@@ -62,14 +84,20 @@ echo "== expert-parallel, rank 0 here, rank 1 on $PEER =="
 # Both ranks check the same tokens, so a mismatch is caught on whichever rank
 # sees it. Copied before rank 1 starts, not after.
 rsync -a "$REF" "$PEER:$REF"
+common_args="--sweep $SWEEP --expert-cache-gib $CACHE_GIB --skip-parity $SKIP_PARITY"
+common_args="$common_args --overlap $OVERLAP --cuda-graph $GRAPH"
+[[ -n $HIST_IN ]] && common_args="$common_args --expert-histogram-in $HIST_IN"
 ssh -o BatchMode=yes -n "$PEER" \
   "$bin --mode parallel --rank 1 --host $HEAD --port $PORT --tokens-file $REF \
-        --sweep $SWEEP --expert-cache-gib $CACHE_GIB --skip-parity $SKIP_PARITY" >/tmp/rocket-static-fire-rank1.log 2>&1 &
+        $common_args" >/tmp/rocket-static-fire-rank1.log 2>&1 &
 peer_pid=$!
 trap 'kill $peer_pid 2>/dev/null || true' EXIT
 
+hist_args=()
+[[ -n $HIST_OUT ]] && hist_args=(--expert-histogram-out "$HIST_OUT")
+# shellcheck disable=SC2086
 "$bin" --mode parallel --rank 0 --host "$HEAD" --port "$PORT" --tokens-file "$REF" \
-       --sweep "$SWEEP" --expert-cache-gib "$CACHE_GIB" --skip-parity "$SKIP_PARITY"
+       $common_args "${hist_args[@]}"
 rc=$?
 wait $peer_pid
 peer_rc=$?

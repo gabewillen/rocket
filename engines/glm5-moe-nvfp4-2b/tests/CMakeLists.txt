@@ -32,6 +32,15 @@ add_test(NAME batch-parity COMMAND test-batch-parity)
 # count, so the budget is doubled rather than padded arbitrarily.
 set_tests_properties(batch-parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 7200)
 
+# The balanced expert partition. Pure host code over a synthetic histogram, so
+# it needs no checkpoint and no peer and never skips.
+add_executable(test-expert-balance test_expert_balance.cc)
+target_link_libraries(test-expert-balance PRIVATE rocket_fabric)
+set_target_properties(test-expert-balance PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME expert-balance COMMAND test-expert-balance)
+set_tests_properties(expert-balance PROPERTIES TIMEOUT 60)
+
 if(NOT EXISTS "${ROCKET_CUTLASS_DIR}/include/cutlass/cutlass.h")
   message(STATUS
     "test-loader-swizzle skipped: no CUTLASS at ${ROCKET_CUTLASS_DIR}. "

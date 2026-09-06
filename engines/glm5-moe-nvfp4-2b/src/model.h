@@ -28,6 +28,7 @@
 // off; the vision tower is ignored.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -130,6 +131,17 @@ class DecodeEngine {
   void set_expert_parallel(fabric::ExpertParallel* ep) { ep_ = ep; }
   fabric::ExpertParallel* expert_parallel() const { return ep_; }
 
+  // Overlaps the routed-expert row exchange with the shared expert's dense
+  // FFN: run_moe posts this rank's rows, launches the shared-expert GEMMs,
+  // and only then blocks on the peer's doorbell. The accumulation order into
+  // acc_ is unchanged (routed scatter-add first, shared expert second), so
+  // this moves when the host waits and not what the step computes. No effect
+  // without an ExpertParallel, and no effect on the CUDA-graph path, where
+  // the shared expert sits in the next captured segment and cannot be moved
+  // ahead of the dispatch.
+  void set_expert_parallel_overlap(bool on) { ep_overlap_ = on; }
+  bool expert_parallel_overlap() const { return ep_overlap_; }
+
   // Test-only: CUDA graph capture of the decode step's non-routing work
   // (blog/posts/runtime/2026-09-07-grouped-gemm-beats-gemv-at-every-m/'s
   // Next item 2). Off by default. Only takes effect when collect_stages is
@@ -139,6 +151,17 @@ class DecodeEngine {
   // and is not captured, and why.
   void set_use_cuda_graph(bool on) { use_cuda_graph_ = on; }
   bool use_cuda_graph() const { return use_cuda_graph_; }
+
+  // Per-routed-expert firing count, summed over every layer and every step
+  // since the last reset. The two-booster split partitions expert ids, so the
+  // load a partition predicts is a sum over layers of these counts; that makes
+  // the histogram 288 numbers rather than 42 * 288, and small enough to
+  // persist next to the engine. Counted on the host from the same routing
+  // readback run_moe already does, so it costs no extra sync.
+  const std::vector<std::uint64_t>& expert_fire_counts() const { return expert_fire_; }
+  void reset_expert_fire_counts() {
+    std::fill(expert_fire_.begin(), expert_fire_.end(), 0ull);
+  }
 
   // Test-only: the raw lm_head logits row for one stream slot from the last
   // step() call, copied to host. Used to compare the grouped and GEMV MoE
@@ -157,8 +180,13 @@ class DecodeEngine {
   void run_moe_gemv(int layer, int batch, const std::vector<int>& idx);
   bool run_moe_grouped(int layer, int batch, const std::vector<int>& idx,
                        const std::vector<float>& wts);
+  // Blocks on the peer's half of the row exchange run_moe_grouped posted,
+  // places those rows, and runs the scatter-add. A no-op on one booster and
+  // after a GEMV fallback, neither of which posts anything.
+  void finish_moe_exchange();
   float sync_rms_slot0(const bf16* x, int n);
   void record_absmax(const std::string& name, const bf16* x, int batch, int n);
+  void record_expert_fire(const std::vector<int>& idx);
 
   // ---- CUDA graph capture path (kept deliberately separate from run_moe
   // and the direct per-layer loop in step(), not a refactor of them: the
@@ -249,8 +277,16 @@ class DecodeEngine {
   float* moe_gate_global_ = nullptr;   // [rows] per-group gate weight_scale_2
   float* moe_up_global_ = nullptr;     // [rows] per-group up weight_scale_2
   float* moe_scatter_w_ = nullptr;     // [rows] topk_w * down weight_scale_2
+  int* moe_crow_of_ = nullptr;         // [rows] compact row -> stream slot, owned rows only
+  int* moe_send_rows_ = nullptr;       // [rows] owned rows, true-row ascending
+  int* moe_recv_rows_ = nullptr;       // [rows] peer rows, true-row ascending
   MoePath moe_path_ = MoePath::kAuto;
   fabric::ExpertParallel* ep_ = nullptr;
+  bool ep_overlap_ = false;
+  // In-flight row exchange, set by run_moe_grouped and consumed by
+  // finish_moe_exchange.
+  bool moe_pending_ = false;
+  int moe_recv_off_rows_ = 0, moe_recv_n_ = 0, moe_rows_ = 0, moe_batch_ = 0;
 
   // ---- CUDA graph capture (model.cu::ensure_graphs_built) ----
   std::vector<int> moe_layer_ids_;   // text-layer indices with sparse MLP, ascending
@@ -278,6 +314,7 @@ class DecodeEngine {
   StageMs stages_;
   std::vector<float> layer_rms_;
   double router_entropy_ = 0.0;
+  std::vector<std::uint64_t> expert_fire_;
 
   bool telemetry_ = false;
   std::unordered_map<std::string, float> telemetry_absmax_;

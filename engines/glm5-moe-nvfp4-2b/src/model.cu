@@ -205,6 +205,9 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   moe_row_of_ = I(MR);
   moe_row_in_group_ = I(MR);
   moe_group_of_row_ = I(MR);
+  moe_crow_of_ = I(MR);
+  moe_send_rows_ = I(MR);
+  moe_recv_rows_ = I(MR);
   moe_sf1_base_ = I64(MR);
   moe_sf2_base_ = I64(MR);
   moe_gate_global_ = F(MR);
@@ -229,6 +232,7 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
 
   for (int l = 0; l < cfg_.text_layers; ++l)
     if (cfg_.layers[l].mlp == fuel::MlpKind::kSparse) moe_layer_ids_.push_back(l);
+  expert_fire_.assign(static_cast<std::size_t>(cfg_.n_routed_experts), 0ull);
 }
 
 std::vector<float> DecodeEngine::last_logits(int stream) const {
@@ -463,28 +467,42 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
   stages_.moe_group_host_ms +=
       std::chrono::duration<double, std::milli>(Clock::now() - t_group0).count();
 
-  std::vector<int> row_of(rows), row_in_group(rows), group_of_row(rows);
+  // Two row spaces, because a rank's expert set is no longer required to be a
+  // contiguous id range (src/fabric/expert_balance.h):
+  //
+  //   true rows     [0, rows), expert-ascending, the order moe_scatter_add
+  //                 accumulates in. Both ranks build the identical list, and
+  //                 the merged accumulator stays bit-identical to the
+  //                 single-booster one because that order never changes.
+  //   compact rows  [0, own_n), this rank's owned rows only, in true-row
+  //                 order. Everything the grouped GEMM consumes is indexed
+  //                 here, so the owned work is one contiguous run even when
+  //                 the owned experts are scattered through the id space.
+  //
+  // The second GEMM still writes its output at the *true* row offset, so
+  // moe_out_ is laid out identically on both ranks and the scatter-add is the
+  // same call the single-booster engine makes.
+  std::vector<int> row_of(rows);
+  std::vector<float> scatter_w(rows);
+  std::vector<int> crow_of, row_in_group, group_of_row, send_rows, recv_rows;
+  crow_of.reserve(static_cast<std::size_t>(rows));
+  send_rows.reserve(static_cast<std::size_t>(rows));
+  recv_rows.reserve(static_cast<std::size_t>(rows));
   std::vector<long long> sf1_base, sf2_base;
   std::vector<float> gate_global, up_global;
-  std::vector<float> scatter_w(rows);
   std::vector<GroupedGemmGroup> groups1, groups2;
   groups1.reserve(by_expert.size());
   groups2.reserve(by_expert.size());
 
-  // Under the two-booster split (src/fabric/expert_parallel.h) this rank runs
-  // the grouped GEMM for its own experts only. Because the split is by expert
-  // id and by_expert is ascending in expert id, the rows this rank computes
-  // are one contiguous run: the prefix on rank 0, the suffix on rank 1. Row
-  // bookkeeping below is still built for every row, owned and foreign alike,
-  // so the scatter-add after the exchange is the same call the single-booster
-  // engine makes over the same row order.
-  int row_start = 0;
+  int row_start = 0;    // next true row
+  int crow = 0;         // next compact row
   long long sf1_off = 0, sf2_off = 0;
   int g = 0;
-  int own_lo = -1, own_hi = 0;
+  int rank0_rows = 0;   // rows rank 0 computes; both ranks compute the same number
   for (const auto& [expert_id, slots] : by_expert) {
     const int Mg = static_cast<int>(slots.size());
     const bool mine = ep_ == nullptr || ep_->owns(expert_id);
+    if (ep_ != nullptr && ep_->owner_of(expert_id) == 0) rank0_rows += Mg;
     float down_global = 0.0f;
 
     if (mine) {
@@ -502,97 +520,147 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
 
       GroupedGemmGroup gr1;
       gr1.m = Mg;
-      gr1.a_packed = moe_a1_packed_ + static_cast<std::size_t>(row_start) * (H / 2);
+      gr1.a_packed = moe_a1_packed_ + static_cast<std::size_t>(crow) * (H / 2);
       gr1.a_scale = moe_a1_sf_ + sf1_off;
       gr1.b_packed = e.gate_packed;  // fused with up_packed, see weights.h
       gr1.b_scale = e.w13_scale;
-      gr1.d_out = moe_gu_ + static_cast<std::size_t>(row_start) * (2 * MI);
+      gr1.d_out = moe_gu_ + static_cast<std::size_t>(crow) * (2 * MI);
       groups1.push_back(gr1);
 
       GroupedGemmGroup gr2;
       gr2.m = Mg;
-      gr2.a_packed = moe_a2_packed_ + static_cast<std::size_t>(row_start) * (MI / 2);
+      gr2.a_packed = moe_a2_packed_ + static_cast<std::size_t>(crow) * (MI / 2);
       gr2.a_scale = moe_a2_sf_ + sf2_off;
       gr2.b_packed = e.down_packed;
       gr2.b_scale = e.down_scale_swizzled;
-      gr2.d_out = moe_out_ + static_cast<std::size_t>(row_start) * H;
+      gr2.d_out = moe_out_ + static_cast<std::size_t>(row_start) * H;  // true row
       groups2.push_back(gr2);
 
-      if (own_lo < 0) own_lo = row_start;
-      own_hi = row_start + Mg;
       sf1_off += mn_tiles * 64 * 512;  // k_tiles(H=4096)=64
       sf2_off += mn_tiles * 32 * 512;  // k_tiles(MI=2048)=32
       ++g;
     } else {
-      // The peer computes these rows and writes them into moe_out_ over the
-      // fabric. This rank still needs their scatter weight, so it reads the
-      // foreign expert's down weight_scale_2 out of the loader's table
-      // (weights.h::expert_down_global) rather than the expert cache it is not
-      // allowed to fetch into.
+      // The peer computes these rows and writes them into the staging region
+      // over the fabric. This rank still needs their scatter weight, so it
+      // reads the foreign expert's down weight_scale_2 out of the loader's
+      // table (weights.h::expert_down_global) rather than the expert cache it
+      // is not allowed to fetch into.
       down_global = w_.expert_down_global(layer, expert_id);
     }
 
     for (int li = 0; li < Mg; ++li) {
       const int row = row_start + li;
       const int slot = slots[static_cast<std::size_t>(li)];
-      row_of[row] = slot / K;         // stream slot this row's activation comes from / goes to
-      // Only owned rows are quantized and grouped, and those calls are passed
-      // the owned sub-range, so a foreign row's group bookkeeping is never
-      // read. It is still written, so the arrays hold no stale values.
-      row_in_group[row] = mine ? li : 0;
-      group_of_row[row] = mine ? g - 1 : 0;
+      row_of[row] = slot / K;  // stream slot this row's activation comes from / goes to
       // The down-projection's own weight_scale_2 is folded into the scatter
       // weight here rather than the GEMM epilogue (moe_grouped.h) or a
       // per-row kernel pass; the router weight and this global both apply
       // once per row with no elementwise interaction, so one multiply on
       // the host, once per (stream, expert) pair, covers both.
       scatter_w[row] = wts[static_cast<std::size_t>(slot)] * down_global;
+      if (mine) {
+        crow_of.push_back(slot / K);
+        row_in_group.push_back(li);
+        group_of_row.push_back(g - 1);
+        send_rows.push_back(row);
+      } else {
+        recv_rows.push_back(row);
+      }
     }
 
+    if (mine) crow += Mg;
     row_start += Mg;
   }
-  if (own_lo < 0) own_lo = own_hi = 0;  // this rank owns no row of this layer
-  const int own_n = own_hi - own_lo;
+  const int own_n = crow;
 
   cudaMemsetAsync(moe_a1_sf_, 0, static_cast<std::size_t>(sf1_off), stream_);
   cudaMemsetAsync(moe_a2_sf_, 0, static_cast<std::size_t>(sf2_off), stream_);
   cudaMemcpyAsync(moe_row_of_, row_of.data(), rows * sizeof(int), cudaMemcpyHostToDevice, stream_);
-  cudaMemcpyAsync(moe_row_in_group_, row_in_group.data(), rows * sizeof(int), cudaMemcpyHostToDevice,
-                  stream_);
-  cudaMemcpyAsync(moe_group_of_row_, group_of_row.data(), rows * sizeof(int), cudaMemcpyHostToDevice,
-                  stream_);
-  cudaMemcpyAsync(moe_sf1_base_, sf1_base.data(), sf1_base.size() * sizeof(long long),
-                  cudaMemcpyHostToDevice, stream_);
-  cudaMemcpyAsync(moe_sf2_base_, sf2_base.data(), sf2_base.size() * sizeof(long long),
-                  cudaMemcpyHostToDevice, stream_);
-  cudaMemcpyAsync(moe_gate_global_, gate_global.data(), gate_global.size() * sizeof(float),
-                  cudaMemcpyHostToDevice, stream_);
-  cudaMemcpyAsync(moe_up_global_, up_global.data(), up_global.size() * sizeof(float),
-                  cudaMemcpyHostToDevice, stream_);
   cudaMemcpyAsync(moe_scatter_w_, scatter_w.data(), rows * sizeof(float), cudaMemcpyHostToDevice,
                   stream_);
-
-  // Every pointer below is offset to this rank's own row run. On one booster
-  // own_lo is 0 and own_n is rows, so these are the same calls as before.
-  const std::size_t o = static_cast<std::size_t>(own_lo);
   if (own_n > 0) {
-    moe_gather_rows(moe_x_ + o * H, normed_, moe_row_of_ + o, own_n, H, stream_);
-    nvfp4_quantize_rows(moe_a1_packed_ + o * (H / 2), moe_a1_sf_, moe_x_ + o * H,
-                        moe_row_in_group_ + o, moe_group_of_row_ + o, moe_sf1_base_, own_n, H,
-                        stream_);
+    cudaMemcpyAsync(moe_crow_of_, crow_of.data(), own_n * sizeof(int), cudaMemcpyHostToDevice,
+                    stream_);
+    cudaMemcpyAsync(moe_row_in_group_, row_in_group.data(), own_n * sizeof(int),
+                    cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(moe_group_of_row_, group_of_row.data(), own_n * sizeof(int),
+                    cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(moe_send_rows_, send_rows.data(), own_n * sizeof(int), cudaMemcpyHostToDevice,
+                    stream_);
+    cudaMemcpyAsync(moe_sf1_base_, sf1_base.data(), sf1_base.size() * sizeof(long long),
+                    cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(moe_sf2_base_, sf2_base.data(), sf2_base.size() * sizeof(long long),
+                    cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(moe_gate_global_, gate_global.data(), gate_global.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(moe_up_global_, up_global.data(), up_global.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream_);
+  }
+  if (!recv_rows.empty())
+    cudaMemcpyAsync(moe_recv_rows_, recv_rows.data(), recv_rows.size() * sizeof(int),
+                    cudaMemcpyHostToDevice, stream_);
+
+  // Every operand below is compact-indexed. On one booster own_n is rows and
+  // the compact space is the true space, so these are the same calls as before.
+  if (own_n > 0) {
+    moe_gather_rows(moe_x_, normed_, moe_crow_of_, own_n, H, stream_);
+    nvfp4_quantize_rows(moe_a1_packed_, moe_a1_sf_, moe_x_, moe_row_in_group_, moe_group_of_row_,
+                        moe_sf1_base_, own_n, H, stream_);
     if (!grouped_gemm_nvfp4(groups1, 2 * MI, H, stream_)) return false;
-    swiglu_grouped(moe_h_ + o * MI, moe_gu_ + o * (2 * MI), moe_gate_global_, moe_up_global_,
-                  moe_group_of_row_ + o, own_n, MI, cfg_.swiglu_limit, stream_);
-    nvfp4_quantize_rows(moe_a2_packed_ + o * (MI / 2), moe_a2_sf_, moe_h_ + o * MI,
-                        moe_row_in_group_ + o, moe_group_of_row_ + o, moe_sf2_base_, own_n, MI,
-                        stream_);
+    swiglu_grouped(moe_h_, moe_gu_, moe_gate_global_, moe_up_global_, moe_group_of_row_, own_n, MI,
+                   cfg_.swiglu_limit, stream_);
+    nvfp4_quantize_rows(moe_a2_packed_, moe_a2_sf_, moe_h_, moe_row_in_group_, moe_group_of_row_,
+                        moe_sf2_base_, own_n, MI, stream_);
     if (!grouped_gemm_nvfp4(groups2, H, MI, stream_)) return false;
   }
 
-  if (ep_ != nullptr) ep_->exchange_rows(moe_out_, own_lo, own_n, rows, stream_, &stages_.fabric);
+  if (ep_ == nullptr) {
+    moe_scatter_add(acc_, moe_out_, moe_row_of_, moe_scatter_w_, rows, batch, H, stream_);
+    return true;
+  }
 
-  moe_scatter_add(acc_, moe_out_, moe_row_of_, moe_scatter_w_, rows, batch, H, stream_);
+  // Staging layout, agreed by both ranks without a message: rank 0's computed
+  // rows first, then rank 1's, each in true-row-ascending order. Both ranks
+  // know every expert's owner and every expert's row count, so both compute
+  // the same rank0_rows and write into disjoint halves of the same region.
+  const int send_off = (ep_->rank() == 0) ? 0 : rank0_rows;
+  const int recv_off = (ep_->rank() == 0) ? rank0_rows : 0;
+  auto* stage = static_cast<bf16*>(ep_->stage());
+  if (own_n > 0)
+    moe_gather_rows(stage + static_cast<std::size_t>(send_off) * H, moe_out_, moe_send_rows_, own_n,
+                    H, stream_);
+  // The NIC reads this memory next, so the GPU's writes have to be complete
+  // and not merely enqueued.
+  cuda_check(cudaStreamSynchronize(stream_), "sync before RDMA write");
+  ep_->exchange_begin(send_off, own_n);
+  moe_pending_ = true;
+  moe_recv_off_rows_ = recv_off;
+  moe_recv_n_ = rows - own_n;
+  moe_rows_ = rows;
+  moe_batch_ = batch;
   return true;
+}
+
+void DecodeEngine::finish_moe_exchange() {
+  if (!moe_pending_) return;
+  const int H = cfg_.hidden_size;
+  ep_->exchange_end(&stages_.fabric);
+  moe_pending_ = false;
+  auto* stage = static_cast<bf16*>(ep_->stage());
+  if (moe_recv_n_ > 0)
+    moe_scatter_rows(moe_out_, stage + static_cast<std::size_t>(moe_recv_off_rows_) * H,
+                     moe_recv_rows_, moe_recv_n_, H, stream_);
+  moe_scatter_add(acc_, moe_out_, moe_row_of_, moe_scatter_w_, moe_rows_, moe_batch_, H, stream_);
+}
+
+// Host-side per-expert firing counter (model.h::expert_fire_counts). Reads the
+// routing decision run_moe already copied back, so it adds no sync and no
+// device work; it is the input to the balanced expert partition
+// (src/fabric/expert_balance.h).
+void DecodeEngine::record_expert_fire(const std::vector<int>& idx) {
+  for (const int e : idx)
+    if (e >= 0 && e < static_cast<int>(expert_fire_.size()))
+      ++expert_fire_[static_cast<std::size_t>(e)];
 }
 
 void DecodeEngine::run_moe(int layer, int batch) {
@@ -620,6 +688,7 @@ void DecodeEngine::run_moe(int layer, int batch) {
     if (p > 0.0) ent -= p * std::log(p);
   }
   router_entropy_ += ent;
+  record_expert_fire(idx);
 
   cudaMemsetAsync(acc_, 0, static_cast<std::size_t>(batch) * H * sizeof(bf16), stream_);
   const bool want_grouped =
@@ -634,10 +703,18 @@ void DecodeEngine::run_moe(int layer, int batch) {
     run_moe_gemv(layer, batch, idx);
   }
 
+  // Without overlap the step blocks here, exactly where the serialized
+  // exchange always sat. With it, the shared expert's dense GEMMs are enqueued
+  // first and run on the device while the host waits on the peer's doorbell.
+  // The scatter-add is still enqueued before add_bf16 either way, so acc_ is
+  // accumulated in the same order and the merged result is unchanged.
+  if (!ep_overlap_) finish_moe_exchange();
+
   gemm_bf16(mlp_gate_, mo.shared.gate, normed_, batch, SI, H, stream_);
   gemm_bf16(mlp_up_, mo.shared.up, normed_, batch, SI, H, stream_);
   swiglu_clamped(mlp_h_, mlp_gate_, mlp_up_, batch * SI, cfg_.swiglu_limit, stream_);
   gemm_bf16(mlp_out_, mo.shared.down, mlp_h_, batch, H, SI, stream_);
+  if (ep_overlap_) finish_moe_exchange();
   add_bf16(acc_, mlp_out_, batch * H, stream_);
   cudaMemcpyAsync(sublayer_out_, acc_, static_cast<std::size_t>(batch) * H * sizeof(bf16),
                   cudaMemcpyDeviceToDevice, stream_);
@@ -760,6 +837,7 @@ void DecodeEngine::run_moe_dispatch_stage(int layer, int batch) {
     if (pr > 0.0) ent -= pr * std::log(pr);
   }
   router_entropy_ += ent;
+  record_expert_fire(idx);
 
   const bool want_grouped =
       moe_path_ == MoePath::kForceGrouped ||
@@ -772,6 +850,10 @@ void DecodeEngine::run_moe_dispatch_stage(int layer, int batch) {
   } else {
     run_moe_gemv(layer, batch, idx);
   }
+  // No overlap on the graph path: run_moe_post_stage (the shared expert) is
+  // inside the next captured segment, which cannot be launched before acc_
+  // holds the routed half.
+  finish_moe_exchange();
 }
 
 // Captured tail of a MoE FFN site: shared-expert dense FFN, added into acc_

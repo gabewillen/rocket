@@ -40,6 +40,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -49,26 +50,48 @@ namespace rocket::fabric {
 
 class ExpertParallel {
  public:
-  // Connects the pair and allocates the staging region. `max_rows` bounds
-  // max_batch * num_experts_per_tok; `width` is hidden_size in elements.
-  // Throws std::runtime_error if the fabric or the allocation fails.
-  ExpertParallel(const Config& cfg, int n_routed_experts, int max_rows, int width);
+  // `owner` is [n_routed_experts] with owner[e] the rank that computes expert
+  // e; both ranks must pass the identical vector, which they do because both
+  // derive it from the same histogram (src/fabric/expert_balance.h) or from
+  // the same id split. `max_rows` bounds max_batch * num_experts_per_tok;
+  // `width` is hidden_size in elements. Throws std::runtime_error if the
+  // fabric or the allocation fails.
+  ExpertParallel(const Config& cfg, const std::vector<int>& owner, int max_rows, int width);
   ~ExpertParallel();
   ExpertParallel(const ExpertParallel&) = delete;
   ExpertParallel& operator=(const ExpertParallel&) = delete;
 
   int rank() const { return fab_->rank(); }
-  int expert_first() const { return first_; }
   int expert_count() const { return count_; }
-  bool owns(int expert_id) const { return expert_id >= first_ && expert_id < first_ + count_; }
+  bool owns(int expert_id) const {
+    return expert_id >= 0 && expert_id < static_cast<int>(owner_.size()) &&
+           owner_[static_cast<std::size_t>(expert_id)] == rank();
+  }
+  int owner_of(int expert_id) const { return owner_[static_cast<std::size_t>(expert_id)]; }
+  std::vector<int> owned_experts() const;
+  // True when this rank's experts are one contiguous ascending id range, which
+  // is the arrangement the id split produces and the balanced partition does
+  // not. Reported so a run says which split it measured.
+  bool contiguous() const;
 
-  // `rows_dev` is the [total_rows, width] BF16 output block of one MoE layer,
-  // of which this rank computed [own_lo, own_lo + own_n). Returns once every
-  // row is present on this rank. Adds its own wall time to *ms_sink when that
-  // is not null; that time includes waiting for the peer, so it is the step's
-  // exposed cost of the split and not the transport's cost alone.
-  void exchange_rows(void* rows_dev, int own_lo, int own_n, int total_rows, cudaStream_t s,
-                     double* ms_sink);
+  // The registered staging region, [max_rows, width] BF16. The engine gathers
+  // this rank's computed expert-output rows into its own slice of it and reads
+  // the peer's rows out of the peer's slice; the fabric only moves bytes and
+  // never interprets rows (model.cu::run_moe_grouped owns the layout).
+  void* stage() { return stage_; }
+
+  // Sends [off_rows, off_rows + n_rows) of the staging region to the same
+  // offset in the peer's, and returns without waiting. The caller must have
+  // completed the device writes into that slice first: the NIC reads this
+  // memory next, so a cudaStreamSynchronize has to have happened, not just an
+  // enqueue.
+  void exchange_begin(int off_rows, int n_rows);
+  // Waits for the peer's matching write to land. Adds the exposed cost of the
+  // split to *ms_sink when that is not null: the time posting this rank's own
+  // write plus the time blocked on the peer's doorbell, and nothing else. The
+  // local sync before exchange_begin is this rank's own GEMM finishing, so it
+  // is compute and is deliberately not counted here.
+  void exchange_end(double* ms_sink);
 
   void barrier() { fab_->barrier(); }
   const Stats& stats() const { return fab_->stats(); }
@@ -79,7 +102,11 @@ class ExpertParallel {
   std::unique_ptr<Fabric> fab_;
   std::uint8_t* stage_ = nullptr;  // cudaHostAlloc, registered with both rails
   std::size_t stage_bytes_ = 0;
-  int first_ = 0, count_ = 0, width_ = 0;
+  std::vector<int> owner_;
+  int count_ = 0, width_ = 0;
+  std::uint64_t seq_ = 0;
+  double post_ms_ = 0.0;
+  bool in_flight_ = false;
 };
 
 }  // namespace rocket::fabric

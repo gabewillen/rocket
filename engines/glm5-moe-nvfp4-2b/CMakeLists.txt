@@ -125,7 +125,8 @@ if(NOT ROCKET_IBVERBS)
     "arrangement (CMakeLists.txt header); install libibverbs-dev.")
 endif()
 
-add_library(rocket_fabric STATIC src/fabric/rdma.cc src/fabric/expert_parallel.cu)
+add_library(rocket_fabric STATIC src/fabric/rdma.cc src/fabric/expert_parallel.cu
+                                 src/fabric/expert_balance.cc)
 target_include_directories(rocket_fabric PUBLIC src)
 target_link_libraries(rocket_fabric PUBLIC ${ROCKET_IBVERBS})
 set_target_properties(rocket_fabric PROPERTIES

@@ -19,11 +19,16 @@ void cuda_check(cudaError_t e, const std::string& what) {
 
 }  // namespace
 
-ExpertParallel::ExpertParallel(const Config& cfg, int n_routed_experts, int max_rows, int width)
-    : width_(width) {
-  if (n_routed_experts % 2 != 0) fail("routed experts must split evenly across the pair");
-  count_ = n_routed_experts / 2;
-  first_ = cfg.rank * count_;
+ExpertParallel::ExpertParallel(const Config& cfg, const std::vector<int>& owner, int max_rows,
+                               int width)
+    : owner_(owner), width_(width) {
+  if (owner_.empty()) fail("no expert ownership vector");
+  for (const int r : owner_)
+    if (r != 0 && r != 1) fail("expert ownership names a rank other than 0 or 1");
+  count_ = 0;
+  for (const int r : owner_)
+    if (r == cfg.rank) ++count_;
+  if (count_ == 0) fail("this rank was given no routed experts to compute");
 
   fab_ = std::make_unique<Fabric>(cfg);
 
@@ -46,40 +51,49 @@ ExpertParallel::~ExpertParallel() {
   if (stage_ != nullptr) cudaFreeHost(stage_);
 }
 
-void ExpertParallel::exchange_rows(void* rows_dev, int own_lo, int own_n, int total_rows,
-                                   cudaStream_t s, double* ms_sink) {
-  const auto t0 = Clock::now();
+std::vector<int> ExpertParallel::owned_experts() const {
+  std::vector<int> out;
+  out.reserve(static_cast<std::size_t>(count_));
+  for (std::size_t e = 0; e < owner_.size(); ++e)
+    if (owner_[e] == rank()) out.push_back(static_cast<int>(e));
+  return out;
+}
+
+bool ExpertParallel::contiguous() const {
+  const std::vector<int> mine = owned_experts();
+  for (std::size_t i = 1; i < mine.size(); ++i)
+    if (mine[i] != mine[i - 1] + 1) return false;
+  return true;
+}
+
+void ExpertParallel::exchange_begin(int off_rows, int n_rows) {
+  if (in_flight_) fail("exchange_begin called twice without an exchange_end");
   const std::size_t rb = static_cast<std::size_t>(width_) * sizeof(std::uint16_t);
-  const std::size_t own_off = static_cast<std::size_t>(own_lo) * rb;
-  const std::size_t own_bytes = static_cast<std::size_t>(own_n) * rb;
-  const int own_hi = own_lo + own_n;
-  if (static_cast<std::size_t>(total_rows) * rb > stage_bytes_)
-    fail("row block of " + std::to_string(total_rows) + " rows exceeds the staging region");
+  const std::size_t off = static_cast<std::size_t>(off_rows) * rb;
+  const std::size_t bytes = static_cast<std::size_t>(n_rows) * rb;
+  if (off + bytes > stage_bytes_)
+    fail("row block [" + std::to_string(off_rows) + ", " + std::to_string(off_rows + n_rows) +
+         ") exceeds the staging region");
+  const auto t0 = Clock::now();
+  // One doorbell sequence number per exchange, taken from the fabric's own
+  // counter rather than invented here, so barrier() and this share one stream
+  // of values (fabric.h::next_seq).
+  seq_ = fab_->next_seq();
+  fab_->post_write(0, off, off, bytes);
+  fab_->signal(seq_);
+  post_ms_ += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+  in_flight_ = true;
+}
 
-  auto* rows = static_cast<std::uint8_t*>(rows_dev);
-  if (own_bytes > 0)
-    cuda_check(cudaMemcpyAsync(stage_ + own_off, rows + own_off, own_bytes, cudaMemcpyDefault, s),
-               "own rows to staging");
-  // The NIC reads this memory next, so the GPU's writes have to be complete
-  // and not merely enqueued.
-  cuda_check(cudaStreamSynchronize(s), "sync before RDMA write");
-
-  fab_->exchange(0, own_off, own_off, own_bytes);
-
-  // The peer wrote into exactly the rows this rank did not compute: the split
-  // is by expert id and the row order is by expert id, so with two ranks the
-  // complement of [own_lo, own_hi) is at most one prefix and one suffix.
-  if (own_lo > 0)
-    cuda_check(cudaMemcpyAsync(rows, stage_, own_off, cudaMemcpyDefault, s), "peer prefix rows");
-  if (own_hi < total_rows)
-    cuda_check(cudaMemcpyAsync(rows + static_cast<std::size_t>(own_hi) * rb,
-                               stage_ + static_cast<std::size_t>(own_hi) * rb,
-                               static_cast<std::size_t>(total_rows - own_hi) * rb,
-                               cudaMemcpyDefault, s),
-               "peer suffix rows");
-
+void ExpertParallel::exchange_end(double* ms_sink) {
+  if (!in_flight_) fail("exchange_end without a matching exchange_begin");
+  const auto t0 = Clock::now();
+  fab_->wait_peer(seq_);
+  fab_->flush();
+  in_flight_ = false;
   if (ms_sink != nullptr)
-    *ms_sink += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    *ms_sink += post_ms_ + std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+  post_ms_ = 0.0;
 }
 
 }  // namespace rocket::fabric

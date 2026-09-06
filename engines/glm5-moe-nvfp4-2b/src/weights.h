@@ -150,11 +150,16 @@ class WeightStore {
   // room for, so a stray fetch is a capacity bug, not a slow path. expert()
   // throws on an id outside the range once one is set.
   void set_expert_range(int first, int count);
-  int expert_range_first() const { return expert_first_; }
+  // The same restriction for an arbitrary set of expert ids, which is what a
+  // load-balanced partition produces (src/fabric/expert_balance.h). An id
+  // range is the special case; both build the same owned mask and the same
+  // foreign weight_scale_2 table.
+  void set_expert_set(const std::vector<int>& expert_ids);
   int expert_range_count() const { return expert_count_; }
   bool owns_expert(int expert_id) const {
-    return expert_count_ == 0 ||
-           (expert_id >= expert_first_ && expert_id < expert_first_ + expert_count_);
+    if (expert_count_ == 0) return true;  // single booster: every expert
+    return expert_id >= 0 && expert_id < static_cast<int>(owned_expert_.size()) &&
+           owned_expert_[static_cast<std::size_t>(expert_id)] != 0;
   }
 
   // weight_scale_2 of every routed expert's down projection, owned and
@@ -217,7 +222,8 @@ class WeightStore {
   std::uint64_t hits_ = 0, misses_ = 0;
   std::size_t streamed_bytes_ = 0;
 
-  int expert_first_ = 0;
+  void build_expert_ownership(const std::vector<int>& expert_ids);
+  std::vector<char> owned_expert_;  // [n_routed_experts], 1 = this rank fetches it
   int expert_count_ = 0;  // 0 means "every expert", the single-booster case
   std::vector<float> down_global_;  // [text_layers * n_routed_experts]
 };

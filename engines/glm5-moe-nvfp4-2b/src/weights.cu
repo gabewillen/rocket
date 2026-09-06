@@ -245,8 +245,15 @@ void WeightStore::set_expert_range(int first, int count) {
   if (first < 0 || count <= 0 || first + count > cfg_.n_routed_experts)
     fail("expert range [" + std::to_string(first) + ", " + std::to_string(first + count) +
          ") does not fit " + std::to_string(cfg_.n_routed_experts) + " routed experts");
-  expert_first_ = first;
-  expert_count_ = count;
+  std::vector<int> ids;
+  ids.reserve(static_cast<std::size_t>(count));
+  for (int e = first; e < first + count; ++e) ids.push_back(e);
+  set_expert_set(ids);
+}
+
+void WeightStore::set_expert_set(const std::vector<int>& expert_ids) {
+  if (expert_ids.empty()) fail("this rank was given no routed experts to own");
+  build_expert_ownership(expert_ids);
 
   // The foreign half's down-projection weight_scale_2, read once here. These
   // are 4 bytes each out of tensors whose packed weights are never touched on
@@ -263,6 +270,20 @@ void WeightStore::set_expert_range(int first, int count) {
   }
 }
 
+void WeightStore::build_expert_ownership(const std::vector<int>& expert_ids) {
+  owned_expert_.assign(static_cast<std::size_t>(cfg_.n_routed_experts), 0);
+  expert_count_ = 0;
+  for (const int e : expert_ids) {
+    if (e < 0 || e >= cfg_.n_routed_experts)
+      fail("expert id " + std::to_string(e) + " is outside the " +
+           std::to_string(cfg_.n_routed_experts) + " routed experts");
+    if (owned_expert_[static_cast<std::size_t>(e)] != 0)
+      fail("expert id " + std::to_string(e) + " was given to this rank twice");
+    owned_expert_[static_cast<std::size_t>(e)] = 1;
+    ++expert_count_;
+  }
+}
+
 float WeightStore::expert_down_global(int layer, int expert_id) const {
   const std::size_t i = static_cast<std::size_t>(layer) * cfg_.n_routed_experts + expert_id;
   return i < down_global_.size() ? down_global_[i] : 0.0f;
@@ -272,8 +293,8 @@ const ExpertDev& WeightStore::expert(int layer, int expert_id, cudaStream_t s) {
   const long long key = static_cast<long long>(layer) * cfg_.n_routed_experts + expert_id;
   if (!owns_expert(expert_id))
     fail("expert " + std::to_string(expert_id) + " of layer " + std::to_string(layer) +
-         " is outside this rank's range [" + std::to_string(expert_first_) + ", " +
-         std::to_string(expert_first_ + expert_count_) + "); the peer owns it");
+         " is not in this rank's set of " + std::to_string(expert_count_) +
+         " routed experts; the peer owns it");
   if (const auto it = resident_expert_.find(key); it != resident_expert_.end()) {
     ++hits_;
     const int slot = it->second;

@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "fabric/expert_balance.h"
 #include "fabric/expert_parallel.h"
 #include "model.h"
 #include "model_config.h"
@@ -200,6 +201,27 @@ int main(int argc, char** argv) {
   // The pair is connected before either rank starts its multi-minute weight
   // load, so a bootstrap failure is reported in seconds rather than after both
   // nodes have read tens of GiB.
+  // The expert partition. Default is the id split, 144/144; with
+  // --expert-histogram-in it is the equal-cardinality greedy bin pack over
+  // measured firing counts (src/fabric/expert_balance.h). Both ranks are given
+  // the same file and run the same deterministic pack, so neither has to be
+  // told the other's set.
+  const std::string hist_in = arg_value(argc, argv, "--expert-histogram-in", "");
+  rocket::fabric::ExpertPartition part;
+  if (hist_in.empty()) {
+    part = rocket::fabric::contiguous_partition(cfg.n_routed_experts, {});
+  } else {
+    const std::vector<std::uint64_t> counts =
+        rocket::fabric::load_expert_histogram(hist_in, cfg.n_routed_experts);
+    part = rocket::fabric::balance_experts(counts);
+    const rocket::fabric::ExpertPartition id_split =
+        rocket::fabric::contiguous_partition(cfg.n_routed_experts, counts);
+    std::printf("expert partition from %s: predicted load %.0f / %.0f rows, imbalance %.3fx "
+                "(id split: %.0f / %.0f, %.3fx)\n",
+                hist_in.c_str(), part.load[0], part.load[1], part.imbalance, id_split.load[0],
+                id_split.load[1], id_split.imbalance);
+  }
+
   std::unique_ptr<rocket::fabric::ExpertParallel> ep;
   if (parallel) {
     rocket::fabric::Config fc;
@@ -207,9 +229,9 @@ int main(int argc, char** argv) {
     fc.bootstrap_host = arg_value(argc, argv, "--host", "192.168.100.10");
     fc.bootstrap_port = std::atoi(arg_value(argc, argv, "--port", "18779"));
     ep = std::make_unique<rocket::fabric::ExpertParallel>(
-        fc, cfg.n_routed_experts, max_batch * cfg.num_experts_per_tok, cfg.hidden_size);
-    std::printf("rank %d: fabric up, experts [%d, %d)\n", ep->rank(), ep->expert_first(),
-                ep->expert_first() + ep->expert_count());
+        fc, part.owner, max_batch * cfg.num_experts_per_tok, cfg.hidden_size);
+    std::printf("rank %d: fabric up, %d experts, %s\n", ep->rank(), ep->expert_count(),
+                ep->contiguous() ? "one contiguous id range" : "a balanced set");
     std::fflush(stdout);
   }
 
@@ -218,9 +240,14 @@ int main(int argc, char** argv) {
                                       static_cast<std::size_t>(cache_gib * (1ull << 30)),
                                       max_tokens, max_batch);
   if (parallel) {
-    engine.weights().set_expert_range(ep->expert_first(), ep->expert_count());
+    engine.weights().set_expert_set(ep->owned_experts());
     engine.set_expert_parallel(ep.get());
+    engine.set_expert_parallel_overlap(arg_value(argc, argv, "--overlap", "0")[0] == 0x31);
   }
+  engine.set_use_cuda_graph(arg_value(argc, argv, "--cuda-graph", "0")[0] == 0x31);
+  std::printf("rank %d: overlap %s, cuda graph %s\n", rank,
+              engine.expert_parallel_overlap() ? "on" : "off",
+              engine.use_cuda_graph() ? "on" : "off");
   std::printf("rank %d: engine loaded in %.1f s, resident %.2f GiB, %zu expert slots\n", rank,
               ms_since(t_load) / 1000.0, engine.weights().resident_bytes() / 1073741824.0,
               engine.weights().expert_slots());
@@ -239,6 +266,27 @@ int main(int argc, char** argv) {
   const std::uint64_t logit_sum = checksum(engine.last_logits(0));
   std::printf("rank %d: stream 0 logits checksum %016llx\n", rank,
               static_cast<unsigned long long>(logit_sum));
+
+  // Expert-firing histogram (model.h::expert_fire_counts). Written after the
+  // parity decode, which is eight real prompts of twenty tokens each, so the
+  // counts describe routing on text rather than on the synthetic tokens the
+  // timing sweep feeds. Run --mode single to see all 288 experts; a rank of
+  // the pair only ever fires the experts it owns.
+  const std::string hist_out = arg_value(argc, argv, "--expert-histogram-out", "");
+  if (!hist_out.empty()) {
+    const auto& counts = engine.expert_fire_counts();
+    std::ofstream h(hist_out);
+    if (!h) {
+      std::fprintf(stderr, "cannot write %s\n", hist_out.c_str());
+      return 1;
+    }
+    h << "# routed-expert firing counts, summed over " << cfg.text_layers
+      << " text layers and the static-fire parity decode (M=" << M << ", " << new_tokens
+      << " new tokens per stream)\n";
+    for (std::size_t e = 0; e < counts.size(); ++e) h << e << " " << counts[e] << "\n";
+    std::printf("rank %d: wrote expert histogram (%zu experts) to %s\n", rank, counts.size(),
+                hist_out.c_str());
+  }
 
   int failures = 0;
   if (skip_parity) {

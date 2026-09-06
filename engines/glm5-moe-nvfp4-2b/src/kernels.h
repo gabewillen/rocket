@@ -209,6 +209,12 @@ void add_bf16(bf16* acc, const bf16* v, int n, cudaStream_t s);
 // the adds are ordered by i to keep the sum reproducible.
 void moe_scatter_add(bf16* acc, const bf16* y, const int* row_of, const float* weight_of, int rows,
                      int batch, int n, cudaStream_t s);
+// Scatter a contiguous [rows, n] block back into the rows of `out` named by
+// `row_of`: out[row_of[i]] = y[i]. The inverse of moe_gather_rows, used by the
+// two-booster split to place the peer's returned expert-output rows at their
+// true positions when this rank's expert set is not a contiguous id range
+// (src/fabric/expert_balance.h).
+void moe_scatter_rows(bf16* out, const bf16* y, const int* row_of, int rows, int n, cudaStream_t s);
 // Gather the rows of `x` named by `row_of` into a contiguous [rows, n] block.
 void moe_gather_rows(bf16* out, const bf16* x, const int* row_of, int rows, int n, cudaStream_t s);
 
