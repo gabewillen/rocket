@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RoCE bandwidth and latency between two boosters.
+# RoCE bandwidth and latency between two GB10 nodes (head, peer).
 #   ./fabric-bw.sh <peer-rail1-ip> <peer-rail2-ip>
 # Assumes perftest on both nodes and passwordless ssh to the peer.
 #

@@ -23,7 +23,7 @@ Method: published sources only. Nothing measured locally.
 | host scheduling | page allocation and request scheduling run on the CPU, adding CPU-GPU synchronization | [MPK](https://zhihaojia.medium.com/compiling-llms-into-a-megakernel-a-path-to-low-latency-inference-cf7840913c17) |
 
 A forward pass split into about 100 kernels stalls weight loading at every
-boundary. A booster has 20 Arm cores to do the host half of that.
+boundary. A GB10 node has 20 Arm cores to do the host half of that.
 
 The 50% figure has independent corroboration: SambaNova reports optimized GPU
 implementations on H100 rarely exceeding 50% HBM bandwidth

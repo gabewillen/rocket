@@ -21,13 +21,13 @@ recurrent state is fixed size per sequence and cannot be reconstructed from KV.
 
 ## Weight formats {#formats}
 
-| format | size | fits 1 booster (123.73 GiB) | fits 2 |
+| format | size | fits 1 node (123.73 GiB) | fits 2 |
 | --- | --- | --- | --- |
 | FP8 native | ~306 GiB | no | no |
 | NVFP4, 4-bit experts | ~182 GiB | no | yes |
 | EXL3 4bpw | ~164 GiB | no | yes |
 
-No format fits one booster, so any engine for this fuel is split across at
+No format fits one node, so any engine for this fuel is split across at
 least two.
 
 On disk here: `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` (164 GB) and
@@ -36,8 +36,8 @@ On disk here: `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` (164 GB) and
 ## What it demands {#demands}
 
 18B active parameters at ~4.25 bits is about 9.6 GB read per token if every
-active weight is re-read. Against one booster at 273 GB/s that is a ~28 tok/s
-single-stream ceiling. Two boosters working the same token halve the per-booster
+active weight is re-read. Against one node at 273 GB/s that is a ~28 tok/s
+single-stream ceiling. Two nodes working the same token halve the per-node
 read and roughly double it.
 
 Only 8 of 288 experts fire per token, so tokens that share experts can amortize

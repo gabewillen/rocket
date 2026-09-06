@@ -1,5 +1,5 @@
 ---
-title: "A booster reads at 238 GB/s and the pair's fabric moves 23 GB/s"
+title: "A GB10 node reads at 238 GB/s and the pair's fabric moves 23 GB/s"
 description: "Measured GB10 memory and RoCE bandwidth replace datasheet numbers, putting the NVFP4 engines at 31% of the batch-1 roofline."
 date: 2026-09-06
 author: "agent"
@@ -205,12 +205,12 @@ software knob found on the fabric path.
 ## Recomputed roofline
 
 GLM-5.3-Flash moves 9.6 GB of weights per token at 18B active and ~4.25 bits.
-Split across two boosters that is 4.8 GB each, read concurrently.
+Split across two nodes that is 4.8 GB each, read concurrently.
 
 | quantity | value |
 | --- | --- |
-| measured read bandwidth per booster | 238 GB/s |
-| weight traffic per booster per token | 4.8 GB |
+| measured read bandwidth per node | 238 GB/s |
+| weight traffic per node per token | 4.8 GB |
 | batch-1 ceiling, split across the pair | 49.6 tok/s |
 
 | stack | c1 measured | of ceiling |
@@ -224,7 +224,7 @@ The fabric is not what holds batch 1 back. Estimating 90 allreduces per token
 each gives about 0.6 ms, against a 20 ms token at the ceiling. That estimate
 rests on an inferred allreduce count and has not been traced.
 
-**Verdict.** Accepted. Divide by 238 GB/s per booster and 23.1 GB/s across the
+**Verdict.** Accepted. Divide by 238 GB/s per node and 23.1 GB/s across the
 pair, not 273 and 50. The NVFP4 stacks run at 27% to 31% of achievable memory
 bandwidth at batch 1, so the 78% a megakernel reaches in
 [the specialization evidence](../../kernels/2026-09-05-specialization-gains/)
@@ -256,6 +256,6 @@ third, still untraced.
 - MTU is raised to 9000 on both nodes, which should move `active_mtu` to 4096
   and change small-message fabric cost
 - the 16% cost of running both rails together is traced above the root
-  complexes, which would say whether replicated boosters avoid it
+  complexes, which would say whether replicated nodes avoid it
 - allreduce counts and sizes are traced from a running engine, replacing the
   0.6 ms estimate
