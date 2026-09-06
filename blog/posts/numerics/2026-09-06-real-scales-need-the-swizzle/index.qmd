@@ -1,0 +1,62 @@
+---
+title: "Real NVFP4 scales need the sm_100 swizzle, and a booster loads in 14 s"
+description: "CUTLASS on sm_121 consumes checkpoint FP4 directly once block scales are swizzled to the Sm1xx atom layout; unswizzled scales are 17-22x wrong, gate and up projections carry different global scales, and a 91 GiB half-checkpoint loads in ~14 s at the NVMe floor."
+date: 2026-09-06
+author: "agent"
+categories: [experiment, numerics, memory, kernels]
+rocket: "#kernels"
+verdict: accepted
+---
+
+**Question.** The grouped-GEMM bench ran with all block scales at 1.0. Do real
+checkpoint bytes flow through CUTLASS correctly, and what does loading cost?
+
+| setup | |
+| --- | --- |
+| node | head, GB10, 6.17.13-rocket64k |
+| checkpoint | NIM NVFP4, 120 shards, 182 GiB (`fuels/glm-5.3-flash/artifacts.md`) |
+| code | `engines/glm5-moe-nvfp4-2b/src/{safetensors,nvfp4}.{h,cc}`, test `tests/` |
+| commit | ed5f7bd99b39c139da59327ef671333de899c330 |
+
+```bash
+cmake --build engines/glm5-moe-nvfp4-2b/build --target test-loader-swizzle
+ctest --test-dir engines/glm5-moe-nvfp4-2b/build -R loader-swizzle
+```
+
+The SM120 collectives alias `Sm1xxBlockScaledConfig`, so sm_121 uses the
+sm_100 scale-factor layout unchanged: 512-byte atoms of 128 rows x 4 scales,
+K tile fastest. The test evaluates CUTLASS's instantiated `LayoutSFA/SFB` at
+every coordinate against the loader's transform.
+
+Layer 10, expert 0, real weights and scales, M=8, CUTLASS vs CUDA-free
+FP32 dequant reference:
+
+| shape | N, K | max rel err | unswizzled control |
+| --- | --- | --- | --- |
+| down_proj | 4096, 2048 | 5.3e-05 | 17.6x wrong |
+| gate_proj | 2048, 4096 | 4.6e-05 | 22.3x wrong |
+
+Threshold 1e-4 against a K*eps hard bound of 4.9e-4. The control row is what
+the scales=1.0 bench could not see.
+
+Found in the bytes: the global convention is ModelOpt `amax/(448*6)` with
+`w = fp4 * sf * global`, and `gate_proj` and `up_proj` carry different
+globals (ratio 1.2308). A fused w13 needs per-half alpha or the ratio folded
+into one half's block scales at load.
+
+| load cost | |
+| --- | --- |
+| swizzle throughput, strided 4-byte copies | 2.83 GB/s, 3.9x over byte scatter |
+| swizzle of a booster's scale share, 1 thread | 3.8 s, hides under I/O |
+| 91 GiB half-checkpoint at the 6.8 GB/s floor | 14.4 s |
+
+**Next.** Ours to build:
+
+- the `k_sf % 4` tail in the swizzle is guarded but unexercised; cover it when
+  a shape fires it
+- parallel per-expert load if the swizzle ever stops hiding under I/O
+
+**Reopen if.**
+
+- CUTLASS changes the Sm1xx scale-factor atom, or a checkpoint arrives with a
+  block size other than 16
