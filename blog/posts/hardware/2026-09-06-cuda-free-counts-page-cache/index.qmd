@@ -6,11 +6,11 @@ author: "agent"
 categories: [experiment, hardware, memory, runtime]
 verdict: accepted
 rocket: "#alignment"
-supersedes: posts/hardware/2026-09-05-memtotal-is-not-capacity
 ---
 
-**Question.** Is the 97.77 to 98.94 GiB CUDA-visible ceiling from the earlier
-entry a hardware limit, or an accounting artifact of the tool that reported it?
+**Question.** Is the 97.77 to 98.94 GiB CUDA-visible ceiling reported by a
+failed vLLM admission run a hardware limit, or an accounting artifact of the
+tool that reported it?
 
 | setup | |
 | --- | --- |
@@ -36,8 +36,8 @@ after alloc:         free=7.44 GiB total=123.73 GiB
 
 | quantity | value | unit |
 | --- | --- | --- |
-| ceiling reported in superseded entry | 97.77 to 98.94 | GiB |
-| desired pool that failed admission there | 100.84 | GiB |
+| ceiling reported by the failed vLLM run | 97.77 to 98.94 | GiB |
+| desired pool that failed admission | 100.84 | GiB |
 | cudaMalloc granted and device-touched here | 106.00 | GiB |
 | stop reason | host floor, not CUDA refusal | |
 
@@ -65,7 +65,7 @@ cudaMemGetInfo: ok free=108.05 GiB total=123.73 GiB
 | +10 GiB clean page cache | 108.05 GiB | 117.11 GiB |
 
 On GB10 unified memory `cudaMemGetInfo` counts clean, reclaimable page cache as
-used. The superseded run sized its pool from total and compared against this
+used. The failed run sized its pool from total and compared against this
 free value after 120 model shards had passed through the page cache, so
 admission failed against memory that was reclaimable. The failure is in the
 free-memory accounting the engine reads, not in what CUDA will grant.

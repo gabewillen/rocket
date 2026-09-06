@@ -44,9 +44,8 @@ expect it.
 
 **Verdict.** Accepted. Engines require the 64K kernel.
 
-The gain is in `MemTotal`, which is not the same as GPU-visible capacity. Sizing
-a pool from it fails:
-[MemTotal is not usable capacity](../2026-09-05-memtotal-is-not-capacity/).
+The gain is CUDA-usable:
+[the 98 GiB CUDA ceiling was page cache, not a limit](../2026-09-06-cuda-free-counts-page-cache/).
 
 **Reopen if.**
 

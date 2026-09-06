@@ -104,8 +104,9 @@ locality. Placement quality is a performance property, not a correctness one.
 
 ### Memory budget {#memory}
 
-Take an absolute byte budget. Never a fraction of `MemTotal`
-([why](posts/hardware/2026-09-05-memtotal-is-not-capacity/)).
+Take an absolute byte budget from measured `MemAvailable` minus an OS floor,
+never a fraction of `MemTotal`
+([why](posts/hardware/2026-09-06-cuda-free-counts-page-cache/)).
 
 ```
 usable = measured_cuda_free_after_registration
