@@ -82,6 +82,7 @@ tree.
 - NEVER write a script to `/tmp` or any other scratch path. ALWAYS commit every script that produced a number, under `scripts/<area>/`, and cite it by repository path in the entry.
 - ALWAYS make a committed script runnable as-is, so a reader reproduces the number without reconstructing it from a fenced block.
 - ALWAYS state, in the Verdict section, what would have to change for the question to be reopened.
+- NEVER put work this project can do itself in a reopen condition; reopen conditions are for external change only (firmware, upstream releases, hardware). Doable work goes in a "Next" list and gets done.
 - ALWAYS log a rejected result with the same care as an accepted one.
 
 ### Before and after

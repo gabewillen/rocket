@@ -114,10 +114,13 @@ Kernel time is flat in M (w13 stays 14.1-14.6 ms from M=8 to M=64 while TFLOPS g
 
 **Rejected.** Rocket does not need its own NVFP4 grouped GEMM port for sm_121. CUTLASS 4.8.0 builds unpatched with one arch flag, verifies correct, and leaves under 20% on the table in a bandwidth-bound regime where a hand port would be competing against the memory system rather than against CUTLASS.
 
-**Reopen if.**
+**Next.** Ours to build, not conditions to wait on:
 
 - a fused SwiGLU epilogue across `w13` and `w2` removes the intermediate round trip, which CUTLASS does not express today and which is worth more than the remaining 20%
 - expert gather and grouped GEMM are fused so the weight stream is issued once per step instead of once per GEMM
-- measured roofline on this box rises above 238 GB/s and CUTLASS does not track it
 - per-expert M falls below 8, where the 128x128x128 tile wastes most of its M extent
+
+**Reopen if.**
+
+- measured roofline on this box rises above 238 GB/s and CUTLASS does not track it
 - CUTLASS drops or regresses `121a` in the supported arch list
