@@ -241,8 +241,39 @@ WeightStore::~WeightStore() {
   if (pinned_ != nullptr) cudaFreeHost(pinned_);
 }
 
+void WeightStore::set_expert_range(int first, int count) {
+  if (first < 0 || count <= 0 || first + count > cfg_.n_routed_experts)
+    fail("expert range [" + std::to_string(first) + ", " + std::to_string(first + count) +
+         ") does not fit " + std::to_string(cfg_.n_routed_experts) + " routed experts");
+  expert_first_ = first;
+  expert_count_ = count;
+
+  // The foreign half's down-projection weight_scale_2, read once here. These
+  // are 4 bytes each out of tensors whose packed weights are never touched on
+  // this rank, so this faults one checkpoint page per expert and nothing more.
+  down_global_.assign(static_cast<std::size_t>(cfg_.text_layers) * cfg_.n_routed_experts, 0.0f);
+  for (int l = 0; l < cfg_.text_layers; ++l) {
+    if (cfg_.layers[l].mlp != fuel::MlpKind::kSparse) continue;
+    const std::string p = layer_prefix(l) + "mlp.experts.";
+    for (int e = 0; e < cfg_.n_routed_experts; ++e) {
+      const fuel::TensorView& g2 = ckpt_.tensor(p + std::to_string(e) + ".down_proj.weight_scale_2");
+      std::memcpy(&down_global_[static_cast<std::size_t>(l) * cfg_.n_routed_experts + e], g2.data,
+                  sizeof(float));
+    }
+  }
+}
+
+float WeightStore::expert_down_global(int layer, int expert_id) const {
+  const std::size_t i = static_cast<std::size_t>(layer) * cfg_.n_routed_experts + expert_id;
+  return i < down_global_.size() ? down_global_[i] : 0.0f;
+}
+
 const ExpertDev& WeightStore::expert(int layer, int expert_id, cudaStream_t s) {
   const long long key = static_cast<long long>(layer) * cfg_.n_routed_experts + expert_id;
+  if (!owns_expert(expert_id))
+    fail("expert " + std::to_string(expert_id) + " of layer " + std::to_string(layer) +
+         " is outside this rank's range [" + std::to_string(expert_first_) + ", " +
+         std::to_string(expert_first_ + expert_count_) + "); the peer owns it");
   if (const auto it = resident_expert_.find(key); it != resident_expert_.end()) {
     ++hits_;
     const int slot = it->second;

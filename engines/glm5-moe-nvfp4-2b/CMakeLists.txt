@@ -114,8 +114,46 @@ target_link_libraries(rocket-test-stand PRIVATE rocket_engine)
 add_executable(rocket-decode src/decode_main.cu)
 target_link_libraries(rocket-decode PRIVATE rocket_engine rocket_fuel)
 
+# Fabric: the RoCE transport between the two boosters (src/fabric/fabric.h).
+# Plain C++ against libibverbs, no CUDA, because nothing in it touches the
+# device: the staging buffers are cudaHostAlloc'd by the caller and register
+# as ordinary pinned host pages.
+find_library(ROCKET_IBVERBS ibverbs)
+if(NOT ROCKET_IBVERBS)
+  message(FATAL_ERROR
+    "libibverbs not found. The two-booster arrangement is the engine's only "
+    "arrangement (CMakeLists.txt header); install libibverbs-dev.")
+endif()
+
+add_library(rocket_fabric STATIC src/fabric/rdma.cc src/fabric/expert_parallel.cu)
+target_include_directories(rocket_fabric PUBLIC src)
+target_link_libraries(rocket_fabric PUBLIC ${ROCKET_IBVERBS})
+set_target_properties(rocket_fabric PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+  CUDA_SEPARABLE_COMPILATION ON
+)
+target_link_libraries(rocket_engine PUBLIC rocket_fabric)
+
+# Transport measurement at the message sizes the decode step uses. Launch both
+# ranks with scripts/fabric/fabric-microbench.sh.
+add_executable(rocket-fabric-bench src/fabric/fabric_bench.cu)
+target_link_libraries(rocket-fabric-bench PRIVATE rocket_fabric)
+
+# Static fire: both boosters lit, expert-parallel, gated on token parity
+# against the single-booster result. Launch with scripts/fabric/static-fire.sh.
+# Registered as a test below rather than in tests/CMakeLists.txt so the target
+# and its ctest entry stay in one place with the rest of the fabric.
+add_executable(rocket-static-fire src/fabric/static_fire.cu)
+target_link_libraries(rocket-static-fire PRIVATE rocket_engine rocket_fuel rocket_fabric)
+
 enable_testing()
 add_test(NAME test-stand COMMAND rocket-test-stand)
+
+# Needs the peer booster, so it skips (77) wherever the peer is not reachable,
+# matching the other real-artifact tests in tests/CMakeLists.txt.
+add_test(NAME static-fire
+  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/fabric/static-fire.sh")
+set_tests_properties(static-fire PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 7200)
 
 add_subdirectory(tests)
 add_subdirectory(bench)

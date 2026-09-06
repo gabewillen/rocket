@@ -143,6 +143,28 @@ class WeightStore {
   // Returns the expert, fetching it from the checkpoint if it is not resident.
   const ExpertDev& expert(int layer, int expert_id, cudaStream_t s);
 
+  // --- two-booster expert parallelism (src/fabric/expert_parallel.h) -------
+  //
+  // A rank owns a contiguous half of the routed experts and must never fetch
+  // the other half: the peer's 144 experts are 91 GiB this node does not have
+  // room for, so a stray fetch is a capacity bug, not a slow path. expert()
+  // throws on an id outside the range once one is set.
+  void set_expert_range(int first, int count);
+  int expert_range_first() const { return expert_first_; }
+  int expert_range_count() const { return expert_count_; }
+  bool owns_expert(int expert_id) const {
+    return expert_count_ == 0 ||
+           (expert_id >= expert_first_ && expert_id < expert_first_ + expert_count_);
+  }
+
+  // weight_scale_2 of every routed expert's down projection, owned and
+  // foreign alike. A rank needs the foreign value because it applies the
+  // scatter weight to rows the peer computed (model.cu::run_moe_grouped), and
+  // the whole table is 42 * 288 floats = 47 KiB against 91 GiB of packed
+  // weights, so the range filter does not apply to it. Built by
+  // set_expert_range; returns 0 if no range was set.
+  float expert_down_global(int layer, int expert_id) const;
+
   // Seam for a future BF16 -> FP8 flip (fuels/glm-5.3-flash/fuel.yaml,
   // serving_regime.quantization_plan): every uploaded resident tensor is
   // keyed here by name to its on-device dtype, read from the checkpoint
@@ -194,6 +216,10 @@ class WeightStore {
   std::size_t pinned_bytes_ = 0;
   std::uint64_t hits_ = 0, misses_ = 0;
   std::size_t streamed_bytes_ = 0;
+
+  int expert_first_ = 0;
+  int expert_count_ = 0;  // 0 means "every expert", the single-booster case
+  std::vector<float> down_global_;  // [text_layers * n_routed_experts]
 };
 
 }  // namespace rocket::engine

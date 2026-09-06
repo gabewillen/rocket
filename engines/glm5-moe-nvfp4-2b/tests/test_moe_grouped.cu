@@ -11,15 +11,30 @@
 //      here with MoePath::kForceGrouped so both sides take the grouped path
 //      (test_batch_parity.cu itself uses the default MoePath::kAuto, which
 //      is the same thing once kGroupedMoeMinBatch is 1)
-//   3. an M-sweep (1, 2, 4, 8) of both paths, forced independently at every
-//      M, to find the crossover and report tok/s and bytes streamed per
-//      token
+//   3. an M-sweep (1, 2, 4, 8, 16, 32) of both paths, forced independently at
+//      every M, to find the crossover and report tok/s and bytes streamed
+//      per token, plus the host-side expert-grouping cost the grouped path
+//      pays per step (blog/posts/runtime/2026-09-07-grouped-gemm-beats-gemv-
+//      at-every-m/'s Next: "measure first" before replacing the std::map
+//      with a flat counting pass)
 //
 // One engine load for the whole file (model loads dominate test runtime; see
-// AGENTS.md and the ~11 minute batch-parity test). max_batch=8 and
-// max_tokens=512 match test_batch_parity.cu exactly, so check 2 above is a
-// true byte-for-byte replica of that test's scenario, just forcing the path
-// explicitly instead of relying on the default crossover.
+// AGENTS.md and the ~11 minute batch-parity test). Checks 1 and 2 build the
+// engine's real prompts at M=8, matching test_batch_parity.cu's scenario
+// exactly (a byte-for-byte replica, just forcing the path explicitly instead
+// of relying on the default crossover); the engine itself is sized to
+// max_batch=kMaxSweepBatch=32 so the M-sweep above can run every M on the
+// same load.
+//
+// max_tokens stays 512, not the fuel's serving context cap (262144,
+// fuels/glm-5.3-flash/fuel.yaml serving_context_cap): KV bytes/stream/token
+// are mla_layers * (kv_lora + 2*index_head_dim) * 2 bytes = 11 * 768 * 2 =
+// 16896 B, so at max_batch=32 that is 264 MiB total for 512 tokens/stream
+// against 135 GiB for 262144 tokens/stream -- more than this booster's
+// 123.73 GiB total memory on its own, before the 20 GiB expert cache and the
+// resident weights. 512 exercises every kernel and launch-bound choice below
+// at the batch sizes this entry measures; it is not a claim about how far a
+// real agent session's context should run.
 //
 // Returns 77 when the checkpoint is not on this node, matching the other
 // real-weight tests.
@@ -63,9 +78,10 @@ double max_rel_diff(const std::vector<float>& a, const std::vector<float>& b) {
 // stream, every step: content does not matter, only that every layer's
 // routing and every kernel actually runs.
 double time_steps(DecodeEngine& engine, int M, MoePath path, int warmup, int timed,
-                  std::uint64_t* bytes_delta) {
+                  std::uint64_t* bytes_delta, bool use_graph = false) {
   engine.reset();
   engine.set_moe_path(path);
+  engine.set_use_cuda_graph(use_graph);
   std::vector<int> tokens(M, 5), next;
   for (int i = 0; i < warmup; ++i) engine.step(tokens, next, false);
   const std::uint64_t before = engine.weights().expert_bytes_streamed();
@@ -73,6 +89,7 @@ double time_steps(DecodeEngine& engine, int M, MoePath path, int warmup, int tim
   for (int i = 0; i < timed; ++i) engine.step(tokens, next, false);
   const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
   if (bytes_delta != nullptr) *bytes_delta = engine.weights().expert_bytes_streamed() - before;
+  engine.set_use_cuda_graph(false);
   return ms / timed;
 }
 
@@ -102,9 +119,11 @@ int main() {
   std::vector<std::vector<int>> prompts;
   for (const auto& p : prompt_text) prompts.push_back(tok.encode(p));
   const int M = static_cast<int>(prompts.size());  // 8, matches test_batch_parity.cu
-  const int max_tokens = 512;
-  std::printf("loading engine (max_batch=%d, max_tokens=%d)...\n", M, max_tokens);
-  DecodeEngine engine(cfg, snapshot, static_cast<std::size_t>(20) * (1ull << 30), max_tokens, M);
+  const int kMaxSweepBatch = 32;                    // widest M in the sweep below
+  const int max_tokens = 512;                       // see header comment
+  std::printf("loading engine (max_batch=%d, max_tokens=%d)...\n", kMaxSweepBatch, max_tokens);
+  DecodeEngine engine(cfg, snapshot, static_cast<std::size_t>(20) * (1ull << 30), max_tokens,
+                      kMaxSweepBatch);
 
   // --- 1. grouped vs GEMV at M=1, same token sequence, logits agreement ---
   std::printf("grouped vs GEMV, M=1\n");
@@ -184,9 +203,10 @@ int main() {
 
   // --- 3. M-sweep: crossover, tok/s, bytes/token -------------------------
   std::printf("\nM-sweep (5 warmup + 10 timed steps per path per M)\n");
-  std::printf("%4s  %10s  %10s  %12s  %12s  %14s  %14s\n", "M", "gemv ms", "grouped ms",
-             "gemv tok/s", "grp tok/s", "gemv GiB/tok", "grp GiB/tok");
-  const std::vector<int> Ms = {1, 2, 4, 8};  // bounded by max_batch=M=8 above
+  std::printf("%4s  %10s  %10s  %12s  %12s  %14s  %14s  %10s  %6s\n", "M", "gemv ms",
+             "grouped ms", "gemv tok/s", "grp tok/s", "gemv GiB/tok", "grp GiB/tok", "grp us",
+             "grp %");
+  const std::vector<int> Ms = {1, 2, 4, 8, 16, 32};  // bounded by max_batch=kMaxSweepBatch above
   int crossover = -1;
   for (const int m : Ms) {
     std::uint64_t bytes_gemv = 0, bytes_grouped = 0;
@@ -196,8 +216,18 @@ int main() {
     const double toks_grouped = 1000.0 * m / ms_grouped;
     const double gib_gemv = bytes_gemv / (1024.0 * 1024.0 * 1024.0) / (10.0 * m);
     const double gib_grouped = bytes_grouped / (1024.0 * 1024.0 * 1024.0) / (10.0 * m);
-    std::printf("%4d  %10.2f  %10.2f  %12.2f  %12.2f  %14.4f  %14.4f\n", m, ms_gemv, ms_grouped,
-               toks_gemv, toks_grouped, gib_gemv, gib_grouped);
+    // Host-side expert-grouping cost (Next: "measure first" before swapping
+    // the std::map for a flat counting pass): one more instrumented step,
+    // engine.stages().moe_group_host_ms is the std::chrono-only wall time of
+    // that one step's std::map builds, summed over every MoE layer.
+    engine.set_moe_path(MoePath::kForceGrouped);
+    std::vector<int> gtoks(m, 5), gnext;
+    engine.step(gtoks, gnext, false);
+    const double group_us = engine.stages().moe_group_host_ms * 1000.0;
+    const double group_pct = 100.0 * engine.stages().moe_group_host_ms / ms_grouped;
+    std::printf("%4d  %10.2f  %10.2f  %12.2f  %12.2f  %14.4f  %14.4f  %10.2f  %5.3f%%\n", m,
+               ms_gemv, ms_grouped, toks_gemv, toks_grouped, gib_gemv, gib_grouped, group_us,
+               group_pct);
     if (crossover < 0 && ms_grouped < ms_gemv) crossover = m;
   }
   if (crossover < 0) {
@@ -208,6 +238,44 @@ int main() {
     std::printf("\nMeasured crossover: grouped path is faster from M=%d (model.cu::kGroupedMoeMinBatch)\n",
                crossover);
   }
+
+  // --- 4. CUDA graph: ms/step with vs without, grouped path, every M in the
+  // sweep. set_use_cuda_graph(true) only changes step()'s internal dispatch
+  // (model.cu::ensure_graphs_built / run_step_layers_graph); output must stay
+  // identical to the non-graph grouped path, checked by the greedy-token
+  // comparison below rather than assumed.
+  std::printf(
+      "\nCUDA graph: grouped path ms/step, with vs without (5 warmup + 10 timed steps)\n");
+  std::printf("%4s  %14s  %14s  %8s\n", "M", "no graph ms", "graph ms", "speedup");
+  for (const int m : Ms) {
+    const double ms_no_graph = time_steps(engine, m, MoePath::kForceGrouped, 5, 10, nullptr, false);
+    const double ms_graph = time_steps(engine, m, MoePath::kForceGrouped, 5, 10, nullptr, true);
+    std::printf("%4d  %14.2f  %14.2f  %7.2fx\n", m, ms_no_graph, ms_graph,
+               ms_no_graph / ms_graph);
+  }
+  // Correctness: graph on vs off must pick the same greedy tokens over a
+  // real generation, not just report similar timing.
+  std::printf("\ngraph vs no-graph, real prompt, greedy tokens\n");
+  auto run_graph_check = [&](bool use_graph) {
+    engine.reset();
+    engine.set_moe_path(MoePath::kForceGrouped);
+    engine.set_use_cuda_graph(use_graph);
+    std::vector<int> out;
+    std::vector<int> next;
+    for (const int id : prompts[0]) engine.step(std::vector<int>{id}, next, false);
+    int last = next[0];
+    for (int t = 0; t < new_tokens; ++t) {
+      out.push_back(last);
+      engine.step(std::vector<int>{last}, next, false);
+      last = next[0];
+    }
+    engine.set_use_cuda_graph(false);
+    return out;
+  };
+  const std::vector<int> graph_off = run_graph_check(false);
+  const std::vector<int> graph_on = run_graph_check(true);
+  check("graph vs no-graph, greedy tokens match", graph_off == graph_on,
+       graph_off == graph_on ? "identical" : "MISMATCH");
 
   std::printf("\n%s: %d failure(s)\n", failures == 0 ? "PASS" : "FAIL", failures);
   return failures == 0 ? 0 : 1;

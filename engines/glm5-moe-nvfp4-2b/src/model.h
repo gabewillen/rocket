@@ -37,6 +37,10 @@
 #include "model_config.h"
 #include "weights.h"
 
+namespace rocket::fabric {
+class ExpertParallel;
+}
+
 namespace rocket::engine {
 
 // Wall time attributed to each stage of one step, in milliseconds, summed
@@ -47,9 +51,23 @@ struct StageMs {
   double embed = 0, hyper_connection = 0, norms = 0, kda = 0, mla = 0, indexer = 0;
   double dense_mlp = 0, moe_router = 0, moe_experts = 0, moe_shared = 0, expert_stream = 0;
   double lm_head = 0;
+  // Host-only wall time (std::chrono, no GPU sync) spent building the
+  // std::map<expert_id, rows> grouping in run_moe_grouped, summed over every
+  // MoE layer of the step. Not part of sum(): it overlaps moe_experts, it is
+  // a diagnostic for the "Next" item in blog/posts/runtime/2026-09-07-
+  // grouped-gemm-beats-gemv-at-every-m/ (replace with a flat counting pass
+  // if it shows up), not a stage the decode step is attributed to.
+  double moe_group_host_ms = 0;
+  // Wall time inside the two-booster routed-expert row exchange
+  // (src/fabric/expert_parallel.h), summed over the step's MoE layers. Zero
+  // on a single booster. Counted in sum() because it is serial in the step:
+  // the layer cannot scatter-add until the peer's rows have landed. It
+  // includes waiting for the peer, so it is the split's exposed cost and an
+  // upper bound on the transport's own.
+  double fabric = 0;
   double sum() const {
     return embed + hyper_connection + norms + kda + mla + indexer + dense_mlp + moe_router +
-           moe_experts + moe_shared + expert_stream + lm_head;
+           moe_experts + moe_shared + expert_stream + lm_head + fabric;
   }
 };
 
@@ -104,6 +122,24 @@ class DecodeEngine {
   void set_moe_path(MoePath p) { moe_path_ = p; }
   MoePath moe_path() const { return moe_path_; }
 
+  // Mounts this engine as one rank of the two-booster expert split. Must be
+  // set before the first step(), and the matching WeightStore::set_expert_range
+  // must already be in place, since run_moe_grouped will only ever fetch the
+  // experts this rank owns. Null (the default) is the single-booster engine,
+  // unchanged.
+  void set_expert_parallel(fabric::ExpertParallel* ep) { ep_ = ep; }
+  fabric::ExpertParallel* expert_parallel() const { return ep_; }
+
+  // Test-only: CUDA graph capture of the decode step's non-routing work
+  // (blog/posts/runtime/2026-09-07-grouped-gemm-beats-gemv-at-every-m/'s
+  // Next item 2). Off by default. Only takes effect when collect_stages is
+  // false and telemetry() is off, since both read back per-stage state with
+  // a host sync that cannot be captured; step() falls back to the direct
+  // per-layer path otherwise. See model.cu::ensure_graphs_built for what is
+  // and is not captured, and why.
+  void set_use_cuda_graph(bool on) { use_cuda_graph_ = on; }
+  bool use_cuda_graph() const { return use_cuda_graph_; }
+
   // Test-only: the raw lm_head logits row for one stream slot from the last
   // step() call, copied to host. Used to compare the grouped and GEMV MoE
   // paths directly (tests/test_moe_grouped.cu) rather than only through the
@@ -123,6 +159,30 @@ class DecodeEngine {
                        const std::vector<float>& wts);
   float sync_rms_slot0(const bf16* x, int n);
   void record_absmax(const std::string& name, const bf16* x, int batch, int n);
+
+  // ---- CUDA graph capture path (kept deliberately separate from run_moe
+  // and the direct per-layer loop in step(), not a refactor of them: the
+  // direct path stays byte-for-byte what it always was, so batch-parity and
+  // moe-grouped exercise it unchanged regardless of use_cuda_graph_). A
+  // layer's attention site and a dense FFN site have no host dependency and
+  // are captured once per batch size, replayed every step. A MoE FFN site
+  // splits into a captured router half (ends at an async device->host copy
+  // of the routing decision, no sync), an uncaptured dispatch half
+  // (WeightStore::expert() is host-driven LRU/mmap bookkeeping -- reading a
+  // checkpoint, updating a std::list -- that graph capture cannot express,
+  // and it must see the routing decision before it can pick pointers for
+  // the grouped GEMM, so this is a structural reason, not a missing
+  // optimization), and a captured shared-expert-FFN-plus-combine tail,
+  // deferred to the *start* of the next graph segment since it depends on
+  // acc_ written by the uncaptured dispatch. See model.cu::ensure_graphs_built.
+  void run_attn_site(int layer, int batch, int n_pools_launch);
+  void run_ffn_site_dense(int layer, int batch);
+  void run_moe_router_stage(int layer, int batch);
+  void run_moe_dispatch_stage(int layer, int batch);
+  void run_moe_post_stage(int layer, int batch);
+  void run_step_layers_graph(int batch);
+  void ensure_graphs_built(int batch);
+  void destroy_graphs();
 
   fuel::ModelConfig cfg_;
   WeightStore w_;
@@ -190,6 +250,21 @@ class DecodeEngine {
   float* moe_up_global_ = nullptr;     // [rows] per-group up weight_scale_2
   float* moe_scatter_w_ = nullptr;     // [rows] topk_w * down weight_scale_2
   MoePath moe_path_ = MoePath::kAuto;
+  fabric::ExpertParallel* ep_ = nullptr;
+
+  // ---- CUDA graph capture (model.cu::ensure_graphs_built) ----
+  std::vector<int> moe_layer_ids_;   // text-layer indices with sparse MLP, ascending
+  bool use_cuda_graph_ = false;
+  int graph_batch_ = -1;             // batch the cached graphs below were built for, -1 = none
+  std::vector<cudaGraph_t> graphs_;
+  std::vector<cudaGraphExec_t> graph_execs_;
+  // Async device->host target for one MoE layer's routing decision inside a
+  // captured graph segment (run_moe_router_stage); pinned so the copy is a
+  // real DMA and a legal graph memcpy node. Reused every MoE layer of every
+  // step: the dispatch that reads it always runs, synchronously, before the
+  // next graph segment's router stage can overwrite it.
+  int* moe_idx_pinned_ = nullptr;    // [moe_max_rows_]
+  float* moe_wts_pinned_ = nullptr;  // [moe_max_rows_]
   bf16 *mlp_gate_ = nullptr, *mlp_up_ = nullptr, *mlp_h_ = nullptr, *mlp_out_ = nullptr;
   bf16* acc_ = nullptr;
   float *logits_ = nullptr, *scratch_f_ = nullptr;

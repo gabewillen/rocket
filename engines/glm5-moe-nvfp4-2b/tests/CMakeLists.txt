@@ -25,7 +25,12 @@ target_link_libraries(test-batch-parity PRIVATE rocket_engine rocket_fuel)
 set_target_properties(test-batch-parity PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 add_test(NAME batch-parity COMMAND test-batch-parity)
-set_tests_properties(batch-parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
+# 3600 covered the original M=8 check alone; the M=32 (4x duplicated prompt)
+# check added in blog/posts/runtime/2026-09-07-grouped-gemm-beats-gemv-at-
+# every-m/'s Next ("batch-parity must stay green at the larger max_batch")
+# adds a second concurrent run at 4x the per-step cost over the same step
+# count, so the budget is doubled rather than padded arbitrarily.
+set_tests_properties(batch-parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 7200)
 
 if(NOT EXISTS "${ROCKET_CUTLASS_DIR}/include/cutlass/cutlass.h")
   message(STATUS
@@ -64,7 +69,10 @@ target_link_libraries(test-moe-grouped PRIVATE rocket_engine rocket_fuel)
 set_target_properties(test-moe-grouped PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 add_test(NAME moe-grouped COMMAND test-moe-grouped)
-set_tests_properties(moe-grouped PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# 1800 covered the M in {1,2,4,8} sweep; extending to {16,32} plus a CUDA
+# graph on/off timing pass over the same M set (each M pays a graph-capture
+# rebuild) roughly triples the wall time this test needs.
+set_tests_properties(moe-grouped PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400)
 
 # Synthetic-input properties the grouped path relies on (row invariance,
 # fused-w13 concatenation, determinism): no checkpoint, seconds not minutes.

@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "kernels.h"
+#include "fabric/expert_parallel.h"
 #include "moe_grouped.h"
 
 namespace rocket::engine {
@@ -209,6 +210,10 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   moe_gate_global_ = F(MR);
   moe_up_global_ = F(MR);
   moe_scatter_w_ = F(MR);
+  cuda_check(cudaHostAlloc(&moe_idx_pinned_, MR * sizeof(int), cudaHostAllocDefault),
+            "pinned moe idx");
+  cuda_check(cudaHostAlloc(&moe_wts_pinned_, MR * sizeof(float), cudaHostAllocDefault),
+            "pinned moe wts");
   mlp_gate_ = A(static_cast<std::size_t>(MB) * big_inter);
   mlp_up_ = A(static_cast<std::size_t>(MB) * big_inter);
   mlp_h_ = A(static_cast<std::size_t>(MB) * big_inter);
@@ -221,6 +226,9 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
 
   pos_.assign(MB, 0);
   layer_rms_.assign(cfg_.text_layers, 0.0f);
+
+  for (int l = 0; l < cfg_.text_layers; ++l)
+    if (cfg_.layers[l].mlp == fuel::MlpKind::kSparse) moe_layer_ids_.push_back(l);
 }
 
 std::vector<float> DecodeEngine::last_logits(int stream) const {
@@ -232,8 +240,21 @@ std::vector<float> DecodeEngine::last_logits(int stream) const {
 }
 
 DecodeEngine::~DecodeEngine() {
+  destroy_graphs();
+  if (moe_idx_pinned_ != nullptr) cudaFreeHost(moe_idx_pinned_);
+  if (moe_wts_pinned_ != nullptr) cudaFreeHost(moe_wts_pinned_);
   for (void* p : owned_) cudaFree(p);
   if (stream_ != nullptr) cudaStreamDestroy(stream_);
+}
+
+void DecodeEngine::destroy_graphs() {
+  for (cudaGraphExec_t e : graph_execs_)
+    if (e != nullptr) cudaGraphExecDestroy(e);
+  for (cudaGraph_t g : graphs_)
+    if (g != nullptr) cudaGraphDestroy(g);
+  graph_execs_.clear();
+  graphs_.clear();
+  graph_batch_ = -1;
 }
 
 void DecodeEngine::reset() {
@@ -436,8 +457,11 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
   // downstream -- is a pure function of which experts fired, not of hash
   // iteration order, which keeps the grouped path as reproducible as the
   // GEMV loop it replaces.
+  const auto t_group0 = Clock::now();
   std::map<int, std::vector<int>> by_expert;
   for (int slot = 0; slot < rows; ++slot) by_expert[idx[static_cast<std::size_t>(slot)]].push_back(slot);
+  stages_.moe_group_host_ms +=
+      std::chrono::duration<double, std::milli>(Clock::now() - t_group0).count();
 
   std::vector<int> row_of(rows), row_in_group(rows), group_of_row(rows);
   std::vector<long long> sf1_base, sf2_base;
@@ -447,59 +471,88 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
   groups1.reserve(by_expert.size());
   groups2.reserve(by_expert.size());
 
+  // Under the two-booster split (src/fabric/expert_parallel.h) this rank runs
+  // the grouped GEMM for its own experts only. Because the split is by expert
+  // id and by_expert is ascending in expert id, the rows this rank computes
+  // are one contiguous run: the prefix on rank 0, the suffix on rank 1. Row
+  // bookkeeping below is still built for every row, owned and foreign alike,
+  // so the scatter-add after the exchange is the same call the single-booster
+  // engine makes over the same row order.
   int row_start = 0;
   long long sf1_off = 0, sf2_off = 0;
   int g = 0;
+  int own_lo = -1, own_hi = 0;
   for (const auto& [expert_id, slots] : by_expert) {
     const int Mg = static_cast<int>(slots.size());
-    const auto t_stream = Clock::now();
-    const ExpertDev& e = w_.expert(layer, expert_id, stream_);
-    stages_.expert_stream +=
-        std::chrono::duration<double, std::milli>(Clock::now() - t_stream).count();
+    const bool mine = ep_ == nullptr || ep_->owns(expert_id);
+    float down_global = 0.0f;
 
-    const long long mn_tiles = (Mg + 127) / 128;
-    sf1_base.push_back(sf1_off);
-    sf2_base.push_back(sf2_off);
-    gate_global.push_back(e.gate_global);
-    up_global.push_back(e.up_global);
+    if (mine) {
+      const auto t_stream = Clock::now();
+      const ExpertDev& e = w_.expert(layer, expert_id, stream_);
+      stages_.expert_stream +=
+          std::chrono::duration<double, std::milli>(Clock::now() - t_stream).count();
+      down_global = e.down_global;
 
-    GroupedGemmGroup gr1;
-    gr1.m = Mg;
-    gr1.a_packed = moe_a1_packed_ + static_cast<std::size_t>(row_start) * (H / 2);
-    gr1.a_scale = moe_a1_sf_ + sf1_off;
-    gr1.b_packed = e.gate_packed;  // fused with up_packed, see weights.h
-    gr1.b_scale = e.w13_scale;
-    gr1.d_out = moe_gu_ + static_cast<std::size_t>(row_start) * (2 * MI);
-    groups1.push_back(gr1);
+      const long long mn_tiles = (Mg + 127) / 128;
+      sf1_base.push_back(sf1_off);
+      sf2_base.push_back(sf2_off);
+      gate_global.push_back(e.gate_global);
+      up_global.push_back(e.up_global);
 
-    GroupedGemmGroup gr2;
-    gr2.m = Mg;
-    gr2.a_packed = moe_a2_packed_ + static_cast<std::size_t>(row_start) * (MI / 2);
-    gr2.a_scale = moe_a2_sf_ + sf2_off;
-    gr2.b_packed = e.down_packed;
-    gr2.b_scale = e.down_scale_swizzled;
-    gr2.d_out = moe_out_ + static_cast<std::size_t>(row_start) * H;
-    groups2.push_back(gr2);
+      GroupedGemmGroup gr1;
+      gr1.m = Mg;
+      gr1.a_packed = moe_a1_packed_ + static_cast<std::size_t>(row_start) * (H / 2);
+      gr1.a_scale = moe_a1_sf_ + sf1_off;
+      gr1.b_packed = e.gate_packed;  // fused with up_packed, see weights.h
+      gr1.b_scale = e.w13_scale;
+      gr1.d_out = moe_gu_ + static_cast<std::size_t>(row_start) * (2 * MI);
+      groups1.push_back(gr1);
+
+      GroupedGemmGroup gr2;
+      gr2.m = Mg;
+      gr2.a_packed = moe_a2_packed_ + static_cast<std::size_t>(row_start) * (MI / 2);
+      gr2.a_scale = moe_a2_sf_ + sf2_off;
+      gr2.b_packed = e.down_packed;
+      gr2.b_scale = e.down_scale_swizzled;
+      gr2.d_out = moe_out_ + static_cast<std::size_t>(row_start) * H;
+      groups2.push_back(gr2);
+
+      if (own_lo < 0) own_lo = row_start;
+      own_hi = row_start + Mg;
+      sf1_off += mn_tiles * 64 * 512;  // k_tiles(H=4096)=64
+      sf2_off += mn_tiles * 32 * 512;  // k_tiles(MI=2048)=32
+      ++g;
+    } else {
+      // The peer computes these rows and writes them into moe_out_ over the
+      // fabric. This rank still needs their scatter weight, so it reads the
+      // foreign expert's down weight_scale_2 out of the loader's table
+      // (weights.h::expert_down_global) rather than the expert cache it is not
+      // allowed to fetch into.
+      down_global = w_.expert_down_global(layer, expert_id);
+    }
 
     for (int li = 0; li < Mg; ++li) {
       const int row = row_start + li;
       const int slot = slots[static_cast<std::size_t>(li)];
       row_of[row] = slot / K;         // stream slot this row's activation comes from / goes to
-      row_in_group[row] = li;
-      group_of_row[row] = g;
+      // Only owned rows are quantized and grouped, and those calls are passed
+      // the owned sub-range, so a foreign row's group bookkeeping is never
+      // read. It is still written, so the arrays hold no stale values.
+      row_in_group[row] = mine ? li : 0;
+      group_of_row[row] = mine ? g - 1 : 0;
       // The down-projection's own weight_scale_2 is folded into the scatter
       // weight here rather than the GEMM epilogue (moe_grouped.h) or a
       // per-row kernel pass; the router weight and this global both apply
       // once per row with no elementwise interaction, so one multiply on
       // the host, once per (stream, expert) pair, covers both.
-      scatter_w[row] = wts[static_cast<std::size_t>(slot)] * e.down_global;
+      scatter_w[row] = wts[static_cast<std::size_t>(slot)] * down_global;
     }
 
     row_start += Mg;
-    sf1_off += mn_tiles * 64 * 512;  // k_tiles(H=4096)=64
-    sf2_off += mn_tiles * 32 * 512;  // k_tiles(MI=2048)=32
-    ++g;
   }
+  if (own_lo < 0) own_lo = own_hi = 0;  // this rank owns no row of this layer
+  const int own_n = own_hi - own_lo;
 
   cudaMemsetAsync(moe_a1_sf_, 0, static_cast<std::size_t>(sf1_off), stream_);
   cudaMemsetAsync(moe_a2_sf_, 0, static_cast<std::size_t>(sf2_off), stream_);
@@ -519,15 +572,25 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
   cudaMemcpyAsync(moe_scatter_w_, scatter_w.data(), rows * sizeof(float), cudaMemcpyHostToDevice,
                   stream_);
 
-  moe_gather_rows(moe_x_, normed_, moe_row_of_, rows, H, stream_);
-  nvfp4_quantize_rows(moe_a1_packed_, moe_a1_sf_, moe_x_, moe_row_in_group_, moe_group_of_row_,
-                      moe_sf1_base_, rows, H, stream_);
-  if (!grouped_gemm_nvfp4(groups1, 2 * MI, H, stream_)) return false;
-  swiglu_grouped(moe_h_, moe_gu_, moe_gate_global_, moe_up_global_, moe_group_of_row_, rows, MI,
-                cfg_.swiglu_limit, stream_);
-  nvfp4_quantize_rows(moe_a2_packed_, moe_a2_sf_, moe_h_, moe_row_in_group_, moe_group_of_row_,
-                      moe_sf2_base_, rows, MI, stream_);
-  if (!grouped_gemm_nvfp4(groups2, H, MI, stream_)) return false;
+  // Every pointer below is offset to this rank's own row run. On one booster
+  // own_lo is 0 and own_n is rows, so these are the same calls as before.
+  const std::size_t o = static_cast<std::size_t>(own_lo);
+  if (own_n > 0) {
+    moe_gather_rows(moe_x_ + o * H, normed_, moe_row_of_ + o, own_n, H, stream_);
+    nvfp4_quantize_rows(moe_a1_packed_ + o * (H / 2), moe_a1_sf_, moe_x_ + o * H,
+                        moe_row_in_group_ + o, moe_group_of_row_ + o, moe_sf1_base_, own_n, H,
+                        stream_);
+    if (!grouped_gemm_nvfp4(groups1, 2 * MI, H, stream_)) return false;
+    swiglu_grouped(moe_h_ + o * MI, moe_gu_ + o * (2 * MI), moe_gate_global_, moe_up_global_,
+                  moe_group_of_row_ + o, own_n, MI, cfg_.swiglu_limit, stream_);
+    nvfp4_quantize_rows(moe_a2_packed_ + o * (MI / 2), moe_a2_sf_, moe_h_ + o * MI,
+                        moe_row_in_group_ + o, moe_group_of_row_ + o, moe_sf2_base_, own_n, MI,
+                        stream_);
+    if (!grouped_gemm_nvfp4(groups2, H, MI, stream_)) return false;
+  }
+
+  if (ep_ != nullptr) ep_->exchange_rows(moe_out_, own_lo, own_n, rows, stream_, &stages_.fabric);
+
   moe_scatter_add(acc_, moe_out_, moe_row_of_, moe_scatter_w_, rows, batch, H, stream_);
   return true;
 }
@@ -583,6 +646,215 @@ void DecodeEngine::run_moe(int layer, int batch) {
     record_absmax("layer" + std::to_string(layer) + ".ffn.normed", normed_, batch, H);
 }
 
+// ---------------------------------------------------------------------------
+// CUDA graph capture path (blog/posts/runtime/2026-09-07-grouped-gemm-beats-
+// gemv-at-every-m/'s Next item 2). Deliberately not a refactor of run_kda,
+// run_mla, run_dense_mlp, or run_moe above: those stay the reference path,
+// exercised unchanged by every existing test regardless of use_cuda_graph_.
+// The functions below duplicate their call sequence for capture; kept in
+// sync by hand, same tradeoff this file already made for MoePath::kForceGemv
+// vs kForceGrouped.
+//
+// A layer's attention site never touches WeightStore::expert() or reads
+// back to the host, so it captures exactly like the direct path executes it
+// -- with one exception: run_mla's indexer calls take a host int
+// (n_pools_max) as a *launch bound*, not a data value (kernels.h says so
+// explicitly for indexer_pool_keys/indexer_scores: "it only sizes the
+// launch, so no kernel reads past a stream's own n_pools", gated by the
+// device array n_pools_dev_ inside the kernel). n_pools_max grows with
+// position, so a graph captured at one position and replayed at a later one
+// would under-launch if it baked in the live value. Passing the worst case
+// (max_tokens_ / index_kpool, safely inside pool_stride_'s buffer bound)
+// instead makes every MLA attention-site graph replay-correct at any
+// position for the engine's whole compiled context, at the cost of some
+// idle blocks at low position -- exactly the tradeoff the doc comment
+// promises is safe.
+void DecodeEngine::run_attn_site(int layer, int batch, int n_pools_launch) {
+  const LayerW& lw = w_.layer(layer);
+  const int H = cfg_.hidden_size;
+  const int hc = cfg_.hc_mult;
+  cudaMemcpyAsync(residual_, streams_, static_cast<std::size_t>(batch) * hc * H * sizeof(bf16),
+                  cudaMemcpyDeviceToDevice, stream_);
+  hc_mix_gemv(mix_, lw.attn_hc.fn, streams_, batch, cfg_.hc_mix(), hc, H, cfg_.rms_norm_eps,
+             stream_);
+  hc_split(post_, comb_, collapsed_, mix_, lw.attn_hc.base, lw.attn_hc.scale, streams_, batch, hc,
+          H, cfg_.hc_eps, cfg_.hc_sinkhorn_iters, stream_);
+  rmsnorm(normed_, collapsed_, lw.input_norm, batch, H, cfg_.rms_norm_eps, stream_);
+  if (cfg_.layers[layer].attn == fuel::AttnKind::kKda) {
+    run_kda(layer, kda_slot_[layer], batch);
+  } else {
+    run_mla(layer, mla_slot_[layer], batch, n_tokens_dev_, n_pools_launch);
+  }
+  hc_combine(streams_, post_, sublayer_out_, comb_, residual_, batch, hc, H, stream_);
+}
+
+// FFN site of a dense-MLP layer. Never called for a sparse (MoE) layer;
+// ensure_graphs_built's segment loop only reaches this for layers strictly
+// between two moe_layer_ids_ entries (or before the first / after the last),
+// which are dense by construction of that list.
+void DecodeEngine::run_ffn_site_dense(int layer, int batch) {
+  const LayerW& lw = w_.layer(layer);
+  const int H = cfg_.hidden_size;
+  const int hc = cfg_.hc_mult;
+  cudaMemcpyAsync(residual_, streams_, static_cast<std::size_t>(batch) * hc * H * sizeof(bf16),
+                  cudaMemcpyDeviceToDevice, stream_);
+  hc_mix_gemv(mix_, lw.ffn_hc.fn, streams_, batch, cfg_.hc_mix(), hc, H, cfg_.rms_norm_eps,
+             stream_);
+  hc_split(post_, comb_, collapsed_, mix_, lw.ffn_hc.base, lw.ffn_hc.scale, streams_, batch, hc, H,
+          cfg_.hc_eps, cfg_.hc_sinkhorn_iters, stream_);
+  rmsnorm(normed_, collapsed_, lw.post_attn_norm, batch, H, cfg_.rms_norm_eps, stream_);
+  run_dense_mlp(layer, batch);
+  hc_combine(streams_, post_, sublayer_out_, comb_, residual_, batch, hc, H, stream_);
+}
+
+// Captured half of a MoE FFN site: hc-mix/split, norm, router GEMM, top-k
+// (device-only, kernels.cu::moe_router_kernel -- no host sync forces this
+// one), and the async device->host copy of the routing decision. Ends
+// without a sync: the caller (run_step_layers_graph) syncs once after
+// launching the graph this sits in, which is the one host sync per MoE
+// layer that stays, same as the direct path's run_moe.
+void DecodeEngine::run_moe_router_stage(int layer, int batch) {
+  const MoeW& mo = w_.layer(layer).moe;
+  const LayerW& lw = w_.layer(layer);
+  const int H = cfg_.hidden_size;
+  const int hc = cfg_.hc_mult;
+  const int K = cfg_.num_experts_per_tok;
+  cudaMemcpyAsync(residual_, streams_, static_cast<std::size_t>(batch) * hc * H * sizeof(bf16),
+                  cudaMemcpyDeviceToDevice, stream_);
+  hc_mix_gemv(mix_, lw.ffn_hc.fn, streams_, batch, cfg_.hc_mix(), hc, H, cfg_.rms_norm_eps,
+             stream_);
+  hc_split(post_, comb_, collapsed_, mix_, lw.ffn_hc.base, lw.ffn_hc.scale, streams_, batch, hc, H,
+          cfg_.hc_eps, cfg_.hc_sinkhorn_iters, stream_);
+  rmsnorm(normed_, collapsed_, lw.post_attn_norm, batch, H, cfg_.rms_norm_eps, stream_);
+
+  gemm_bf16_f32(router_logits_, mo.router, normed_, batch, cfg_.n_routed_experts, H, stream_);
+  moe_router(topk_idx_, topk_w_, router_logits_, mo.router_bias, batch, cfg_.n_routed_experts, K,
+            cfg_.norm_topk_prob, cfg_.routed_scaling_factor, stream_);
+  const int rows = batch * K;
+  cudaMemcpyAsync(moe_idx_pinned_, topk_idx_, static_cast<std::size_t>(rows) * sizeof(int),
+                  cudaMemcpyDeviceToHost, stream_);
+  cudaMemcpyAsync(moe_wts_pinned_, topk_w_, static_cast<std::size_t>(rows) * sizeof(float),
+                  cudaMemcpyDeviceToHost, stream_);
+  cudaMemsetAsync(acc_, 0, static_cast<std::size_t>(batch) * H * sizeof(bf16), stream_);
+}
+
+// Uncaptured half: the routing decision is on the host now (the caller
+// synced after this layer's router-stage graph), so this reads
+// moe_idx_pinned_/moe_wts_pinned_, does the router-entropy accumulation
+// run_moe does inline, then dispatches to the grouped GEMM or the GEMV
+// fallback exactly as run_moe does. Never appears inside a captured graph:
+// w_.expert()'s LRU/mmap bookkeeping is host code with no CUDA-graph
+// analogue, and it must run after this layer's routing is known.
+void DecodeEngine::run_moe_dispatch_stage(int layer, int batch) {
+  const int H = cfg_.hidden_size;
+  const int K = cfg_.num_experts_per_tok;
+  const int rows = batch * K;
+  std::vector<int> idx(moe_idx_pinned_, moe_idx_pinned_ + rows);
+  std::vector<float> wts(moe_wts_pinned_, moe_wts_pinned_ + rows);
+
+  double ent = 0.0;
+  double norm = 0.0;
+  for (int t = 0; t < K; ++t) norm += wts[static_cast<std::size_t>(t)];
+  for (int t = 0; t < K; ++t) {
+    const double pr = wts[static_cast<std::size_t>(t)] / (norm > 0.0 ? norm : 1.0);
+    if (pr > 0.0) ent -= pr * std::log(pr);
+  }
+  router_entropy_ += ent;
+
+  const bool want_grouped =
+      moe_path_ == MoePath::kForceGrouped ||
+      (moe_path_ == MoePath::kAuto && batch >= kGroupedMoeMinBatch);
+  if (moe_path_ != MoePath::kForceGemv && want_grouped) {
+    if (!run_moe_grouped(layer, batch, idx, wts)) {
+      cudaMemsetAsync(acc_, 0, static_cast<std::size_t>(batch) * H * sizeof(bf16), stream_);
+      run_moe_gemv(layer, batch, idx);
+    }
+  } else {
+    run_moe_gemv(layer, batch, idx);
+  }
+}
+
+// Captured tail of a MoE FFN site: shared-expert dense FFN, added into acc_
+// (written by the uncaptured dispatch immediately before this runs), then
+// hc-combine. Deferred to the *start* of the next graph segment
+// (ensure_graphs_built) because it must run after dispatch, which is never
+// itself inside a graph.
+void DecodeEngine::run_moe_post_stage(int layer, int batch) {
+  const MoeW& mo = w_.layer(layer).moe;
+  const int H = cfg_.hidden_size;
+  const int MI = cfg_.moe_intermediate_size;
+  const int SI = MI * cfg_.n_shared_experts;
+  const int hc = cfg_.hc_mult;
+  gemm_bf16(mlp_gate_, mo.shared.gate, normed_, batch, SI, H, stream_);
+  gemm_bf16(mlp_up_, mo.shared.up, normed_, batch, SI, H, stream_);
+  swiglu_clamped(mlp_h_, mlp_gate_, mlp_up_, batch * SI, cfg_.swiglu_limit, stream_);
+  gemm_bf16(mlp_out_, mo.shared.down, mlp_h_, batch, H, SI, stream_);
+  add_bf16(acc_, mlp_out_, batch * H, stream_);
+  cudaMemcpyAsync(sublayer_out_, acc_, static_cast<std::size_t>(batch) * H * sizeof(bf16),
+                  cudaMemcpyDeviceToDevice, stream_);
+  hc_combine(streams_, post_, sublayer_out_, comb_, residual_, batch, hc, H, stream_);
+}
+
+// Builds (or rebuilds, if batch changed) one CUDA graph per segment: segment
+// i covers everything from just after moe_layer_ids_[i-1]'s dispatch (its
+// deferred post-stage) through every following dense/KDA/MLA layer up to
+// and including moe_layer_ids_[i]'s router stage; the last segment runs
+// through the end of the layer stack. num_moe_layers segments have a router
+// stage at their end and are followed by an uncaptured dispatch;
+// num_moe_layers + 1 segments exist in total. Rebuilding tears down any
+// prior graphs first (destroy_graphs) since a graph captured for one batch
+// size bakes in that batch's kernel launch dimensions.
+void DecodeEngine::ensure_graphs_built(int batch) {
+  if (graph_batch_ == batch && !graph_execs_.empty()) return;
+  destroy_graphs();
+  graph_batch_ = batch;
+  const int num_moe = static_cast<int>(moe_layer_ids_.size());
+  const int n_pools_worst = max_tokens_ / cfg_.index_kpool;
+  graphs_.assign(static_cast<std::size_t>(num_moe) + 1, nullptr);
+  graph_execs_.assign(static_cast<std::size_t>(num_moe) + 1, nullptr);
+
+  int layer = 0;
+  for (int seg = 0; seg <= num_moe; ++seg) {
+    cuda_check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal),
+              "graph capture begin");
+    if (seg > 0) run_moe_post_stage(moe_layer_ids_[static_cast<std::size_t>(seg) - 1], batch);
+    const int stop_at = (seg < num_moe) ? moe_layer_ids_[static_cast<std::size_t>(seg)]
+                                        : cfg_.text_layers;
+    for (; layer < stop_at; ++layer) {
+      run_attn_site(layer, batch, n_pools_worst);
+      run_ffn_site_dense(layer, batch);
+    }
+    if (seg < num_moe) {
+      run_attn_site(layer, batch, n_pools_worst);
+      run_moe_router_stage(layer, batch);
+      ++layer;  // this layer's post-stage is deferred to segment seg + 1
+    }
+    cudaGraph_t g = nullptr;
+    cuda_check(cudaStreamEndCapture(stream_, &g), "graph capture end");
+    graphs_[static_cast<std::size_t>(seg)] = g;
+    cuda_check(cudaGraphInstantiate(&graph_execs_[static_cast<std::size_t>(seg)], g, 0),
+              "graph instantiate");
+  }
+}
+
+// Replays the graphs built by ensure_graphs_built, doing the one unavoidable
+// per-MoE-layer host sync and uncaptured dispatch between segments i and
+// i + 1. This is the entire routing-forced-sync count for the step: 42 on
+// this chemistry (cfg_.layers with mlp == kSparse), not 45 and not more --
+// the indexer's own top-k (kernels.cu::indexer_select) needs none, since it
+// is device-only and gated by a device array, not a host readback.
+void DecodeEngine::run_step_layers_graph(int batch) {
+  const int num_moe = static_cast<int>(moe_layer_ids_.size());
+  for (int seg = 0; seg <= num_moe; ++seg) {
+    cuda_check(cudaGraphLaunch(graph_execs_[static_cast<std::size_t>(seg)], stream_),
+              "graph launch");
+    if (seg < num_moe) {
+      cuda_check(cudaStreamSynchronize(stream_), "graph segment sync");
+      run_moe_dispatch_stage(moe_layer_ids_[static_cast<std::size_t>(seg)], batch);
+    }
+  }
+}
+
 void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_tokens,
                        bool collect_stages) {
   const int batch = static_cast<int>(tokens.size());
@@ -612,6 +884,16 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
     embed_streams(streams_, w_.embed(), tokens_dev_, batch, hc, H, stream_);
   }
 
+  // Graphs need collect_stages off (StageTimer's destructor syncs to
+  // attribute wall time to a stage, which cannot happen inside a capture)
+  // and telemetry off (record_absmax syncs too); step() falls back to the
+  // direct per-layer loop below for either, exactly as if use_cuda_graph_
+  // were never set.
+  const bool use_graph = use_cuda_graph_ && !collect_stages && !telemetry_;
+  if (use_graph) {
+    ensure_graphs_built(batch);
+    run_step_layers_graph(batch);
+  } else {
   for (int l = 0; l < cfg_.text_layers; ++l) {
     const LayerW& lw = w_.layer(l);
 
@@ -675,6 +957,7 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
       layer_rms_[l] = sync_rms_slot0(hmean_, H);
     }
   }
+  }  // else (!use_graph)
 
   std::vector<int> next(batch, 0);
   {

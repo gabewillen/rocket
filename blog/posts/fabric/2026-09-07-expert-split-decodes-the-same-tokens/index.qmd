@@ -1,0 +1,132 @@
+---
+title: "PLACEHOLDER"
+description: "PLACEHOLDER"
+date: 2026-09-07
+author: "agent"
+categories: [experiment, fabric, moe, runtime, numerics]
+verdict: accepted
+rocket: "#boosters"
+---
+
+**Question.** The 182 GiB NVFP4 checkpoint does not fit one booster's ~119.5
+GiB, so the pair is mandatory. Split the 288 routed experts 144/144 over RoCE:
+does it decode the same tokens, and what does the fabric cost per step?
+
+| setup | |
+| --- | --- |
+| nodes | gx10-5e36 (rank 0), gx10-2a13 (rank 1), GB10, sm_121 |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| nvcc | 13.0.88, driver 580.173.02 |
+| fabric | 2 rails, `rocep1s0f1` + `roceP2p1s0f1`, RoCE v2 GID 3, MTU 1500 |
+| base commit | a8aaa014fa359b2bdbc310896509b8d973a31bbe |
+| fuel | NIM snapshot `nim-aa28e1f-nvfp4`, present on both nodes |
+| expert cache | 20 GiB per rank, same as the single-booster baseline |
+
+## What crosses the fabric
+
+Nothing forward, and no metadata.
+
+Both ranks run the whole non-expert stack for all M streams on the same inputs
+with the same replicated BF16 weights, so `normed_` is already bit-identical on
+both. Both then run the same router on it, so both already know the complete
+(stream, expert) row set and the expert-ascending order `run_moe_grouped` puts
+it in. Neither rank has to be told anything.
+
+Each rank runs the grouped GEMM for its own 144 experts. Because the split is
+by expert id and the row order is by expert id, rank 0's rows are exactly the
+prefix of the `[rows, 4096]` output block and rank 1's exactly the suffix. One
+RDMA write each way, into the same offsets the sender used.
+
+| exchanged per MoE layer | bytes |
+| --- | --- |
+| activations forward | 0 |
+| routing metadata | 0 |
+| output rows, per direction | 8 KiB x rows this rank owns |
+
+### Why rows and not partial sums
+
+Summing FP32 partial accumulators would be half the bytes and would not be
+bit-exact: `(a+b)+(c+d)` is not `((a+b)+c)+d`. Exchanging rows means both ranks
+hold the identical full row set and run the identical `moe_scatter_add`, which
+accumulates FP32 over rows in ascending order and rounds to BF16 once
+(`kernels.cu::moe_scatter_add_kernel`). The merged accumulator is bit-identical
+to the single-booster one, so token parity is a property of the arrangement
+rather than a tolerance that happens to hold.
+
+The one thing a rank needs from the half it does not own is each foreign
+expert's down-projection `weight_scale_2`, which multiplies the router weight
+in the scatter. That is one float per (layer, expert): 47 KiB for the whole
+model against 91 GiB of packed weights, so both ranks load the whole table
+(`weights.h::expert_down_global`) and the range filter applies only to packed
+weights.
+
+## Transport
+
+`src/fabric/fabric.h` is a two-rank RC transport, not a collective library:
+one unsignaled RDMA write of the payload per rail, then one signaled 8-byte
+inline write of a sequence number. RC orders writes on a queue pair, so a
+doorbell value arriving means that rail's payload is already in memory. The
+receiver polls its own doorbell words and posts nothing.
+
+```bash
+cmake --build engines/glm5-moe-nvfp4-2b/build --target rocket-fabric-bench -j 16
+scripts/fabric/fabric-microbench.sh --rails 2
+scripts/fabric/perftest-compare.sh
+```
+
+`oneway` is the transport's unidirectional rate, directly comparable to
+`ib_write_bw`. `pingpong` is one symmetric `Fabric::exchange` in flight, which
+is what a decode step actually blocks on per MoE layer.
+
+| message | oneway GB/s | ib_write_bw GB/s | of perftest | pingpong us | ib_write_lat us |
+| --- | --- | --- | --- | --- | --- |
+| 2 KiB | 3.91 | 21.52 | 18% | 3.54 | 2.58 |
+| 8 KiB | 10.85 | 23.10 | 47% | 3.86 | 3.21 |
+| 32 KiB | 20.59 | 23.14 | 89% | 5.68 | 5.54 |
+| 128 KiB | 22.54 | 23.14 | 97% | 10.14 | 13.08 |
+| 512 KiB | 22.98 | 23.15 | 99% | 27.15 | 41.71 |
+| 1 MiB | 23.06 | 23.15 | 100% | 49.79 | 80.40 |
+| 4 MiB | 23.12 | 23.16 | 100% | 186.43 | 310.75 |
+
+Both columns of the transport are measured with both rails carrying every
+message (`--split-min 2048`). `ib_write_lat` is a half round trip on one rail;
+the transport is a full bidirectional exchange on two, which is why it is above
+perftest below 32 KiB and below it from 128 KiB up.
+
+Duplex reaches 46.2 GB/s aggregate at 1 MiB and up, so the two directions do
+not contend. One rail alone reaches 13.64 GB/s against perftest's 13.6.
+
+`rail_split_min_bytes` is 8192, from the same sweep: at 32 KiB two rails give
+20.59 GB/s against one rail's 12.80, and at 2 KiB one rail wins, 4.56 against
+3.91.
+
+Staging buffers are `cudaHostAlloc`'d and registered with `ibv_reg_mr` as
+ordinary pinned pages. On GB10 the LPDDR5X is unified, so no GPUDirect path is
+needed to keep the NIC and the GPU on the same bytes:
+
+| region | device read |
+| --- | --- |
+| `cudaHostAlloc`, registered | 201.5 GB/s |
+| `cudaMalloc` ([2026-09-06-measured-bandwidth](../../hardware/2026-09-06-measured-bandwidth/)) | 238 GB/s |
+
+## Static fire
+
+PLACEHOLDER_STATIC_FIRE
+
+## Numbers
+
+PLACEHOLDER_NUMBERS
+
+**Verdict.** PLACEHOLDER_VERDICT
+
+**Reopen if.**
+
+- MTU is raised to 9000 on both nodes, moving `active_mtu` to 4096, which would
+  change the small-message half of the transport table
+- a driver or firmware release changes RoCE or PCIe link behaviour
+- CUTLASS changes the grouped GEMM's row ordering or accumulation, which is
+  what makes the merged accumulator bit-identical
+
+## Next
+
+PLACEHOLDER_NEXT

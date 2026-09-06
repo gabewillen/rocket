@@ -1,8 +1,14 @@
 // Batch parity: M=8 concurrent streams, 8 different prompts, must decode
 // token-for-token identically to running each prompt alone at M=1 on the
-// same engine instance (same resident weights, same expert cache). Returns
-// 77 when the checkpoint is not on this node, matching the other real-weight
-// tests.
+// same engine instance (same resident weights, same expert cache). A second
+// check repeats the same 8 prompts 4x to fill M=32 concurrent streams (the
+// engine is built with max_batch=32; see blog/posts/runtime/2026-09-07-
+// grouped-gemm-beats-gemv-at-every-m/'s Next: "batch-parity must stay green
+// at the larger max_batch"), reusing the same 8 M=1 references rather than
+// recomputing them 4 times, since a duplicate prompt on an independent
+// stream slot is a parity check of KV/state isolation, not a new reference.
+// Returns 77 when the checkpoint is not on this node, matching the other
+// real-weight tests.
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -39,12 +45,13 @@ int main() {
       "The largest planet in the solar system is",
       "Roses are red, violets are",
   };
-  const int M = static_cast<int>(prompts.size());
+  const int M = static_cast<int>(prompts.size());  // 8 unique prompts
+  const int kWideBatch = 32;                        // 4x duplication of the 8 above
 
-  std::printf("loading engine (max_batch=%d)...\n", M);
+  std::printf("loading engine (max_batch=%d)...\n", kWideBatch);
   const int max_tokens = 512;
   rocket::engine::DecodeEngine engine(cfg, snapshot, static_cast<std::size_t>(20) * (1ull << 30),
-                                      max_tokens, M);
+                                      max_tokens, kWideBatch);
 
   std::vector<std::vector<int>> prompt_ids(M);
   for (int i = 0; i < M; ++i) prompt_ids[i] = tok.encode(prompts[i]);
@@ -111,5 +118,46 @@ int main() {
   }
 
   std::printf("\n%s: %d/%d streams mismatched\n", failures == 0 ? "PASS" : "FAIL", failures, M);
-  return failures == 0 ? 0 : 1;
+
+  // --- kWideBatch=32 concurrent: each of the 8 prompts run on 4 independent
+  // stream slots, every slot compared against its own prompt's M=1 reference
+  // above (ref[i % M], not a new M=1 run) -------------------------------
+  engine.reset();
+  std::vector<std::vector<int>> prompt_ids_wide(kWideBatch);
+  for (int i = 0; i < kWideBatch; ++i) prompt_ids_wide[i] = prompt_ids[i % M];
+  const std::size_t max_prompt_len_wide = [&] {
+    std::size_t m = 0;
+    for (const auto& p : prompt_ids_wide) m = std::max(m, p.size());
+    return m;
+  }();
+  std::vector<int> last_wide(kWideBatch, 0);
+  std::vector<std::vector<int>> got_wide(kWideBatch);
+  const std::size_t total_steps_wide = max_prompt_len_wide - 1 + kNewTokens;
+  for (std::size_t t = 0; t < total_steps_wide; ++t) {
+    std::vector<int> tokens(kWideBatch);
+    for (int i = 0; i < kWideBatch; ++i)
+      tokens[i] = (t < prompt_ids_wide[i].size()) ? prompt_ids_wide[i][t] : last_wide[i];
+    engine.step(tokens, next_batch, false);
+    for (int i = 0; i < kWideBatch; ++i) {
+      last_wide[i] = next_batch[i];
+      if (t + 1 >= prompt_ids_wide[i].size() &&
+          got_wide[i].size() < static_cast<std::size_t>(kNewTokens))
+        got_wide[i].push_back(next_batch[i]);
+    }
+  }
+  int failures_wide = 0;
+  for (int i = 0; i < kWideBatch; ++i) {
+    const std::vector<int>& r = ref[i % M];
+    bool ok = got_wide[i].size() == r.size();
+    for (std::size_t t = 0; ok && t < got_wide[i].size(); ++t) ok = ok && got_wide[i][t] == r[t];
+    if (!ok) ++failures_wide;
+  }
+  std::printf("\nM=%d stream vs M=1 (prompt i %% %d): %d/%d streams mismatched\n", kWideBatch, M,
+             failures_wide, kWideBatch);
+
+  const int total_failures = failures + failures_wide;
+  std::printf("\n%s: %d failure(s) (%d at M=%d, %d at M=%d)\n",
+             total_failures == 0 ? "PASS" : "FAIL", total_failures, failures, M, failures_wide,
+             kWideBatch);
+  return total_failures == 0 ? 0 : 1;
 }
