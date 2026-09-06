@@ -88,7 +88,7 @@ void test_gemv() {
   auto dx = to_dev(as_bf16(x));
   float* dy = nullptr;
   cudaMalloc(&dy, N * sizeof(float));
-  rocket::engine::gemv_bf16_f32(dy, dw, dx, N, K, nullptr);
+  rocket::engine::gemm_bf16_f32(dy, dw, dx, 1, N, K, nullptr);
   cudaDeviceSynchronize();
   check("gemv_bf16_f32", rel_err(to_host(dy, N), ref), 2e-3);
   cudaFree(dw); cudaFree(dx); cudaFree(dy);
@@ -184,10 +184,10 @@ void test_hyperconnection() {
   cudaMalloc(&dcomb, hc * hc * sizeof(float));
   cudaMalloc(&dcol, hidden * sizeof(bf16));
   cudaMalloc(&dout, flat * sizeof(bf16));
-  rocket::engine::hc_mix_gemv(dmix, dfn, dstreams, mix_n, hc, hidden, eps, nullptr);
-  rocket::engine::hc_split(dpost, dcomb, dcol, dmix, dbase, dscale, dstreams, hc, hidden, hc_eps,
+  rocket::engine::hc_mix_gemv(dmix, dfn, dstreams, 1, mix_n, hc, hidden, eps, nullptr);
+  rocket::engine::hc_split(dpost, dcomb, dcol, dmix, dbase, dscale, dstreams, 1, hc, hidden, hc_eps,
                            iters, nullptr);
-  rocket::engine::hc_combine(dout, dpost, dy, dcomb, dres, hc, hidden, nullptr);
+  rocket::engine::hc_combine(dout, dpost, dy, dcomb, dres, 1, hc, hidden, nullptr);
   cudaDeviceSynchronize();
 
   check("mHC mix logits", rel_err(to_host(dmix, mix_n), mix), 3e-3);
@@ -273,12 +273,12 @@ void test_kda() {
   auto dcs = to_dev(as_bf16(cstate));
   bf16* dconv = nullptr;
   cudaMalloc(&dconv, 3 * qkv * sizeof(bf16));
-  rocket::engine::kda_conv_update(dconv, dcs, din, dcw, 3 * qkv, kernel, nullptr);
+  rocket::engine::kda_conv_update(dconv, dcs, din, dcw, 1, 3 * qkv, kernel, nullptr);
   cudaDeviceSynchronize();
   check("kda conv + silu", rel_err(as_float(to_host(dconv, 3 * qkv)), conv_ref), 5e-3);
   check("kda conv state advance", rel_err(as_float(to_host(dcs, 3 * qkv * taps)), cstate_ref), 1e-6);
 
-  rocket::engine::kda_norm_qk(dconv, dconv + qkv, heads, hd, nullptr);
+  rocket::engine::kda_norm_qk(dconv, dconv + qkv, 1, heads, hd, /*row_stride=*/3 * qkv, nullptr);
   cudaDeviceSynchronize();
   auto got_q = as_float(to_host(dconv, qkv));
   auto got_k = as_float(to_host(dconv + qkv, qkv));
@@ -290,7 +290,7 @@ void test_kda() {
   auto dal = to_dev(alog);
   bf16* dg = nullptr;
   cudaMalloc(&dg, qkv * sizeof(bf16));
-  rocket::engine::kda_forget_gate(dg, dfb, ddt, dal, heads, hd, lower, nullptr);
+  rocket::engine::kda_forget_gate(dg, dfb, ddt, dal, 1, heads, hd, lower, nullptr);
   cudaDeviceSynchronize();
   check("kda forget gate", rel_err(as_float(to_host(dg, qkv)), g), 5e-3);
 
@@ -299,7 +299,7 @@ void test_kda() {
   bf16* dout = nullptr;
   cudaMalloc(&dout, qkv * sizeof(bf16));
   rocket::engine::kda_recurrent_step(dstate, dout, dconv, dconv + qkv, dconv + 2 * qkv, dg, dbeta,
-                                     heads, hd, nullptr);
+                                     1, heads, hd, /*row_stride=*/3 * qkv, nullptr);
   cudaDeviceSynchronize();
   check("kda recurrent readout", rel_err(as_float(to_host(dout, qkv)), o), 2e-2);
   check("kda recurrent state", rel_err(to_host(dstate, heads * hd * hd), state_ref), 2e-2);
@@ -336,7 +336,7 @@ void test_router() {
   float* dw = nullptr;
   cudaMalloc(&di, K * sizeof(int));
   cudaMalloc(&dw, K * sizeof(float));
-  rocket::engine::moe_router(di, dw, dl, db, E, K, true, scale, nullptr);
+  rocket::engine::moe_router(di, dw, dl, db, 1, E, K, true, scale, nullptr);
   cudaDeviceSynchronize();
   const auto got_i = to_host(di, K);
   bool idx_ok = true;
@@ -413,9 +413,13 @@ void test_nvfp4_gemv() {
 // selection must return the true top-k when the candidate set is larger than
 // the budget (the radix path).
 void test_indexer() {
+  // Batch 1, one physical page holding every pool's member tokens
+  // contiguously, so a KvPages of max_pages=1 behaves like the old flat
+  // arrays while exercising the real paged-lookup code path.
   const int kpool = 4, hd = 128, n_pools = 37, heads = 32;
-  const std::vector<float> keys = randn(n_pools * kpool * hd);
-  const std::vector<float> gates = randn(n_pools * kpool * hd);
+  const int n_tokens = n_pools * kpool;
+  const std::vector<float> keys = randn(n_tokens * hd);
+  const std::vector<float> gates = randn(n_tokens * hd);
   const std::vector<float> ape = randn(kpool * hd, 0.5f);
   std::vector<float> ref(n_pools * hd);
   for (int p = 0; p < n_pools; ++p)
@@ -432,12 +436,26 @@ void test_indexer() {
       for (int i = 0; i < kpool; ++i) acc += (l[i] / sum) * keys[((p * kpool + i) * hd) + c];
       ref[p * hd + c] = acc;
     }
-  auto dk = to_dev(as_bf16(keys));
-  auto dg = to_dev(as_bf16(gates));
+
+  rocket::engine::KvPages kv{};
+  kv.latent = nullptr;
+  kv.key = to_dev(as_bf16(keys));
+  kv.gate = to_dev(as_bf16(gates));
+  int table_h = 0;
+  int* dtable = to_dev(std::vector<int>{table_h});
+  kv.table = dtable;
+  kv.max_pages = 1;
+  kv.page_tokens = n_tokens;
+  kv.layers = 1;
+  kv.kv_lora = 0;
+  kv.index_head_dim = hd;
+
   auto da = to_dev(as_bf16(ape));
+  int* dnpools = to_dev(std::vector<int>{n_pools});
   bf16* dpk = nullptr;
   cudaMalloc(&dpk, n_pools * hd * sizeof(bf16));
-  rocket::engine::indexer_pool_keys(dpk, dk, dg, da, n_pools, kpool, hd, nullptr);
+  rocket::engine::indexer_pool_keys(dpk, kv, da, dnpools, n_pools, /*pool_stride=*/n_pools,
+                                    /*batch=*/1, /*layer_slot=*/0, kpool, hd, nullptr);
   cudaDeviceSynchronize();
   check("indexer pool compression", rel_err(as_float(to_host(dpk, n_pools * hd)), ref), 5e-3);
 
@@ -459,7 +477,8 @@ void test_indexer() {
   auto dhw = to_dev(hw);
   float* dsc = nullptr;
   cudaMalloc(&dsc, n_pools * sizeof(float));
-  rocket::engine::indexer_scores(dsc, dq, dpk, dhw, n_pools, heads, hd, nullptr);
+  rocket::engine::indexer_scores(dsc, dq, dpk, dhw, dnpools, n_pools, /*pool_stride=*/n_pools,
+                                 /*batch=*/1, heads, hd, nullptr);
   cudaDeviceSynchronize();
   check("indexer scores (relu inside)", rel_err(to_host(dsc, n_pools), sref), 1e-2);
 
@@ -468,7 +487,8 @@ void test_indexer() {
   int *dsel = nullptr, *dn = nullptr;
   cudaMalloc(&dsel, select_k * sizeof(int));
   cudaMalloc(&dn, sizeof(int));
-  rocket::engine::indexer_select(dsel, dn, dsc, n_pools, select_k, nullptr);
+  rocket::engine::indexer_select(dsel, dn, dsc, dnpools, n_pools, /*pool_stride=*/n_pools,
+                                 /*sel_pool_stride=*/select_k, /*batch=*/1, select_k, nullptr);
   cudaDeviceSynchronize();
   const int n_sel = to_host(dn, 1)[0];
   const auto sel = to_host(dsel, select_k);
@@ -482,7 +502,9 @@ void test_indexer() {
   if (!sel_ok) ++failures;
 
   // budget larger than the candidate set: everything is selected
-  rocket::engine::indexer_select(dsel, dn, dsc, 8, select_k, nullptr);
+  int* dnpools_small = to_dev(std::vector<int>{8});
+  rocket::engine::indexer_select(dsel, dn, dsc, dnpools_small, 8, /*pool_stride=*/n_pools,
+                                 /*sel_pool_stride=*/select_k, /*batch=*/1, select_k, nullptr);
   cudaDeviceSynchronize();
   const bool all_ok = to_host(dn, 1)[0] == 8;
   std::printf("  %-34s %s\n", "indexer select takes all when P<=k", all_ok ? "ok" : "FAIL");

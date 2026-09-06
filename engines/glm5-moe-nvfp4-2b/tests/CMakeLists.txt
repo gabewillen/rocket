@@ -17,6 +17,16 @@ set_target_properties(test-fuel-registry PROPERTIES
 add_test(NAME fuel-registry COMMAND test-fuel-registry)
 set_tests_properties(fuel-registry PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 
+# M=8 concurrent streams vs the same engine's M=1 output, token for token.
+# Real weights, real expert cache; the streaming half makes this the slowest
+# test here.
+add_executable(test-batch-parity test_batch_parity.cu)
+target_link_libraries(test-batch-parity PRIVATE rocket_engine rocket_fuel)
+set_target_properties(test-batch-parity PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME batch-parity COMMAND test-batch-parity)
+set_tests_properties(batch-parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
+
 if(NOT EXISTS "${ROCKET_CUTLASS_DIR}/include/cutlass/cutlass.h")
   message(STATUS
     "test-loader-swizzle skipped: no CUTLASS at ${ROCKET_CUTLASS_DIR}. "

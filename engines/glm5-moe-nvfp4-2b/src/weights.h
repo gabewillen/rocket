@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -120,6 +122,15 @@ class WeightStore {
   // Returns the expert, fetching it from the checkpoint if it is not resident.
   const ExpertDev& expert(int layer, int expert_id, cudaStream_t s);
 
+  // Seam for a future BF16 -> FP8 flip (fuels/glm-5.3-flash/fuel.yaml,
+  // serving_regime.quantization_plan): every uploaded resident tensor is
+  // keyed here by name to its on-device dtype, read from the checkpoint
+  // rather than assumed. Today every entry is kBF16, since no FP8 kernel
+  // exists yet; a projection converted to FP8 would upload FP8 bytes and
+  // register kF8E4M3 here, and callers that care (none yet) would branch on
+  // this instead of hardcoding BF16.
+  fuel::DType dtype_of(std::string_view tensor_name) const;
+
   std::size_t resident_bytes() const { return resident_bytes_; }
   std::size_t expert_slot_bytes() const { return slot_bytes_; }
   std::size_t expert_slots() const { return slots_.size(); }
@@ -129,6 +140,7 @@ class WeightStore {
 
  private:
   const bf16* upload_bf16(std::string_view name, std::int64_t expect_numel);
+  void record_dtype(std::string_view name, fuel::DType dt);
   const float* upload_f32(std::string_view name, std::int64_t expect_numel);
   // Concatenates several tensors of equal trailing shape into one device buffer.
   const bf16* upload_concat(const std::vector<std::string>& names, std::int64_t expect_numel);
@@ -137,6 +149,7 @@ class WeightStore {
 
   fuel::ModelConfig cfg_;
   fuel::Checkpoint ckpt_;
+  std::unordered_map<std::string, fuel::DType> dtype_registry_;
   std::vector<LayerW> layers_;
   const bf16* embed_ = nullptr;
   const bf16* final_norm_ = nullptr;

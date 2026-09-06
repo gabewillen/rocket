@@ -70,7 +70,7 @@ int main(int argc, char** argv) {
   auto t_load = Clock::now();
   rocket::engine::DecodeEngine engine(cfg, snapshot,
                                       static_cast<std::size_t>(cache_gib * (1ull << 30)),
-                                      max_tokens);
+                                      max_tokens, /*max_batch=*/1);
   const double load_ms = ms_since(t_load);
   std::printf("resident  %.2f GiB   expert cache %zu slots x %.2f MiB = %.2f GiB\n",
               engine.weights().resident_bytes() / 1073741824.0, engine.weights().expert_slots(),
@@ -86,7 +86,11 @@ int main(int argc, char** argv) {
   // Prefill runs the decode path once per prompt token.
   auto t_prefill = Clock::now();
   int next = 0;
-  for (const int id : prompt_ids) next = engine.step(id, false);
+  std::vector<int> next_batch;
+  for (const int id : prompt_ids) {
+    engine.step(std::vector<int>{id}, next_batch, false);
+    next = next_batch[0];
+  }
   const double prefill_ms = ms_since(t_prefill);
 
   std::vector<int> generated;
@@ -102,7 +106,8 @@ int main(int argc, char** argv) {
     if (last) break;
     const bool instrument = (i == instrument_at);
     const auto t0 = Clock::now();
-    next = engine.step(next, instrument);
+    engine.step(std::vector<int>{next}, next_batch, instrument);
+    next = next_batch[0];
     const double dt = ms_since(t0);
     if (instrument) {
       stages = engine.stages();

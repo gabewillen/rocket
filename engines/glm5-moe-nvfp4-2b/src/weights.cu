@@ -44,6 +44,16 @@ void WeightStore::copy_in(void* dst, const void* src, std::size_t bytes) {
   }
 }
 
+void WeightStore::record_dtype(std::string_view name, fuel::DType dt) {
+  dtype_registry_.emplace(std::string(name), dt);
+}
+
+fuel::DType WeightStore::dtype_of(std::string_view tensor_name) const {
+  const auto it = dtype_registry_.find(std::string(tensor_name));
+  if (it == dtype_registry_.end()) fail(std::string(tensor_name) + " was never uploaded");
+  return it->second;
+}
+
 const bf16* WeightStore::upload_bf16(std::string_view name, std::int64_t expect_numel) {
   const fuel::TensorView& t = ckpt_.tensor(name);
   if (t.dtype != fuel::DType::kBF16) fail(std::string(name) + " is not BF16");
@@ -52,6 +62,7 @@ const bf16* WeightStore::upload_bf16(std::string_view name, std::int64_t expect_
          std::to_string(expect_numel));
   void* d = device_alloc(t.nbytes);
   copy_in(d, t.data, t.nbytes);
+  record_dtype(name, fuel::DType::kBF16);
   return static_cast<const bf16*>(d);
 }
 
@@ -62,6 +73,7 @@ const float* WeightStore::upload_f32(std::string_view name, std::int64_t expect_
     fail(std::string(name) + " has the wrong element count");
   void* d = device_alloc(t.nbytes);
   copy_in(d, t.data, t.nbytes);
+  record_dtype(name, fuel::DType::kF32);
   return static_cast<const float*>(d);
 }
 
