@@ -37,7 +37,7 @@ endif()
 set(ROCKET_PAGE_BYTES 65536 CACHE STRING "Host page size the plan is aligned to")
 
 add_library(rocket_engine STATIC
-  src/booster.cu
+  src/engine.cu
 )
 target_include_directories(rocket_engine PUBLIC src)
 target_compile_definitions(rocket_engine PUBLIC

@@ -3,7 +3,7 @@
 // Refusals here mirror the ones the engine owes at startup
 // (blog/rocket.qmd#launch): wrong architecture or wrong page size is a
 // refusal, not a fallback.
-#include "booster.h"
+#include "engine.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -13,7 +13,7 @@ namespace {
 
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
-int expected_arch(const rocket::BoosterFacts& facts) {
+int expected_arch(const rocket::MountFacts& facts) {
   return facts.compute_major * 10 + facts.compute_minor;
 }
 
@@ -21,7 +21,7 @@ int expected_arch(const rocket::BoosterFacts& facts) {
 
 int main() {
   try {
-    const rocket::BoosterFacts facts = rocket::probe_booster();
+    const rocket::MountFacts facts = rocket::probe_mount();
 
     std::printf("booster            %s (%s)\n",
                 facts.hostname.c_str(), facts.kernel_release.c_str());

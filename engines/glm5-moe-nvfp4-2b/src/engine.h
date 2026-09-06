@@ -1,4 +1,5 @@
-// One booster is one GB10 spark node (blog/rocket.qmd#boosters).
+// The engine probes the booster it is mounted on. A booster is one GB10
+// spark node and can mount one or more engines (blog/rocket.qmd#boosters).
 //
 // Everything here is read once at startup and compared against the compiled
 // plan. Nothing in the serving path calls it.
@@ -10,7 +11,7 @@
 
 namespace rocket {
 
-struct BoosterFacts {
+struct MountFacts {
   std::string device_name;
   int compute_major = 0;
   int compute_minor = 0;
@@ -34,7 +35,7 @@ struct BoosterFacts {
 };
 
 // Throws std::runtime_error on any CUDA failure.
-BoosterFacts probe_booster(int device_ordinal = 0);
+MountFacts probe_mount(int device_ordinal = 0);
 
 // Runs one trivial kernel on the device and returns the value it wrote.
 // Proves the compiled cubin loads and launches on this booster.

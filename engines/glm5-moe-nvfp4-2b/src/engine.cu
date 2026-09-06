@@ -1,4 +1,4 @@
-#include "booster.h"
+#include "engine.h"
 
 #include <cuda_runtime.h>
 
@@ -51,8 +51,8 @@ __global__ void ignition_kernel(std::uint32_t* out) {
 
 int compiled_arch() { return ROCKET_CUDA_ARCH; }
 
-BoosterFacts probe_booster(int device_ordinal) {
-  BoosterFacts facts;
+MountFacts probe_mount(int device_ordinal) {
+  MountFacts facts;
 
   cudaDeviceProp prop{};
   check(cudaGetDeviceProperties(&prop, device_ordinal), "cudaGetDeviceProperties");
