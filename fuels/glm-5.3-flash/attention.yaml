@@ -103,29 +103,69 @@ indexer:
   k_norm: {weight: [128], bias: [128]}    # [shape]
   kpool_compress_gate: [128, 4096]        # [shape]
   kpool_compress_ape: [4, 128]            # [shape] one embedding per pool slot
-  # Two things the checkpoint does not settle:
+  # Three things the checkpoint alone did not settle. All three are now
+  # established from the reference implementation (priority (a)), with an
+  # independent llama.cpp DSA-layer port (priority (b) analog, since neither
+  # vLLM nor SGLang has glm5_next support yet per LibertAIDAI/GLM-5.3-Flash-NVFP4
+  # README: "glm5_next is a brand-new architecture ... not yet in vLLM main")
+  # cross-checking the same behavior, plus the DSA paper for the score formula
+  # (priority (c) tie-break).
   top_k_unit:
-    established: false
+    established: true
+    unit: tokens
     note: >
-      index_topk is 2048, but nothing on disk says whether that counts tokens or
-      pooled groups. With kpool 4 the two readings differ by 4x in gathered KV.
-      Benches use 2048 tokens, the larger reading.
+      index_topk (2048) counts final gathered tokens, not pooled groups. The
+      reference runs top-k over the POOL axis at a pool count of
+      index_topk / index_kpool = 2048 / 4 = 512, then expands each selected
+      pool to its 4 member tokens: 512 * 4 = 2048 tokens gathered, matching
+      index_topk exactly. Source: ggml-org/llama.cpp PR #27754 ("model: add
+      GLM-5-Next (GLM-5.3-Flash)"), citing the checkpoint's own
+      modular_glm5_next.py, Glm5NextTextIndexer.forward: "Top-k runs over the
+      POOL axis at select_k = index_topk/index_kpool, and the selected pools
+      are expanded to their member cells through pool_cells. That is the
+      reference's own two-step ... topk over the pool axis, then
+      selected_indices = pool_indices[batch_idx, selected]". This confirms
+      the bench's existing assumption (2048 tokens) was right; the 4x reading
+      (512 tokens) does not occur anywhere in the reference.
   score_nonlinearity:
-    established: false
-    assumed: relu
+    established: true
+    nonlinearity: relu
+    formula: "I_t = sum_j weights_proj[j] * relu(Q_tj . K_tj^T)"
     note: >
-      weights_proj gives one scalar per head, so the score is a weighted sum of
-      32 head dot products. Whether a ReLU sits inside is modeling code. It does
-      not change the scan cost, only whether the 32 heads could collapse to one
-      128 wide dot.
+      ReLU sits inside the per-head dot product, before the weights_proj sum
+      over the 32 heads. Two independent sources agree: (1) the DSA paper
+      (arXiv:2604.22312, "Guess-Verify-Refine"), section 2.1, gives the
+      indexer score as "I_t = sum_{j=1}^h W_j^I . ReLU(Q_{t,j}^I(K_t^I)^T)".
+      (2) ggml-org/llama.cpp PR #27754, debugging GLM-5-Next's own pooled
+      top-k, states plainly for this checkpoint's indexer: "ReLU drives most
+      pool scores to exactly 0.0, and ggml_top_k is explicitly unordered
+      among equals, so the cut falls inside an inter-pool tie group" -- a
+      behavior only possible if ReLU already sits inside the per-token score
+      before pooling. The ReLU does not change scan FLOPs (it is applied
+      per head before a sum any implementation must already do), so this
+      only closes out the open question, it does not move any byte count.
   cached_key_form:
-    established: false
-    candidates: [per_token_128, pooled_4to1_128]
+    established: true
+    form: per_token_128_plus_gate_128
     note: >
-      kpool_compress is true and the compress gate exists, so pooled keys can be
-      built as tokens arrive without retaining raw keys. Whether the engine also
-      keeps per-token keys is a runtime choice. Both are carried below and both
-      are measured.
+      The reference does not store only a pooled 4-to-1 key. ggml-org/llama.cpp
+      PR #27754 ("model: add GLM-5-Next (GLM-5.3-Flash)") describes the
+      checkpoint's own compression as: "GLM's compressor is not a mean pool:
+      it is a per-channel softmax over the kpool slots with logits gate + ape,
+      where the gate is a second projection of the hidden state of width
+      indexer_head_size. Caching it beside the key is the only way a pool
+      survives its member tokens leaving the batch." Because the pool weight
+      is a softmax over per-token gate logits (not a fixed average), the
+      per-token key (128 wide, wk) AND the per-token compressor gate (128
+      wide, kpool_compress_gate) must both be retained; the pooled form
+      (128-wide key amortized over kpool 4 members, 32 elements / 64 bytes
+      per token) quoted as a candidate in earlier drafts of this file cannot
+      be reconstructed from a discarded per-token gate, so it is ruled out,
+      not merely unmeasured. Same PR: "llama_memory_hybrid
+      therefore gains an optional third cache holding one indexer key and one
+      compressor gate per token." This doubles the earlier
+      indexer_key_per_token_per_layer estimate (128 elements assumed, now
+      256: key + gate), recomputed below.
 
 # --------------------------------------------------------------- state bytes
 # All arithmetic below is BF16 unless stated. Shown so it can be checked.
@@ -144,62 +184,92 @@ bytes:
       total_mib: 140.78125
 
   mla_kv_per_token_per_layer: 1024        # 512 latent * 2, no rope tail
-  indexer_key_per_token_per_layer: 256    # 128 * 2
-  indexer_key_per_token_per_layer_pooled: 64   # 256 / kpool 4
+  # Settled by indexer.cached_key_form above: the reference keeps both a
+  # per-token key (128 elements, wk) and a per-token compressor gate (128
+  # elements, kpool_compress_gate), not the key alone. 256 elements * 2 B
+  # (BF16) = 512 B/token/layer. The old 256 B/token/layer figure assumed
+  # only the key and undercounted by 2x.
+  indexer_key_per_token_per_layer: 512    # (128 key + 128 gate) * 2
+  indexer_key_per_token_per_layer_pooled:
+    established: true
+    value: null
+    ruled_out: true
+    note: >
+      Not a usable runtime option. indexer.cached_key_form settles that the
+      per-token gate cannot be discarded once its pool is formed (the pool
+      weight is a softmax over that gate, not a fixed average), so a 128 / 4
+      = 32 element (64 B) amortized-pooled cache cannot reconstruct what the
+      reference needs to keep scoring correctly as new pools form. Retained
+      here as a null so a future reader does not have to re-derive why it is
+      gone.
 
   at_serving_cap:                         # 262144 tokens [cap]
     context_tokens: 262144
     mla_latent_11_layers: 2952790016      # 11 * 262144 * 1024
     mla_latent_11_layers_gib: 2.75
-    indexer_pooled_11_layers: 184549376   # 11 * 262144 * 64
-    indexer_pooled_11_layers_gib: 0.171875
-    indexer_per_token_11_layers: 738197504  # 11 * 262144 * 256
-    indexer_per_token_11_layers_gib: 0.6875
+    indexer_per_token_11_layers: 1476395008 # 11 * 262144 * 512
+    indexer_per_token_11_layers_gib: 1.375
     derived: true
 
 # ------------------------------------------------------------ per-stream cost
-# Three accountings, because two of the inputs are runtime choices rather than
-# checkpoint facts. Each names exactly what it assumes.
+# Three accountings. indexer_keys now always uses the settled per-token
+# (key + gate) form; the only remaining runtime choice is kda.state_dtype
+# (fuels/glm-5.3-flash/attention.yaml, kda.state_dtype, still
+# established: false), which is what tells "bf16" from "fp32" apart below.
 per_stream_at_262144:
-  - name: pooled_bf16_no_mtp
-    assumes: [kda_state_bf16, indexer_keys_pooled_4to1, mtp_cache_not_resident]
+  - name: bf16_no_mtp
+    assumes: [kda_state_bf16, indexer_keys_per_token, mtp_cache_not_resident]
     kda_state: 76316672
     mla_latent: 2952790016
-    indexer_keys: 184549376
-    total_bytes: 3213656064
-    total_gib: 2.99296875
+    indexer_keys: 1476395008              # 11 * 262144 * 512
+    total_bytes: 4505501696               # 76316672 + 2952790016 + 1476395008
+    total_gib: 4.196075439453125
     derived: true
-  - name: pooled_bf16_with_mtp
-    assumes: [kda_state_bf16, indexer_keys_pooled_4to1, mtp_layer_45_cached]
-    total_bytes: 3498868736               # + 268435456 latent + 16777216 pooled keys
-    total_gib: 3.258789
+  - name: bf16_with_mtp
+    assumes: [kda_state_bf16, indexer_keys_per_token, mtp_layer_45_cached]
+    kda_state: 76316672
+    mla_latent: 3221225472                # 12 layers: 12 * 262144 * 1024
+    indexer_keys: 1610612736              # 12 layers: 12 * 262144 * 512
+    total_bytes: 4908154880               # 76316672 + 3221225472 + 1610612736
+    total_gib: 4.571075439453125
+    # Delta over bf16_no_mtp from adding layer 45's cache: +268435456 B
+    # (0.25 GiB) of MLA latent and +134217728 B (0.125 GiB) of indexer
+    # key+gate, both exact eighths/quarters of a GiB because 262144 tokens
+    # is 2^18: 262144*1024/2^30 = 0.25, 262144*512/2^30 = 0.125.
     derived: true
-  - name: per_token_fp32_with_mtp
+  - name: fp32_kda_with_mtp
     assumes: [kda_state_fp32, indexer_keys_per_token, mtp_layer_45_cached]
     kda_state: 147619840
     mla_latent: 3221225472                # 12 layers
-    indexer_keys: 805306368               # 12 layers, 256 B/token
-    total_bytes: 4174151680
-    total_gib: 3.887451
+    indexer_keys: 1610612736              # 12 layers, settled 512 B/token
+    total_bytes: 4979458048               # 147619840 + 3221225472 + 1610612736
+    total_gib: 4.637481689453125
     derived: true
 
-streams_in_60gib_kv_budget:               # 64424509440 B
-  pooled_bf16_no_mtp: 20                  # 64424509440 / 3213656064 = 20.05
-  pooled_bf16_with_mtp: 18                # = 18.41
-  per_token_fp32_with_mtp: 15             # = 15.43
+streams_in_60gib_kv_budget:               # 64424509440 B = 60 GiB
+  bf16_no_mtp: 14                         # 64424509440 / 4505501696 = 14.30
+  bf16_with_mtp: 13                       # = 13.13
+  fp32_kda_with_mtp: 12                   # = 12.94
   derived: true
+  # Settling cached_key_form raised indexer_key_per_token_per_layer from 256
+  # to 512 B, which raised every total_bytes above and dropped every stream
+  # count from the previous pooled-assumption draft (20/18/15 -> 14/13/12).
   # Under the two-booster split the MLA latent and the indexer keys are head
-  # independent, so they replicate on both boosters; only the KDA state shards
-  # with heads. Per booster that is 2.75 + 0.171875 + 0.0355 = 2.957 GiB per
-  # stream, so a 60 GiB budget on each booster still buys 20 streams, not 40.
-  per_booster_gib_pooled_bf16: 2.957
-  streams_per_booster_pooled_bf16: 20
-  # A 60 GiB KV budget is larger than this engine currently has. The booster is
-  # 123.73 GiB (blog/posts/hardware/2026-09-05-spark-cluster-baseline/) and the
-  # NVFP4 weights take 91 GiB of it (fuel.yaml), leaving 32.73 GiB.
+  # independent, so they replicate on both boosters; only the KDA state
+  # shards with heads. Per booster that is 2.75 (mla) + 1.375 (indexer,
+  # settled) + 0.0355377 (half of 76316672 B kda_state) = 4.1605377 GiB per
+  # stream, so a 60 GiB budget on each booster buys 14 streams, matching the
+  # non-sharded bf16_no_mtp total above (both are dominated by the same
+  # replicated mla+indexer cost; halving the small kda_state term barely
+  # moves the total).
+  per_booster_gib_bf16_no_mtp: 4.1605377
+  streams_per_booster_bf16_no_mtp: 14     # 60 / 4.1605377 = 14.42
+  # A 60 GiB KV budget is larger than this engine currently has. The booster
+  # is 123.73 GiB (blog/posts/hardware/2026-09-05-spark-cluster-baseline/)
+  # and the NVFP4 weights take 91 GiB of it (fuel.yaml), leaving 32.73 GiB.
   headroom_note:
     booster_gib: 123.73
     weights_per_booster_gib: 91
     kv_headroom_gib: 32.73
-    streams_at_headroom: 10               # 32.73 / 2.957
+    streams_at_headroom: 7                # 32.73 / 4.1605377 = 7.87
     derived: true

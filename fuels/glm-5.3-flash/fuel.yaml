@@ -41,6 +41,34 @@ reusable_state:
   - name: kda_recurrent
     growth: fixed_per_sequence
     reconstructible_from_kv: false
+  - name: mtp_draft_sparse_mla_kv
+    growth: with_sequence_length
+    active_only_when: speculative_decoding_enabled
+    note: >
+      Layer 45, the MTP draft layer, is a 12th sparse_mla-shaped layer, not
+      an addition to the 11 counted above (attention.yaml, layers.mtp_layer_id
+      45, mtp_layer_kind sparse_mla: "layer 45 carries kv_a_proj_with_mqa,
+      kv_b_proj, q_a/q_b, indexer and eh_proj, so the draft layer is
+      MLA-shaped and has its own KV cache when speculation is on"). It carries
+      its own MLA latent cache (512-wide, same shape as the other 11) and its
+      own indexer tensors (wk, wq_b, weights_proj), so it can run its own
+      indexer key+gate cache too. config.json's index_share_for_mtp_iteration
+      is true, meaning the reference reuses the trunk's already-computed
+      top-k *indices* for the draft step instead of re-scanning -- but that
+      sharing is itself unimplemented in at least one public port: ggml-org/
+      llama.cpp PR #27752 states "index_share_for_mtp_iteration is not
+      implemented. The reference shares the trunk index for the MTP step,
+      which a separate MTP context cannot see, so the draft head attends
+      densely." An engine that does not implement the cross-context index
+      share therefore still needs layer 45's own indexer key+gate cache, not
+      just its MLA latent cache, to run it sparsely rather than densely.
+      Per-stream cost of adding this 12th cache at the 262144-token serving
+      cap (attention.yaml, per_stream_at_262144, bf16_with_mtp minus
+      bf16_no_mtp): +268435456 B (0.25 GiB) of MLA latent and +134217728 B
+      (0.125 GiB) of indexer key+gate, both exact because 262144 = 2^18:
+      262144*1024/2^30 = 0.25, 262144*512/2^30 = 0.125. Total +0.375 GiB per
+      stream, which is why streams_in_60gib_kv_budget drops from 14
+      (bf16_no_mtp) to 13 (bf16_with_mtp) in attention.yaml.
 
 weight_formats:                          # [fuel]
   - name: fp8_native
