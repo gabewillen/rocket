@@ -30,11 +30,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "kernels.h"
+#include "kv/kv_arena.h"
+#include "kv/page_pool.h"
 #include "model_config.h"
 #include "weights.h"
 
@@ -76,12 +79,22 @@ enum class MoePath { kAuto, kForceGemv, kForceGrouped };
 
 class DecodeEngine {
  public:
-  // max_batch bounds every per-stream buffer and the trivial one-page-per-
-  // stream KV table (see model.cu: stage 1 gives every stream slot its own
-  // physical page rather than a real evicting page pool; the KvPages plumbing
-  // is real, only the allocator behind it is the simplification).
+  // max_batch bounds every per-stream buffer.
+  //
+  // kv_pool_pages selects the KV backend. Zero keeps the stage-1 allocator:
+  // one physical page per stream slot, sized to the whole context, no sharing
+  // (see model.cu). A positive value allocates that many fixed-size pages of
+  // kv_page_tokens tokens into a refcounted pool with a radix tree over token
+  // sequences (src/kv/page_pool.h), which is what fork/detach/resume need.
+  //
+  // The pool is opt-in rather than the default because the cutover is gated
+  // on a token-parity run against the real checkpoint, which this lane could
+  // not make: see the log entry's Next list. Nothing about the kernels
+  // differs between the two backends, only max_pages and what the block
+  // table points at.
   DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::path& snapshot_dir,
-               std::size_t expert_cache_bytes, int max_tokens, int max_batch);
+               std::size_t expert_cache_bytes, int max_tokens, int max_batch,
+               int kv_pool_pages = 0, int kv_page_tokens = 128);
   ~DecodeEngine();
 
   // Runs one batched step. tokens[i] is the input token for stream slot i,
@@ -96,6 +109,28 @@ class DecodeEngine {
   // position, exactly as the single-stream engine already relied on before
   // batching (its KV was never cleared here either).
   void reset();
+
+  // ---- paged KV, only when the engine was built with kv_pool_pages > 0 ----
+  bool kv_pooled() const { return kv_cache_ != nullptr; }
+  // Binds `child_slot` to a new sequence sharing every full page of
+  // `parent_slot` below `fork_pos`, and copies the parent's KDA state, which
+  // is a recurrent hidden state and cannot be shared. Returns the child's
+  // session id. The child's position starts at fork_pos.
+  int kv_fork(int parent_slot, int fork_pos, int child_slot);
+  // Frees the stream slot and takes its KDA state off the device. The pages
+  // stay pinned by the returned session id.
+  int kv_detach(int slot);
+  // Reattaches a detached session to a stream slot and restores its KDA
+  // state. The slot must be free.
+  void kv_resume(int session, int slot);
+  // Drops a session's claim on its pages and its saved KDA state.
+  void kv_destroy(int session);
+  int kv_session_in_slot(int slot) const;
+  int kv_pinned_pages() const;
+  // One stream's KDA recurrent + conv state. FP32 recurrent state, which is
+  // what this engine allocates, so this is attention.yaml's fp32 figure and
+  // not its bf16 one.
+  std::size_t kda_bytes_per_stream() const;
 
   const StageMs& stages() const { return stages_; }
   // RMS of stream slot 0's hyper-connection stream mean after each layer,
@@ -187,6 +222,14 @@ class DecodeEngine {
   float sync_rms_slot0(const bf16* x, int n);
   void record_absmax(const std::string& name, const bf16* x, int batch, int n);
   void record_expert_fire(const std::vector<int>& idx);
+  // The KDA slice of one stream slot is strided across kda_layers_, so
+  // moving it takes one copy per layer per tensor rather than one memcpy.
+  void kda_pack(int slot, void* dst);
+  void kda_unpack(int slot, const void* src);
+  void kda_copy_slot(int dst_slot, int src_slot);
+  // Advances every active slot's sequence by one token and reuploads the
+  // block table of any slot whose table changed. No-op without a pool.
+  void kv_advance(const std::vector<int>& tokens, int batch);
 
   // ---- CUDA graph capture path (kept deliberately separate from run_moe
   // and the direct per-layer loop in step(), not a refactor of them: the
@@ -231,6 +274,16 @@ class DecodeEngine {
   // slot (max_pages = 1, page_tokens = max_tokens). ---
   KvPages mla_kv_;
   int* kv_table_ = nullptr;  // [max_batch], table[m] = m
+
+  // --- paged KV pool (kv_pool_pages > 0). mla_kv_ above is then the arena's
+  // KvPages and kv_table_ is unused. ---
+  std::unique_ptr<kv::PagePool> kv_pool_;
+  std::unique_ptr<kv::PrefixTree> kv_tree_;
+  std::unique_ptr<kv::KvArena> kv_arena_;
+  std::unique_ptr<kv::KvCache> kv_cache_;
+  std::unique_ptr<kv::HostKdaStateStore> kda_store_;
+  std::vector<int> kv_seq_of_slot_;  // [max_batch], -1 when the slot is free
+  void* kda_stage_ = nullptr;        // [kda_bytes_per_stream()], detach staging
 
   // per-step device scratch
   int* tokens_dev_ = nullptr;

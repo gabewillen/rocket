@@ -1,0 +1,166 @@
+---
+title: "Radix-paged KV holds 93 streams at 262k where 8 fit unshared"
+description: "A refcounted page pool with a radix tree over token sequences cuts per-session KV on the c32 agent trace from 4.00 to 0.35 GiB, taking 262k-context streams per booster from 8 to 93; page size turns out not to matter and the next wall is the 140.8 MiB FP32 KDA state."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, cache, memory, attention]
+rocket: "#state"
+verdict: accepted
+---
+
+**Question.** `blog/posts/cache/2026-09-06-indexer-caches-gates-too/` left
+radix-tree KV sharing on its Next list. What page size does the pool want, and
+what does sharing actually buy on the forked-prefix agent workload, counted
+from page tables rather than from token averages?
+
+| setup | |
+| --- | --- |
+| node | head, one GB10 booster |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| base commit | ca5d748145df78d98f6e83cf5d20d24ce9198272 |
+| checkpoint | none loaded; synthetic KV throughout |
+
+## The kernels were already paged
+
+Every KV-touching kernel in `src/kernels.cu` resolves a logical position
+through `kv_locate(kv, m, pos)`, which reads `KvPages::table[m * max_pages +
+pos / page_tokens]`. That covers both kernels the task named: the DSA indexer
+scan (`indexer_pool_kernel`) and the sparse-MLA gather (`mla_scores_kernel`,
+`mla_context_kernel`). Stage 1 set `max_pages = 1` and `page_tokens =
+max_tokens`, so the table was the identity. No kernel changed in this work.
+
+## Page size does not matter
+
+```bash
+scripts/cache/kv-page-gather.sh scatter
+```
+
+One layer of 11, 8 streams of 65536 tokens, 8.25 GiB arena, best of 3 after a
+full warmup pass, one process per page size. `rr` is round-robin physical
+placement (what a real pool produces), `seq` is stream-contiguous.
+
+| page_tokens | page KiB | pages | layout | scan ms | gather ms |
+| --- | --- | --- | --- | --- | --- |
+| 128 | 2112 | 4096 | rr | 15.249 | 16.422 |
+| 128 | 2112 | 4096 | seq | 15.249 | 16.423 |
+| 256 | 4224 | 2048 | rr | 15.243 | 16.361 |
+| 512 | 8448 | 1024 | rr | 15.238 | 16.400 |
+| 1024 | 16896 | 512 | rr | 15.236 | 16.398 |
+| 2048 | 33792 | 256 | rr | 15.235 | 16.410 |
+| 2048 | 33792 | 256 | seq | 15.234 | 16.364 |
+
+Spread over a 16x page-size range and both layouts: 0.1% on the scan, 0.4% on
+the gather. `--sel dense`, which replaces the scattered top-k with 512
+adjacent pools, lands at 15.234 / 16.331: also the same.
+
+The gather moves 33.6 MB per call (2048 tokens x 8 streams x 512 latents x
+2 B, read twice) in 16.4 ms, which is 2.0 GB/s against the node's measured
+240 GB/s (`blog/posts/hardware/2026-09-06-measured-bandwidth/`). At 0.85% of
+the bandwidth floor there is no locality to lose. `mla_scores_kernel` runs 64
+sequential block reductions per block; that is what the 16.4 ms is.
+
+Cold processes read 20-23 ms on the same configuration. Every number above is
+best of 3 after a warmup pass, one page size per process, for that reason.
+
+So page size is chosen on sharing granularity. 128 is the smallest value that
+keeps an indexer pool (`kpool` 4) inside one page and a page slab a whole
+number of 64 KiB platform pages (`blog/rocket.qmd#alignment`): 16896 B/token x
+128 = 2162688 B = 33 platform pages exactly. `KvGeometry::valid()` rejects
+anything else, and the test checks both rejections.
+
+## Capacity, from the page tables
+
+```bash
+scripts/cache/kv-capacity-replay.sh
+```
+
+The c32 trace replayed through `PagePool` / `PrefixTree` / `KvCache`, peak
+resident rather than cumulative. Sessions retire at their last trace event.
+The 212000 root-prefix row is the one whose sessions sit at 262k-scale
+contexts, so its unshared column is comparable to the earlier entry's 7.
+
+KDA state bf16 (76316672 B/stream, `attention.yaml`):
+
+| root prefix | GiB/session shared | unshared | sessions at 32.73 GiB shared | unshared |
+| --- | --- | --- | --- | --- |
+| 8192 | 0.2771 | 0.7255 | 118 | 45 |
+| 65536 | 0.2787 | 1.6279 | 117 | 20 |
+| 212000 | 0.2829 | 3.9326 | 115 | 8 |
+
+KDA state fp32 (147619840 B/stream, what `model.h` actually allocates):
+
+| root prefix | GiB/session shared | unshared | sessions at 32.73 GiB shared | unshared |
+| --- | --- | --- | --- | --- |
+| 8192 | 0.3435 | 0.7920 | 95 | 41 |
+| 65536 | 0.3451 | 1.6943 | 94 | 19 |
+| 212000 | 0.3493 | 3.9990 | 93 | 8 |
+
+A degenerate control: with the root prefix pinned at the full 262144 cap,
+every session shares the same 2048 pages and nothing diverges. Unshared cost
+is 4.1961 GiB/session and 7 sessions, reproducing
+`blog/posts/cache/2026-09-06-indexer-caches-gates-too/` exactly.
+
+Paging overhead is small enough to ignore. The replay's sharing ratio is
+0.3819 at prefix 8192 and 0.0719 at 212000, against 0.3810 and 0.0718 from
+`agent-workload.py`'s token-level estimate: 0.3% apart. Copy on extend fired
+568 times over the whole trace, 1.14 GiB of device copies.
+
+## Two things the code settled
+
+`attention.yaml` carries `kda.state_dtype: {established: false}`. This engine
+allocates `float* kda_state_` (`model.h`), so the state is FP32 and costs
+147619840 B per stream, 140.78 MiB, not the 72.78 MiB bf16 figure. At 32.73
+GiB of headroom that alone caps the engine at 238 streams before any KV.
+
+Content-addressed reuse across independently computed sequences is not safe to
+turn on here. Identical token prefixes produce identical KV only if the KV was
+computed batch-invariantly, and the grouped-GEMM routed-expert path
+(`moe_grouped.h`) groups rows by the batch it ran in. `KvCache::fork` carries
+no such condition because it shares the bytes themselves, so it is the default
+path; `open_shared()` is the separate entry point that takes the assumption.
+
+## Tests
+
+```
+$ ctest --test-dir build -R kv-radix
+kv-radix .......................   Passed    0.77 sec
+```
+
+41 checks in `tests/test_kv_radix.cu`, all synthetic KV: fork sharing and
+refcounts, copy on extend privatising only the boundary page, a 4-deep fork
+chain, detach/resume restoring the KDA state byte for byte, eviction refused
+while refcounted, the geometry against `attention.yaml`, and a decode loop
+with conditional table uploads across a fork and a detach/resume.
+
+The one that decides this runs `indexer_pool_keys`, `indexer_scores`, `mla_scores`,
+`mla_softmax` and `mla_context` over a forked stream and over a materialised
+copy of the same logical sequence in private pages, in one launch, and
+compares bit for bit. Both are filled from the same host model of what each
+logical token holds, never from each other. A negative control points the
+forked slot's table at its parent and confirms the gather notices.
+
+**Verdict.** Accepted. Prefix sharing takes 262k-context streams per booster
+from 8 to 93 on the c32 trace, and the binding constraint moves off the
+MLA/indexer cache onto the per-stream FP32 KDA state.
+
+**Next.** Ours to build:
+
+- token-parity run of the pooled backend against the real checkpoint, then
+  delete the stage-1 one-page-per-stream allocator and the `kv_pool_pages`
+  argument. `DecodeEngine` is wired (`kv_advance`, `kv_fork`, `kv_detach`,
+  `kv_resume`) but the pool is opt-in and unexercised against weights, because
+  this lane could not load the checkpoint
+- BF16 the KDA recurrent state, or shard it across the pair, and settle
+  `kda.state_dtype` in `attention.yaml` from the engine rather than leaving it
+  `established: false`
+- NVMe tier behind `KdaStateStore`; the host implementation is the only one
+- eviction policy under a pool that is actually full: the replay sizes the
+  pool so nothing is evicted, so LRU reclaim past the tree is untested at scale
+- `mla_scores_kernel`'s 64 sequential block reductions are the 16.4 ms, and
+  nothing about paging changes that
+
+**Reopen if.**
+
+- a driver or firmware release changes unified-memory page migration enough
+  that physical page placement starts showing up in the gather
+- upstream publishes a GLM-5.3-Flash serving cap other than 262144

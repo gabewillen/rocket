@@ -57,7 +57,8 @@ class StageTimer {
 }  // namespace
 
 DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::path& snapshot_dir,
-                           std::size_t expert_cache_bytes, int max_tokens, int max_batch)
+                           std::size_t expert_cache_bytes, int max_tokens, int max_batch,
+                           int kv_pool_pages, int kv_page_tokens)
     : cfg_(cfg),
       w_(cfg, snapshot_dir, expert_cache_bytes),
       max_tokens_(max_tokens),
@@ -111,24 +112,49 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   v_conv_state_ = A(static_cast<std::size_t>(nk) * MB * qkv * taps);
   kda_state_ = F(static_cast<std::size_t>(nk) * MB * heads_kda * hd * hd);
 
-  // --- paged MLA latent + indexer key/gate: one physical page per stream
-  // slot, sized to the whole context window. ---
-  mla_kv_.latent = A(static_cast<std::size_t>(MB) * nm * max_tokens * kvl);
-  mla_kv_.key = A(static_cast<std::size_t>(MB) * nm * max_tokens * ihd);
-  mla_kv_.gate = A(static_cast<std::size_t>(MB) * nm * max_tokens * ihd);
-  mla_kv_.max_pages = 1;
-  mla_kv_.page_tokens = max_tokens;
-  mla_kv_.layers = nm;
-  mla_kv_.kv_lora = kvl;
-  mla_kv_.index_head_dim = ihd;
-  kv_table_ = I(MB);
-  {
-    std::vector<int> table(MB);
-    std::iota(table.begin(), table.end(), 0);
-    cuda_check(cudaMemcpy(kv_table_, table.data(), MB * sizeof(int), cudaMemcpyHostToDevice),
-              "kv table upload");
+  // --- MLA latent + indexer key/gate. Two backends behind the same KvPages
+  // block table the kernels already read through kv_locate(). ---
+  if (kv_pool_pages > 0) {
+    // Refcounted page pool: fixed-size pages shared across streams, one
+    // block-table row per stream slot (src/kv/page_pool.h).
+    const kv::KvGeometry geom{kv_page_tokens, nm, kvl, ihd, cfg_.index_kpool};
+    const std::string bad = geom.why_invalid();
+    if (!bad.empty()) fail("kv pool geometry: " + bad);
+    if (max_tokens % kv_page_tokens != 0)
+      fail("max_tokens must be a whole number of KV pages");
+    const int pages_per_stream = max_tokens / kv_page_tokens;
+    if (kv_pool_pages < pages_per_stream)
+      fail("kv_pool_pages cannot back even one full-context stream");
+    kv_arena_ = std::make_unique<kv::KvArena>(geom, kv_pool_pages, MB, pages_per_stream, stream_);
+    kv_pool_ = std::make_unique<kv::PagePool>(kv_pool_pages, kv_page_tokens);
+    kv_tree_ = std::make_unique<kv::PrefixTree>();
+    kv_cache_ = std::make_unique<kv::KvCache>(geom, kv_pool_.get(), kv_tree_.get(),
+                                              kv_arena_.get());
+    kda_store_ = std::make_unique<kv::HostKdaStateStore>(stream_);
+    mla_kv_ = kv_arena_->pages();
+    kv_seq_of_slot_.assign(MB, -1);
+    for (int m = 0; m < MB; ++m) kv_seq_of_slot_[m] = kv_cache_->open(m);
+    kda_stage_ = alloc(kda_bytes_per_stream());
+  } else {
+    // Stage 1: one physical page per stream slot, sized to the whole context
+    // window, so table[m] = m and nothing is ever shared or evicted.
+    mla_kv_.latent = A(static_cast<std::size_t>(MB) * nm * max_tokens * kvl);
+    mla_kv_.key = A(static_cast<std::size_t>(MB) * nm * max_tokens * ihd);
+    mla_kv_.gate = A(static_cast<std::size_t>(MB) * nm * max_tokens * ihd);
+    mla_kv_.max_pages = 1;
+    mla_kv_.page_tokens = max_tokens;
+    mla_kv_.layers = nm;
+    mla_kv_.kv_lora = kvl;
+    mla_kv_.index_head_dim = ihd;
+    kv_table_ = I(MB);
+    {
+      std::vector<int> table(MB);
+      std::iota(table.begin(), table.end(), 0);
+      cuda_check(cudaMemcpy(kv_table_, table.data(), MB * sizeof(int), cudaMemcpyHostToDevice),
+                "kv table upload");
+    }
+    mla_kv_.table = kv_table_;
   }
-  mla_kv_.table = kv_table_;
 
   tokens_dev_ = I(MB);
   pos_dev_ = I(MB);
@@ -278,6 +304,145 @@ void DecodeEngine::reset() {
   cudaMemsetAsync(streams_, 0, static_cast<std::size_t>(MB) * cfg_.hc_mult * H * sizeof(bf16),
                   stream_);
   cudaStreamSynchronize(stream_);
+
+  // With the stage-1 allocator the paged KV is deliberately not cleared:
+  // positions restart at 0 and nothing reads above a stream's position. A
+  // pool cannot do that, because the stale pages are refcounted and would
+  // never come back. Every slot gets a fresh empty sequence instead.
+  if (kv_cache_) {
+    for (int m = 0; m < MB; ++m) {
+      if (kv_seq_of_slot_[m] >= 0) kv_cache_->destroy(kv_seq_of_slot_[m]);
+      kv_seq_of_slot_[m] = kv_cache_->open(m);
+    }
+  }
+}
+
+// ------------------------------------------------------------- paged KV
+
+std::size_t DecodeEngine::kda_bytes_per_stream() const {
+  const std::size_t conv = 3ull * cfg_.kda_qkv_dim() * cfg_.conv_state_taps() * sizeof(bf16);
+  const std::size_t state = static_cast<std::size_t>(cfg_.kda_heads) * cfg_.kda_head_dim *
+                            cfg_.kda_head_dim * sizeof(float);
+  return static_cast<std::size_t>(kda_layers_) * (conv + state);
+}
+
+int DecodeEngine::kv_pinned_pages() const { return kv_pool_ ? kv_pool_->pinned_pages() : 0; }
+
+int DecodeEngine::kv_session_in_slot(int slot) const {
+  if (!kv_cache_ || slot < 0 || slot >= max_batch_) return -1;
+  return kv_seq_of_slot_[slot];
+}
+
+// One stream's KDA state is strided across kda_layers_ (the buffers are
+// layer-slot-major so a per-layer call sees a contiguous [batch, ...] block),
+// so packing it is one copy per tensor per layer.
+void DecodeEngine::kda_pack(int slot, void* dst) {
+  const int MB = max_batch_;
+  const std::size_t conv_n = static_cast<std::size_t>(cfg_.kda_qkv_dim()) * cfg_.conv_state_taps();
+  const std::size_t state_n = static_cast<std::size_t>(cfg_.kda_heads) * cfg_.kda_head_dim *
+                              cfg_.kda_head_dim;
+  auto* out = static_cast<std::uint8_t*>(dst);
+  for (int li = 0; li < kda_layers_; ++li) {
+    const std::size_t coff = (static_cast<std::size_t>(li) * MB + slot) * conv_n;
+    for (const bf16* src : {q_conv_state_, k_conv_state_, v_conv_state_}) {
+      cuda_check(cudaMemcpyAsync(out, src + coff, conv_n * sizeof(bf16),
+                                 cudaMemcpyDeviceToDevice, stream_), "kda pack conv");
+      out += conv_n * sizeof(bf16);
+    }
+    const std::size_t soff = (static_cast<std::size_t>(li) * MB + slot) * state_n;
+    cuda_check(cudaMemcpyAsync(out, kda_state_ + soff, state_n * sizeof(float),
+                               cudaMemcpyDeviceToDevice, stream_), "kda pack state");
+    out += state_n * sizeof(float);
+  }
+  cuda_check(cudaStreamSynchronize(stream_), "kda pack sync");
+}
+
+void DecodeEngine::kda_unpack(int slot, const void* src) {
+  const int MB = max_batch_;
+  const std::size_t conv_n = static_cast<std::size_t>(cfg_.kda_qkv_dim()) * cfg_.conv_state_taps();
+  const std::size_t state_n = static_cast<std::size_t>(cfg_.kda_heads) * cfg_.kda_head_dim *
+                              cfg_.kda_head_dim;
+  const auto* in = static_cast<const std::uint8_t*>(src);
+  for (int li = 0; li < kda_layers_; ++li) {
+    const std::size_t coff = (static_cast<std::size_t>(li) * MB + slot) * conv_n;
+    for (bf16* dst : {q_conv_state_, k_conv_state_, v_conv_state_}) {
+      cuda_check(cudaMemcpyAsync(dst + coff, in, conv_n * sizeof(bf16),
+                                 cudaMemcpyDeviceToDevice, stream_), "kda unpack conv");
+      in += conv_n * sizeof(bf16);
+    }
+    const std::size_t soff = (static_cast<std::size_t>(li) * MB + slot) * state_n;
+    cuda_check(cudaMemcpyAsync(kda_state_ + soff, in, state_n * sizeof(float),
+                               cudaMemcpyDeviceToDevice, stream_), "kda unpack state");
+    in += state_n * sizeof(float);
+  }
+  cuda_check(cudaStreamSynchronize(stream_), "kda unpack sync");
+}
+
+void DecodeEngine::kda_copy_slot(int dst_slot, int src_slot) {
+  kda_pack(src_slot, kda_stage_);
+  kda_unpack(dst_slot, kda_stage_);
+}
+
+int DecodeEngine::kv_fork(int parent_slot, int fork_pos, int child_slot) {
+  if (!kv_cache_) fail("kv_fork needs an engine built with kv_pool_pages > 0");
+  if (parent_slot < 0 || parent_slot >= max_batch_) fail("kv_fork: parent slot out of range");
+  if (child_slot < 0 || child_slot >= max_batch_) fail("kv_fork: child slot out of range");
+  if (kv_seq_of_slot_[parent_slot] < 0) fail("kv_fork: parent slot holds no sequence");
+  if (kv_seq_of_slot_[child_slot] >= 0) kv_cache_->destroy(kv_seq_of_slot_[child_slot]);
+  const int child = kv_cache_->fork(kv_seq_of_slot_[parent_slot], fork_pos, child_slot);
+  kv_seq_of_slot_[child_slot] = child;
+  kv_arena_->upload_table(child_slot, kv_cache_->page_table(child));
+  // The recurrent state is not shareable, so the child pays a full copy.
+  kda_copy_slot(child_slot, parent_slot);
+  pos_[child_slot] = fork_pos;
+  return child;
+}
+
+int DecodeEngine::kv_detach(int slot) {
+  if (!kv_cache_) fail("kv_detach needs an engine built with kv_pool_pages > 0");
+  if (slot < 0 || slot >= max_batch_ || kv_seq_of_slot_[slot] < 0)
+    fail("kv_detach: slot holds no sequence");
+  const int session = kv_seq_of_slot_[slot];
+  kda_pack(slot, kda_stage_);
+  kda_store_->save(session, kda_stage_, kda_bytes_per_stream());
+  kv_cache_->detach(session);
+  kv_seq_of_slot_[slot] = -1;
+  return session;
+}
+
+void DecodeEngine::kv_resume(int session, int slot) {
+  if (!kv_cache_) fail("kv_resume needs an engine built with kv_pool_pages > 0");
+  if (slot < 0 || slot >= max_batch_) fail("kv_resume: slot out of range");
+  if (kv_seq_of_slot_[slot] >= 0) fail("kv_resume: slot is occupied");
+  kv_cache_->attach(session, slot);
+  kv_seq_of_slot_[slot] = session;
+  kv_arena_->upload_table(slot, kv_cache_->page_table(session));
+  kda_store_->load(session, kda_stage_, kda_bytes_per_stream());
+  kda_unpack(slot, kda_stage_);
+  pos_[slot] = kv_cache_->info(session).length;
+}
+
+void DecodeEngine::kv_destroy(int session) {
+  if (!kv_cache_) fail("kv_destroy needs an engine built with kv_pool_pages > 0");
+  const int slot = kv_cache_->slot_of(session);
+  if (slot >= 0) kv_seq_of_slot_[slot] = -1;
+  kv_cache_->destroy(session);
+  kda_store_->drop(session);
+}
+
+// Reserves this step's token in every active slot and reuploads the block
+// table of any slot whose table changed, which is one slot in every
+// page_tokens steps plus whatever copy on extend privatised.
+void DecodeEngine::kv_advance(const std::vector<int>& tokens, int batch) {
+  if (!kv_cache_) return;
+  for (int m = 0; m < batch; ++m) {
+    const int seq = kv_seq_of_slot_[m];
+    if (seq < 0) fail("step: stream slot holds no KV sequence");
+    const kv::AppendSite site = kv_cache_->append_token(seq, tokens[m]);
+    if (site.page < 0) fail("step: KV pool exhausted");
+    if (site.grew_table || site.copied_on_extend)
+      kv_arena_->upload_table(m, kv_cache_->page_table(seq));
+  }
 }
 
 float DecodeEngine::sync_rms_slot0(const bf16* x, int n) {
@@ -943,6 +1108,10 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
   if (batch <= 0 || batch > max_batch_) fail("batch out of [1, max_batch] range");
   for (const int p : pos_)
     if (p > max_tokens_) fail("position exceeds the compiled max_tokens");
+
+  // Must run before any KV write: it is what decides which physical page
+  // this step's position resolves to.
+  kv_advance(tokens, batch);
 
   const int H = cfg_.hidden_size;
   const int hc = cfg_.hc_mult;

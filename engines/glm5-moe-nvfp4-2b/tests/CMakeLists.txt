@@ -41,6 +41,16 @@ set_target_properties(test-expert-balance PROPERTIES
 add_test(NAME expert-balance COMMAND test-expert-balance)
 set_tests_properties(expert-balance PROPERTIES TIMEOUT 60)
 
+# Radix-tree paged KV: fork sharing, refcounts, copy on extend, detach/resume,
+# and the indexer scan plus sparse-MLA gather over a forked stream against a
+# materialised copy. Synthetic KV, no checkpoint, seconds not minutes.
+add_executable(test-kv-radix test_kv_radix.cu)
+target_link_libraries(test-kv-radix PRIVATE rocket_engine rocket_fuel)
+set_target_properties(test-kv-radix PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME kv-radix COMMAND test-kv-radix)
+set_tests_properties(kv-radix PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 if(NOT EXISTS "${ROCKET_CUTLASS_DIR}/include/cutlass/cutlass.h")
   message(STATUS
     "test-loader-swizzle skipped: no CUTLASS at ${ROCKET_CUTLASS_DIR}. "

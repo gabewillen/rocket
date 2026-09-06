@@ -41,6 +41,8 @@ add_library(rocket_engine STATIC
   src/kernels.cu
   src/weights.cu
   src/model.cu
+  src/kv/page_pool.cc
+  src/kv/kv_arena.cu
 )
 target_include_directories(rocket_engine PUBLIC src)
 target_compile_definitions(rocket_engine PUBLIC

@@ -26,6 +26,18 @@ function(rocket_add_bench name)
   )
 endfunction()
 
+# Page size for the KV pool: gather locality against sharing granularity, on
+# the two kernels that read the cache through the block table every step.
+# No CUTLASS, no checkpoint.
+rocket_add_bench(kv-page-gather kv_page_gather.cu)
+
+# The agent-workload trace replayed through the real page tables: peak
+# resident pages, not a cumulative average. Host only, no CUDA, no checkpoint.
+add_executable(bench-kv-capacity-replay kv_capacity_replay.cc)
+target_link_libraries(bench-kv-capacity-replay PRIVATE rocket_engine rocket_fuel)
+set_target_properties(bench-kv-capacity-replay PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bench")
+
 # CUTLASS is header-only for the kernel. Pinned checkout and exact commit:
 #   third_party/cutlass, ROCKET_PINNED_SHA
 # sm_121a is an upstream-supported arch (CUTLASS_NVCC_ARCHS_SUPPORTED, CUDA>=12.9);
