@@ -99,6 +99,21 @@ minimum_boosters: 2                      # no format fits one booster [fuel]
 # resident expert set, and concurrency moves it toward the upper bound.
 serving_regime:
   concurrency_first: true
+  quantization_plan:
+    # The 16.62 GiB BF16 half is read once per step, so concurrency amortizes
+    # it; it still sets a 70 ms/step floor (16.62 GiB / 238 GB/s) and low-M
+    # latency. Staged plan, operator-approved 2026-09-07:
+    #   1. serve BF16, capture calibration traces via engine telemetry
+    #   2. quantize selected KDA/MLA linear projections to FP8
+    #   3. perplexity + token-parity eval against BF16
+    #   4. progressively widen the FP8 set as evals hold
+    # Source for calibration/quantization is the NIM checkpoint's BF16
+    # tensors (no separate BF16 checkpoint exists on disk, artifacts.md).
+    # Engine requirement: per-tensor dtype registry in the loader so any
+    # projection can flip BF16 -> FP8 without a new checkpoint format.
+    stage: 1
+    step_floor_ms_bf16: 70               # derived: 16.62 GiB / 238 GB/s
+    step_floor_ms_fp8_projection: 35     # derived, if the full half converts
   weight_traffic:
     # Measured off safetensors headers 2026-09-07, scripts/runtime/active-set-bytes.py:
     # only mlp.experts.* is NVFP4; attention, dense MLP, shared expert, router,
