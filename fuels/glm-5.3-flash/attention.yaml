@@ -1,0 +1,205 @@
+# Fuel: GLM-5.3-Flash, attention geometry
+#
+# Every dimension here is read off the on-disk NVFP4 checkpoint, never inferred
+# from a model card. Each block names its source:
+#   [cfg]    config.json text_config, NIM snapshot nim-aa28e1f-nvfp4
+#   [shape]  safetensors header shapes, scripts/attention/dump-attention-shapes.py
+#   [cap]    fuels/glm-5.3-flash/fuel.yaml serving_context_cap
+#   [bench]  blog/posts/attention/2026-09-06-dsa-indexer-is-the-attention-cost/
+# Values marked `derived: true` are arithmetic on a cited number.
+# Values marked `established: false` could not be settled from on-disk sources
+# and say so instead of guessing.
+#
+# Checkpoint:
+#   ~/.cache/nim-glm53-2.1.2/ngc/hub/models--nim--zai-org--glm-5.3-flash/
+#     snapshots/nim-aa28e1f-nvfp4/
+# Vision encoder ignored throughout (config.json vision_config, 24 layers).
+
+id: glm-5.3-flash
+hidden_size: 4096                        # [cfg] hidden_size
+text_layers: 45                          # [cfg] num_hidden_layers
+
+# ---------------------------------------------------------------- interleave
+# config.json carries the pattern three ways and all three agree: layer_types,
+# linear_attn_config.kda_layers, and linear_attn_config.full_attn_layers.
+layers:                                   # [cfg]
+  pattern: three_kda_then_one_mla
+  kda_layer_ids: [0,1,2, 4,5,6, 8,9,10, 12,13,14, 16,17,18, 20,21,22,
+                  24,25,26, 28,29,30, 32,33,34, 36,37,38, 40,41,42, 44]
+  mla_layer_ids: [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43]
+  kda_count: 34
+  mla_count: 11
+  # Layer 44 is KDA and the run ends there, so the last block is a triple of
+  # KDA with no MLA after it. The interleave is exact, not approximate; the
+  # "~34" in fuel.yaml is confirmed as exactly 34.
+  mtp_layer_id: 45                        # [shape] num_nextn_predict_layers 1
+  mtp_layer_kind: sparse_mla              # [shape] layer 45 carries kv_a_proj_with_mqa,
+                                          # kv_b_proj, q_a/q_b, indexer and eh_proj,
+                                          # so the draft layer is MLA-shaped and has
+                                          # its own KV cache when speculation is on
+
+# ---------------------------------------------------------------------- KDA
+# Kimi-delta-style linear attention. Shapes fix the state; the recurrence
+# itself lives in modeling code.
+kda:
+  num_heads: 64                           # [cfg] linear_attn_config.num_heads
+  head_dim: 128                           # [cfg] linear_attn_config.head_dim
+  qkv_width: 8192                         # [shape] q/k/v_proj [8192, 4096] = 64*128
+  k_is_full_width: true                   # [shape] k_proj is 8192 wide, not MQA
+  v_head_dim: 128                         # [shape] v_proj [8192, 4096]
+  short_conv_kernel_size: 4               # [cfg] linear_attn_config.short_conv_kernel_size
+  conv_tensors: 3                         # [shape] q_conv1d, k_conv1d, v_conv1d, each [8192,1,4]
+  conv_depthwise: true                    # [shape] middle dim 1
+  conv_state_taps: 3                      # derived: true, kernel_size - 1
+  gate_lower_bound: -5.0                  # [cfg] linear_attn_config.gate_lower_bound
+  gates:                                  # [shape]
+    decay:  {a: [128, 4096], b: [8192, 128], rank: 128, per: channel}   # f_a_proj / f_b_proj
+    output: {a: [128, 4096], b: [8192, 128], rank: 128, per: channel}   # g_a_proj / g_b_proj
+    beta:   {w: [64, 4096], per: head}                                  # b_proj
+  a_log: [64]                             # [shape] F32, per head
+  dt_bias: [8192]                         # [shape] F32, per channel
+  o_norm: [128]                           # [shape] RMSNorm over head_dim
+  o_proj: [4096, 8192]                    # [shape]
+  recurrent_state_shape: [64, 128, 128]   # derived: true, heads x key dim x value dim
+  recurrent_state_elements: 1048576       # derived: true
+  # Not on disk: whether the engine keeps the recurrent state in BF16 or FP32.
+  # It is a runtime choice, so both are carried below.
+  state_dtype: {established: false, candidates: [bf16, fp32]}
+
+# ---------------------------------------------------------------------- MLA
+# NoPE throughout: qk_rope_head_dim is 0 and kv_a_proj_with_mqa is exactly
+# kv_lora_rank wide, with no rope tail. That is what makes the cached latent
+# 512 and not 576.
+mla:
+  num_heads: 64                           # [cfg] num_attention_heads
+  q_lora_rank: 1536                       # [cfg], [shape] q_a_proj [1536, 4096]
+  kv_lora_rank: 512                       # [cfg], [shape] kv_a_proj_with_mqa [512, 4096]
+  qk_head_dim: 256                        # [cfg] qk_head_dim
+  qk_nope_head_dim: 256                   # [cfg]
+  qk_rope_head_dim: 0                     # [cfg]
+  v_head_dim: 256                         # [cfg]
+  use_nope: true                          # [cfg] mla_use_nope
+  q_b_proj: [16384, 1536]                 # [shape] 64 * 256
+  kv_b_proj: [32768, 512]                 # [shape] 64 * (256 nope + 256 v)
+  o_proj: [4096, 16384]                   # [shape] 64 * 256
+  cached_per_token: latent_only
+  cached_width: 512                       # derived: true, kv_lora_rank, no rope tail
+  absorbed_decode: true                   # W^K_b folds into q, so all 64 heads
+                                          # score against one 512 wide latent [bench]
+
+# -------------------------------------------------------------------- DSA
+indexer:
+  n_heads: 32                             # [cfg] index_n_heads
+  head_dim: 128                           # [cfg] index_head_dim
+  top_k: 2048                             # [cfg] index_topk
+  kpool: 4                                # [cfg] index_kpool
+  kpool_compress: true                    # [cfg] index_kpool_compress
+  kpool_always_select_tail: true          # [cfg] index_kpool_always_select_tail
+  rope_interleave: true                   # [cfg] indexer_rope_interleave
+  share_for_mtp_iteration: true           # [cfg] index_share_for_mtp_iteration
+  wk: [128, 4096]                         # [shape] one 128 wide key per token
+  wq_b: [4096, 1536]                      # [shape] 32 * 128, from the q lora
+  weights_proj: [32, 4096]                # [shape] one scalar per head
+  k_norm: {weight: [128], bias: [128]}    # [shape]
+  kpool_compress_gate: [128, 4096]        # [shape]
+  kpool_compress_ape: [4, 128]            # [shape] one embedding per pool slot
+  # Two things the checkpoint does not settle:
+  top_k_unit:
+    established: false
+    note: >
+      index_topk is 2048, but nothing on disk says whether that counts tokens or
+      pooled groups. With kpool 4 the two readings differ by 4x in gathered KV.
+      Benches use 2048 tokens, the larger reading.
+  score_nonlinearity:
+    established: false
+    assumed: relu
+    note: >
+      weights_proj gives one scalar per head, so the score is a weighted sum of
+      32 head dot products. Whether a ReLU sits inside is modeling code. It does
+      not change the scan cost, only whether the 32 heads could collapse to one
+      128 wide dot.
+  cached_key_form:
+    established: false
+    candidates: [per_token_128, pooled_4to1_128]
+    note: >
+      kpool_compress is true and the compress gate exists, so pooled keys can be
+      built as tokens arrive without retaining raw keys. Whether the engine also
+      keeps per-token keys is a runtime choice. Both are carried below and both
+      are measured.
+
+# --------------------------------------------------------------- state bytes
+# All arithmetic below is BF16 unless stated. Shown so it can be checked.
+bytes:
+  kda_state_per_stream:                   # context independent
+    recurrent_per_layer: 2097152          # 64 * 128 * 128 * 2
+    conv_per_layer: 147456                # 3 tensors * 8192 ch * 3 taps * 2
+    per_layer_total: 2244608
+    layers: 34
+    total: 76316672                       # 2244608 * 34
+    total_mib: 72.78125
+    derived: true
+    if_state_fp32:
+      per_layer_total: 4341760            # 4194304 recurrent + 147456 conv
+      total: 147619840
+      total_mib: 140.78125
+
+  mla_kv_per_token_per_layer: 1024        # 512 latent * 2, no rope tail
+  indexer_key_per_token_per_layer: 256    # 128 * 2
+  indexer_key_per_token_per_layer_pooled: 64   # 256 / kpool 4
+
+  at_serving_cap:                         # 262144 tokens [cap]
+    context_tokens: 262144
+    mla_latent_11_layers: 2952790016      # 11 * 262144 * 1024
+    mla_latent_11_layers_gib: 2.75
+    indexer_pooled_11_layers: 184549376   # 11 * 262144 * 64
+    indexer_pooled_11_layers_gib: 0.171875
+    indexer_per_token_11_layers: 738197504  # 11 * 262144 * 256
+    indexer_per_token_11_layers_gib: 0.6875
+    derived: true
+
+# ------------------------------------------------------------ per-stream cost
+# Three accountings, because two of the inputs are runtime choices rather than
+# checkpoint facts. Each names exactly what it assumes.
+per_stream_at_262144:
+  - name: pooled_bf16_no_mtp
+    assumes: [kda_state_bf16, indexer_keys_pooled_4to1, mtp_cache_not_resident]
+    kda_state: 76316672
+    mla_latent: 2952790016
+    indexer_keys: 184549376
+    total_bytes: 3213656064
+    total_gib: 2.99296875
+    derived: true
+  - name: pooled_bf16_with_mtp
+    assumes: [kda_state_bf16, indexer_keys_pooled_4to1, mtp_layer_45_cached]
+    total_bytes: 3498868736               # + 268435456 latent + 16777216 pooled keys
+    total_gib: 3.258789
+    derived: true
+  - name: per_token_fp32_with_mtp
+    assumes: [kda_state_fp32, indexer_keys_per_token, mtp_layer_45_cached]
+    kda_state: 147619840
+    mla_latent: 3221225472                # 12 layers
+    indexer_keys: 805306368               # 12 layers, 256 B/token
+    total_bytes: 4174151680
+    total_gib: 3.887451
+    derived: true
+
+streams_in_60gib_kv_budget:               # 64424509440 B
+  pooled_bf16_no_mtp: 20                  # 64424509440 / 3213656064 = 20.05
+  pooled_bf16_with_mtp: 18                # = 18.41
+  per_token_fp32_with_mtp: 15             # = 15.43
+  derived: true
+  # Under the two-booster split the MLA latent and the indexer keys are head
+  # independent, so they replicate on both boosters; only the KDA state shards
+  # with heads. Per booster that is 2.75 + 0.171875 + 0.0355 = 2.957 GiB per
+  # stream, so a 60 GiB budget on each booster still buys 20 streams, not 40.
+  per_booster_gib_pooled_bf16: 2.957
+  streams_per_booster_pooled_bf16: 20
+  # A 60 GiB KV budget is larger than this engine currently has. The booster is
+  # 123.73 GiB (blog/posts/hardware/2026-09-05-spark-cluster-baseline/) and the
+  # NVFP4 weights take 91 GiB of it (fuel.yaml), leaving 32.73 GiB.
+  headroom_note:
+    booster_gib: 123.73
+    weights_per_booster_gib: 91
+    kv_headroom_gib: 32.73
+    streams_at_headroom: 10               # 32.73 / 2.957
+    derived: true

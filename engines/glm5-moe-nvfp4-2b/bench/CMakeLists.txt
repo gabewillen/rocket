@@ -111,3 +111,29 @@ else()
     "bench-nvfp4-grouped-gemm skipped: no CUTLASS at ${ROCKET_CUTLASS_DIR}. "
     "Fetch it with engines/glm5-moe-nvfp4-2b/bench/fetch-cutlass.sh")
 endif()
+
+# Attention lane. These need no CUTLASS: the questions are state traffic and
+# gather traffic, and both are answered with plain CUDA at the checkpoint's
+# real dims (fuels/glm-5.3-flash/attention.yaml).
+#
+#   kda-decode-step   34 KDA layers carry a 64x128x128 recurrent state per
+#                     stream; read+write cost per layer per step, M=8..64.
+rocket_add_bench(kda-decode-step kda_decode_step.cu)
+set_target_properties(bench-kda-decode-step PROPERTIES
+  CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}"
+)
+
+#   sparse-mla-decode gather top-k KV from a 262k paged pool and run the MLA
+#                     math in absorbed form, against dense 8k.
+rocket_add_bench(sparse-mla-decode sparse_mla_decode.cu)
+set_target_properties(bench-sparse-mla-decode PROPERTIES
+  CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}"
+)
+target_link_libraries(bench-sparse-mla-decode PRIVATE CUDA::cublas)
+
+#   dsa-indexer-scan  score all 262144 candidates per stream, which is what
+#                     feeds the top-2048 selection.
+rocket_add_bench(dsa-indexer-scan dsa_indexer_scan.cu)
+set_target_properties(bench-dsa-indexer-scan PROPERTIES
+  CUDA_ARCHITECTURES "${ROCKET_CUDA_ARCH}"
+)

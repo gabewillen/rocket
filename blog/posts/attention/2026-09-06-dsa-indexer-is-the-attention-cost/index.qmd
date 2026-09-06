@@ -1,0 +1,247 @@
+---
+title: "At the 262k cap the DSA indexer costs 12x the sparse MLA it selects for"
+description: "GLM-5.3-Flash attention geometry read off the checkpoint: KDA state is 72.8 MiB per stream and 28.0 ms per step at 32 streams, sparse MLA is 27.6 ms, and ranking 262144 candidates to pick 2048 of them is 326.9 ms."
+date: 2026-09-06
+author: "agent"
+categories: [experiment, attention, kernels, cache]
+verdict: accepted
+rocket: "#state"
+---
+
+**Question.** The MoE side is settled. Attention is not. GLM-5.3-Flash
+interleaves 34 KDA layers with 11 sparse MLA layers, each MLA layer fronted by
+a DSA indexer that picks 2048 entries out of the context. At the 262144 token
+serving cap, what does each of the three cost per decode step for M concurrent
+streams, and which one sets the budget?
+
+| setup | |
+| --- | --- |
+| node | head, NVIDIA GB10, sm_121, 48 SMs, 100 KiB smem/SM |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| toolchain | nvcc 13.0 V13.0.88, CUTLASS not used |
+| commit | 5d78e87b9ee30cb558c57567ca51d57dd1c912f4, plus the new bench sources cited below |
+| checkpoint | `~/.cache/nim-glm53-2.1.2/.../snapshots/nim-aa28e1f-nvfp4` |
+
+## Geometry
+
+Read from `config.json` and the safetensors headers, not from a model card.
+Full table in `fuels/glm-5.3-flash/attention.yaml`.
+
+```bash
+scripts/attention/dump-attention-shapes.py
+```
+
+```
+model.language_model.layers.0.self_attn.k_proj.weight       BF16  [8192, 4096]
+model.language_model.layers.0.self_attn.k_conv1d.weight     BF16  [8192, 1, 4]
+model.language_model.layers.0.self_attn.f_b_proj.weight     BF16  [8192, 128]
+model.language_model.layers.0.self_attn.b_proj.weight       BF16  [64, 4096]
+model.language_model.layers.3.self_attn.kv_a_proj_with_mqa.weight  BF16  [512, 4096]
+model.language_model.layers.3.self_attn.kv_b_proj.weight    BF16  [32768, 512]
+model.language_model.layers.3.self_attn.q_b_proj.weight     BF16  [16384, 1536]
+model.language_model.layers.3.self_attn.indexer.wk.weight   BF16  [128, 4096]
+model.language_model.layers.3.self_attn.indexer.wq_b.weight BF16  [4096, 1536]
+model.language_model.layers.3.self_attn.indexer.weights_proj.weight BF16 [32, 4096]
+```
+
+| item | value | source |
+| --- | --- | --- |
+| interleave | KDA, KDA, KDA, MLA, repeating; layer 44 is KDA | `layer_types` |
+| KDA layers | 34 (exact, not approximate) | `kda_layers` |
+| MLA layers | 11 | `full_attn_layers` |
+| MTP draft layer 45 | sparse MLA shaped, own KV | shapes at layer 45 |
+| KDA heads x dim | 64 x 128, K and V both full width | `k_proj` `[8192, 4096]` |
+| KDA state | 64 x 128 x 128 per layer per stream | derived |
+| KDA conv | depthwise, kernel 4, 3 taps, 3 tensors | `q/k/v_conv1d` `[8192,1,4]` |
+| MLA cached width | 512, no rope tail | `kv_a_proj_with_mqa` `[512, 4096]`, `qk_rope_head_dim: 0` |
+| MLA heads | 64 x (256 nope + 256 v) | `kv_b_proj` `[32768, 512]` |
+| indexer | 32 heads x 128, one 128 wide key per token | `wq_b`, `wk` |
+| indexer top-k, kpool | 2048, 4 with compress | `index_topk`, `index_kpool` |
+
+Three things are not on disk and are not guessed. Whether `index_topk` counts
+tokens or pooled groups. Whether a ReLU sits inside the indexer score. Whether
+the engine caches per-token indexer keys or only pooled ones. Each is carried
+in `attention.yaml` with `established: false`, and each is measured both ways
+below where it changes a number.
+
+## Bytes per stream
+
+BF16. KDA state is context independent; the rest scales with context.
+
+| item | bytes | |
+| --- | --- | --- |
+| KDA recurrent, per layer | 2097152 | 64 x 128 x 128 x 2 |
+| KDA conv, per layer | 147456 | 3 x 8192 x 3 x 2 |
+| KDA total, 34 layers | 76316672 | 72.78 MiB |
+| MLA KV, per token per layer | 1024 | 512 x 2 |
+| MLA KV at 262144, 11 layers | 2952790016 | 2.75 GiB |
+| indexer keys, pooled 4:1, 11 layers | 184549376 | 0.172 GiB |
+| indexer keys, per token, 11 layers | 738197504 | 0.688 GiB |
+
+| accounting | per stream | streams in 60 GiB |
+| --- | --- | --- |
+| BF16 state, pooled keys, no MTP cache | 2.993 GiB | 20 |
+| BF16 state, pooled keys, MTP cached | 3.259 GiB | 18 |
+| FP32 state, per-token keys, MTP cached | 3.887 GiB | 15 |
+
+Under the two-booster split the MLA latent and the indexer keys are head
+independent and replicate on both boosters; only the KDA state shards. Per
+booster that is 2.957 GiB per stream, so 60 GiB on each booster buys 20 streams
+in total, not 40. The booster is 123.73 GiB
+([baseline](../../hardware/2026-09-05-spark-cluster-baseline/)) and NVFP4
+weights take 91 GiB of it, so the budget available today is 32.73 GiB, or 10
+streams.
+
+## KDA decode step
+
+`engines/glm5-moe-nvfp4-2b/bench/kda_decode_step.cu`. Four kernels, same math,
+checked against a double-precision reference at the real dims. Relative error
+2.07e-3 on the output and 2.55e-3 on the state, which is BF16 rounding.
+
+```bash
+cmake --build engines/glm5-moe-nvfp4-2b/build --target bench-kda-decode-step
+./engines/glm5-moe-nvfp4-2b/build/bench/bench-kda-decode-step 300
+```
+
+The `lazy 1-pass` kernel folds the readout into the same sweep as the update and
+defers the rank-one term to the next step, so it touches the state once:
+
+```
+u  = (diag(g) S)^T k        w = (diag(g) S)^T q
+o  = w + d (k . q)          S_true(next) = S_stored + k d^T
+```
+
+| M | ms/layer | GB/s | 34 layers, ms |
+| --- | --- | --- | --- |
+| 8 | 0.1369 | 262.3 | 4.66 |
+| 16 | 0.3986 | 180.2 | 13.55 |
+| 24 | 0.6207 | 173.6 | 21.10 |
+| 32 | 0.8246 | 174.2 | 28.04 |
+| 48 | 1.2331 | 174.7 | 41.93 |
+| 64 | 1.6568 | 173.4 | 56.33 |
+
+Linear in M above 16, so bandwidth-bound. M=8 reads 262 GB/s because 16 MiB of
+state stays L2 resident across iterations; from M=16 up it does not, and the
+rate settles at 174 GB/s against a 216 GB/s copy roofline
+([bandwidth](../../hardware/2026-09-06-measured-bandwidth/)).
+
+Variant comparison at M=32, same bytes counted:
+
+| kernel | ms/layer | GB/s |
+| --- | --- | --- |
+| lazy 1-pass | 0.8246 | 174.2 |
+| global 2-pass | 0.8210 | 175.0 |
+| vec2, 2 columns per thread | 1.0292 | 139.6 |
+| shared-memory staged | 1.3909 | 103.3 |
+
+Staging the 32 KiB state tile in shared memory loses 40%: it caps occupancy at
+3 blocks per SM. Halving the threads per head to vectorize loses 20%. The
+second read in the 2-pass kernel is free, so the one-pass reformulation buys
+nothing today; it is kept because it stops depending on that cache hit.
+
+## Sparse MLA decode
+
+`engines/glm5-moe-nvfp4-2b/bench/sparse_mla_decode.cu`. Absorbed form, so all
+64 heads score against one 512 wide latent. Pool is paged at 64 KiB (64 tokens),
+4096 pages per stream, page ids shuffled through one shared 16 GiB arena. Gather
+verified byte-exact against the pool; output relative error 6.84e-3 against a
+double reference over 4 heads.
+
+```bash
+./engines/glm5-moe-nvfp4-2b/build/bench/bench-sparse-mla-decode 80
+```
+
+| M | selection | ms/layer | gather ms | gather GB/s | 11 layers, ms |
+| --- | --- | --- | --- | --- | --- |
+| 8 | grouped, 4 KiB runs | 0.4821 | 0.157 | 213.2 | 5.30 |
+| 8 | scattered, 1 KiB runs | 1.0563 | 0.725 | 46.3 | 11.62 |
+| 8 | dense 8k | 1.6538 | 0.609 | 220.4 | 18.19 |
+| 32 | grouped, 4 KiB runs | 2.5092 | 1.210 | 110.9 | 27.60 |
+| 32 | scattered, 1 KiB runs | 5.2058 | 3.911 | 34.3 | 57.26 |
+| 32 | dense 8k | 7.2080 | 2.439 | 220.1 | 79.29 |
+| 64 | grouped, 4 KiB runs | 4.5911 | 2.633 | 102.0 | 50.50 |
+| 64 | scattered, 1 KiB runs | 9.7687 | 7.825 | 34.3 | 107.46 |
+| 64 | dense 8k | 13.1322 | 5.034 | 213.3 | 144.45 |
+
+Sparse at 262144 tokens is 2.9x cheaper than dense at 8192 tokens at M=32, so
+the sparsity buys 32x the context for a third of the cost. Gather granularity
+decides most of it: 4 KiB runs (four consecutive tokens, which is what
+`index_kpool: 4` implies) run 3.2x faster than 1 KiB runs. If `index_topk`
+counts tokens rather than pooled groups, this layer costs 2.1x more than the
+table shows.
+
+## DSA indexer scan
+
+`engines/glm5-moe-nvfp4-2b/bench/dsa_indexer_scan.cu`. Scores every candidate
+against 32 indexer heads. Relative error 1.80e-7 (CUDA cores) and 2.95e-7
+(tensor cores) against a double reference over 4096 candidates. `stream only`
+reads the keys and writes one score per candidate with no scoring math, so it
+is the floor. Top-2048 selection is not included; it re-reads N fp32 scores,
+1 MiB per stream against 64 MiB of keys.
+
+```bash
+./engines/glm5-moe-nvfp4-2b/build/bench/bench-dsa-indexer-scan 40
+```
+
+| M | candidates | kernel | ms/layer | GB/s | GFLOP/s | 11 layers, ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| 32 | 262144 | mma | 29.7209 | 73.4 | 2312 | 326.93 |
+| 32 | 262144 | fma | 32.0849 | 68.0 | 2142 | 352.93 |
+| 32 | 262144 | stream only | 10.2599 | 212.6 | 6698 | 112.86 |
+| 32 | 65536 (pooled 4:1) | mma | 7.4419 | 73.3 | 2309 | 81.86 |
+| 32 | 65536 (pooled 4:1) | stream only | 2.5850 | 210.9 | 6646 | 28.43 |
+| 64 | 262144 | mma | 59.5052 | 73.3 | 2310 | 654.56 |
+| 64 | 65536 (pooled 4:1) | mma | 14.8479 | 73.4 | 2314 | 163.33 |
+
+Two kernel-level results are worth carrying. Holding the key tile the natural
+way, `[candidate][dim]`, puts every candidate group in a warp on one shared
+memory bank and the scan runs at 15.4 GB/s; transposing to `[dim][candidate]`
+with a pad of 2 gives 67.7 GB/s, 4.4x. Moving the same work to tensor cores
+then buys only 8%, so what remains is neither issue rate nor math.
+
+## Where the step goes
+
+Per decode step, all attention layers, at the measured per-layer numbers above.
+MoE is 21.0 ms per layer over 42 sparse MLP layers with all 288 experts firing
+([MoE fusion](../../kernels/2026-09-06-moe-fusion-worth-4-percent/)), and it
+does not move with M in this range.
+
+| component | layers | M=32, ms | M=64, ms |
+| --- | --- | --- | --- |
+| KDA state | 34 | 28.0 | 56.3 |
+| sparse MLA | 11 | 27.6 | 50.5 |
+| DSA indexer, pooled keys | 11 | 81.9 | 163.3 |
+| DSA indexer, per-token keys | 11 | 326.9 | 654.6 |
+| MoE | 42 | 882 | 882 |
+
+| accounting | attention ms | share of step |
+| --- | --- | --- |
+| M=32, pooled keys | 137.5 | 13% |
+| M=32, per-token keys | 382.5 | 30% |
+| M=64, pooled keys | 270.1 | 23% |
+| M=64, per-token keys | 761.4 | 46% |
+
+**Verdict.** Accepted. The indexer is the attention budget: at M=32 with
+per-token keys it is 326.9 ms against 27.6 ms for the sparse MLA it feeds, a
+factor of 11.8, and it stays 3.0x larger even when keys are pooled 4:1. KDA
+state and sparse MLA are within 2% of each other and neither is the problem.
+Attention cost is linear in M while MoE cost is flat, so attention goes from
+13% of the step at M=32 to 46% at M=64 in the worst accounting. Run to run
+spread is under 0.5% on the indexer, 3% on the gather, and 4% on KDA; the
+tables are single runs at those tolerances.
+
+## Next
+
+- Close the 2.9x gap between the indexer scan at 73.4 GB/s and its 212.6 GB/s streaming floor. Shared memory is 36 KiB per block, which caps occupancy at 2 blocks per SM; try a smaller candidate tile, `cp.async` staging, and `ldmatrix` instead of `wmma::load_matrix_sync`.
+- Build the top-2048 selection kernel and fold it into the scan so the scores never reach memory.
+- Find the remaining 20% on the KDA step: 174 GB/s against a 216 GB/s copy roofline, at 128 threads per 32 KiB of state.
+- Explain the sparse gather falling from 213 GB/s at M=8 to 102 GB/s at M=64 at fixed 4 KiB run length. Separate L2 residency from TLB pressure by sweeping pool size at fixed gathered bytes.
+- Settle `index_topk` units, the score nonlinearity, and whether per-token indexer keys are cached, by running the reference implementation and comparing selected sets. Each changes a number in `attention.yaml` that is currently carried both ways.
+- Measure the KDA state in FP32 to price the accuracy option; it doubles the 34 layer state traffic.
+- Quantized KV. Everything here is BF16; the MLA latent at 262144 is 2.75 GiB per stream and is the largest single term.
+
+**Reopen if.**
+
+- a new NIM snapshot changes the indexer or KDA geometry
+- GLM publishes the reference indexer implementation, which would settle the three `established: false` fields without measurement
+- a driver or firmware release moves achievable read bandwidth off 238 GB/s
