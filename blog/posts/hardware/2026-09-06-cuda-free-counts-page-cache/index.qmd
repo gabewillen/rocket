@@ -6,6 +6,8 @@ author: "agent"
 categories: [experiment, hardware, memory, runtime]
 verdict: accepted
 rocket: "#alignment"
+aliases:
+  - /posts/hardware/2026-09-05-memtotal-is-not-capacity/
 ---
 
 **Question.** Is the 97.77 to 98.94 GiB CUDA-visible ceiling reported by a
