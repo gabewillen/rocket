@@ -46,6 +46,8 @@ class PatchTests(unittest.TestCase):
         self.assertIn('rocket.qwen38.activation-telemetry.v2', patched)
         self.assertIn('ROCKET_QWEN38_LINEAR_LOAD', patched)
         self.assertIn('getattr(value, "shard_id", None)', patched)
+        self.assertIn('type(self.quant_method).__name__', patched)
+        self.assertIn('sorted(self._parameters)', patched)
         self.assertIn('getattr(layer, "linear_attn", None)', patched)
         self.assertIn('getattr(layer, "self_attn", None)', patched)
         self.assertIn('getattr(layer, "ple", None)', patched)

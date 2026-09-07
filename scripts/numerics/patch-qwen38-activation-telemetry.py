@@ -30,6 +30,8 @@ def _rocket_install_linear_load_trace():
                         {
                             "prefix": self.prefix,
                             "name": name,
+                            "quant_method": type(self.quant_method).__name__,
+                            "parameters": sorted(self._parameters),
                             "shard_id": getattr(value, "shard_id", None),
                             "shape": list(value.shape),
                             "dtype": str(value.dtype),

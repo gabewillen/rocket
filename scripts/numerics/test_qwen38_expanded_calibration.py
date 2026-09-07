@@ -79,6 +79,8 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("patch-vllm-64k-loader.py", self.source)
         self.assertIn("patch-qwen38-activation-telemetry.py", self.source)
         self.assertIn("ROCKET_QWEN38_LOAD_TRACE=1", self.source)
+        self.assertIn("qwen38-embed-fp8-config.py", self.source)
+        self.assertIn("config_fp8_patched.json", self.source)
         for name in (
             "ple_layer_patched.py",
             "modelopt_patched.py",

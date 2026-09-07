@@ -214,6 +214,12 @@ for file in ple_layer_patched.py modelopt_patched.py qsa_ops_patched.py \
     [[ -f "$RUNTIME_FILES/$file" ]] || fail "runtime generator did not produce $file"
     cp "$RUNTIME_FILES/$file" "$ARTIFACT_DIR/$file"
 done
+if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
+    python3 "$REPO_ROOT/scripts/runtime/qwen38-embed-fp8-config.py" \
+        "$ARTIFACT_DIR/config_patched.json" \
+        "$FP8_ARTIFACT_DIR/hf_quant_config.json" \
+        "$ARTIFACT_DIR/config_fp8_patched.json"
+fi
 
 verify_sha() {
     local expected=$1 file=$2 actual
@@ -279,9 +285,10 @@ scp -q "$ARTIFACT_DIR"/* "$SSH_TARGET:$REMOTE_OUTPUT/artifacts/"
 
 write_launch_script() {
     local destination=$1 node_rank=$2 node_ip=$3 iface=$4 hca=$5 cache_mount=$6 artifact_dir=$7 mode=$8 cache_access=$9 fp8_host_dir=${10}
-    local fp8_options="" quant_config_source="$artifact_dir/hf_quant_config_patched.json"
+    local fp8_options="" quant_config_source="$artifact_dir/hf_quant_config_patched.json" config_source="$artifact_dir/config_patched.json"
     if [[ -n "$fp8_host_dir" ]]; then
         quant_config_source="$fp8_host_dir/hf_quant_config.json"
+        config_source="$artifact_dir/config_fp8_patched.json"
         fp8_options="
   -v $(printf '%q' "$fp8_host_dir"):/rocket/qwen38-linear-fp8:ro \\
   -e ROCKET_QWEN38_FP8_OVERLAY_MANIFEST=/rocket/qwen38-linear-fp8/manifest.json \\
@@ -310,7 +317,7 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   -v $(printf '%q' "$artifact_dir/model_telemetry.py"):$CONTAINER_MODEL_DIR/model.py:ro \\
   -v $(printf '%q' "$artifact_dir/qsa_ops_patched.py"):$CONTAINER_MODEL_DIR/ops/qsa.py:ro \\
   -v $(printf '%q' "$artifact_dir/qsa_nvidia_patched.py"):$CONTAINER_MODEL_DIR/qsa.py:ro \\
-  -v $(printf '%q' "$artifact_dir/config_patched.json"):/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/config.json:ro \\
+  -v $(printf '%q' "$config_source"):/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/config.json:ro \\
   -v $(printf '%q' "$quant_config_source"):/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/hf_quant_config.json:ro \\
   -v $(printf '%q' "$cache_mount"):/root/.cache/huggingface:$cache_access \\
   -v \$HOME/.cache/vllm:/root/.cache/vllm \\
