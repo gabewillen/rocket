@@ -308,7 +308,7 @@ extract_image_file "$CONTAINER_MODEL_DIR/ops/qsa.py" "$RUNTIME_FILES/qsa_ops_pat
 extract_image_file "$CONTAINER_MODEL_DIR/qsa.py" "$RUNTIME_FILES/qsa_nvidia_patched.py.orig"
 extract_image_file "$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py" \
     "$ARTIFACT_DIR/weight_utils_64k.py"
-extract_image_file "$CONTAINER_MODEL_DIR/model.py" "$ARTIFACT_DIR/model_telemetry.py"
+extract_image_file "$CONTAINER_MODEL_DIR/model.py" "$ARTIFACT_DIR/model_router.py"
 
 python3 "$RUNTIME_FILES/patch_ple_layer.py" >/dev/null
 python3 "$RUNTIME_FILES/patch_modelopt_mxfp8.py" >/dev/null
@@ -328,11 +328,12 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
     python3 "$REPO_ROOT/scripts/runtime/patch-qwen38-nvfp4-overlay-loader.py" \
         "$ARTIFACT_DIR/weight_utils_64k.py"
 fi
-python3 "$SCRIPT_DIR/patch-qwen38-activation-telemetry.py" "$ARTIFACT_DIR/model_telemetry.py"
 if [[ "$NVFP4_HAS_BASE_ROUTERS" == true ]]; then
     python3 "$REPO_ROOT/scripts/runtime/patch-qwen38-nvfp4-router.py" \
-        "$ARTIFACT_DIR/model_telemetry.py"
+        "$ARTIFACT_DIR/model_router.py"
 fi
+cp "$ARTIFACT_DIR/model_router.py" "$ARTIFACT_DIR/model_telemetry.py"
+python3 "$SCRIPT_DIR/patch-qwen38-activation-telemetry.py" "$ARTIFACT_DIR/model_telemetry.py"
 
 for file in ple_layer_patched.py modelopt_patched.py qsa_ops_patched.py \
     qsa_nvidia_patched.py config_patched.json hf_quant_config_patched.json; do
@@ -383,17 +384,21 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         -v "$ARTIFACT_DIR/modelopt_patched.py:$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro" \
         -v "$NVFP4_ARTIFACT_DIR/hf_quant_config.json:/work/hf_quant_config.json:ro" \
         -v "$ARTIFACT_DIR/model_telemetry.py:/work/model.py:ro" \
+        -v "$ARTIFACT_DIR/model_router.py:/work/model_router.py:ro" \
         -e "ROCKET_NVFP4_FAMILIES=$NVFP4_FAMILIES_CSV" \
         --entrypoint /usr/bin/python3 "$IMAGE_TAG" -c \
-        "import json,os,pathlib; from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig; config=ModelOptMixedPrecisionConfig.from_config(json.load(open('/work/hf_quant_config.json'))); families=set(os.environ['ROCKET_NVFP4_FAMILIES'].split(',')); prefix='mtp.layers.48.mlp.experts'; algo=config._resolve_quant_algo(prefix); block=config._fp8_block_scales_config(prefix); assert algo in ('FP8_BLOCK_SCALES', 'FP8_PB_WO'), algo; assert block.weight_block_size == [128, 128], block.weight_block_size; checks={'base_routers':'model.language_model.model.layers.0.mlp.gate','base_ple':'model.language_model.model.layers.1.ple.key_proj'}; [(_ for _ in ()).throw(AssertionError((family, config._resolve_quant_algo(target)))) for family,target in checks.items() if family in families and config._resolve_quant_algo(target) != 'NVFP4']; marker='ROCKET_QWEN38_NVFP4_ROUTER_V1' in pathlib.Path('/work/model.py').read_text(); assert marker == ('base_routers' in families), marker; print(f'validated NVFP4 semantics: {sorted(families)}; MTP {algo} {block.weight_block_size}')"
+        "import json,os,pathlib; from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig; config=ModelOptMixedPrecisionConfig.from_config(json.load(open('/work/hf_quant_config.json'))); families=set(os.environ['ROCKET_NVFP4_FAMILIES'].split(',')); prefix='mtp.layers.48.mlp.experts'; algo=config._resolve_quant_algo(prefix); block=config._fp8_block_scales_config(prefix); assert algo in ('FP8_BLOCK_SCALES', 'FP8_PB_WO'), algo; assert block.weight_block_size == [128, 128], block.weight_block_size; checks={'base_routers':'model.language_model.model.layers.0.mlp.gate','base_ple':'model.language_model.model.layers.1.ple.key_proj'}; [(_ for _ in ()).throw(AssertionError((family, config._resolve_quant_algo(target)))) for family,target in checks.items() if family in families and config._resolve_quant_algo(target) != 'NVFP4']; telemetry=pathlib.Path('/work/model.py').read_text(); runtime=pathlib.Path('/work/model_router.py').read_text(); selected='base_routers' in families; assert ('ROCKET_QWEN38_NVFP4_ROUTER_V1' in telemetry) == selected; assert ('ROCKET_QWEN38_NVFP4_ROUTER_V1' in runtime) == selected; assert 'ROCKET_NVFP4_TELEMETRY' in telemetry; assert 'ROCKET_NVFP4_TELEMETRY' not in runtime; print(f'validated NVFP4 mounted-model semantics: {sorted(families)}; MTP {algo} {block.weight_block_size}')"
 fi
 verify_sha 0669d6334f58a624c89c15f3e46c90f28e59b0b913507101dec1c5765e3c3b12 "$ARTIFACT_DIR/qsa_ops_patched.py"
 verify_sha ee5de40742ad48a6064ea24b99a285ff69c47d57bbb170f57c4eef71567a1df3 "$ARTIFACT_DIR/qsa_nvidia_patched.py"
 verify_sha c3864cf981365bfe6b40deaaaa6d12e8402e60a3cef03d009c29f95b4e995403 "$ARTIFACT_DIR/config_patched.json"
 verify_sha dd8727422cafbb0257d11a7163442bda46421f6e67c78eb9acd58669cb6eb5f8 "$ARTIFACT_DIR/hf_quant_config_patched.json"
 
-docker run --rm -v "$ARTIFACT_DIR/model_telemetry.py:/work/model.py:ro" \
-    --entrypoint /usr/bin/python3 "$IMAGE_TAG" -m py_compile /work/model.py
+docker run --rm \
+    -v "$ARTIFACT_DIR/model_telemetry.py:/work/model.py:ro" \
+    -v "$ARTIFACT_DIR/model_router.py:/work/model_router.py:ro" \
+    --entrypoint /usr/bin/python3 "$IMAGE_TAG" -m py_compile \
+    /work/model.py /work/model_router.py
 if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
     FP8_CONTAINER_DIR="/rocket/qwen38-linear-fp8"
     docker run --rm \
@@ -552,9 +557,10 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         -v '$REMOTE_OUTPUT/artifacts/modelopt_patched.py:$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro' \
         -v '$REMOTE_NVFP4_ARTIFACT/hf_quant_config.json:/work/hf_quant_config.json:ro' \
         -v '$REMOTE_OUTPUT/artifacts/model_telemetry.py:/work/model.py:ro' \
+        -v '$REMOTE_OUTPUT/artifacts/model_router.py:/work/model_router.py:ro' \
         -e ROCKET_NVFP4_FAMILIES='$NVFP4_FAMILIES_CSV' \
         --entrypoint /usr/bin/python3 '$IMAGE_TAG' -c \
-        \"import json,os,pathlib; from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig; config=ModelOptMixedPrecisionConfig.from_config(json.load(open('/work/hf_quant_config.json'))); families=set(os.environ['ROCKET_NVFP4_FAMILIES'].split(',')); checks={'base_routers':'model.language_model.model.layers.0.mlp.gate','base_ple':'model.language_model.model.layers.1.ple.value_proj'}; [(_ for _ in ()).throw(AssertionError((family, config._resolve_quant_algo(target)))) for family,target in checks.items() if family in families and config._resolve_quant_algo(target) != 'NVFP4']; marker='ROCKET_QWEN38_NVFP4_ROUTER_V1' in pathlib.Path('/work/model.py').read_text(); assert marker == ('base_routers' in families), marker; print(f'validated worker NVFP4 semantics: {sorted(families)}')\""
+        \"import json,os,pathlib; from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig; config=ModelOptMixedPrecisionConfig.from_config(json.load(open('/work/hf_quant_config.json'))); families=set(os.environ['ROCKET_NVFP4_FAMILIES'].split(',')); checks={'base_routers':'model.language_model.model.layers.0.mlp.gate','base_ple':'model.language_model.model.layers.1.ple.value_proj'}; [(_ for _ in ()).throw(AssertionError((family, config._resolve_quant_algo(target)))) for family,target in checks.items() if family in families and config._resolve_quant_algo(target) != 'NVFP4']; telemetry=pathlib.Path('/work/model.py').read_text(); runtime=pathlib.Path('/work/model_router.py').read_text(); selected='base_routers' in families; assert ('ROCKET_QWEN38_NVFP4_ROUTER_V1' in telemetry) == selected; assert ('ROCKET_QWEN38_NVFP4_ROUTER_V1' in runtime) == selected; assert 'ROCKET_NVFP4_TELEMETRY' in telemetry; assert 'ROCKET_NVFP4_TELEMETRY' not in runtime; print(f'validated worker NVFP4 mounted-model semantics: {sorted(families)}')\""
 fi
 write_launch_script "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE" \
     "$WORKER_HCA" "$WORKER_HF_VOLUME" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT" "$REMOTE_NVFP4_ARTIFACT"
@@ -567,9 +573,13 @@ if [[ "$PRODUCTION" == true ]]; then
             -e '/ROCKET_NVFP4_SAMPLE_ELEMENTS=/d' \
             -e '/ROCKET_NVFP4_MAX_EMISSIONS=/d' \
             -e '/ROCKET_QWEN38_LOAD_TRACE=/d' \
-            -e '/model_telemetry.py:.*\/model.py:ro/d' \
             -e 's/--enforce-eager //' \
             "$launch_script"
+        if [[ "$NVFP4_HAS_BASE_ROUTERS" == true ]]; then
+            sed -i 's/model_telemetry.py:/model_router.py:/' "$launch_script"
+        else
+            sed -i '/model_telemetry.py:.*\/model.py:ro/d' "$launch_script"
+        fi
     done
 fi
 scp -q "$OUTPUT_DIR/launch-worker.sh" "$SSH_TARGET:$REMOTE_OUTPUT/launch-worker.sh"

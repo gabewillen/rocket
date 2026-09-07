@@ -127,6 +127,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         for name in (
             "ple_layer_patched.py",
             "modelopt_patched.py",
+            "model_router.py",
             "weight_utils_64k.py",
             "qsa_ops_patched.py",
             "qsa_nvidia_patched.py",
@@ -162,7 +163,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("ROCKET_QWEN38_NVFP4_ROUTER_V1", self.source)
         self.assertIn("model.language_model.model.layers.0.mlp.gate", self.source)
         self.assertIn("model.language_model.model.layers.1.ple.key_proj", self.source)
-        self.assertIn("validated worker NVFP4 semantics", self.source)
+        self.assertIn("validated worker NVFP4 mounted-model semantics", self.source)
         self.assertLess(self.source.index(semantic), self.source.index(launch))
 
     def test_worker_transfers_are_checksummed_and_nvfp4_is_preflighted(self):
@@ -208,6 +209,42 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn('if [[ "$family" == base_routers ]]', self.source)
         self.assertEqual(self.source.count(patcher), 1)
         self.assertLess(self.source.index(condition), self.source.index(patcher))
+
+    def test_production_with_routers_mounts_router_only_model(self):
+        function = self.source[
+            self.source.index("write_launch_script() {"):
+            self.source.index('\nREMOTE_FP8_ARTIFACT=""')
+        ]
+        production = self.source[
+            self.source.index('if [[ "$PRODUCTION" == true ]]; then', self.source.index("write_launch_script() {")):
+            self.source.index('\nscp -q "$OUTPUT_DIR/launch-worker.sh"')
+        ]
+        with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+            root = pathlib.Path(directory)
+            harness = root / "production.sh"
+            harness.write_text(
+                "set -euo pipefail\n"
+                'HEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n'
+                'CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n'
+                'MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n'
+                'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\n'
+                f'OUTPUT_DIR={root}\nPRODUCTION=true\nNVFP4_HAS_BASE_ROUTERS=true\n'
+                + function
+                + f'\nwrite_launch_script {root / "launch-worker.sh"} 1 10.0.0.2 eth1 hca /cache /generated --headless ro "" /durable/nvfp4\n'
+                + f'write_launch_script {root / "launch-head.sh"} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" /durable/nvfp4\n'
+                + production
+            )
+            result = subprocess.run(
+                ["bash", str(harness)], capture_output=True, text=True, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in ("launch-head.sh", "launch-worker.sh"):
+                generated = (root / name).read_text()
+                self.assertIn(
+                    "/generated/model_router.py:/vllm/model/model.py:ro", generated
+                )
+                self.assertNotIn("model_telemetry.py", generated)
+                self.assertNotIn("ROCKET_NVFP4_CALIBRATE", generated)
 
     def test_generated_launch_scripts_are_single_commands(self):
         function = self.source[
