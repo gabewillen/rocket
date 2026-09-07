@@ -1,0 +1,297 @@
+{
+  "checkpoint": {
+    "config_sha256": "deef67a61f3311faf051b23dc4192f442c7fee4f9cd2f38cbcbe4da55c763a80",
+    "revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+    "source_weight_dtype": "bfloat16"
+  },
+  "families": [
+    {
+      "cuda_allocated_bytes_c16": 25794969600,
+      "cuda_allocated_bytes_per_layer_per_stream": 134348800,
+      "cuda_allocated_bytes_per_stream": 1612185600,
+      "cuda_allocation_accounted": true,
+      "cuda_blocks_per_stream": 82,
+      "cuda_page_bytes_per_layer": 1638400,
+      "family": "full-attention QSA main paged KV",
+      "id": "target.full_attention.kv",
+      "layers": 12,
+      "logical_bytes_per_layer_per_stream": 134217728,
+      "logical_bytes_per_stream": 1610612736,
+      "logical_shape_per_layer_per_stream": [
+        262144,
+        1,
+        512
+      ],
+      "nvme_padded_bytes_per_stream": 1610612736,
+      "owner": "target",
+      "restore_atomicity": "restore with every required family at one accepted-token boundary",
+      "sequence_dependence": "one K and V row per token, paged to full context",
+      "serving_dtype": "fp8_e4m3",
+      "shares_cuda_allocation_with": null,
+      "source_dtype": "runtime-produced",
+      "tp_ownership": "TP-sharded KV heads"
+    },
+    {
+      "cuda_allocated_bytes_c16": 39321600,
+      "cuda_allocated_bytes_per_layer_per_stream": 204800,
+      "cuda_allocated_bytes_per_stream": 2457600,
+      "cuda_allocation_accounted": true,
+      "cuda_blocks_per_stream": 1,
+      "cuda_page_bytes_per_layer": 204800,
+      "family": "QSA raw-key/MRoPE circular compressor state",
+      "id": "target.qsa.raw",
+      "layers": 12,
+      "logical_bytes_per_layer_per_stream": 2240,
+      "logical_bytes_per_stream": 26880,
+      "logical_shape_per_layer_per_stream": [
+        8,
+        1,
+        140
+      ],
+      "nvme_padded_bytes_per_stream": 65536,
+      "owner": "target",
+      "restore_atomicity": "restore with every required family at one accepted-token boundary",
+      "sequence_dependence": "fixed 8-row ring per live stream; allocator pads its page to the compressed-cache page",
+      "serving_dtype": "bfloat16",
+      "shares_cuda_allocation_with": null,
+      "source_dtype": "runtime-produced",
+      "tp_ownership": "replicated on both TP ranks"
+    },
+    {
+      "cuda_allocated_bytes_c16": 3224371200,
+      "cuda_allocated_bytes_per_layer_per_stream": 16793600,
+      "cuda_allocated_bytes_per_stream": 201523200,
+      "cuda_allocation_accounted": true,
+      "cuda_blocks_per_stream": 82,
+      "cuda_page_bytes_per_layer": 204800,
+      "family": "QSA compressed-key paged cache",
+      "id": "target.qsa.compressed",
+      "layers": 12,
+      "logical_bytes_per_layer_per_stream": 16777216,
+      "logical_bytes_per_stream": 201326592,
+      "logical_shape_per_layer_per_stream": [
+        65536,
+        1,
+        128
+      ],
+      "nvme_padded_bytes_per_stream": 201326592,
+      "owner": "target",
+      "restore_atomicity": "restore with every required family at one accepted-token boundary",
+      "sequence_dependence": "one key per complete 4-token group",
+      "serving_dtype": "bfloat16",
+      "shares_cuda_allocation_with": null,
+      "source_dtype": "runtime-produced",
+      "tp_ownership": "replicated on both TP ranks"
+    },
+    {
+      "cuda_allocated_bytes_c16": 1887436800,
+      "cuda_allocated_bytes_per_layer_per_stream": 3276800,
+      "cuda_allocated_bytes_per_stream": 117964800,
+      "cuda_allocation_accounted": true,
+      "cuda_blocks_per_stream": 2,
+      "cuda_page_bytes_per_layer": 1638400,
+      "family": "linear-attention convolution state",
+      "id": "target.linear.conv",
+      "layers": 36,
+      "logical_bytes_per_layer_per_stream": 61440,
+      "logical_bytes_per_stream": 2211840,
+      "logical_shape_per_layer_per_stream": [
+        6,
+        5120
+      ],
+      "nvme_padded_bytes_per_stream": 2228224,
+      "owner": "target",
+      "restore_atomicity": "restore with every required family at one accepted-token boundary",
+      "sequence_dependence": "fixed current state; align mode holds two pages padded to the main-KV page",
+      "serving_dtype": "bfloat16",
+      "shares_cuda_allocation_with": null,
+      "source_dtype": "runtime-produced",
+      "tp_ownership": "TP-sharded projection width"
+    },
+    {
+      "cuda_allocated_bytes_c16": 1887436800,
+      "cuda_allocated_bytes_per_layer_per_stream": 3276800,
+      "cuda_allocated_bytes_per_stream": 117964800,
+      "cuda_allocation_accounted": false,
+      "cuda_blocks_per_stream": 2,
+      "cuda_page_bytes_per_layer": 1638400,
+      "family": "linear-attention recurrent matrix",
+      "id": "target.linear.recurrent",
+      "layers": 36,
+      "logical_bytes_per_layer_per_stream": 1572864,
+      "logical_bytes_per_stream": 56623104,
+      "logical_shape_per_layer_per_stream": [
+        24,
+        128,
+        128
+      ],
+      "nvme_padded_bytes_per_stream": 56623104,
+      "owner": "target",
+      "restore_atomicity": "restore with every required family at one accepted-token boundary",
+      "sequence_dependence": "shares each padded GDN page with convolution state; allocated bytes are reported jointly",
+      "serving_dtype": "float32",
+      "shares_cuda_allocation_with": "target.linear.conv",
+      "source_dtype": "runtime-produced",
+      "tp_ownership": "TP-sharded value heads"
+    },
+    {
+      "cuda_allocated_bytes_c16": 52428800,
+      "cuda_allocated_bytes_per_layer_per_stream": 3276800,
+      "cuda_allocated_bytes_per_stream": 3276800,
+      "cuda_allocation_accounted": true,
+      "cuda_blocks_per_stream": 2,
+      "cuda_page_bytes_per_layer": 1638400,
+      "family": "PLE dilated short-convolution state",
+      "id": "target.ple.conv",
+      "layers": 1,
+      "logical_bytes_per_layer_per_stream": 245760,
+      "logical_bytes_per_stream": 245760,
+      "logical_shape_per_layer_per_stream": [
+        12,
+        10240
+      ],
+      "nvme_padded_bytes_per_stream": 262144,
+      "owner": "target",
+      "restore_atomicity": "restore with every required family at one accepted-token boundary",
+      "sequence_dependence": "fixed 12-row state; align mode holds two pages padded to the main-KV page",
+      "serving_dtype": "bfloat16",
+      "shares_cuda_allocation_with": null,
+      "source_dtype": "runtime-produced",
+      "tp_ownership": "replicated on both TP ranks (tp_replicated=True)"
+    },
+    {
+      "cuda_allocated_bytes_c16": 2149580800,
+      "cuda_allocated_bytes_per_layer_per_stream": 134348800,
+      "cuda_allocated_bytes_per_stream": 134348800,
+      "cuda_allocation_accounted": true,
+      "cuda_blocks_per_stream": 82,
+      "cuda_page_bytes_per_layer": 1638400,
+      "family": "MTP parity QSA main paged KV",
+      "id": "mtp.full_attention.kv",
+      "layers": 1,
+      "logical_bytes_per_layer_per_stream": 134217728,
+      "logical_bytes_per_stream": 134217728,
+      "logical_shape_per_layer_per_stream": [
+        262144,
+        1,
+        512
+      ],
+      "nvme_padded_bytes_per_stream": 134217728,
+      "owner": "mtp",
+      "restore_atomicity": "restore with every required family at one accepted-token boundary",
+      "sequence_dependence": "one K and V row per token for the full-attention draft layer",
+      "serving_dtype": "fp8_e4m3",
+      "shares_cuda_allocation_with": null,
+      "source_dtype": "runtime-produced",
+      "tp_ownership": "TP-sharded KV heads"
+    },
+    {
+      "cuda_allocated_bytes_c16": 3276800,
+      "cuda_allocated_bytes_per_layer_per_stream": 204800,
+      "cuda_allocated_bytes_per_stream": 204800,
+      "cuda_allocation_accounted": true,
+      "cuda_blocks_per_stream": 1,
+      "cuda_page_bytes_per_layer": 204800,
+      "family": "MTP parity QSA raw-key/MRoPE ring",
+      "id": "mtp.qsa.raw",
+      "layers": 1,
+      "logical_bytes_per_layer_per_stream": 2240,
+      "logical_bytes_per_stream": 2240,
+      "logical_shape_per_layer_per_stream": [
+        8,
+        1,
+        140
+      ],
+      "nvme_padded_bytes_per_stream": 65536,
+      "owner": "mtp",
+      "restore_atomicity": "restore with every required family at one accepted-token boundary",
+      "sequence_dependence": "fixed 8-row ring per live stream; allocator pads its page to the compressed-cache page",
+      "serving_dtype": "bfloat16",
+      "shares_cuda_allocation_with": null,
+      "source_dtype": "runtime-produced",
+      "tp_ownership": "replicated on both TP ranks"
+    },
+    {
+      "cuda_allocated_bytes_c16": 268697600,
+      "cuda_allocated_bytes_per_layer_per_stream": 16793600,
+      "cuda_allocated_bytes_per_stream": 16793600,
+      "cuda_allocation_accounted": true,
+      "cuda_blocks_per_stream": 82,
+      "cuda_page_bytes_per_layer": 204800,
+      "family": "MTP parity QSA compressed-key cache",
+      "id": "mtp.qsa.compressed",
+      "layers": 1,
+      "logical_bytes_per_layer_per_stream": 16777216,
+      "logical_bytes_per_stream": 16777216,
+      "logical_shape_per_layer_per_stream": [
+        65536,
+        1,
+        128
+      ],
+      "nvme_padded_bytes_per_stream": 16777216,
+      "owner": "mtp",
+      "restore_atomicity": "restore with every required family at one accepted-token boundary",
+      "sequence_dependence": "one key per complete 4-token group",
+      "serving_dtype": "bfloat16",
+      "shares_cuda_allocation_with": null,
+      "source_dtype": "runtime-produced",
+      "tp_ownership": "replicated on both TP ranks"
+    }
+  ],
+  "implementation": {
+    "image": "vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8",
+    "image_id": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
+    "source_sha256": {
+      "flash_attn.py": "6bcd9c496e25abffef257aebb8a5efd332343af3da302560596aa9b2e2815935",
+      "kv_cache_interface.py": "7452e823367960daf73520f80824aee0d5ed8ad2731d0404705695814d3bcff7",
+      "kv_cache_utils.py": "f6643bad29b7b3cb044482b6736a042afa91a4f43a11f034317a8e8029d3a8a4",
+      "mamba_utils.py": "e168adae4ac9a951f2566aa5fd84a4615aed97d1fbca3787be9acf9cc192c3eb",
+      "model.py": "d900cd6fcacba18f460e00b3f018fbf36fbe6ecc310692b6adb1451f7f53cc17",
+      "mtp.py": "7735cee47d0d1e4776bebd30d907e4a62160409ce4ef2d65611559f8d58af431",
+      "platform_interface.py": "7109cdf97649c1b7a3e471fc98df06be2eacb77501df94016a44f1327b01f55d",
+      "qsa_cache.py": "e3460b06cd7ed309e47ad5dfd3d4250890539b912385503133bd98a003f73ba8"
+    }
+  },
+  "next_allocation_command": "docker exec \"$MODEL_CONTAINER\" python3 /rocket/scripts/memory/qwen38-state-capacity.py --cuda-allocate-plan /rocket/scripts/memory/qwen38-state-capacity-plan.json --cuda-proof-output /rocket/run/qwen38-state-capacity-cuda-proof.json",
+  "parity_exclusions": [
+    {
+      "reason": "step-local scratch is recomputed after restore; pinned mtp.py persists sequence history only through its full-attention QSA caches",
+      "state": "MTP multi_hidden, logits, top-k indices, and forward metadata"
+    }
+  ],
+  "proof": {
+    "cuda_allocation": "not-run",
+    "remaining_gap": "allocate and bind every listed tensor inside one model-resident rank, then report allocator deltas and an evict/restore parity trace at the shared accepted-token boundary"
+  },
+  "restore_contract": {
+    "boundary": "one accepted target-token count shared by target, MTP, QSA, GDN, and PLE records",
+    "host_io_alignment_bytes": 65536,
+    "partial_restore": "forbidden",
+    "publication": "write and checksum every family record before atomically publishing the boundary manifest"
+  },
+  "schema": "rocket.qwen38.state-capacity.v1",
+  "serving": {
+    "concurrency": 16,
+    "context_tokens": 262144,
+    "effective_block_size_tokens": 3200,
+    "host_page_bytes": 65536,
+    "kernel_block_alignment_tokens": 16,
+    "kv_cache_dtype": "fp8_e4m3",
+    "mamba_cache_dtype": "bfloat16",
+    "mamba_cache_mode": "align",
+    "mamba_ssm_cache_dtype": "float32",
+    "mtp_speculative_tokens": 3,
+    "requested_block_size_tokens": 16,
+    "sequence_pages": 82,
+    "tensor_parallel_size": 2
+  },
+  "status": "allocation-plan-only",
+  "totals_per_rank": {
+    "cuda_allocated_bytes_c16": 33420083200,
+    "cuda_allocated_bytes_per_stream": 2088755200,
+    "cuda_double_count_exclusion": "target.linear.recurrent shares the target.linear.conv GDN Mamba page",
+    "logical_bytes_per_stream": 2022044096,
+    "nvme_padded_bytes_c16": 32354861056,
+    "nvme_padded_bytes_per_stream": 2022178816
+  }
+}
