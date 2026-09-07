@@ -63,6 +63,7 @@ class NativeExecutor final : public decode::AcceptedStateParticipant {
     return state_.transaction_bytes(); }
   void stage_accept(std::uint64_t, std::byte*, const std::int32_t*,
                     decode::DecoderVerifierShape, cudaStream_t) override;
+  void validate_after_fence(std::uint64_t generation) override;
   void commit(std::uint64_t) noexcept override;
   void export_telemetry_after_fence(std::uint64_t) noexcept;
   void discard(std::uint64_t) noexcept override;

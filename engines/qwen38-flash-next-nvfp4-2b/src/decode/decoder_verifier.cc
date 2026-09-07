@@ -154,6 +154,7 @@ VerificationOutput DecoderVerifier::step(
                                     stream_);
     }
     runtime_.synchronize(stream_);
+    if (accepted_state_) accepted_state_->validate_after_fence(generation);
     state_.publish(inactive);
     inactive = nullptr;
     if (state_.active_generation() != generation) {

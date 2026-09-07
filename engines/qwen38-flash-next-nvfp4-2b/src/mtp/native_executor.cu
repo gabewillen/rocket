@@ -123,6 +123,11 @@ void NativeExecutor::commit(std::uint64_t generation) noexcept {
     phase_ = ExecutorPhase::kReady;
   } else phase_ = ExecutorPhase::kFaulted;
 }
+void NativeExecutor::validate_after_fence(std::uint64_t generation) {
+  if (phase_ != ExecutorPhase::kDrafted || generation != pending_generation_)
+    throw NativeExecutorError("MTP post-fence generation changed");
+  exchange_.validate_after_fence();
+}
 void NativeExecutor::export_telemetry_after_fence(
     std::uint64_t generation) noexcept {
   if (phase_ != ExecutorPhase::kReady || generation != active_generation_) return;

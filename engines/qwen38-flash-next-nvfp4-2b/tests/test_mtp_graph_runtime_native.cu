@@ -1,4 +1,5 @@
 #include "mtp/graph_runtime.h"
+#include "mtp/nccl_winner_exchange.h"
 
 #include <cuda_runtime.h>
 
@@ -47,6 +48,9 @@ class FakeWinnerExchange final : public mtp::WinnerExchangePort {
                                                     peer_value_);
     cuda_check(cudaPeekAtLastError(), "enqueue fake winner exchange");
   }
+  void validate_after_fence() override {
+    if (fault_) throw std::runtime_error("injected winner exchange fault");
+  }
   float peer_value_;
   bool fault_ = false;
 };
@@ -54,6 +58,14 @@ class FakeWinnerExchange final : public mtp::WinnerExchangePort {
 
 int main() {
   try {
+    bool missing_nccl_rejected = false;
+    try {
+      mtp::NcclWinnerExchange unavailable(
+          reinterpret_cast<void*>(1), 0, "/rocket/missing/libnccl.so");
+    } catch (const std::runtime_error&) {
+      missing_nccl_rejected = true;
+    }
+    check(missing_nccl_rejected, "missing NCCL library was accepted");
     mtp::NonexpertLayout layout{};
     std::uint64_t mtp_bytes = 0;
     mtp_bytes = append(layout.pre_fc_norm_embedding, mtp_bytes, 5'120);

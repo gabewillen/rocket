@@ -183,12 +183,14 @@ set_target_properties(qwen38_token_output PROPERTIES
 add_library(qwen38_mtp_executor STATIC
   src/mtp/graph_runtime.cu
   src/mtp/input_fusion.cu
+  src/mtp/nccl_winner_exchange.cu
   src/mtp/native_executor.cu
   src/mtp/state_arena.cu
 )
 target_include_directories(qwen38_mtp_executor PUBLIC src)
 target_link_libraries(qwen38_mtp_executor PUBLIC
-  qwen38_hyperconnection qwen38_token_output CUDA::cudart CUDA::cublas)
+  qwen38_hyperconnection qwen38_token_output CUDA::cudart CUDA::cublas
+  ${CMAKE_DL_LIBS})
 target_compile_options(qwen38_mtp_executor PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
 )

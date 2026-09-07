@@ -114,6 +114,7 @@ class AcceptedStateParticipant {
                             const std::int32_t* accepted_widths_device,
                             DecoderVerifierShape shape,
                             cudaStream_t stream) = 0;
+  virtual void validate_after_fence(std::uint64_t generation) = 0;
   virtual void commit(std::uint64_t generation) noexcept = 0;
   virtual void discard(std::uint64_t generation) noexcept = 0;
 };

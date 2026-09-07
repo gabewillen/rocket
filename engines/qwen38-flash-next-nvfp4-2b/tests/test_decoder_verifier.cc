@@ -80,12 +80,17 @@ class MtpParticipant final : public decode::AcceptedStateParticipant {
     active = generation;
     ++commits;
   }
+  void validate_after_fence(std::uint64_t generation) override {
+    check(generation == 8, "MTP post-fence generation changed");
+    if (fail_validate) throw std::runtime_error("injected MTP fabric failure");
+  }
   void discard(std::uint64_t) noexcept override { ++discards; }
   std::uint64_t active = 7;
   int stages = 0;
   int commits = 0;
   int discards = 0;
   bool fail_stage = false;
+  bool fail_validate = false;
 };
 
 class Gdn final : public decode::GdnVerifierPort {
@@ -272,11 +277,12 @@ void test_partial_accept_keeps_active_state_unchanged() {
 }
 
 void test_mtp_accept_faults_leave_every_generation_unpublished() {
-  for (int fault = 0; fault < 2; ++fault) {
+  for (int fault = 0; fault < 3; ++fault) {
     Fixture fixture;
     MtpParticipant mtp;
     fixture.state.fail_mtp_state = fault == 0;
     mtp.fail_stage = fault == 1;
+    mtp.fail_validate = fault == 2;
     decode::DecoderVerifier verifier(
         fixture.ports, fixture.runtime, fixture.state, fixture.telemetry,
         reinterpret_cast<cudaStream_t>(0xb000), &mtp);

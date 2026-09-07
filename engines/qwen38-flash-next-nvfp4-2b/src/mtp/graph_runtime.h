@@ -67,6 +67,9 @@ class WinnerExchangePort {
   virtual void enqueue(const output::Winner* local,
                        output::Winner* rank_ordered, int m, int rank,
                        cudaStream_t stream) = 0;
+  // Called after DecoderStepRuntime's sole terminal fence and before the
+  // common transaction publishes. Async fabric failure must throw here.
+  virtual void validate_after_fence() = 0;
 };
 
 // Owns fixed c16 storage and immutable CUDA graphs for the native non-QSA MTP

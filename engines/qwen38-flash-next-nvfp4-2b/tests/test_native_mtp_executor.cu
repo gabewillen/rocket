@@ -27,6 +27,7 @@ class Exchange final : public mtp::WinnerExchangePort { public:
                int rank, cudaStream_t s) override {
     order<<<1, 32, 0, s>>>(local, both, m, rank);
   }
+  void validate_after_fence() override {}
 };
 class Middle final : public mtp::MtpMiddleStagePort { public:
   Middle(int sequences, int depth) : sequences_(sequences), depth_(depth) {
