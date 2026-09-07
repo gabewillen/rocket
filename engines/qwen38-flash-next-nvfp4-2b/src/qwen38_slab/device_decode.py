@@ -11,11 +11,12 @@ after ``publish`` faults the binding because device ownership is then unknown.
 Runtime library, owns a nonblocking stream, one pinned host staging set, two
 device banks, and one graph executable for each bank and captured batch size.
 Each graph then runs the Qwen3.8 TP2 K0 target prologue, which consumes all
-seven metadata fields and writes deterministic row descriptors. When an
-authenticated rank-slab payload is supplied, the graph also performs c16
-activation requantization and executes a fixed layer-3 Q/K/V W4A4 projection.
-Index top-k, full projection width, sparse paged attention, and sampling remain
-excluded.
+seven metadata fields and writes deterministic row descriptors. With an
+authenticated full rank-slab payload, the same graph requantizes a stable live
+c16 activation buffer and executes the production layer-3 Q/K/V widths through
+one fixed SM121 W4A4 projection. The twelve-output scalar kernel remains an
+explicit oracle path. Indexer scoring/top-k, sparse paged attention, and
+sampling remain excluded.
 
 OpenTelemetry span attributes are ``phase`` (six values), ``depth`` (k0),
 ``graph_batch`` (1, 2, 4, 8, or 16), and ``outcome`` (success or failure).
@@ -55,6 +56,7 @@ from .k0_target import (
     K0TargetRow,
 )
 from .projection import (
+    FullQkvProjectionPayload,
     PROJECTION_K,
     PROJECTION_OUTPUTS,
     PROJECTION_ROWS_PER_FAMILY,
@@ -423,6 +425,8 @@ class Cuda13GraphRuntime:
         driver: Path = DEFAULT_CUDA_DRIVER,
         target_binding: K0TargetBinding = K0TargetBinding(),
         projection: QkvProjectionPayload | None = None,
+        full_projection: FullQkvProjectionPayload | None = None,
+        cutlass_library: Path | None = None,
     ):
         if isinstance(device, bool) or not isinstance(device, int) or device < 0:
             raise DeviceDecodeError("CUDA device must be a nonnegative integer")
@@ -430,8 +434,14 @@ class Cuda13GraphRuntime:
             raise DeviceDecodeError("CUDA Runtime library must be an explicit Path")
         if not isinstance(target_binding, K0TargetBinding):
             raise DeviceDecodeError("K0 target binding ABI is invalid")
+        if projection is not None and full_projection is not None:
+            raise DeviceDecodeError("compact and full QKV projections are exclusive")
         if projection is not None:
             self._validate_projection(projection)
+        if full_projection is not None and not isinstance(
+            full_projection, FullQkvProjectionPayload
+        ):
+            raise DeviceDecodeError("full Q/K/V projection payload ABI is invalid")
         self._api = _Cuda13Api(library)
         self._stream = ctypes.c_void_p()
         self._host: dict[str, ctypes.c_void_p] = {}
@@ -440,8 +450,14 @@ class Cuda13GraphRuntime:
         self._execs: dict[tuple[int, int], ctypes.c_void_p] = {}
         self._target_kernel: K0TargetKernel | None = None
         self._projection = projection
+        self._full_projection = full_projection
+        self._full_qkv = None
         self._projection_device: dict[str, ctypes.c_void_p] = {}
-        self._graph_nodes = TARGET_GRAPH_NODES + 2 * int(projection is not None)
+        self._graph_nodes = (
+            TARGET_GRAPH_NODES
+            + 2 * int(projection is not None)
+            + 3 * int(full_projection is not None)
+        )
         self._active_bank = -1
         self._active_graph_batch: int | None = None
         self._staged: _CudaStage | None = None
@@ -459,6 +475,15 @@ class Cuda13GraphRuntime:
             self._api.call(
                 "cudaStreamCreateWithFlags", ctypes.byref(self._stream), 1
             )
+            if full_projection is not None:
+                from .cutlass_qkv import CutlassQkvRuntime, DEFAULT_CUTLASS_QKV
+
+                self._full_qkv = CutlassQkvRuntime(
+                    full_projection,
+                    device=device,
+                    library=cutlass_library or DEFAULT_CUTLASS_QKV,
+                    cudart=library,
+                )
             for name, length in BUFFER_LAYOUT:
                 host = ctypes.c_void_p()
                 self._api.call("cudaHostAlloc", ctypes.byref(host), length, 0)
@@ -498,12 +523,20 @@ class Cuda13GraphRuntime:
                 (
                     self._projection_device["packed_weights"].value
                     if projection is not None
-                    else target_binding.slab_weight_table
+                    else (
+                        self._full_qkv.weight_table_pointer
+                        if self._full_qkv is not None
+                        else target_binding.slab_weight_table
+                    )
                 ),
                 (
                     int(projection.descriptor.chunk_sha256[:16], 16)
                     if projection is not None
-                    else target_binding.slab_weight_generation
+                    else (
+                        int(full_projection.descriptor.chunk_sha256[:16], 16)
+                        if full_projection is not None
+                        else target_binding.slab_weight_generation
+                    )
                 ),
             )
             for bank in range(2):
@@ -649,7 +682,11 @@ class Cuda13GraphRuntime:
         """Copy the active representative layer-3 Q/K/V projection output."""
 
         self._require_open()
-        if self._projection is None or self._active_bank not in (0, 1):
+        if self._active_bank not in (0, 1):
+            raise DeviceDecodeError("no CUDA Q/K/V projection has been published")
+        if self._full_qkv is not None:
+            return self._full_qkv.selected_outputs()
+        if self._projection is None:
             raise DeviceDecodeError("no CUDA Q/K/V projection has been published")
         output = ctypes.create_string_buffer(PROJECTION_OUTPUT_BYTES)
         self._api.call(
@@ -660,6 +697,14 @@ class Cuda13GraphRuntime:
             2,
         )
         return struct.unpack(f"<{MAX_STREAMS * PROJECTION_OUTPUTS}f", output.raw)
+
+    def update_qkv_activations(self, activations_bf16: bytes) -> None:
+        """Refresh the stable full-width input before a metadata transaction."""
+
+        self._require_open()
+        if self._full_qkv is None or self._staged is not None:
+            raise DeviceDecodeError("full QKV activation update is unavailable")
+        self._full_qkv.update_activations(activations_bf16)
 
     @property
     def target_schema(self) -> str:
@@ -679,6 +724,7 @@ class Cuda13GraphRuntime:
         self._require_open()
         if (
             self._projection is None
+            and self._full_qkv is None
             or self._active_bank not in (0, 1)
             or isinstance(iterations, bool)
             or not isinstance(iterations, int)
@@ -717,6 +763,16 @@ class Cuda13GraphRuntime:
                 "cudaGraphLaunch", self._execs[(active, graph_batch)], self._stream
             )
         )
+        if self._full_qkv is not None:
+            isolated = self._full_qkv.benchmark(iterations)
+            return MappingProxyType(
+                {
+                    "graph_ms": graph_ms,
+                    "projection_graph_ms": isolated["graph_ms"],
+                    "projection_ms": isolated["projection_ms"],
+                    "requant_ms": isolated["requant_ms"],
+                }
+            )
         requant_ms = measured(
             lambda: self._target_kernel.launch_requant(
                 self._projection_device["activations"],
@@ -725,9 +781,7 @@ class Cuda13GraphRuntime:
                 self._stream,
             )
         )
-        return MappingProxyType(
-            {"graph_ms": graph_ms, "requant_ms": requant_ms}
-        )
+        return MappingProxyType({"graph_ms": graph_ms, "requant_ms": requant_ms})
 
     def close(self) -> None:
         """Synchronize and release all owned CUDA resources exactly once."""
@@ -785,6 +839,8 @@ class Cuda13GraphRuntime:
                 self._device[bank]["qkv_projection"],
                 self._stream,
             )
+        if self._full_qkv is not None:
+            self._full_qkv.capture_launch(self._stream)
         self._api.call("cudaStreamEndCapture", self._stream, ctypes.byref(graph))
         self._graphs[(bank, graph_batch)] = graph
         nodes = ctypes.c_size_t()
@@ -833,6 +889,12 @@ class Cuda13GraphRuntime:
             release("cudaGraphExecDestroy", handle)
         for handle in self._graphs.values():
             release("cudaGraphDestroy", handle)
+        if self._full_qkv is not None:
+            try:
+                self._full_qkv.close()
+            except Exception as exc:
+                errors.append(str(exc))
+            self._full_qkv = None
         if self._target_kernel is not None:
             try:
                 self._target_kernel.close()

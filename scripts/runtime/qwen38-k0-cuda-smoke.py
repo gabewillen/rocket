@@ -29,11 +29,12 @@ from qwen38_slab.k0_target import (  # noqa: E402
     K0TargetRow,
 )
 from qwen38_slab.projection import (  # noqa: E402
+    PROJECTION_FAMILY_ROWS,
     PROJECTION_K,
-    PROJECTION_OUTPUTS,
+    load_full_projection_payload,
     load_projection_payload,
     load_rank0_layer3_projection,
-    reference_projection,
+    reference_cutlass_projection,
 )
 
 
@@ -83,13 +84,15 @@ def run(
 ) -> dict[str, object]:
     tracer = RecordingTracer()
     executor = DepthZeroDecodeExecutor(tracer)
-    projection = load_projection_payload(load_rank0_layer3_projection(rank_slab))
+    descriptor = load_rank0_layer3_projection(rank_slab)
+    projection = load_projection_payload(descriptor)
+    full_projection = load_full_projection_payload(descriptor)
     with Cuda13GraphRuntime(
         device=device,
         library=cudart,
         nvrtc=nvrtc,
         driver=driver,
-        projection=projection,
+        full_projection=full_projection,
     ) as runtime:
         binding = K0DeviceBinding(runtime, tracer)
         first = executor.prepare(
@@ -104,7 +107,9 @@ def run(
             runtime.read_target_rows() == expected_target_rows(first)
         )
         first_qkv = runtime.read_qkv_projection()
-        reference_qkv = reference_projection(projection, first.lease.actual_batch)
+        reference_qkv = reference_cutlass_projection(
+            projection, first.lease.actual_batch
+        )
         qkv_max_abs_error = max(
             abs(actual - expected)
             for actual, expected in zip(first_qkv, reference_qkv)
@@ -112,6 +117,10 @@ def run(
         timing = dict(runtime.benchmark_projection())
         first_pointers = dict(runtime.active_device_pointers)
 
+        negated = bytearray(full_projection.activations_bf16)
+        for index in range(1, len(negated), 2):
+            negated[index] ^= 0x80
+        runtime.update_qkv_activations(bytes(negated))
         second = executor.prepare(
             [StreamStep(slot, 64 + slot, Depth.K0) for slot in range(5)]
         )
@@ -127,6 +136,7 @@ def run(
         runtime_qkv_second = runtime.read_qkv_projection()
         second_pointers = dict(runtime.active_device_pointers)
 
+        runtime.update_qkv_activations(full_projection.activations_bf16)
         third = executor.prepare(
             [StreamStep(slot, 64 + slot, Depth.K0) for slot in range(5)]
         )
@@ -153,21 +163,24 @@ def run(
         raise RuntimeError("CUDA metadata publications did not alternate banks")
     if third_target_rows != second_target_rows:
         raise RuntimeError("CUDA target-prologue repeat was not bit-exact")
-    if qkv_max_abs_error > 1.0e-6:
+    if qkv_max_abs_error > 2.5e-3:
         raise RuntimeError("CUDA Q/K/V projection exceeded scalar reference error")
-    if third_qkv != runtime_qkv_second:
-        raise RuntimeError("CUDA Q/K/V projection repeat was not bit-exact")
-    projection_flops = 16 * PROJECTION_OUTPUTS * PROJECTION_K * 2
-    projection_bytes = 16 * PROJECTION_OUTPUTS * (
-        PROJECTION_K // 2
-        + PROJECTION_K // 16 * 4
-        + PROJECTION_K // 2
-        + PROJECTION_K // 16
-        + 8
+    if runtime_qkv_second == first_qkv or third_qkv != first_qkv:
+        raise RuntimeError("CUDA Q/K/V live activation replay contract failed")
+    full_outputs = sum(PROJECTION_FAMILY_ROWS)
+    projection_flops = 16 * full_outputs * PROJECTION_K * 2
+    projection_bytes = full_outputs * (PROJECTION_K // 2 + PROJECTION_K // 16)
+    projection_bytes += 16 * (PROJECTION_K // 2 + PROJECTION_K // 16)
+    projection_bytes += 16 * full_outputs * 2
+    output_bytes = 16 * full_outputs * 2
+    requant_bytes = 16 * (
+        PROJECTION_K * 2 + PROJECTION_K // 2 + PROJECTION_K // 16
     )
-    requant_bytes = 16 * (PROJECTION_K * 2 + PROJECTION_K // 2 + PROJECTION_K // 16 * 4)
-    graph_gbps = projection_bytes / (timing["graph_ms"] * 1.0e6)
-    graph_tflops = projection_flops / (timing["graph_ms"] * 1.0e9)
+    graph_gbps = projection_bytes / (timing["projection_ms"] * 1.0e6)
+    physical_gbps = (projection_bytes + 2 * output_bytes) / (
+        timing["projection_ms"] * 1.0e6
+    )
+    graph_tflops = projection_flops / (timing["projection_ms"] * 1.0e9)
     requant_gbps = requant_bytes / (timing["requant_ms"] * 1.0e6)
     rank_local_traffic_roof = 238.0
     base_step_ms = 1000.0 * 16 / 330.835
@@ -189,13 +202,16 @@ def run(
             "artifact_key": projection.descriptor.artifact_key,
             "layer": projection.descriptor.layer,
             "rank": projection.descriptor.rank,
-            "shape": [16, PROJECTION_OUTPUTS, PROJECTION_K],
+            "shape": [16, full_outputs, PROJECTION_K],
             "max_abs_error": qkv_max_abs_error,
             "deterministic_repeat": "bit_exact",
             "graph_ms": timing["graph_ms"],
+            "isolated_graph_ms": timing["projection_graph_ms"],
+            "projection_ms": timing["projection_ms"],
             "effective_gbps": graph_gbps,
+            "physical_gbps_including_postscale": physical_gbps,
             "tflops": graph_tflops,
-            "fraction_of_238_gbps_rank_local_roof": graph_gbps
+            "fraction_of_238_gbps_rank_local_roof": physical_gbps
             / rank_local_traffic_roof,
         },
         "activation_requant": {

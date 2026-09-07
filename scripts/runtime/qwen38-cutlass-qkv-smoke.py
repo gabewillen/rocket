@@ -52,6 +52,9 @@ def run(rank_slab: Path, library: Path, device: int, iterations: int) -> dict[st
     requant_bytes = activation_bytes + 16 * PROJECTION_K // 2 + 16 * (PROJECTION_K // 16)
     flops = 2 * 16 * outputs * PROJECTION_K
     projection_gbps = projection_bytes / (timing["projection_ms"] * 1.0e6)
+    physical_gbps = (projection_bytes + 2 * output_bytes) / (
+        timing["projection_ms"] * 1.0e6
+    )
     projection_tflops = flops / (timing["projection_ms"] * 1.0e9)
     requant_gbps = requant_bytes / (timing["requant_ms"] * 1.0e6)
     scalar_control_gbps = 26.7613
@@ -80,7 +83,9 @@ def run(rank_slab: Path, library: Path, device: int, iterations: int) -> dict[st
             "graph_with_requant_ms": timing["graph_ms"],
             "effective_gbps": projection_gbps,
             "tflops": projection_tflops,
-            "fraction_of_238_gbps_rank_local_roof": projection_gbps / local_roof_gbps,
+            "physical_gbps_including_postscale": physical_gbps,
+            "fraction_of_238_gbps_rank_local_roof": physical_gbps
+            / local_roof_gbps,
             "scalar_control_gbps": scalar_control_gbps,
             "effective_bandwidth_speedup": projection_gbps / scalar_control_gbps,
         },

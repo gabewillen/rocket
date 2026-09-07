@@ -50,6 +50,11 @@ set_target_properties(qwen38_cutlass_qkv PROPERTIES
 )
 target_link_libraries(qwen38_cutlass_qkv PRIVATE CUDA::cudart)
 
+add_executable(qwen38-qsa-expand-smoke bench/qsa_expand_smoke.cu)
+target_include_directories(qwen38-qsa-expand-smoke PRIVATE src)
+target_link_libraries(qwen38-qsa-expand-smoke PRIVATE qwen38_cutlass_qkv CUDA::cudart)
+set_target_properties(qwen38-qsa-expand-smoke PROPERTIES CUDA_ARCHITECTURES "121")
+
 add_library(qwen38_pair_reduce STATIC
   src/pair_reduce/pair_reduce.cu
   src/pair_reduce/rdma.cc
@@ -78,6 +83,7 @@ add_executable(qwen38-decode-pair-reduce-smoke bench/decode_execution_smoke.cu)
 target_link_libraries(qwen38-decode-pair-reduce-smoke PRIVATE qwen38_decode_execution)
 
 enable_testing()
+add_test(NAME qwen38-qsa-expand-smoke COMMAND qwen38-qsa-expand-smoke)
 add_executable(qwen38-test-pair-reduce tests/test_pair_reduce.cu)
 target_link_libraries(qwen38-test-pair-reduce PRIVATE qwen38_pair_reduce)
 target_compile_options(qwen38-test-pair-reduce PRIVATE

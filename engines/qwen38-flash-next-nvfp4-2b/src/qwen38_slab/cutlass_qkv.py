@@ -115,6 +115,78 @@ class CutlassQkvRuntime:
         self._require_open()
         self._api.call("cudaGraphLaunch", self._exec, self._stream)
 
+    def capture_launch(self, stream: ctypes.c_void_p) -> None:
+        """Append quantization and fixed Q/K/V nodes to an external capture."""
+
+        self._require_open()
+        if not isinstance(stream, ctypes.c_void_p) or not stream.value:
+            raise DeviceDecodeError("external CUDA stream is invalid")
+        self._native_call(
+            "qwen38_cutlass_qkv_launch",
+            self._plan,
+            self._device_buffers[-1],
+            stream,
+        )
+
+    def capture_qsa_topk_expansion(
+        self,
+        block_indices: ctypes.c_void_p,
+        logical_positions: ctypes.c_void_p,
+        sequence_lengths: ctypes.c_void_p,
+        token_to_request: ctypes.c_void_p,
+        token_indices: ctypes.c_void_p,
+        rows: int,
+        stream: ctypes.c_void_p,
+    ) -> None:
+        """Append fixed 512-block to 2,051-token expansion to a capture."""
+
+        self._require_open()
+        pointers = (
+            block_indices,
+            logical_positions,
+            sequence_lengths,
+            token_to_request,
+            token_indices,
+            stream,
+        )
+        if (
+            any(
+                not isinstance(pointer, ctypes.c_void_p) or not pointer.value
+                for pointer in pointers
+            )
+            or isinstance(rows, bool)
+            or not isinstance(rows, int)
+            or not 1 <= rows <= 16
+        ):
+            raise DeviceDecodeError("fixed QSA expansion pointer ABI is invalid")
+        self._native_call(
+            "qwen38_qsa_expand_topk",
+            block_indices,
+            logical_positions,
+            sequence_lengths,
+            token_to_request,
+            token_indices,
+            rows,
+            stream,
+        )
+
+    def update_activations(self, activations_bf16: bytes) -> None:
+        """Replace the stable c16 input contents without changing graph pointers."""
+
+        self._require_open()
+        if (
+            not isinstance(activations_bf16, bytes)
+            or len(activations_bf16) != 16 * PROJECTION_K * 2
+        ):
+            raise DeviceDecodeError("live QKV activation extent is invalid")
+        self._api.call(
+            "cudaMemcpy",
+            self._device_buffers[-1],
+            ctypes.c_char_p(activations_bf16),
+            len(activations_bf16),
+            1,
+        )
+
     def finish(self) -> None:
         self._require_open()
         self._api.call("cudaStreamSynchronize", self._stream)
@@ -136,11 +208,11 @@ class CutlassQkvRuntime:
             for (value,) in struct.iter_unpack("<H", raw)
         ]
         result = []
-        family_base = (0, 16 * 6144, 16 * (6144 + 256))
+        family_base = (0, 6144, 6144 + 256)
         widths = PROJECTION_FAMILY_ROWS
         for batch in range(16):
             for base, width in zip(family_base, widths):
-                start = base + batch * width
+                start = batch * FULL_OUTPUTS + base
                 result.extend(values[start : start + rows])
         return tuple(result)
 
@@ -150,6 +222,13 @@ class CutlassQkvRuntime:
         nodes = ctypes.c_size_t()
         self._api.call("cudaGraphGetNodes", self._graph, None, ctypes.byref(nodes))
         return nodes.value
+
+    @property
+    def weight_table_pointer(self) -> int:
+        """Return the borrowed first weight address for target ABI identity."""
+
+        self._require_open()
+        return int(self._device_buffers[0].value)
 
     def benchmark(self, iterations: int = 200) -> Mapping[str, float]:
         self._require_open()
@@ -209,6 +288,7 @@ class CutlassQkvRuntime:
             "qwen38_cutlass_qkv_create", "qwen38_cutlass_qkv_launch",
             "qwen38_cutlass_qkv_quantize", "qwen38_cutlass_qkv_project",
             "qwen38_cutlass_qkv_output", "qwen38_cutlass_qkv_destroy",
+            "qwen38_qsa_expand_topk",
         ):
             getattr(self._native, name).restype = ctypes.c_int
 

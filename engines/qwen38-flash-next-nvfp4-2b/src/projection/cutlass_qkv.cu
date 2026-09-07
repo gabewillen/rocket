@@ -31,6 +31,10 @@ constexpr int kNk = 256;
 constexpr int kNv = 256;
 constexpr int kN = kNq + kNk + kNv;
 constexpr int kSfaBytes = 128 * ((kK / 16 + 3) / 4) * 4;
+constexpr int kBlockTopk = 512;
+constexpr int kCompressRatio = 4;
+constexpr int kTokenTopk = 2048;
+constexpr int kExpandedWidth = kTokenTopk + kCompressRatio - 1;
 
 thread_local std::string last_error;
 
@@ -137,6 +141,52 @@ __global__ void quantize_c16(std::uint8_t* packed, std::uint8_t* scales,
   }
 }
 
+__global__ void expand_qsa_topk(const std::int32_t* block_indices,
+                                const std::int64_t* logical_positions,
+                                const std::int32_t* sequence_lengths,
+                                const std::int32_t* token_to_request,
+                                std::int32_t* token_indices, int rows) {
+  const int row = blockIdx.x;
+  const int column = blockIdx.y * blockDim.x + threadIdx.x;
+  if (row >= rows || column >= kExpandedWidth) return;
+  const int request = token_to_request[row];
+  int token = -1;
+  if (request >= 0 && request < kM) {
+    const std::int64_t query_end = logical_positions[row] + 1;
+    const int sequence_length = sequence_lengths[request];
+    const int complete_blocks = min(
+        min(static_cast<int>(query_end / kCompressRatio),
+            sequence_length / kCompressRatio),
+        kBlockTopk);
+    const int expanded_count = complete_blocks * kCompressRatio;
+    std::int64_t candidate = -1;
+    if (column < expanded_count) {
+      const int block = block_indices[row * kBlockTopk + column / kCompressRatio];
+      candidate = static_cast<std::int64_t>(block) * kCompressRatio +
+                  column % kCompressRatio;
+    } else {
+      const std::int64_t tail_start = (query_end / kCompressRatio) * kCompressRatio;
+      const int tail_offset = column - expanded_count;
+      const int tail_count = static_cast<int>(query_end - tail_start);
+      if (tail_offset < tail_count && tail_offset < kCompressRatio - 1)
+        candidate = tail_start + tail_offset;
+    }
+    if (candidate >= 0 && candidate < sequence_length)
+      token = static_cast<int>(candidate);
+  }
+  token_indices[row * kExpandedWidth + column] = token;
+}
+
+__global__ void scale_qkv_families(__nv_bfloat16* output, float q_scale,
+                                   float k_scale, float v_scale) {
+  const int column = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y;
+  if (column >= kN) return;
+  const float scale = column < kNq ? q_scale : (column < kNq + kNk ? k_scale : v_scale);
+  const int index = row * kN + column;
+  output[index] = __float2bfloat16(__bfloat162float(output[index]) * scale);
+}
+
 struct FixedPlan {
   cutlass::DeviceAllocation<std::uint8_t> workspace;
   Gemm gemm;
@@ -168,9 +218,18 @@ struct FixedPlan {
 struct QkvPlan {
   std::uint8_t* packed = nullptr;
   std::uint8_t* sfa = nullptr;
+  std::uint8_t* fused_weight = nullptr;
+  std::uint8_t* fused_scale = nullptr;
   __nv_bfloat16* output = nullptr;
-  FixedPlan q, k, v;
-  ~QkvPlan() { cudaFree(output); cudaFree(sfa); cudaFree(packed); }
+  float q_global = 1.0f, k_global = 1.0f, v_global = 1.0f;
+  FixedPlan fused;
+  ~QkvPlan() {
+    cudaFree(output);
+    cudaFree(fused_scale);
+    cudaFree(fused_weight);
+    cudaFree(sfa);
+    cudaFree(packed);
+  }
 };
 
 bool cuda_ok(cudaError_t status, const char* operation) {
@@ -199,15 +258,35 @@ extern "C" int qwen38_cutlass_qkv_create(
   if (!cuda_ok(cudaSetDevice(device), "cudaSetDevice") ||
       !cuda_ok(cudaMalloc(&plan->packed, kM * kK / 2), "cudaMalloc packed A") ||
       !cuda_ok(cudaMalloc(&plan->sfa, kSfaBytes), "cudaMalloc SFA") ||
+      !cuda_ok(cudaMalloc(&plan->fused_weight, kN * kK / 2), "cudaMalloc fused B") ||
+      !cuda_ok(cudaMalloc(&plan->fused_scale, kN * kK / 16), "cudaMalloc fused SFB") ||
       !cuda_ok(cudaMalloc(&plan->output, kM * kN * sizeof(__nv_bfloat16)), "cudaMalloc output"))
     return 1;
   try {
-    if (!plan->q.init(kNq, plan->packed, plan->sfa, q_weight, q_scale, q_global,
-                      plan->output, device) ||
-        !plan->k.init(kNk, plan->packed, plan->sfa, k_weight, k_scale, k_global,
-                      plan->output + kM * kNq, device) ||
-        !plan->v.init(kNv, plan->packed, plan->sfa, v_weight, v_scale, v_global,
-                      plan->output + kM * (kNq + kNk), device)) {
+    const std::size_t q_weight_bytes = static_cast<std::size_t>(kNq) * kK / 2;
+    const std::size_t k_weight_bytes = static_cast<std::size_t>(kNk) * kK / 2;
+    const std::size_t q_scale_bytes = static_cast<std::size_t>(kNq) * kK / 16;
+    const std::size_t k_scale_bytes = static_cast<std::size_t>(kNk) * kK / 16;
+    if (!cuda_ok(cudaMemcpy(plan->fused_weight, q_weight, q_weight_bytes,
+                            cudaMemcpyDeviceToDevice), "copy Q weight") ||
+        !cuda_ok(cudaMemcpy(plan->fused_weight + q_weight_bytes, k_weight,
+                            k_weight_bytes, cudaMemcpyDeviceToDevice), "copy K weight") ||
+        !cuda_ok(cudaMemcpy(plan->fused_weight + q_weight_bytes + k_weight_bytes,
+                            v_weight, static_cast<std::size_t>(kNv) * kK / 2,
+                            cudaMemcpyDeviceToDevice), "copy V weight") ||
+        !cuda_ok(cudaMemcpy(plan->fused_scale, q_scale, q_scale_bytes,
+                            cudaMemcpyDeviceToDevice), "copy Q scale") ||
+        !cuda_ok(cudaMemcpy(plan->fused_scale + q_scale_bytes, k_scale,
+                            k_scale_bytes, cudaMemcpyDeviceToDevice), "copy K scale") ||
+        !cuda_ok(cudaMemcpy(plan->fused_scale + q_scale_bytes + k_scale_bytes,
+                            v_scale, static_cast<std::size_t>(kNv) * kK / 16,
+                            cudaMemcpyDeviceToDevice), "copy V scale"))
+      return 1;
+    plan->q_global = q_global;
+    plan->k_global = k_global;
+    plan->v_global = v_global;
+    if (!plan->fused.init(kN, plan->packed, plan->sfa, plan->fused_weight,
+                          plan->fused_scale, 1.0f, plan->output, device)) {
       last_error = "CUTLASS cannot initialize the fixed QKV shape";
       return 1;
     }
@@ -239,12 +318,13 @@ extern "C" int qwen38_cutlass_qkv_project(void* opaque, cudaStream_t stream) {
   last_error.clear();
   if (!opaque) { last_error = "null QKV projection plan"; return 1; }
   auto* plan = static_cast<QkvPlan*>(opaque);
-  if (plan->q.gemm.run(stream) != cutlass::Status::kSuccess ||
-      plan->k.gemm.run(stream) != cutlass::Status::kSuccess ||
-      plan->v.gemm.run(stream) != cutlass::Status::kSuccess) {
+  if (plan->fused.gemm.run(stream) != cutlass::Status::kSuccess) {
     if (last_error.empty()) last_error = "CUTLASS QKV launch failed";
     return 1;
   }
+  scale_qkv_families<<<dim3((kN + 255) / 256, kM), 256, 0, stream>>>(
+      plan->output, plan->q_global, plan->k_global, plan->v_global);
+  if (!cuda_ok(cudaGetLastError(), "scale_qkv_families")) return 1;
   return 0;
 }
 
@@ -262,3 +342,19 @@ extern "C" int qwen38_cutlass_qkv_destroy(void* opaque) {
 }
 
 extern "C" const char* qwen38_cutlass_qkv_last_error() { return last_error.c_str(); }
+
+extern "C" int qwen38_qsa_expand_topk(
+    const std::int32_t* block_indices, const std::int64_t* logical_positions,
+    const std::int32_t* sequence_lengths, const std::int32_t* token_to_request,
+    std::int32_t* token_indices, int rows, cudaStream_t stream) {
+  last_error.clear();
+  if (!block_indices || !logical_positions || !sequence_lengths ||
+      !token_to_request || !token_indices || rows < 1 || rows > kM) {
+    last_error = "invalid fixed QSA expansion arguments";
+    return 1;
+  }
+  expand_qsa_topk<<<dim3(rows, (kExpandedWidth + 255) / 256), 256, 0, stream>>>(
+      block_indices, logical_positions, sequence_lengths, token_to_request,
+      token_indices, rows);
+  return cuda_ok(cudaGetLastError(), "expand_qsa_topk") ? 0 : 1;
+}
