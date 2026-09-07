@@ -1,0 +1,175 @@
+---
+title: "Tensor dispatch and duplicate passes dominate Qwen3.8 startup"
+description: "Qwen3.8 loads 299,545 gapless tensors at 1.997 ms each and reads the checkpoint twice for MTP3, while one shard streams from NVMe at 4.65 GB/s."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, runtime, memory]
+verdict: accepted
+rocket: "#engine-status"
+---
+
+**Question.** Does NVMe bandwidth or loader structure dominate Qwen3.8 startup?
+
+| setup | |
+| --- | --- |
+| nodes | head and worker; head is gx10-5e36 |
+| kernel page | 65,536 B |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| commit | `51a110bd33df6d7a0f5f4efd74ae63489a6ce78f` plus `scripts/runtime/safetensors-loader-phases.py` changes in this entry |
+| replicates | loader and phase timing: 1; phase iterations: 3 |
+
+```bash
+CHECKPOINT=/home/glwillen/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47
+python3 scripts/runtime/safetensors-loader-phases.py \
+  --checkpoint "$CHECKPOINT" --sample-bytes 1073741824 \
+  --chunk-bytes 67108864 --iterations 3
+```
+
+```text
+phase                 median_GiB_s  min_GiB_s  max_GiB_s
+preadv_aligned             19.598     18.106     19.915
+mmap_fault_copy            16.669     16.655     16.901
+hot_reused_memcpy          26.197     25.614     26.225
+```
+
+| cached phase, 1 GiB sample | median | range | unit |
+| --- | ---: | ---: | --- |
+| `preadv` | 19.598 | 18.106 to 19.915 | GiB/s |
+| mmap plus copy | 16.669 | 16.655 to 16.901 | GiB/s |
+| hot reused memcpy, 64 MiB working set | 26.197 | 25.614 to 26.225 | GiB/s |
+
+The checkpoint remained in the ambient page cache. Phase order was fixed, so
+the measurements do not isolate cold storage or order effects.
+
+```bash
+python3 - "$CHECKPOINT" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+rows = []
+gaps = 0
+for path in sorted(root.glob("*.safetensors")):
+    with path.open("rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(n))
+    file_rows = sorted(tuple(v["data_offsets"]) for k, v in header.items() if k != "__metadata__")
+    gaps += sum(left[1] != right[0] for left, right in zip(file_rows, file_rows[1:]))
+    rows.extend(file_rows)
+sizes = [b - a for a, b in rows]
+print(f"files={len(list(root.glob('*.safetensors')))} tensors={len(rows)} payload_bytes={sum(sizes)}")
+print(f"le_65536={sum(x <= 65536 for x in sizes)} le_1048576={sum(x <= 1048576 for x in sizes)} gaps={gaps}")
+PY
+```
+
+```text
+files=11 tensors=299545 payload_bytes=132639846394
+le_65536=149531 le_1048576=297194 gaps=0
+```
+
+| checkpoint inventory | value | unit |
+| --- | ---: | --- |
+| safetensors files | 11 | files |
+| tensors | 299,545 | tensors |
+| payload | 132,639,846,394 | B |
+| tensors at most 65,536 B | 149,531 | tensors |
+| tensors at most 1 MiB | 297,194 | tensors |
+| inter-tensor payload gaps | 0 | gaps |
+
+```bash
+RUN=/home/glwillen/calibration/qwen38-expanded-mtp3-20260907-03
+(cd "$RUN/logs" && rg -n 'non-default args|Loading weights took|Model loading took|GET /health' \
+  head.log worker.log)
+```
+
+```text
+head.log:7:2026-09-07T02:42:34.123731204Z (APIServer pid=1) INFO 09-07 02:42:34 [api_utils.py:272] non-default args: {...}
+head.log:90:2026-09-07T02:54:30.492277557Z (Worker_TP0_EP0 pid=256) INFO 09-07 02:54:30 [default_loader.py:430] Loading weights took 625.24 seconds
+head.log:117:2026-09-07T03:00:02.081214839Z (Worker_TP0_EP0 pid=256) INFO 09-07 03:00:02 [default_loader.py:430] Loading weights took 328.95 seconds
+head.log:123:2026-09-07T03:00:11.598658807Z (Worker_TP0_EP0 pid=256) INFO 09-07 03:00:11 [model_runner.py:407] Model loading took 64.3 GiB memory and 977.241677 seconds
+head.log:2358:2026-09-07T03:04:34.775673541Z (APIServer pid=1) INFO: 127.0.0.1:59450 - "GET /health HTTP/1.1" 200 OK
+worker.log:60:2026-09-07T02:47:54.323726929Z (Worker_TP1_EP1 pid=196) INFO 09-07 02:47:54 [default_loader.py:430] Loading weights took 237.06 seconds
+worker.log:73:2026-09-07T02:50:28.241714345Z (Worker_TP1_EP1 pid=196) INFO 09-07 02:50:28 [default_loader.py:430] Loading weights took 152.38 seconds
+worker.log:79:2026-09-07T02:50:32.334859934Z (Worker_TP1_EP1 pid=196) INFO 09-07 02:50:32 [model_runner.py:407] Model loading took 64.3 GiB memory and 398.086870 seconds
+```
+
+The target and MTP rows are the two load lines in order. Model-ready values are
+the logged model-loading durations. Health-ready is the head launch-to-health
+timestamp difference.
+
+| successful MTP3 load | head | worker | unit |
+| --- | ---: | ---: | --- |
+| target | 625.24 | 237.06 | s |
+| MTP | 328.95 | 152.38 | s |
+| model ready | 977.24 | 398.09 | s |
+| health ready | 1,320.66 | unavailable | s |
+
+```bash
+EVIDENCE=/home/glwillen/Development/rocket/goal/sessions/01a07472-fd72-7680-a695-34f2b362f7fc/runs/20260906T234500Z-qwen38-model-first/progress.jsonl
+rg -n 'startup_tensor_granularity_diagnosed|startup_double_pass_diagnosed' "$EVIDENCE"
+```
+
+```text
+8:{"event":"startup_tensor_granularity_diagnosed","payload_bytes":132639846394,"vllm_load_seconds":598.34,"mean_milliseconds_per_tensor":1.997,"direct_read_probe":{"file":"model-00001-of-00010.safetensors","bytes":3115991696,"seconds":0.67,"gigabytes_per_second":4.65}}
+9:{"event":"startup_double_pass_diagnosed","checkpoint_bytes":132639846394,"observed_read_bytes":242288619520,"head_seconds":{"target":625.24,"mtp":328.95,"model_total":977.24,"ready":1320.66},"worker_seconds":{"target":237.06,"mtp":152.38,"model_total":398.09}}
+```
+
+| loader counter | value | unit |
+| --- | ---: | --- |
+| vLLM weight load | 598.34 | s |
+| average per tensor | 1.997 | ms/tensor |
+| process read bytes | 242,288,619,520 | B |
+| raw checkpoint payload | 132,639,846,394 | B |
+
+Target and MTP filtering happens after `.clone()`, so the successful MTP3 load
+reads the checkpoint twice. Single-run startup variance is unavailable.
+
+```bash
+nl -ba "$RUN/artifacts/weight_utils_64k.py" | sed -n '966,973p'
+nl -ba "$RUN/artifacts/model_telemetry.py" | sed -n '1199,1206p'
+```
+
+```text
+   966            with safe_open(st_file, framework="pt") as f:
+   967                for name in f.keys():  # noqa: SIM118
+   968                    if should_skip_weight(name, local_expert_ids):
+   969                        continue
+   970                    # Bound staging to one tensor and avoid CUDA copying directly
+   971                    # from a 64 KiB-page safetensors mmap.
+   972                    param = f.get_tensor(name).clone()
+   973                    yield name, param
+  1199    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+  1200        loader = AutoWeightsLoader(
+  1201            self,
+  1202            skip_prefixes=["visual."] if self.language_model_only else None,
+  1203            skip_substrs=["mtp."],
+  1204            ignore_unexpected_suffixes=_QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy(),
+  1205        )
+  1206        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+```
+
+```bash
+dd if="$CHECKPOINT/model-00001-of-00010.safetensors" of=/dev/null \
+  bs=8M iflag=direct status=progress
+```
+
+```text
+3115991696 bytes copied, 0.67 s, 4.65 GB/s
+```
+
+| direct shard read | value | unit |
+| --- | ---: | --- |
+| bytes | 3,115,991,696 | B |
+| elapsed | 0.67 | s |
+| throughput | 4.65 | GB/s |
+
+**Verdict.** Accepted. Tensor dispatch and duplicate checkpoint passes dominate
+startup. The measured NVMe path does not.
+
+**Next.**
+
+- build four rank-local target and MTP prepacked slabs
+- implement the exact TP2, EP2, and PLE planner
+- verify chunks during one load pass
+
+**Reopen if.**
+
+- an upstream loader, kernel, or driver change alters the measured path
