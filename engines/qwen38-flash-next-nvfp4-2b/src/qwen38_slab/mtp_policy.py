@@ -5,13 +5,15 @@ probes, a 3% Wilson-bound promotion margin, two failing eight-round windows
 before demotion, exploration every 64 eligible rounds, and a 2,698,026,496-byte
 cold MTP charge amortized over 64 rounds.
 
-Depth support extends to K7. Maximum depth is configured for exact concurrency
-values only. Unconfigured decode concurrency fails closed. Matched K1 through
-K7 controls establish K7 execution availability at c1, c2, and c4. One run is
-not enough to turn the narrow c4 K6 throughput lead into a fixed K6 choice, so
-those cohorts retain K7 as a lazy probe. Measured c8 and c16 controls cap both
-cohorts at K1 and forbid deeper residency. No result from the single coding
-prompt is treated as a coding-quality verdict.
+Depth support extends to K7. Maximum and initial-probe depths are configured for
+exact concurrency values only. Unconfigured decode concurrency fails closed.
+Matched K1 through K7 controls establish K7 execution availability at c1, c2,
+and c4. One run is not enough to turn the narrow c4 K6 throughput lead into a
+fixed K6 choice, so those cohorts retain K7 as a lazy probe. Measured c8 stays
+at K1. The c16 generic control starts and probes at K1, while the independent
+high-acceptance K4 result admits lazy K2 through K4 exploration. Promotion
+still requires this policy's live accepted-token, byte-cost, roofline, and
+hysteresis gates. No result from a single coding prompt is a quality verdict.
 
 Inputs and outputs are immutable. The policy retains no mutable state and
 performs no I/O or residency mutation. Ordered prefix residency commands request
@@ -94,10 +96,19 @@ class ConcurrencyCeiling:
 
     concurrency: int
     max_depth: MtpDepth
+    initial_probe_depth: MtpDepth | None = None
 
     def __post_init__(self) -> None:
         _require_int(self.concurrency, 1, 16, "ceiling concurrency")
         _require_depth(self.max_depth, "ceiling max_depth")
+        if self.initial_probe_depth is not None:
+            _require_depth(self.initial_probe_depth, "ceiling initial_probe_depth")
+            if self.initial_probe_depth > self.max_depth:
+                raise MtpPolicyError("initial probe depth cannot exceed maximum depth")
+
+    @property
+    def probe_depth(self) -> MtpDepth:
+        return self.max_depth if self.initial_probe_depth is None else self.initial_probe_depth
 
 
 @dataclass(frozen=True)
@@ -145,7 +156,10 @@ class PolicyConfig:
         """Return the configuration identity stored with policy state."""
 
         record = {
-            "ceilings": [[item.concurrency, int(item.max_depth)] for item in self.ceilings],
+            "ceilings": [
+                [item.concurrency, int(item.max_depth), int(item.probe_depth)]
+                for item in self.ceilings
+            ],
             "promotion_margin_ppm": self.promotion_margin_ppm,
             "demotion_window_rounds": self.demotion_window_rounds,
             "demotion_failing_windows": self.demotion_failing_windows,
@@ -171,7 +185,7 @@ def matched_live_policy_config() -> PolicyConfig:
             ConcurrencyCeiling(2, MtpDepth.K7),
             ConcurrencyCeiling(4, MtpDepth.K7),
             ConcurrencyCeiling(8, MtpDepth.K1),
-            ConcurrencyCeiling(16, MtpDepth.K1),
+            ConcurrencyCeiling(16, MtpDepth.K4, MtpDepth.K1),
         )
     )
 
@@ -552,6 +566,12 @@ class AdaptiveMtpPolicy:
 
             if cohort.decode_rounds < len(PROBE_DEPTHS):
                 requested = MtpDepth(PROBE_DEPTHS[cohort.decode_rounds])
+                ceiling_record = next(
+                    item
+                    for item in self._config.ceilings
+                    if item.concurrency == event.concurrency
+                )
+                requested = MtpDepth(min(int(requested), int(ceiling_record.probe_depth)))
                 selected = MtpDepth(min(int(requested), int(cap)))
                 reason = DecisionReason.PROBE
             elif (
