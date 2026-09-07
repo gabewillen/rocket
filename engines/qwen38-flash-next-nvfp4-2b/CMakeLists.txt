@@ -180,7 +180,10 @@ set_target_properties(qwen38_token_output PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-add_library(qwen38_mtp_executor STATIC src/mtp/native_executor.cu)
+add_library(qwen38_mtp_executor STATIC
+  src/mtp/native_executor.cu
+  src/mtp/state_arena.cu
+)
 target_include_directories(qwen38_mtp_executor PUBLIC src)
 target_link_libraries(qwen38_mtp_executor PUBLIC CUDA::cudart)
 target_compile_options(qwen38_mtp_executor PRIVATE
@@ -293,3 +296,7 @@ target_compile_options(qwen38-test-native-mtp-executor PRIVATE
 )
 add_test(NAME qwen38-native-mtp-executor-contract
   COMMAND qwen38-test-native-mtp-executor)
+
+add_executable(qwen38-test-mtp-state-arena tests/test_mtp_state_arena.cu)
+target_link_libraries(qwen38-test-mtp-state-arena PRIVATE qwen38_mtp_executor CUDA::cudart)
+add_test(NAME qwen38-mtp-state-arena-contract COMMAND qwen38-test-mtp-state-arena)
