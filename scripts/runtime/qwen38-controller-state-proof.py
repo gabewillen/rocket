@@ -9,9 +9,6 @@ import base64
 import hashlib
 import json
 import os
-import selectors
-import shlex
-import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -23,6 +20,7 @@ from qwen38_slab.controller_rpc import (
     ControllerRpcError,
     MAX_RPC_BYTES,
     PhysicalDecoderRestoreController,
+    ProcessTransport,
     RpcCudaRuntime,
     RpcRankStore,
 )
@@ -302,33 +300,6 @@ class WorkerState:
             publication = self.owner.upload_and_launch(generation)
             return {"generation": publication.generation}
         raise RuntimeError("unknown worker command")
-
-
-class ProcessTransport:
-    def __init__(self, command, key, timeout):
-        self.process = subprocess.Popen(
-            shlex.split(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=sys.stderr, bufsize=0,
-        )
-        self.timeout = timeout
-        bootstrap = base64.b64encode(key) + b"\n"
-        self.process.stdin.write(bootstrap); self.process.stdin.flush()
-        self.selector = selectors.DefaultSelector()
-        self.selector.register(self.process.stdout, selectors.EVENT_READ)
-
-    def exchange(self, request, timeout_seconds):
-        self.process.stdin.write(request + b"\n"); self.process.stdin.flush()
-        if not self.selector.select(min(timeout_seconds, self.timeout)):
-            raise TimeoutError("worker response timeout")
-        response = self.process.stdout.readline(MAX_RPC_BYTES + 2)
-        if not response or len(response) > MAX_RPC_BYTES + 1:
-            raise ControllerRpcError("worker response is absent or oversized")
-        return response.rstrip(b"\n")
-
-    def close(self):
-        if self.process.poll() is None:
-            self.process.terminate()
-        self.process.wait(timeout=30)
 
 
 def run_worker(args):

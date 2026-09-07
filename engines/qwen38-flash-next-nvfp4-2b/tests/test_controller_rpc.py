@@ -4,7 +4,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import shlex
+import subprocess
+import sys
 import threading
+import time
 import unittest
 
 from qwen38_slab.controller_restore import DecoderContinuation
@@ -13,6 +17,7 @@ from qwen38_slab.controller_rpc import (
     AuthenticatedRpcWorker,
     ControllerRpcError,
     PhysicalDecoderRestoreController,
+    ProcessTransport,
     RemoteAllocation,
     RpcCudaRuntime,
 )
@@ -190,6 +195,31 @@ class ControllerRpcTests(unittest.TestCase):
         channel = AuthenticatedRpcChannel(0, KEY, ScriptedTransport(timeout), 0.25)
         with self.assertRaisesRegex(ControllerRpcError, "timed out"):
             channel.request("status", {})
+
+    def test_process_transport_close_escalates_and_reaps_stubborn_worker(self):
+        code = (
+            "import signal,sys,time;"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+            "sys.stdin.buffer.readline();time.sleep(60)"
+        )
+        transport = ProcessTransport(
+            shlex.join((sys.executable, "-c", code)), KEY, 0.05
+        )
+        pid = transport.process.pid
+        started = time.monotonic()
+        transport.close()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIsNotNone(transport.process.returncode)
+        with self.assertRaises(ProcessLookupError):
+            __import__("os").kill(pid, 0)
+
+    def test_process_transport_close_sends_eof_before_signals(self):
+        code = "import sys;sys.stdin.buffer.readline();sys.stdin.buffer.read()"
+        transport = ProcessTransport(
+            shlex.join((sys.executable, "-c", code)), KEY, 0.5
+        )
+        transport.close()
+        self.assertEqual(transport.process.returncode, 0)
 
     def test_oversized_request_is_rejected_before_transport(self):
         transport = ScriptedTransport(lambda *_args: self.fail("transport was called"))

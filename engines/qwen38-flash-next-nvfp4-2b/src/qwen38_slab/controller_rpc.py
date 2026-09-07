@@ -7,6 +7,10 @@ import base64
 import hashlib
 import hmac
 import json
+import selectors
+import shlex
+import subprocess
+import sys
 import threading
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -32,6 +36,55 @@ class ControllerRpcError(RuntimeError):
 
 class RpcTransport:
     def exchange(self, request: bytes, timeout_seconds: float) -> bytes: ...
+
+
+class ProcessTransport:
+    """Bounded line RPC over a worker process with terminal child cleanup."""
+
+    def __init__(self, command: str, key: bytes, timeout: float):
+        self.process = subprocess.Popen(
+            shlex.split(command),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            bufsize=0,
+        )
+        self.timeout = float(timeout)
+        bootstrap = base64.b64encode(key) + b"\n"
+        self.process.stdin.write(bootstrap)
+        self.process.stdin.flush()
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.process.stdout, selectors.EVENT_READ)
+
+    def exchange(self, request: bytes, timeout_seconds: float) -> bytes:
+        self.process.stdin.write(request + b"\n")
+        self.process.stdin.flush()
+        if not self.selector.select(min(timeout_seconds, self.timeout)):
+            raise TimeoutError("worker response timeout")
+        response = self.process.stdout.readline(MAX_RPC_BYTES + 2)
+        if not response or len(response) > MAX_RPC_BYTES + 1:
+            raise ControllerRpcError("worker response is absent or oversized")
+        return response.rstrip(b"\n")
+
+    def close(self) -> None:
+        phase_timeout = min(self.timeout, 5.0)
+        try:
+            if self.process.stdin is not None and not self.process.stdin.closed:
+                self.process.stdin.close()
+            if self.process.poll() is None:
+                try:
+                    self.process.wait(timeout=phase_timeout)
+                except subprocess.TimeoutExpired:
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=phase_timeout)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait(timeout=phase_timeout)
+        finally:
+            self.selector.close()
+            if self.process.stdout is not None:
+                self.process.stdout.close()
 
 
 class AuthenticatedRpcChannel:
