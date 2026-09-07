@@ -1,0 +1,100 @@
+---
+title: "Captured NCCL PairReduce misses the Qwen3.8 verifier step budget"
+description: "A same-stream TP2 NCCL all-reduce preserves every measured BF16 result but costs 5.68 to 23.05 ms for 96 reductions, so this transport is retained as a correctness reference rather than an integration candidate."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, fabric, kernels, runtime, numerics, telemetry]
+verdict: rejected
+rocket: "#kernels"
+---
+
+**Question.** Can one captured NCCL graph perform all 96 TP2 PairReduce
+operations for verifier row counts 32 through 128 without a host payload path
+and fit the more-than-451 tok/s regime?
+
+| setup | |
+| --- | --- |
+| nodes | gx10-5e36 (rank 0), gx10-2a13 (rank 1), GB10, sm_121 |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| fabric | 2 RoCE rails, GID 3, NCCL `NET/IB` |
+| implementation | `c2352d87cfbdf0a4511936158000c4327ebff0cf` |
+| baseline | `e1f584f`, GPU to mapped-host staging with two stream fences per reduction |
+| container | `vllm/vllm-openai:qwen38-flash-next`, vLLM `8e685d198` |
+| NCCL header and loaded runtime | 2.30.7 / 2.30.7 |
+| PyTorch compile contract | NCCL 2.29.7 |
+
+The vLLM and SGLang collective paths were inspected before this cutover. Both
+enqueue NCCL on the caller stream during graph capture and keep communicator
+abort and teardown outside capture. SGLang was inspected at `c99d906effa8bd05573995127f0d4a0984c5a96a`.
+
+```bash
+cmake --build engines/qwen38-flash-next-nvfp4-2b/build -j 8
+ctest --test-dir engines/qwen38-flash-next-nvfp4-2b/build --output-on-failure
+
+# Run concurrently on both nodes. Rank 1 adds --host 192.168.100.10 --rank 1.
+NCCL_SOCKET_IFNAME=enp1s0f1np1 \
+NCCL_IB_HCA=rocep1s0f1,roceP2p1s0f1 NCCL_IB_GID_INDEX=3 \
+engines/qwen38-flash-next-nvfp4-2b/build/qwen38-pair-reduce-bench \
+  --rank 0 --warmup 100 --iterations 1000
+```
+
+```
+100% tests passed, 0 tests failed out of 8
+qwen38 PairReduce: 24 verifier shapes, graph replay, and terminal fault passed
+```
+
+One graph contains 96 `ncclAllReduce` calls followed by BF16-to-FP32
+conversions. The graph replays on one non-default transaction stream. One event
+is the post-transaction completion and health fence. Construction allocates one
+fixed 128x2560 BF16 scratch tensor and one event; replay allocates nothing and
+copies no payload through host memory.
+
+| rows | policy point | rank 0 median / p95 | rank 1 median / p95 | slowest median per reduction | output FNV-1a | max abs error |
+| ---: | --- | ---: | ---: | ---: | --- | ---: |
+| 32 | K1, sequences 16 | 5.676 / 6.137 ms | 5.677 / 6.141 ms | 59.13 us | `eea038f30aaa9968` | 0 |
+| 64 | K3, sequences 16 | 8.636 / 9.209 ms | 8.641 / 9.219 ms | 90.01 us | `dcec235ae56cf902` | 0 |
+| 80 | K4, sequences 16 | 11.218 / 11.883 ms | 11.214 / 11.878 ms | 116.86 us | `b5a93adf4e00e56c` | 0 |
+| 128 | K7, sequences 16 | 23.051 / 23.511 ms | 23.050 / 23.512 ms | 240.12 us | `bc2ab909ad3552db` | 0 |
+
+The hashes equal the earlier mapped-host implementation for all four row
+counts. Its 96-call median upper bounds were 2.72, 3.72, 4.24, and 5.74 ms for
+rows 32, 64, 80, and 128. That path is excluded from production because every
+reduction performs GPU-to-mapped-host staging and two stream synchronizations.
+
+```bash
+# Both ranks capture first. Rank 1 then stalls for 500 ms.
+qwen38-pair-reduce-bench --rank 0 --port 18953 --timeout-ms 100 \
+  --warmup 1 --iterations 1
+qwen38-pair-reduce-bench --rank 1 --host 192.168.100.10 --port 18953 \
+  --timeout-ms 100 --fault-stall-rank 1 --fault-stall-ms 500 \
+  --warmup 1 --iterations 1
+```
+
+```
+rank0_status=1 rank1_status=2
+qwen38-pair-reduce-bench: qwen38 PairReduce completion timed out after 100000223 ns
+```
+
+Both rank containers were absent after the fault run. A fault makes the
+PairReduce object terminal. Communicator abort runs outside the graph, and the
+decoder cannot publish the transaction after completion failure. Metric labels
+are bounded by rank, 24 row buckets plus invalid, dtype, and four outcomes.
+Trace and request IDs remain span fields.
+
+**Verdict.** Rejected on value. K1 at concurrency 16 spends 6.14 ms p95 on
+PairReduce alone, K4 spends 11.88 ms, and K7 spends 23.51 ms. The 451 tok/s
+aggregate regime allows about 2.22 ms per accepted token before accounting for
+attention, MoE, state, logits, or sampling. The device-only graph remains an
+authenticated correctness and fault reference; it is not accepted for decoder
+integration.
+
+**Next.**
+
+- fuse or specialize the fabric path below NCCL's 96-call launch and protocol cost
+- profile the register-resident GDN verifier with accepted-prefix replay
+- keep graph cold construction and exact output hashes in every replacement gate
+
+**Reopen if.**
+
+- an NCCL runtime, network plugin, driver, or firmware release changes captured
+  small-collective latency on this two-node GB10 pair
