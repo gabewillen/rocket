@@ -1,0 +1,85 @@
+---
+title: "A reduction barrier makes Qwen GDN graph replay bit exact"
+description: "The fixed layer-0 GDN graph reaches 175.14 GB/s at c16 after a shared-memory barrier removes nondeterministic replay."
+date: 2026-09-08
+author: "agent"
+categories: [incident, kernels, attention, numerics]
+verdict: accepted
+rocket: "#kernels"
+---
+
+**Question.** Can the exact rank-0 layer-0 GDN transition replay immutable
+c1, c2, c4, c8, and c16 CUDA graphs without recurrent-state divergence?
+
+| setup | |
+| --- | --- |
+| node | gx10-5e36, GB10, 6.17.13-rocket64k, 64 KiB pages |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| slab | rank 0 target, artifact `a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4` |
+| source base | Rocket `0ea4f63e823119609f6cd3cf4ec020a08a335eaa` |
+| recurrent reference | vLLM `8e685d198`, `vllm/third_party/flash_linear_attention/ops/fused_recurrent.py`, Apache-2.0 |
+| decode layout reference | FlashInfer `91bda04c66f7cb851e1ab3b78b9fecea644b9844`, `gdn_decode_pretranspose.py`, Apache-2.0 |
+| serving path | SM121 CUTLASS W4A4 QKVZ/BA and output projections, BF16 causal convolution, FP32 recurrent state |
+
+The fixed path removes runtime head, dtype, layout, and sequence dispatch. This
+specialization is tied to Qwen3.8 TP2, layer 0, rank 0, and five decode buckets.
+
+```bash
+engines/qwen38-flash-next-nvfp4-2b/build/qwen38-gdn-graph-smoke \
+  /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank0-target.slab 0
+```
+
+The unchanged first reproduction failed at c4 with `GDN graph replay is not bit
+exact`. Racecheck attributed four shared-memory hazards to consecutive
+`block_sum` calls. Threads could overwrite `warp_sums[0]` before every warp had
+loaded the prior result.
+
+```bash
+compute-sanitizer --tool racecheck --error-exitcode 86 \
+  engines/qwen38-flash-next-nvfp4-2b/build/qwen38-gdn-graph-smoke \
+  /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank0-target.slab 0
+```
+
+```text
+========= ERROR SUMMARY: 4 errors
+```
+
+The repair loads the shared result into a register and adds one block barrier
+before the next reduction may reuse shared storage. The unchanged racecheck
+command then reported:
+
+```text
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+```
+
+| bucket | output FNV64 | convolution FNV64 | recurrent FNV64 | mean | min | max | spread | traffic | effective bandwidth | local 238 GB/s roof |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| c1 | 2094140510013443831 | 2632192570053400071 | 16152784557364020220 | 0.197798 ms | 0.196480 ms | 0.199360 ms | 1.456% | 19,548,000 B | 98.83 GB/s | 41.52% |
+| c2 | 18409453748136569205 | 5973325176120232657 | 6510725419916986288 | 0.204064 ms | 0.201408 ms | 0.206496 ms | 2.493% | 22,765,408 B | 111.56 GB/s | 46.87% |
+| c4 | 9813492436941187344 | 16703809889338588992 | 722657970438016337 | 0.227974 ms | 0.226304 ms | 0.230400 ms | 1.797% | 29,200,224 B | 128.09 GB/s | 53.82% |
+| c8 | 8885288149986110687 | 13451372243622991674 | 9395544135626384196 | 0.275117 ms | 0.273536 ms | 0.278752 ms | 1.896% | 42,069,856 B | 152.92 GB/s | 64.25% |
+| c16 | 11074375103635821707 | 4290084717095826202 | 2331313288061051028 | 0.387181 ms | 0.384960 ms | 0.389120 ms | 1.074% | 67,809,120 B | 175.14 GB/s | 73.59% |
+
+Each row reports five graph replays after warmup. Reset replay reproduced all
+three hashes. A c16 to c1 transition cleared all 15 inactive output rows. Slot
+0 retained zero output and unchanged convolution and recurrent state.
+
+CUDA initcheck reported uninitialized reads at the CUTLASS output consumer.
+CUTLASS WGMMA output writes are not visible to that instrumentation, so this
+run is non-decisive. Bit-exact reset replay and racecheck cover the custom GDN
+kernels.
+
+**Verdict.** Accepted for the fixed rank-0 layer-0 GDN graph. The c16 path
+reaches 175.14 GB/s, 73.59% of one GB10's local traffic roof, with bit-exact
+output and recurrent-state replay.
+
+**Next.**
+
+- compare every intermediate against the pinned vLLM BF16 recurrent path
+- bind rank 1 and the physical TP2 PairReduce transition
+- profile the c1 quantization and launch overhead behind the 41.52% roof result
+
+**Reopen if.**
+
+- CUDA racecheck gains complete SM121 WGMMA initialization tracking
+- a CUDA, CUTLASS, firmware, or GB10 revision changes shared-memory ordering

@@ -1,0 +1,469 @@
+// SPDX-License-Identifier: Apache-2.0
+// Reuses the fixed non-grouped SM121 block-scaled CUTLASS structure proven in
+// projection/cutlass_qkv.cu. It removes runtime shapes and fuses only matrices
+// whose row boundaries preserve the pinned SFB tile layout.
+#include "linear_attention/gdn_cutlass.h"
+
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+
+#include <cmath>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+#include "cute/tensor.hpp"
+#include "cutlass/cutlass.h"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/util/device_memory.h"
+#include "cutlass/util/packed_stride.hpp"
+
+using namespace cute;
+
+namespace rocket::qwen38::linear_attention {
+namespace {
+
+thread_local std::string graph_last_error;
+
+constexpr int kM = 16;
+constexpr int kInputK = 2'560;
+constexpr int kQkvN = 5'120;
+constexpr int kZN = 3'072;
+constexpr int kQkvzN = kQkvN + kZN;
+constexpr int kBN = 24;
+constexpr int kAN = 24;
+constexpr int kBaN = kBN + kAN;
+constexpr int kOutputK = 3'072;
+constexpr int kOutputN = 2'560;
+constexpr float kOutputActivationGlobal = 1.0F / 256.0F;
+constexpr int kInputSfaBytes = 128 * ((kInputK / 16 + 3) / 4) * 4;
+constexpr int kOutputSfaBytes = 128 * ((kOutputK / 16 + 3) / 4) * 4;
+constexpr int kBaSfbBytes = 128 * (kInputK / 16);
+
+using ElementInput = cutlass::float_e2m1_t;
+using ElementA = cutlass::nv_float4_t<ElementInput>;
+using ElementB = cutlass::nv_float4_t<ElementInput>;
+using ElementD = cutlass::bfloat16_t;
+using ElementC = void;
+using LayoutATag = cutlass::layout::RowMajor;
+using LayoutBTag = cutlass::layout::ColumnMajor;
+using LayoutCTag = cutlass::layout::RowMajor;
+using ElementAccumulator = float;
+using ArchTag = cutlass::arch::Sm120;
+using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+using ThreadBlockShape = Shape<_128, _128, _128>;
+using ClusterShape = Shape<_1, _1, _1>;
+using CollectiveEpilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        ArchTag, OperatorClass, ThreadBlockShape, ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
+        ElementAccumulator, ElementC, LayoutCTag, 8, ElementD, LayoutCTag, 8,
+        cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+using CollectiveMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        ArchTag, OperatorClass, ElementA, LayoutATag, 32, ElementB, LayoutBTag,
+        32, ElementAccumulator, ThreadBlockShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+            sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+using StrideA = typename Gemm::GemmKernel::StrideA;
+using StrideB = typename Gemm::GemmKernel::StrideB;
+using StrideD = typename Gemm::GemmKernel::StrideD;
+using LayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::LayoutSFA;
+using LayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::LayoutSFB;
+using ScaleConfig =
+    typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+using ElementSF = typename Gemm::GemmKernel::CollectiveMainloop::ElementSF;
+
+__constant__ float kE2M1[8] = {0.0F, 0.5F, 1.0F, 1.5F,
+                               2.0F, 3.0F, 4.0F, 6.0F};
+
+void cuda_check(cudaError_t status, const char* operation) {
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string(operation) + ": " +
+                             cudaGetErrorString(status));
+  }
+}
+
+__device__ __forceinline__ float e4m3_to_float(std::uint8_t bits) {
+  const std::uint32_t sign = (bits & 0x80U) ? 0x80000000U : 0U;
+  const std::uint32_t exp = (bits >> 3) & 0x0fU;
+  const std::uint32_t mant = bits & 7U;
+  if (exp == 0) {
+    if (mant == 0) return __uint_as_float(sign);
+    const float value = static_cast<float>(mant) * (1.0F / 8.0F) * 0.015625F;
+    return sign ? -value : value;
+  }
+  return __uint_as_float(sign | ((exp + 120U) << 23) | (mant << 20));
+}
+
+__device__ __forceinline__ std::uint8_t float_to_e2m1(float value) {
+  const std::uint8_t sign = value < 0.0F ? 8U : 0U;
+  const float magnitude = fabsf(value);
+  int best = 0;
+  float best_error = magnitude;
+#pragma unroll
+  for (int code = 0; code < 8; ++code) {
+    const float error = fabsf(magnitude - kE2M1[code]);
+    if (error < best_error || (error == best_error && (code & 1) == 0)) {
+      best_error = error;
+      best = code;
+    }
+  }
+  return static_cast<std::uint8_t>(sign | best);
+}
+
+__device__ __forceinline__ std::size_t sf_offset(int row, int sf) {
+  return static_cast<std::size_t>(sf / 4) * 512 +
+         static_cast<std::size_t>((row % 32) * 16 + (row / 32) * 4 + sf % 4);
+}
+
+template <int K>
+__global__ void quantize_fixed(std::uint8_t* packed, std::uint8_t* scales,
+                               const __nv_bfloat16* input,
+                               float activation_global) {
+  const int row = blockIdx.x;
+  for (int block = threadIdx.x; block < K / 16; block += blockDim.x) {
+    float values[16];
+    float amax = 0.0F;
+#pragma unroll
+    for (int item = 0; item < 16; ++item) {
+      values[item] = __bfloat162float(input[row * K + block * 16 + item]);
+      amax = fmaxf(amax, fabsf(values[item]));
+    }
+    const std::uint8_t scale =
+        amax > 0.0F
+            ? __nv_cvt_float_to_fp8(amax / (6.0F * activation_global),
+                                    __NV_SATFINITE, __NV_E4M3)
+            : 0;
+    scales[sf_offset(row, block)] = scale;
+    const float combined = e4m3_to_float(scale) * activation_global;
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+      const std::uint8_t lo = combined > 0.0F
+          ? float_to_e2m1(values[item * 2] / combined) : 0;
+      const std::uint8_t hi = combined > 0.0F
+          ? float_to_e2m1(values[item * 2 + 1] / combined) : 0;
+      packed[row * (K / 2) + block * 8 + item] = lo | (hi << 4);
+    }
+  }
+}
+
+__global__ void fuse_ba_scales(const std::uint8_t* b,
+                               const std::uint8_t* a,
+                               std::uint8_t* fused) {
+  const int sf = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y;
+  if (row >= kBaN || sf >= kInputK / 16) return;
+  const int source_row = row < kBN ? row : row - kBN;
+  const auto* source = row < kBN ? b : a;
+  fused[sf_offset(row, sf)] = source[sf_offset(source_row, sf)];
+}
+
+__global__ void scale_projection(__nv_bfloat16* output, int n,
+                                 int split, float first, float second) {
+  const int column = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y;
+  if (column >= n) return;
+  const int index = row * n + column;
+  const float scale = column < split ? first : second;
+  output[index] = __float2bfloat16(__bfloat162float(output[index]) * scale);
+}
+
+struct FixedGemm {
+  cutlass::DeviceAllocation<std::uint8_t> workspace;
+  Gemm gemm;
+
+  void init(int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
+            const std::uint8_t* b, const std::uint8_t* sfb,
+            __nv_bfloat16* output) {
+    StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {kM, k, 1});
+    StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
+    StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {kM, n, 1});
+    LayoutSFA la = ScaleConfig::tile_atom_to_shape_SFA(make_shape(kM, n, k, 1));
+    LayoutSFB lb = ScaleConfig::tile_atom_to_shape_SFB(make_shape(kM, n, k, 1));
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {kM, n, k, 1},
+        {reinterpret_cast<const ElementInput*>(a), sa,
+         reinterpret_cast<const ElementInput*>(b), sb,
+         reinterpret_cast<const ElementSF*>(sfa), la,
+         reinterpret_cast<const ElementSF*>(sfb), lb},
+        {{1.0F, 0.0F}, nullptr, sd, reinterpret_cast<ElementD*>(output), sd}};
+    if (gemm.can_implement(args) != cutlass::Status::kSuccess) {
+      throw std::runtime_error("CUTLASS fixed GDN shape is unsupported");
+    }
+    workspace.reset(Gemm::get_workspace_size(args));
+    if (gemm.initialize(args, workspace.get()) != cutlass::Status::kSuccess) {
+      throw std::runtime_error("CUTLASS fixed GDN initialization failed");
+    }
+  }
+};
+
+void copy(void* destination, const void* source, std::size_t bytes,
+          const char* operation) {
+  cuda_check(cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToDevice),
+             operation);
+}
+
+}  // namespace
+
+struct CutlassGdnGraph::Impl {
+  Impl(int selected_device, GdnWeights selected_weights)
+      : device(selected_device), globals(selected_weights) {}
+
+  int device;
+  GdnWeights globals;
+  std::uint8_t *input_packed = nullptr, *input_sfa = nullptr;
+  std::uint8_t *qkvz_weight = nullptr, *qkvz_scale = nullptr;
+  std::uint8_t *ba_weight = nullptr, *ba_scale = nullptr;
+  std::uint8_t *output_packed = nullptr, *output_sfa = nullptr;
+  std::uint8_t *output_weight = nullptr, *output_scale = nullptr;
+  __nv_bfloat16 *qkvz = nullptr, *ba = nullptr, *projected = nullptr;
+  FixedGemm qkvz_gemm, ba_gemm, output_gemm;
+  std::unique_ptr<CorePlan> core;
+
+  ~Impl() {
+    cudaSetDevice(device);
+    cudaFree(projected); cudaFree(ba); cudaFree(qkvz);
+    cudaFree(output_scale); cudaFree(output_weight);
+    cudaFree(output_sfa); cudaFree(output_packed);
+    cudaFree(ba_scale); cudaFree(ba_weight);
+    cudaFree(qkvz_scale); cudaFree(qkvz_weight);
+    cudaFree(input_sfa); cudaFree(input_packed);
+  }
+};
+
+CutlassGdnGraph::CutlassGdnGraph(int device, GdnWeights weights)
+    : impl_(new Impl(device, weights)) {
+  const Nvfp4Matrix matrices[] = {weights.qkv, weights.z, weights.b,
+                                  weights.a, weights.output};
+  if (device < 0 || !weights.conv || !weights.a_log || !weights.dt_bias ||
+      !weights.norm) {
+    delete impl_; impl_ = nullptr;
+    throw std::invalid_argument("authenticated GDN weight pointers are required");
+  }
+  for (const auto& matrix : matrices) {
+    if (!matrix.weight || !matrix.scale || !std::isfinite(matrix.global_scale) ||
+        matrix.global_scale <= 0.0F) {
+      delete impl_; impl_ = nullptr;
+      throw std::invalid_argument("authenticated NVFP4 GDN matrix is invalid");
+    }
+  }
+  try {
+    cuda_check(cudaSetDevice(device), "cudaSetDevice");
+    cuda_check(cudaMalloc(&impl_->input_packed, kM * kInputK / 2), "malloc input A");
+    cuda_check(cudaMalloc(&impl_->input_sfa, kInputSfaBytes), "malloc input SFA");
+    cuda_check(cudaMalloc(&impl_->qkvz_weight,
+                          static_cast<std::size_t>(kQkvzN) * kInputK / 2),
+               "malloc QKVZ B");
+    cuda_check(cudaMalloc(&impl_->qkvz_scale,
+                          static_cast<std::size_t>(kQkvzN) * kInputK / 16),
+               "malloc QKVZ SFB");
+    cuda_check(cudaMalloc(&impl_->ba_weight,
+                          static_cast<std::size_t>(kBaN) * kInputK / 2),
+               "malloc BA B");
+    cuda_check(cudaMalloc(&impl_->ba_scale, kBaSfbBytes), "malloc BA SFB");
+    cuda_check(cudaMalloc(&impl_->output_packed, kM * kOutputK / 2),
+               "malloc output A");
+    cuda_check(cudaMalloc(&impl_->output_sfa, kOutputSfaBytes),
+               "malloc output SFA");
+    cuda_check(cudaMalloc(&impl_->output_weight,
+                          static_cast<std::size_t>(kOutputN) * kOutputK / 2),
+               "malloc output B");
+    cuda_check(cudaMalloc(&impl_->output_scale,
+                          static_cast<std::size_t>(kOutputN) * kOutputK / 16),
+               "malloc output SFB");
+    cuda_check(cudaMalloc(&impl_->qkvz,
+                          static_cast<std::size_t>(kM) * kQkvzN * 2),
+               "malloc QKVZ output");
+    cuda_check(cudaMalloc(&impl_->ba,
+                          static_cast<std::size_t>(kM) * kBaN * 2),
+               "malloc BA output");
+    cuda_check(cudaMalloc(&impl_->projected,
+                          static_cast<std::size_t>(kM) * kOutputN * 2),
+               "malloc projected output");
+
+    const std::size_t qkv_w = static_cast<std::size_t>(kQkvN) * kInputK / 2;
+    const std::size_t qkv_s = static_cast<std::size_t>(kQkvN) * kInputK / 16;
+    copy(impl_->qkvz_weight, weights.qkv.weight, qkv_w, "copy QKV weight");
+    copy(impl_->qkvz_weight + qkv_w, weights.z.weight,
+         static_cast<std::size_t>(kZN) * kInputK / 2, "copy Z weight");
+    copy(impl_->qkvz_scale, weights.qkv.scale, qkv_s, "copy QKV scale");
+    copy(impl_->qkvz_scale + qkv_s, weights.z.scale,
+         static_cast<std::size_t>(kZN) * kInputK / 16, "copy Z scale");
+    const std::size_t ba_w = static_cast<std::size_t>(kBN) * kInputK / 2;
+    copy(impl_->ba_weight, weights.b.weight, ba_w, "copy B weight");
+    copy(impl_->ba_weight + ba_w, weights.a.weight, ba_w, "copy A weight");
+    fuse_ba_scales<<<dim3((kInputK / 16 + 255) / 256, kBaN), 256>>>(
+        weights.b.scale, weights.a.scale, impl_->ba_scale);
+    cuda_check(cudaGetLastError(), "fuse BA scale layout");
+    copy(impl_->output_weight, weights.output.weight,
+         static_cast<std::size_t>(kOutputN) * kOutputK / 2,
+         "copy output weight");
+    copy(impl_->output_scale, weights.output.scale,
+         static_cast<std::size_t>(kOutputN) * kOutputK / 16,
+         "copy output scale");
+    cuda_check(cudaDeviceSynchronize(), "synchronize immutable GDN weights");
+
+    impl_->qkvz_gemm.init(kQkvzN, kInputK, impl_->input_packed,
+                          impl_->input_sfa, impl_->qkvz_weight,
+                          impl_->qkvz_scale, impl_->qkvz);
+    impl_->ba_gemm.init(kBaN, kInputK, impl_->input_packed,
+                        impl_->input_sfa, impl_->ba_weight,
+                        impl_->ba_scale, impl_->ba);
+    impl_->core = std::make_unique<CorePlan>(
+        device, weights.conv, weights.a_log, weights.dt_bias, weights.norm);
+    impl_->output_gemm.init(kOutputN, kOutputK, impl_->output_packed,
+                            impl_->output_sfa, impl_->output_weight,
+                            impl_->output_scale, impl_->projected);
+  } catch (...) {
+    delete impl_; impl_ = nullptr;
+    throw;
+  }
+}
+
+CutlassGdnGraph::~CutlassGdnGraph() { delete impl_; }
+
+std::uint64_t CutlassGdnGraph::logical_bytes_per_row(int m) const noexcept {
+  if (!allowed_m(m)) return 0;
+  constexpr std::uint64_t weight_bytes =
+      static_cast<std::uint64_t>(kQkvzN + kBaN) * kInputK * 9 / 16 +
+      static_cast<std::uint64_t>(kOutputN) * kOutputK * 9 / 16 +
+      static_cast<std::uint64_t>(kQkvWidth) * kConvKernel * 2 +
+      static_cast<std::uint64_t>(kValueHeads * 2 + kHeadDim) * 2;
+  constexpr std::uint64_t state_bytes =
+      2ULL * kValueHeads * kHeadDim * kHeadDim * sizeof(float) +
+      6ULL * kQkvWidth * sizeof(__nv_bfloat16);
+  return weight_bytes / static_cast<std::uint64_t>(m) + state_bytes +
+         2ULL * kInputK + 2ULL * kOutputN;
+}
+
+void CutlassGdnGraph::launch(
+    const __nv_bfloat16* block_input, __nv_bfloat16* conv_state,
+    float* recurrent_state, const std::int32_t* state_indices, int m,
+    cudaStream_t stream) {
+  if (!block_input || !conv_state || !recurrent_state || !state_indices ||
+      !allowed_m(m) || !stream) {
+    throw decode::DecodeExecutionContractError(
+        "fixed Qwen GDN graph arguments changed");
+  }
+  quantize_fixed<kInputK><<<kM, 256, 0, stream>>>(
+      impl_->input_packed, impl_->input_sfa, block_input, 1.0F);
+  if (impl_->qkvz_gemm.gemm.run(stream) != cutlass::Status::kSuccess ||
+      impl_->ba_gemm.gemm.run(stream) != cutlass::Status::kSuccess) {
+    throw std::runtime_error("fixed Qwen GDN input projection failed");
+  }
+  scale_projection<<<dim3((kQkvzN + 255) / 256, kM), 256, 0, stream>>>(
+      impl_->qkvz, kQkvzN, kQkvN, impl_->globals.qkv.global_scale,
+      impl_->globals.z.global_scale);
+  scale_projection<<<dim3((kBaN + 255) / 256, kM), 256, 0, stream>>>(
+      impl_->ba, kBaN, kBN, impl_->globals.b.global_scale,
+      impl_->globals.a.global_scale);
+  impl_->core->launch(
+      impl_->qkvz, impl_->ba, conv_state,
+      static_cast<std::size_t>(kConvStateRows) * kQkvWidth, recurrent_state,
+      static_cast<std::size_t>(kValueHeads) * kHeadDim * kHeadDim,
+      state_indices, m, stream);
+  quantize_fixed<kOutputK><<<kM, 256, 0, stream>>>(
+      impl_->output_packed, impl_->output_sfa, impl_->core->output(),
+      kOutputActivationGlobal);
+  if (impl_->output_gemm.gemm.run(stream) != cutlass::Status::kSuccess) {
+    throw std::runtime_error("fixed Qwen GDN output projection failed");
+  }
+  scale_projection<<<dim3((kOutputN + 255) / 256, kM), 256, 0, stream>>>(
+      impl_->projected, kOutputN, kOutputN,
+      impl_->globals.output.global_scale * kOutputActivationGlobal,
+      impl_->globals.output.global_scale * kOutputActivationGlobal);
+  cuda_check(cudaGetLastError(), "fixed Qwen GDN graph launch");
+}
+
+const __nv_bfloat16* CutlassGdnGraph::projected_output() const noexcept {
+  return impl_ ? impl_->projected : nullptr;
+}
+
+}  // namespace rocket::qwen38::linear_attention
+
+namespace {
+template <typename F>
+int graph_wrap(F&& fn) noexcept {
+  try {
+    fn();
+    return 0;
+  } catch (const std::exception& error) {
+    rocket::qwen38::linear_attention::graph_last_error = error.what();
+    return 1;
+  } catch (...) {
+    rocket::qwen38::linear_attention::graph_last_error = "unknown failure";
+    return 1;
+  }
+}
+}  // namespace
+
+extern "C" int qwen38_gdn_graph_create(
+    int device,
+    const std::uint8_t* qkv_weight, const std::uint8_t* qkv_scale,
+    float qkv_global, const std::uint8_t* z_weight,
+    const std::uint8_t* z_scale, float z_global,
+    const std::uint8_t* b_weight, const std::uint8_t* b_scale,
+    float b_global, const std::uint8_t* a_weight,
+    const std::uint8_t* a_scale, float a_global,
+    const std::uint8_t* output_weight, const std::uint8_t* output_scale,
+    float output_global, const __nv_bfloat16* conv,
+    const __nv_bfloat16* a_log, const __nv_bfloat16* dt_bias,
+    const __nv_bfloat16* norm, void** graph) {
+  return graph_wrap([&] {
+    if (!graph) throw std::invalid_argument("graph output is required");
+    *graph = nullptr;
+    using namespace rocket::qwen38::linear_attention;
+    *graph = new CutlassGdnGraph(
+        device, {{qkv_weight, qkv_scale, qkv_global},
+                 {z_weight, z_scale, z_global},
+                 {b_weight, b_scale, b_global},
+                 {a_weight, a_scale, a_global},
+                 {output_weight, output_scale, output_global},
+                 conv, a_log, dt_bias, norm});
+  });
+}
+
+extern "C" int qwen38_gdn_graph_launch(
+    void* graph, const __nv_bfloat16* block_input,
+    __nv_bfloat16* conv_state, float* recurrent_state,
+    const std::int32_t* state_indices, int m, cudaStream_t stream) {
+  return graph_wrap([&] {
+    if (!graph) throw std::invalid_argument("GDN graph is required");
+    static_cast<rocket::qwen38::linear_attention::CutlassGdnGraph*>(graph)
+        ->launch(block_input, conv_state, recurrent_state, state_indices, m,
+                 stream);
+  });
+}
+
+extern "C" int qwen38_gdn_graph_output(
+    void* graph, void** output_bf16, std::size_t* elements) {
+  return graph_wrap([&] {
+    if (!graph || !output_bf16 || !elements) {
+      throw std::invalid_argument("GDN graph output arguments are required");
+    }
+    auto* typed =
+        static_cast<rocket::qwen38::linear_attention::CutlassGdnGraph*>(graph);
+    *output_bf16 = const_cast<__nv_bfloat16*>(typed->projected_output());
+    *elements = 16U * 2'560U;
+  });
+}
+
+extern "C" int qwen38_gdn_graph_destroy(void* graph) {
+  return graph_wrap([&] {
+    delete static_cast<rocket::qwen38::linear_attention::CutlassGdnGraph*>(graph);
+  });
+}
+
+extern "C" const char* qwen38_gdn_graph_last_error() {
+  return rocket::qwen38::linear_attention::graph_last_error.c_str();
+}

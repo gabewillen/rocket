@@ -74,6 +74,7 @@ set_target_properties(qwen38_pair_reduce PROPERTIES
 add_library(qwen38_decode_execution STATIC
   src/decode/execution.cc
   src/decode/full_attention_layer.cc
+  src/decode/linear_attention_layer.cc
 )
 target_include_directories(qwen38_decode_execution PUBLIC src)
 target_link_libraries(qwen38_decode_execution PUBLIC qwen38_pair_reduce CUDA::cudart)
@@ -98,6 +99,40 @@ set_target_properties(qwen38_residual_rmsnorm PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
   POSITION_INDEPENDENT_CODE ON
 )
+
+add_library(qwen38_gdn_core SHARED src/linear_attention/gdn_core.cu)
+target_include_directories(qwen38_gdn_core PUBLIC src)
+target_link_libraries(qwen38_gdn_core PUBLIC CUDA::cudart)
+target_compile_options(qwen38_gdn_core PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
+)
+set_target_properties(qwen38_gdn_core PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
+add_library(qwen38_gdn_graph SHARED src/linear_attention/gdn_cutlass.cu)
+target_include_directories(qwen38_gdn_graph PUBLIC
+  src
+  "${ROCKET_QWEN38_CUTLASS_DIR}/include"
+  "${ROCKET_QWEN38_CUTLASS_DIR}/tools/util/include"
+)
+target_link_libraries(qwen38_gdn_graph PUBLIC
+  qwen38_gdn_core qwen38_decode_execution CUDA::cudart
+)
+target_compile_options(qwen38_gdn_graph PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>
+)
+set_target_properties(qwen38_gdn_graph PROPERTIES
+  CUDA_ARCHITECTURES "121a"
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
+add_executable(qwen38-gdn-graph-smoke bench/gdn_graph_smoke.cu)
+target_include_directories(qwen38-gdn-graph-smoke PRIVATE src)
+target_link_libraries(qwen38-gdn-graph-smoke PRIVATE qwen38_gdn_graph CUDA::cudart)
+set_target_properties(qwen38-gdn-graph-smoke PROPERTIES CUDA_ARCHITECTURES "121")
 
 add_library(qwen38_hyperconnection SHARED src/hyperconnection/hyperconnection.cu)
 target_include_directories(qwen38_hyperconnection PUBLIC src)
@@ -163,6 +198,12 @@ target_link_libraries(qwen38-test-full-attention-layer PRIVATE qwen38_decode_exe
 target_compile_options(qwen38-test-full-attention-layer PRIVATE -Wall -Wextra -Werror)
 set_target_properties(qwen38-test-full-attention-layer PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-full-attention-layer-contract COMMAND qwen38-test-full-attention-layer)
+
+add_executable(qwen38-test-linear-attention-layer tests/test_linear_attention_layer.cc)
+target_link_libraries(qwen38-test-linear-attention-layer PRIVATE qwen38_decode_execution)
+target_compile_options(qwen38-test-linear-attention-layer PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-linear-attention-layer PROPERTIES LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-linear-attention-layer-contract COMMAND qwen38-test-linear-attention-layer)
 
 add_executable(qwen38-test-hyperconnection tests/test_hyperconnection.cu)
 target_link_libraries(qwen38-test-hyperconnection PRIVATE qwen38_hyperconnection CUDA::cudart)
