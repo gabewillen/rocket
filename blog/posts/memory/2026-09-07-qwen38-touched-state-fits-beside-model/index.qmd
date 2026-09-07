@@ -1,0 +1,89 @@
+---
+title: "The fully touched Qwen3.8 c16 state allocation fits beside the 62.46 GiB model"
+description: "One GB10 rank held the resident 62.46 GiB model and 33,420,083,200 bytes of fully touched c16 state with two complete 64 KiB page readbacks."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, memory, cache, attention]
+verdict: accepted
+rocket: "#state"
+supersedes: posts/memory/2026-09-07-qwen38-state-capacity-ledger
+---
+
+**Question.** Does the planned c16 state allocation fit on one GB10 rank beside
+the resident combined-attention model after every CUDA byte is touched?
+
+| setup | |
+| --- | --- |
+| node | `gx10-5e36`, GB10 |
+| kernel | `6.17.13-rocket64k`, 64 KiB pages |
+| allocation-plan commit | `da33f20e28a932822a12219956cd73787575f488` |
+| touched-proof commit | `b976ff560fc3d3493619779b3e1001c904b30106` |
+| serving | TP2, c16, MTP3, 262144-token context |
+| resident model | combined linear-attention and full-attention NVFP4, 62.46 GiB |
+| allocator | PyTorch CUDA caching allocator on `cuda:0` |
+| change from superseded entry | allocation plan replaced by a fully touched CUDA capacity proof |
+
+```bash
+docker cp scripts/memory/qwen38-state-capacity.py rocket-qwen38-calibration-head:/rocket/run/qwen38-state-capacity.py && \
+docker cp scripts/memory/qwen38-state-capacity-plan.json rocket-qwen38-calibration-head:/rocket/run/qwen38-state-capacity-plan.json && \
+{ rc=0; docker exec rocket-qwen38-calibration-head python3 /rocket/run/qwen38-state-capacity.py \
+    --cuda-allocate-plan /rocket/run/qwen38-state-capacity-plan.json \
+    --cuda-proof-output /rocket/run/qwen38-state-capacity-cuda-proof-v2.json \
+    --cuda-timeout-seconds 900 || rc=$?; \
+  docker cp rocket-qwen38-calibration-head:/rocket/run/qwen38-state-capacity-cuda-proof-v2.json \
+    /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/qwen38-state-capacity-cuda-proof-v2.json; \
+  exit $rc; }
+
+jq '{status, requested_bytes, storage_bytes, touched_bytes, touch_page_bytes,
+  verified_pages, expected_pages, allocator_allocated_delta_bytes,
+  allocator_reserved_delta_bytes, resident_delta_bytes, elapsed_seconds,
+  deterministic_readback}' \
+  /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/qwen38-state-capacity-cuda-proof-v2.json
+```
+
+```json
+{
+  "status": "passed",
+  "requested_bytes": 33420083200,
+  "storage_bytes": 33420083200,
+  "touched_bytes": 33420083200,
+  "touch_page_bytes": 65536,
+  "verified_pages": 509950,
+  "expected_pages": 509950,
+  "allocator_allocated_delta_bytes": 33421656064,
+  "allocator_reserved_delta_bytes": 33443282944,
+  "resident_delta_bytes": 34044837888,
+  "elapsed_seconds": 1.3653820880026615,
+  "deterministic_readback": true
+}
+```
+
+| metric | value | unit |
+| --- | ---: | --- |
+| requested state | 33,420,083,200 | B |
+| allocated storage | 33,420,083,200 | B |
+| GPU-written extent | 33,420,083,200 | B |
+| pages read immediately after each family allocation | 509,950 | 64 KiB pages |
+| pages read again after all allocations | 509,950 | 64 KiB pages |
+| allocator allocated delta | 33,421,656,064 | B |
+| allocator reserved delta | 33,443,282,944 | B |
+| resident delta | 34,044,837,888 | B |
+| elapsed | 1.365 | s |
+| run status | passed | status |
+
+Run-to-run variance is unavailable from this one retained-model allocation run.
+Both readback passes covered all 509,950 pages.
+
+**Verdict.** Accepted for raw CUDA capacity on one GB10 rank. The full c16
+state extent remained readable beside the resident 62.46 GiB combined-attention
+model.
+
+**Next.**
+
+- bind every state allocation to the serving engine
+- prove atomic NVMe evict and restore parity at one shared accepted-token boundary
+
+**Reopen if.**
+
+- NVIDIA changes GB10 unified-memory residency behavior, CUDA allocator behavior,
+  or the hardware capacity
