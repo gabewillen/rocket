@@ -57,6 +57,7 @@ class DistributedStateTests(unittest.TestCase):
         )
         self.policy_state = policy.dump_state(policy.initial_state())
         self.policy_digest = hashlib.sha256(self.policy_state).hexdigest()
+        self.policy = policy
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -69,7 +70,9 @@ class DistributedStateTests(unittest.TestCase):
                 family: GeneratedFamilySource(17 + index, rank * 16 + index + 1)
                 for index, family in enumerate(STATE_FAMILIES)
             }
-            store = RankStateStore(rank, root / f"rank{rank}", self.identity, Tracer())
+            store = RankStateStore(
+                rank, root / f"rank{rank}", self.identity, Tracer(), self.policy
+            )
             endpoints.append(
                 LocalRankEndpoint(store, sources, publications[rank].append)
             )
@@ -115,7 +118,8 @@ class DistributedStateTests(unittest.TestCase):
 
                 with self.assertRaises(InjectedCrash):
                     coordinator.commit(
-                        "session", "txn", self.boundary, inject_fault=inject
+                        "session", "txn", self.boundary,
+                        policy_state=self.policy_state, inject_fault=inject,
                     )
                 if transition is Transition.AFTER_INDEX_RANK1:
                     receipts = coordinator.restore("session")
@@ -130,6 +134,35 @@ class DistributedStateTests(unittest.TestCase):
         coordinator, publications = self._coordinator(self.root / "invalid")
         with self.assertRaisesRegex(StateTransactionError, "policy"):
             coordinator.commit("session", "txn", self.boundary, policy_state=b"")
+        self.assertEqual(publications, ([], []))
+
+    def test_rank_policy_configuration_mismatch_fails_before_commit(self):
+        coordinator, publications = self._coordinator(self.root / "mismatch")
+        mismatched = AdaptiveMtpPolicy(
+            Tracer(),
+            PolicyConfig((
+                ConcurrencyCeiling(1, Depth.K6),
+                ConcurrencyCeiling(16, Depth.K1),
+            )),
+        )
+        coordinator.endpoints[1].store.policy = mismatched
+        with self.assertRaisesRegex(StateTransactionError, "policy"):
+            coordinator.commit(
+                "session", "txn", self.boundary, policy_state=self.policy_state
+            )
+        self.assertEqual(publications, ([], []))
+
+    def test_rank_policy_payload_tamper_blocks_both_publications(self):
+        coordinator, publications = self._coordinator(self.root / "tamper")
+        coordinator.commit(
+            "session", "txn", self.boundary, policy_state=self.policy_state
+        )
+        policy_path = (
+            self.root / "tamper" / "rank1" / "transactions" / "txn" / "POLICY.json"
+        )
+        policy_path.write_bytes(self.policy_state + b" ")
+        with self.assertRaisesRegex(StateTransactionError, "policy"):
+            coordinator.restore("session")
         self.assertEqual(publications, ([], []))
 
 

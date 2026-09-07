@@ -7,8 +7,10 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -73,14 +75,18 @@ def _identity() -> StateIdentity:
 
 
 def _policy_state() -> bytes:
-    policy = AdaptiveMtpPolicy(
+    policy = _policy()
+    return policy.dump_state(policy.initial_state())
+
+
+def _policy() -> AdaptiveMtpPolicy:
+    return AdaptiveMtpPolicy(
         _Tracer(),
         PolicyConfig((
             ConcurrencyCeiling(1, Depth.K7),
             ConcurrencyCeiling(16, Depth.K1),
         )),
     )
-    return policy.dump_state(policy.initial_state())
 
 
 def _sources(plan_path: Path, rank: int):
@@ -139,17 +145,19 @@ def worker(rank: int, store_path: Path, plan_path: Path) -> None:
     store_path.mkdir(parents=True, exist_ok=True)
     sources, record_bytes = _sources(plan_path, rank)
     available = shutil.disk_usage(store_path).free
-    if available < record_bytes + RESERVE_BYTES:
+    reclaimable = _footprint(store_path)
+    if available + reclaimable < record_bytes + RESERVE_BYTES:
         raise RuntimeError("owner-local NVMe preflight failed")
     publications = []
     endpoint = LocalRankEndpoint(
-        RankStateStore(rank, store_path, _identity(), _Tracer()),
+        RankStateStore(rank, store_path, _identity(), _Tracer(), _policy()),
         sources,
         publications.append,
     )
     print(json.dumps({
         "ok": True, "event": "ready", "rank": rank,
-        "free_bytes": available, "record_bytes": record_bytes,
+        "free_bytes": available, "reclaimable_bytes": reclaimable,
+        "record_bytes": record_bytes,
     }), flush=True)
     for line in sys.stdin:
         request = json.loads(line)
@@ -266,10 +274,13 @@ class _EndpointProxy:
         self._timed("publish", receipt=_encode(receipt))
 
 
-def _command(repo: Path, rank: int, remote: str | None):
+def _command(
+    repo: Path, rank: int, remote: str | None, container_name: str
+):
     owner_path = f"/var/lib/rocket/qwen38-state/rank{rank}"
     command = [
-        "docker", "run", "--rm", "--entrypoint", "python3", "-i",
+        "docker", "run", "--rm", "--name", container_name,
+        "--entrypoint", "python3", "-i",
         "-v", f"{repo}:{CONTAINER_REPO}:ro", "-v", f"{owner_path}:/state",
         "-e", f"PYTHONPATH={CONTAINER_REPO}/engines/qwen38-flash-next-nvfp4-2b/src",
         IMAGE, f"{CONTAINER_REPO}/{SCRIPT}", "--worker", "--rank", str(rank),
@@ -278,36 +289,99 @@ def _command(repo: Path, rank: int, remote: str | None):
     return command if remote is None else ["ssh", "-o", "BatchMode=yes", remote, shlex.join(command)]
 
 
-class InjectedCrash(RuntimeError): pass
+def _start_processes(repo: Path, remote: str, prefix: str):
+    return (
+        _Process(_command(repo, 0, None, f"{prefix}-rank0")),
+        _Process(_command(repo, 1, remote, f"{prefix}-rank1")),
+    )
+
+
+def crash_case(repo: Path, remote: str, transition: Transition, prefix: str):
+    processes = _start_processes(repo, remote, prefix)
+    endpoints = (
+        _EndpointProxy(0, processes[0]), _EndpointProxy(1, processes[1])
+    )
+    coordinator = DistributedStateCoordinator(endpoints, _Tracer())
+    policy_state = _policy_state()
+
+    def kill_at_boundary(observed):
+        if observed is transition:
+            print(json.dumps({
+                "event": "sigkill",
+                "transition": transition.value,
+                "policy_digest": hashlib.sha256(policy_state).hexdigest(),
+                "rank_timings": tuple(endpoint.timings for endpoint in endpoints),
+                "workers": tuple(process.ready for process in processes),
+            }, sort_keys=True), flush=True)
+            os.kill(os.getpid(), signal.SIGKILL)
+
+    coordinator.commit(
+        "physical", f"txn-{transition.value}", _boundary(),
+        policy_state=policy_state, inject_fault=kill_at_boundary,
+    )
+    raise RuntimeError("coordinator passed configured SIGKILL transition")
+
+
+def _container_exists(remote: str | None, name: str) -> bool:
+    command = ["docker", "inspect", name]
+    if remote is not None:
+        command = ["ssh", "-o", "BatchMode=yes", remote, shlex.join(command)]
+    return subprocess.run(
+        command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ).returncode == 0
+
+
+def _await_worker_exit(remote: str, prefix: str) -> None:
+    owners = ((None, f"{prefix}-rank0"), (remote, f"{prefix}-rank1"))
+    deadline = time.monotonic() + 30
+    while any(_container_exists(owner, name) for owner, name in owners):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("SIGKILL worker descendants did not exit on stdin EOF")
+        time.sleep(0.25)
+
+
+def _run_killed_case(repo: Path, remote: str, transition: Transition, prefix: str):
+    command = [
+        sys.executable, str(repo / SCRIPT), "--crash-case", transition.value,
+        "--repo", str(repo), "--remote", remote, "--container-prefix", prefix,
+    ]
+    start = time.perf_counter()
+    result = subprocess.run(command, text=True, capture_output=True)
+    seconds = time.perf_counter() - start
+    if result.returncode != -signal.SIGKILL:
+        raise RuntimeError(
+            f"coordinator crash returned {result.returncode}: {result.stderr[-400:]}"
+        )
+    lines = tuple(line for line in result.stdout.splitlines() if line)
+    if len(lines) != 1:
+        raise RuntimeError("coordinator SIGKILL evidence is missing or ambiguous")
+    evidence = json.loads(lines[0])
+    if evidence.get("event") != "sigkill" or evidence.get("transition") != transition.value:
+        raise RuntimeError("coordinator died outside the configured transition")
+    _await_worker_exit(remote, prefix)
+    evidence["coordinator_seconds"] = round(seconds, 6)
+    evidence["returncode"] = result.returncode
+    return evidence
 
 
 def matrix(repo: Path, remote: str):
-    processes = (
-        _Process(_command(repo, 0, None)),
-        _Process(_command(repo, 1, remote)),
-    )
-    try:
-        cases = []
-        for transition in Transition:
-            for process in processes: process.request("cleanup")
+    cases = []
+    for transition in Transition:
+        prefix = f"qwen38-state-{transition.value.replace('_', '-')}"
+        cleanup_processes = _start_processes(repo, remote, f"{prefix}-preflight")
+        try:
+            cleanup = tuple(process.request("cleanup") for process in cleanup_processes)
+            if any(value["payload_bytes"] for value in cleanup):
+                raise RuntimeError("preflight cleanup left payload bytes")
+        finally:
+            for process in cleanup_processes: process.close()
+        evidence = _run_killed_case(repo, remote, transition, prefix)
+        processes = _start_processes(repo, remote, prefix)
+        try:
             endpoints = (
                 _EndpointProxy(0, processes[0]), _EndpointProxy(1, processes[1])
             )
             coordinator = DistributedStateCoordinator(endpoints, _Tracer())
-
-            def inject(observed):
-                if observed is transition: raise InjectedCrash(transition.value)
-
-            start = time.perf_counter()
-            try:
-                coordinator.commit(
-                    "physical", f"txn-{transition.value}", _boundary(),
-                    policy_state=_policy_state(),
-                    inject_fault=inject,
-                )
-            except InjectedCrash:
-                pass
-            commit_seconds = time.perf_counter() - start
             before = tuple(process.request("status") for process in processes)
             restored = False
             restore_seconds = None
@@ -329,23 +403,26 @@ def matrix(repo: Path, remote: str):
                 raise RuntimeError("pre-final crash exposed a publication")
             cases.append({
                 "transition": transition.value,
-                "commit_seconds": round(commit_seconds, 6),
+                "crash": evidence,
                 "restore_seconds": None if restore_seconds is None else round(restore_seconds, 6),
                 "restored": restored,
                 "payload_bytes": tuple(value["payload_bytes"] for value in before),
-                "rank_timings": tuple(endpoint.timings for endpoint in endpoints),
+                "recovery_timings": tuple(endpoint.timings for endpoint in endpoints),
             })
-        cleanup = tuple(process.request("cleanup") for process in processes)
-        if any(value["payload_bytes"] for value in cleanup):
-            raise RuntimeError("physical crash matrix cleanup left payload bytes")
-        return {"workers": tuple(process.ready for process in processes), "cases": cases, "cleanup": cleanup}
-    finally:
-        for process in processes: process.close()
+            cleanup = tuple(process.request("cleanup") for process in processes)
+            if any(value["payload_bytes"] for value in cleanup):
+                raise RuntimeError("physical crash matrix cleanup left payload bytes")
+            cases[-1]["cleanup"] = cleanup
+        finally:
+            for process in processes: process.close()
+    return {"signal": "SIGKILL", "cases": cases}
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--crash-case", choices=tuple(value.value for value in Transition))
+    parser.add_argument("--container-prefix")
     parser.add_argument("--rank", type=int, choices=(0, 1))
     parser.add_argument("--store", type=Path)
     parser.add_argument("--plan", type=Path, default=Path(PLAN))
@@ -359,6 +436,13 @@ def main():
     if args.worker:
         if args.rank is None or args.store is None: raise SystemExit("worker requires rank/store")
         worker(args.rank, args.store, args.plan)
+    elif args.crash_case:
+        if not args.remote or not args.container_prefix:
+            raise SystemExit("crash case requires remote/container-prefix")
+        crash_case(
+            args.repo.resolve(), args.remote, Transition(args.crash_case),
+            args.container_prefix,
+        )
     else:
         if not args.remote: raise SystemExit("matrix requires remote")
         print(json.dumps(matrix(args.repo.resolve(), args.remote), sort_keys=True))

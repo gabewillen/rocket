@@ -22,6 +22,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Iterator, Protocol
 
+from .mtp_policy import AdaptiveMtpPolicy, MtpPolicyError
 from .state_txn import (
     IO_CHUNK_BYTES,
     PAGE_BYTES,
@@ -93,7 +94,7 @@ class PrepareReceipt:
     boundary: AcceptedBoundary
     prepared_sha256: str
     rank_sha256: str
-    policy_digest: str | None
+    policy_digest: str
 
 
 @dataclass(frozen=True)
@@ -113,7 +114,7 @@ class RestoreInspection:
     commit_sha256: str
     prepared_sha256: str
     rank_sha256: str
-    policy_digest: str | None
+    policy_digest: str
 
 
 @dataclass(frozen=True)
@@ -132,8 +133,8 @@ class LocalAuthenticatedState:
 
     rank: int
     boundary: AcceptedBoundary
-    policy_digest: str | None
-    policy_state: bytes | None
+    policy_digest: str
+    policy_state: bytes
     families: Mapping[str, AuthenticatedFamilyExtent]
 
 
@@ -143,7 +144,7 @@ class AuthenticationReceipt:
     boundary: AcceptedBoundary
     commit_sha256: str
     rank_sha256: str
-    policy_digest: str | None
+    policy_digest: str
 
 
 class RankEndpoint(Protocol):
@@ -151,7 +152,7 @@ class RankEndpoint(Protocol):
 
     def prepare(
         self, session_id: str, transaction_id: str,
-        boundary: AcceptedBoundary, policy_state: bytes | None,
+        boundary: AcceptedBoundary, policy_state: bytes,
     ) -> PrepareReceipt: ...
     def commit(self, receipts: tuple[PrepareReceipt, PrepareReceipt]) -> CommitReceipt: ...
     def index(self, receipts: tuple[CommitReceipt, CommitReceipt]) -> None: ...
@@ -197,7 +198,12 @@ class RankStateStore:
     """One rank's durable transaction participant and local authenticator."""
 
     def __init__(
-        self, rank: int, store: Path, identity: StateIdentity, tracer: OtelTracer
+        self,
+        rank: int,
+        store: Path,
+        identity: StateIdentity,
+        tracer: OtelTracer,
+        policy: AdaptiveMtpPolicy,
     ):
         if isinstance(rank, bool) or rank not in (0, 1):
             raise StateTransactionError("rank store rank must be 0 or 1")
@@ -209,10 +215,13 @@ class RankStateStore:
             raise StateTransactionError("rank store topology is invalid")
         if tracer is None:
             raise StateTransactionError("an OpenTelemetry tracer is required")
+        if not isinstance(policy, AdaptiveMtpPolicy):
+            raise StateTransactionError("an adaptive MTP policy is required")
         self.rank = rank
         self.store = Path(store)
         self.identity = identity
         self.tracer = tracer
+        self.policy = policy
 
     def prepare(
         self,
@@ -220,9 +229,10 @@ class RankStateStore:
         transaction_id: str,
         boundary: AcceptedBoundary,
         sources: Mapping[str, GeneratedFamilySource],
-        policy_state: bytes | None,
+        policy_state: bytes,
     ) -> PrepareReceipt:
-        policy_digest = _policy_digest(policy_state)
+        policy_state = _canonical_policy_state(self.policy, policy_state)
+        policy_digest = hashlib.sha256(policy_state).hexdigest()
         _validate_common(session_id, transaction_id, boundary, policy_digest)
         if tuple(sources) != STATE_FAMILIES or any(
             not isinstance(source, GeneratedFamilySource)
@@ -254,8 +264,7 @@ class RankStateStore:
                 "padded_sha256": padded_digest,
             })
         _fsync_directory(directory / "families")
-        if policy_state is not None:
-            _atomic_write(directory / "POLICY.json", policy_state)
+        _atomic_write(directory / "POLICY.json", policy_state)
         record = {
             "schema": DISTRIBUTED_SCHEMA,
             "record": "PREPARED",
@@ -394,15 +403,13 @@ class RankStateStore:
         )
 
     def _read_policy(self, inspection):
-        if inspection.policy_digest is None:
-            return None
         policy = self._read_bounded(
             self._transaction_dir(inspection.transaction_id) / "POLICY.json",
             MAX_POLICY_BYTES,
         )
         if hashlib.sha256(policy).hexdigest() != inspection.policy_digest:
             raise StateTransactionError("local policy state digest changed")
-        return policy
+        return _canonical_policy_state(self.policy, policy)
 
     def _write_family(self, family, path, source, length):
         flags = getattr(os, "O_DIRECT", None)
@@ -551,7 +558,7 @@ class DistributedStateCoordinator:
         self.tracer = tracer
 
     def commit(
-        self, session_id, transaction_id, boundary, *, policy_state=None,
+        self, session_id, transaction_id, boundary, *, policy_state,
         inject_fault: FaultInjector | None = None,
     ):
         policy_digest = _policy_digest(policy_state)
@@ -621,21 +628,29 @@ def _validate_common(session, transaction, boundary, policy_digest):
         or not _HEX_256.fullmatch(boundary.token_hash)
     ):
         raise StateTransactionError("accepted boundary is invalid")
-    if policy_digest is not None and (
-        not isinstance(policy_digest, str) or not _HEX_256.fullmatch(policy_digest)
-    ):
-        raise StateTransactionError("policy digest slot is invalid")
+    if not isinstance(policy_digest, str) or not _HEX_256.fullmatch(policy_digest):
+        raise StateTransactionError("canonical policy digest is invalid")
 
 
 def _policy_digest(policy_state):
-    if policy_state is None:
-        return None
     if (
         not isinstance(policy_state, bytes)
         or not 0 < len(policy_state) <= MAX_POLICY_BYTES
     ):
         raise StateTransactionError("policy state must be 1 through 65536 bytes")
     return hashlib.sha256(policy_state).hexdigest()
+
+
+def _canonical_policy_state(policy, encoded):
+    _policy_digest(encoded)
+    try:
+        decoded = policy.load_state(encoded)
+        canonical = policy.dump_state(decoded)
+    except MtpPolicyError as exc:
+        raise StateTransactionError("adaptive MTP policy state is invalid") from exc
+    if canonical != encoded:
+        raise StateTransactionError("adaptive MTP policy state is not canonical")
+    return canonical
 
 
 def _validate_prepare_receipts(receipts):
