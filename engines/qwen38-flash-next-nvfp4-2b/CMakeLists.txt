@@ -111,6 +111,17 @@ set_target_properties(qwen38_gdn_core PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+add_library(qwen38_gdn_prefill_fused STATIC
+  src/linear_attention/gdn_prefill_fused.cu)
+target_include_directories(qwen38_gdn_prefill_fused PUBLIC src)
+target_link_libraries(qwen38_gdn_prefill_fused PUBLIC CUDA::cudart)
+target_compile_options(qwen38_gdn_prefill_fused PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+set_target_properties(qwen38_gdn_prefill_fused PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
 add_library(qwen38_gdn_graph SHARED
   src/linear_attention/gdn_cutlass.cu
   src/linear_attention/gdn_verifier.cu
@@ -136,6 +147,14 @@ add_executable(qwen38-gdn-graph-smoke bench/gdn_graph_smoke.cu)
 target_include_directories(qwen38-gdn-graph-smoke PRIVATE src)
 target_link_libraries(qwen38-gdn-graph-smoke PRIVATE qwen38_gdn_graph CUDA::cudart)
 set_target_properties(qwen38-gdn-graph-smoke PROPERTIES CUDA_ARCHITECTURES "121")
+
+add_executable(qwen38-gdn-prefill-fused-bench
+  bench/gdn_prefill_fused_bench.cu)
+target_include_directories(qwen38-gdn-prefill-fused-bench PRIVATE src)
+target_link_libraries(qwen38-gdn-prefill-fused-bench PRIVATE
+  qwen38_gdn_prefill_fused CUDA::cudart)
+target_compile_options(qwen38-gdn-prefill-fused-bench PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
 
 add_library(qwen38_decoder_verifier STATIC src/decode/decoder_verifier.cc)
 target_include_directories(qwen38_decoder_verifier PUBLIC src)
@@ -324,3 +343,19 @@ target_compile_options(qwen38-test-mtp-graph-runtime-native PRIVATE
 )
 add_test(NAME qwen38-mtp-graph-runtime-native-contract
   COMMAND qwen38-test-mtp-graph-runtime-native)
+
+add_executable(qwen38-test-gdn-prefill-fused tests/test_gdn_prefill_fused.cu)
+target_link_libraries(qwen38-test-gdn-prefill-fused PRIVATE
+  qwen38_gdn_prefill_fused CUDA::cudart)
+target_compile_options(qwen38-test-gdn-prefill-fused PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>)
+add_test(NAME qwen38-gdn-prefill-fused-contract
+  COMMAND qwen38-test-gdn-prefill-fused)
+
+add_executable(qwen38-test-gdn-prefill-width4
+  tests/test_gdn_prefill_width4.cc)
+target_include_directories(qwen38-test-gdn-prefill-width4 PRIVATE src)
+target_compile_options(qwen38-test-gdn-prefill-width4 PRIVATE
+  -Wall -Wextra -Werror)
+add_test(NAME qwen38-gdn-prefill-width4-cpu-contract
+  COMMAND qwen38-test-gdn-prefill-width4)
