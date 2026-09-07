@@ -1,0 +1,79 @@
+---
+title: "Exact-N640 dynamic MoE cuts Qwen c16 latency by 17.7%"
+description: "FlashInfer's exact-N640 dynamic path takes 2.05 ms on GB10 while the static path pads expert traffic by 20% and takes 2.49 ms."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, kernels, numerics, telemetry]
+verdict: accepted
+rocket: "#kernels"
+---
+
+**Question.** Which pinned FlashInfer b12x backend should Rocket adapt for Qwen hidden 2560, intermediate 640, 512 experts, top-k 10, and c1 through c16?
+
+| setup | |
+| --- | --- |
+| node | head (`gx10-5e36`) |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| GPU / CUDA | NVIDIA GB10, `sm_121` / 13.0.88 |
+| Rocket base | `2be8bcfa3d90fd05a4c834e17fb58c59714fea3d` plus this entry's commit |
+| FlashInfer | [`91bda04c66f7cb851e1ab3b78b9fecea644b9844`](https://github.com/flashinfer-ai/flashinfer/commit/91bda04c66f7cb851e1ab3b78b9fecea644b9844), Apache-2.0 |
+| slab plan | `a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4` |
+| payload | generated packed E2M1 weights and E4M3 group-16 SFB scales; 1,415,585,792 B |
+
+```bash
+python3 scripts/kernels/test_qwen38_flashinfer_b12x_moe.py
+docker run --rm --gpus all --entrypoint python3 \
+  -v "$PWD:/rocket:ro" \
+  -v /home/glwillen/Development/inference-references/flashinfer:/flashinfer:ro \
+  -v /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4:/artifact:ro \
+  -v /home/glwillen/.cache/rocket-qwen38-b12x:/root/.cache/flashinfer \
+  -e PYTHONPATH=/flashinfer vllm/vllm-openai:qwen38-flash-next \
+  /rocket/scripts/kernels/qwen38-flashinfer-b12x-moe.py \
+  --flashinfer-repo /flashinfer --manifest /artifact/manifest.json \
+  --tokens 1 2 4 8 16 --backends direct_micro micro static dynamic \
+  --warmup 3 --iterations 20
+```
+
+| M | micro N768 | static N768 | dynamic N640 | best | dynamic versus static | unit |
+| ---: | ---: | ---: | ---: | --- | ---: | --- |
+| 1 | 0.140760 ± 0.009649 | 0.138651 ± 0.007088 | 0.147517 ± 0.010407 | static | -6.394 | ms / % |
+| 2 | 0.315507 ± 0.013404 | 0.313661 ± 0.012675 | 0.311362 ± 0.000783 | dynamic | 0.733 | ms / % |
+| 4 | 0.626235 ± 0.013359 | 0.631614 ± 0.015162 | 0.558498 ± 0.012503 | dynamic | 11.576 | ms / % |
+| 8 | 1.287768 ± 0.024422 | 1.246256 ± 0.012881 | 1.060357 ± 0.016098 | dynamic | 14.917 | ms / % |
+| 16 | ineligible | 2.490822 ± 0.015006 | 2.050989 ± 0.010202 | dynamic | 17.658 | ms / % |
+
+| M | logical traffic | padded static traffic | best-path read roof | static parity max abs | replay max abs | unit |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 27,658,480 | 33,188,080 | 99.198 | 0 | 0 | B / % |
+| 2 | 55,316,960 | 66,376,160 | 73.627 | 0 | 0 | B / % |
+| 4 | 110,633,920 | 132,752,320 | 82.094 | 0 | 0 | B / % |
+| 8 | 221,267,840 | 265,504,640 | 86.479 | 0 | 0 | B / % |
+| 16 | 442,535,680 | 531,009,280 | 89.419 | 0 | 0 | B / % |
+
+| source profile | result |
+| --- | --- |
+| direct micro | difficulty rejection: hard intermediate maximum is 512 |
+| micro | hard token maximum is 8; N640 enters the retained static N768 layout |
+| static | retained two-slice schedule pads N640 to N768, adding 88,473,600 B at c16 |
+| dynamic | exact N640; generic gated body because the optimized body also caps N at 512 |
+| generic dynamic control plane | source-counted five resident-grid barriers before consumption, 512-entry expert prefix scan, global route/task queues; barrier stall time is not measured |
+| c2 selector | dynamic is 0.733% faster, below the static run's 4.041% relative standard deviation |
+
+| slab binding check | value |
+| --- | ---: |
+| owner-local experts per rank | 256 |
+| layer-0 expert payload per rank | 707,794,944 B |
+| authenticated expert components | 6,144 |
+| tensor alignment | 256 B |
+
+**Verdict.** Keep padded static at c1. Use exact-N640 dynamic as the c4, c8, and c16 adaptation control. Keep c2 open to a longer matched selector run. The benchmark proves generated ModelOpt-layout parity across reference backends, not checkpoint logits or a rank-local EP2 launch.
+
+**Next.**
+
+- Replace the dynamic kernel's contiguous E512 tensors with authenticated owner-local E256 slab views and routed-pair compaction.
+- Profile the five barriers, 512-entry prefix scan, and global task queue before changing the dynamic compute body.
+- Bind the BF16 `[M,2560]` output to the two-rank reduction and pending hyperconnection combine.
+
+**Reopen if.**
+
+- A FlashInfer, CUDA, or GB10 firmware release changes the N640 backend crossover.
