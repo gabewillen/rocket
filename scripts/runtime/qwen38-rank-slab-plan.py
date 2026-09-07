@@ -265,12 +265,8 @@ def _suffix_rule(name: str) -> SliceRule | None:
         return linear[leaf]
 
     if leaf.startswith("self_attn."):
-        if leaf.endswith(("q_proj.weight", "k_proj.weight", "v_proj.weight")):
-            return SliceRule("self_attn.qkv", "column", 0)
-        if leaf.endswith("o_proj.weight"):
-            return SliceRule("self_attn.o_proj", "row", 1)
-        if leaf.endswith(("q_norm.weight", "k_norm.weight")):
-            return SliceRule("self_attn.qk_norm", "replicated")
+        # The indexer leaf ends in ``q_proj.weight`` too. Match the full
+        # replicated name before the generic TP-column Q/K/V suffixes.
         if leaf.endswith(
             (
                 "indexer.index_qk_proj.weight",
@@ -279,6 +275,12 @@ def _suffix_rule(name: str) -> SliceRule | None:
             )
         ):
             return SliceRule("self_attn.indexer", "replicated")
+        if leaf.endswith(("q_proj.weight", "k_proj.weight", "v_proj.weight")):
+            return SliceRule("self_attn.qkv", "column", 0)
+        if leaf.endswith("o_proj.weight"):
+            return SliceRule("self_attn.o_proj", "row", 1)
+        if leaf.endswith(("q_norm.weight", "k_norm.weight")):
+            return SliceRule("self_attn.qk_norm", "replicated")
 
     if leaf.startswith("mlp."):
         if leaf == "mlp.gate.weight" or leaf == "mlp.shared_expert_gate.weight":
