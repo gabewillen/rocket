@@ -77,6 +77,17 @@ __global__ void hc_silu_and_injection(const __nv_bfloat16* merged,
         merged[row * kMergedRows + kLowRank + threadIdx.x];
 }
 
+__global__ void hc_silu(const __nv_bfloat16* projected,
+                        __nv_bfloat16* lora) {
+  const int row = blockIdx.x;
+  for (int column = threadIdx.x; column < kLowRank; column += blockDim.x) {
+    const float value = __bfloat162float(projected[row * kLowRank + column]) /
+                        static_cast<float>(kStreams);
+    lora[row * kLowRank + column] =
+        __float2bfloat16(value / (1.0F + expf(-value)));
+  }
+}
+
 __global__ void gate_mix(const __nv_bfloat16* normalized,
                          const __nv_bfloat16* gate,
                          __nv_bfloat16* block_input) {
@@ -207,6 +218,76 @@ Plan::Plan(int device, Weights attention, Weights mlp) : impl_(new Impl) {
 
 Plan::~Plan() { delete impl_; }
 
+struct FinalPlan::Impl {
+  cublasHandle_t handle = nullptr;
+  const __nv_bfloat16* norm = nullptr;
+  const __nv_bfloat16* down = nullptr;
+  const __nv_bfloat16* up = nullptr;
+  __nv_bfloat16* normalized = nullptr;
+  __nv_bfloat16* projected = nullptr;
+  __nv_bfloat16* lora = nullptr;
+  __nv_bfloat16* gate = nullptr;
+
+  ~Impl() {
+    cudaFree(gate);
+    cudaFree(lora);
+    cudaFree(projected);
+    cudaFree(normalized);
+    if (handle) cublasDestroy(handle);
+  }
+};
+
+FinalPlan::FinalPlan(int device, const __nv_bfloat16* norm,
+                     const __nv_bfloat16* down,
+                     const __nv_bfloat16* up)
+    : impl_(new Impl) {
+  if (device < 0 || !norm || !down || !up)
+    throw std::invalid_argument("Qwen final HC requires exact device weights");
+  try {
+    cuda_check(cudaSetDevice(device), "set final HC device");
+    cublas_check(cublasCreate(&impl_->handle), "create final HC handle");
+    impl_->norm = norm;
+    impl_->down = down;
+    impl_->up = up;
+    auto allocate = [](auto** pointer, std::size_t elements) {
+      cuda_check(cudaMalloc(pointer, elements * sizeof(__nv_bfloat16)),
+                 "allocate final HC buffer");
+    };
+    allocate(&impl_->normalized, 16 * kHyperHidden);
+    allocate(&impl_->projected, 16 * kLowRank);
+    allocate(&impl_->lora, 16 * kLowRank);
+    allocate(&impl_->gate, 16 * kHyperHidden);
+  } catch (...) {
+    delete impl_;
+    impl_ = nullptr;
+    throw;
+  }
+}
+
+FinalPlan::~FinalPlan() { delete impl_; }
+
+void FinalPlan::combine_and_collapse(
+    const __nv_bfloat16* hidden, const float* block_output,
+    const __nv_bfloat16* injection, __nv_bfloat16* updated_hidden,
+    __nv_bfloat16* token_hidden, int m, cudaStream_t stream) {
+  if (!hidden || !block_output || !injection || !updated_hidden ||
+      !token_hidden || !allowed_m(m) || !stream)
+    throw std::invalid_argument("Qwen final HC contract drift");
+  cublas_check(cublasSetStream(impl_->handle, stream),
+               "bind final HC stream");
+  combine_norm<<<m * kStreams, kThreads, kHidden * sizeof(float), stream>>>(
+      hidden, block_output, injection, impl_->norm, updated_hidden,
+      impl_->normalized);
+  gemm(impl_->handle, impl_->normalized, impl_->down, impl_->projected, m,
+       kLowRank, kHyperHidden);
+  hc_silu<<<m, kThreads, 0, stream>>>(impl_->projected, impl_->lora);
+  gemm(impl_->handle, impl_->lora, impl_->up, impl_->gate, m, kHyperHidden,
+       kLowRank);
+  gate_mix<<<m, kThreads, 0, stream>>>(impl_->normalized, impl_->gate,
+                                      token_hidden);
+  cuda_check(cudaPeekAtLastError(), "launch final HC");
+}
+
 void Plan::mix(const __nv_bfloat16* hidden, __nv_bfloat16* block_input,
                __nv_bfloat16* injection, int m, cudaStream_t stream) {
   if (!hidden || !block_input || !injection || !allowed_m(m) || !stream)
@@ -308,6 +389,34 @@ extern "C" int qwen38_hc_combine_and_mix(
 
 extern "C" int qwen38_hc_destroy(void* opaque) {
   delete static_cast<rocket::qwen38::hyperconnection::Plan*>(opaque);
+  return 0;
+}
+
+extern "C" int qwen38_final_hc_create(
+    int device, const __nv_bfloat16* norm, const __nv_bfloat16* down,
+    const __nv_bfloat16* up, void** result) {
+  if (!result) return 1;
+  *result = nullptr;
+  return hc_call([&] {
+    *result = new rocket::qwen38::hyperconnection::FinalPlan(
+        device, norm, down, up);
+  });
+}
+
+extern "C" int qwen38_final_hc_combine_and_collapse(
+    void* opaque, const __nv_bfloat16* hidden, const float* block_output,
+    const __nv_bfloat16* injection, __nv_bfloat16* updated_hidden,
+    __nv_bfloat16* token_hidden, int m, cudaStream_t stream) {
+  if (!opaque) return 1;
+  return hc_call([&] {
+    static_cast<rocket::qwen38::hyperconnection::FinalPlan*>(opaque)
+        ->combine_and_collapse(hidden, block_output, injection, updated_hidden,
+                               token_hidden, m, stream);
+  });
+}
+
+extern "C" int qwen38_final_hc_destroy(void* opaque) {
+  delete static_cast<rocket::qwen38::hyperconnection::FinalPlan*>(opaque);
   return 0;
 }
 

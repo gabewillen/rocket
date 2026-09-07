@@ -48,6 +48,29 @@ class Plan final {
   Impl* impl_;
 };
 
+// The MTP tail uses GatedResidual(use_combine=false). It consumes the final
+// PairReduce result and collapses four causal streams to one token hidden
+// state. Unlike Plan, it has no injection projection or next-block output.
+class FinalPlan final {
+ public:
+  FinalPlan(int device, const __nv_bfloat16* norm,
+            const __nv_bfloat16* down, const __nv_bfloat16* up);
+  ~FinalPlan();
+  FinalPlan(const FinalPlan&) = delete;
+  FinalPlan& operator=(const FinalPlan&) = delete;
+
+  void combine_and_collapse(const __nv_bfloat16* hidden,
+                            const float* block_output,
+                            const __nv_bfloat16* injection,
+                            __nv_bfloat16* updated_hidden,
+                            __nv_bfloat16* token_hidden, int m,
+                            cudaStream_t stream);
+
+ private:
+  struct Impl;
+  Impl* impl_;
+};
+
 constexpr bool allowed_m(int m) noexcept {
   return m == 1 || m == 2 || m == 4 || m == 8 || m == 16;
 }
@@ -74,5 +97,13 @@ int qwen38_hc_combine_and_mix(
     __nv_bfloat16* next_block_input, __nv_bfloat16* next_injection,
     int m, cudaStream_t stream);
 int qwen38_hc_destroy(void* plan);
+int qwen38_final_hc_create(int device, const __nv_bfloat16* norm,
+                           const __nv_bfloat16* down,
+                           const __nv_bfloat16* up, void** plan);
+int qwen38_final_hc_combine_and_collapse(
+    void* plan, const __nv_bfloat16* hidden, const float* block_output,
+    const __nv_bfloat16* injection, __nv_bfloat16* updated_hidden,
+    __nv_bfloat16* token_hidden, int m, cudaStream_t stream);
+int qwen38_final_hc_destroy(void* plan);
 const char* qwen38_hc_last_error();
 }

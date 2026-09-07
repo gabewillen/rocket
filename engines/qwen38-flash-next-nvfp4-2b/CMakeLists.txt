@@ -181,11 +181,13 @@ set_target_properties(qwen38_token_output PROPERTIES
 )
 
 add_library(qwen38_mtp_executor STATIC
+  src/mtp/input_fusion.cu
   src/mtp/native_executor.cu
   src/mtp/state_arena.cu
 )
 target_include_directories(qwen38_mtp_executor PUBLIC src)
-target_link_libraries(qwen38_mtp_executor PUBLIC CUDA::cudart)
+target_link_libraries(qwen38_mtp_executor PUBLIC
+  qwen38_hyperconnection CUDA::cudart CUDA::cublas)
 target_compile_options(qwen38_mtp_executor PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
 )
@@ -300,3 +302,12 @@ add_test(NAME qwen38-native-mtp-executor-contract
 add_executable(qwen38-test-mtp-state-arena tests/test_mtp_state_arena.cu)
 target_link_libraries(qwen38-test-mtp-state-arena PRIVATE qwen38_mtp_executor CUDA::cudart)
 add_test(NAME qwen38-mtp-state-arena-contract COMMAND qwen38-test-mtp-state-arena)
+
+add_executable(qwen38-test-mtp-input-fusion tests/test_mtp_input_fusion.cu)
+target_link_libraries(qwen38-test-mtp-input-fusion PRIVATE
+  qwen38_mtp_executor CUDA::cudart)
+target_compile_options(qwen38-test-mtp-input-fusion PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
+)
+add_test(NAME qwen38-mtp-input-fusion-contract
+  COMMAND qwen38-test-mtp-input-fusion)

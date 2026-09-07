@@ -54,6 +54,8 @@ int main() {
     auto* d_updated = allocate<__nv_bfloat16>(hyper);
     auto* d_next_block = allocate<__nv_bfloat16>(static_cast<std::size_t>(rows) * hc::kHidden);
     auto* d_next_injection = allocate<__nv_bfloat16>(static_cast<std::size_t>(rows) * hc::kStreams);
+    auto* d_final_hidden = allocate<__nv_bfloat16>(hyper);
+    auto* d_token_hidden = allocate<__nv_bfloat16>(static_cast<std::size_t>(rows) * hc::kHidden);
     cuda_check(cudaMemcpy(d_hidden, hidden.data(), hidden.size() * 2,
                           cudaMemcpyHostToDevice), "copy hidden");
     cuda_check(cudaMemset(d_norm, 0, zero_norm.size() * 2), "clear norm");
@@ -65,13 +67,34 @@ int main() {
                           cudaMemcpyHostToDevice), "copy reduction");
     hc::Weights weights{d_norm, d_down, d_injection_weight, d_up};
     hc::Plan plan(0, weights, weights);
+    hc::FinalPlan final_plan(0, d_norm, d_down, d_up);
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
     for (const int m : {1, 2, 4, 8, 16}) {
       plan.mix(d_hidden, d_block, d_injection, m, stream);
       plan.combine_and_mix(d_hidden, d_reduced, d_injection, d_updated,
                            d_next_block, d_next_injection, m, stream);
+      final_plan.combine_and_collapse(d_hidden, d_reduced, d_injection,
+                                      d_final_hidden, d_token_hidden, m,
+                                      stream);
       cuda_check(cudaStreamSynchronize(stream), "complete HC bucket");
+    }
+    for (const int m : {1, 16}) {
+      cudaGraph_t graph = nullptr;
+      cudaGraphExec_t executable = nullptr;
+      cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+                 "begin final HC capture");
+      final_plan.combine_and_collapse(d_hidden, d_reduced, d_injection,
+                                      d_final_hidden, d_token_hidden, m,
+                                      stream);
+      cuda_check(cudaStreamEndCapture(stream, &graph),
+                 "end final HC capture");
+      cuda_check(cudaGraphInstantiate(&executable, graph, 0),
+                 "instantiate final HC graph");
+      cuda_check(cudaGraphLaunch(executable, stream), "replay final HC graph");
+      cuda_check(cudaStreamSynchronize(stream), "complete final HC graph");
+      cudaGraphExecDestroy(executable);
+      cudaGraphDestroy(graph);
     }
     std::vector<__nv_bfloat16> injection(rows * hc::kStreams), next(injection.size());
     cuda_check(cudaMemcpy(injection.data(), d_injection, injection.size() * 2,
@@ -114,9 +137,26 @@ int main() {
       check(std::all_of(values.begin(), values.end(), [](__nv_bfloat16 value) {
               return std::isfinite(__bfloat162float(value));
             }), "HC produced nonfinite output");
-    std::printf("qwen38_hc buckets=1,2,4,8,16 output_elements=%zu result=match\n",
+    std::vector<__nv_bfloat16> final_hidden(hyper), token_hidden(first.size());
+    cuda_check(cudaMemcpy(final_hidden.data(), d_final_hidden,
+                          final_hidden.size() * 2, cudaMemcpyDeviceToHost),
+               "copy final hidden");
+    cuda_check(cudaMemcpy(token_hidden.data(), d_token_hidden,
+                          token_hidden.size() * 2, cudaMemcpyDeviceToHost),
+               "copy token hidden");
+    for (std::size_t index = 0; index < final_hidden.size(); ++index)
+      check(__bfloat162float(final_hidden[index]) ==
+                __bfloat162float(updated[index]),
+            "final HC residual publication drift");
+    check(std::all_of(token_hidden.begin(), token_hidden.end(),
+                      [](__nv_bfloat16 value) {
+                        return std::isfinite(__bfloat162float(value));
+                      }),
+          "final HC produced nonfinite token hidden");
+    std::printf("qwen38_hc buckets=1,2,4,8,16 captured=1,16 output_elements=%zu result=match\n",
                 first.size() + second.size());
     cudaStreamDestroy(stream);
+    cudaFree(d_token_hidden); cudaFree(d_final_hidden);
     cudaFree(d_next_injection); cudaFree(d_next_block); cudaFree(d_updated);
     cudaFree(d_injection); cudaFree(d_block); cudaFree(d_reduced); cudaFree(d_up);
     cudaFree(d_injection_weight); cudaFree(d_down); cudaFree(d_norm); cudaFree(d_hidden);
