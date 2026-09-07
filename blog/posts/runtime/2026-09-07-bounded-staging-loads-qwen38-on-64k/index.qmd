@@ -1,0 +1,61 @@
+---
+title: "One-tensor staging loads Qwen3.8 on 64 KiB pages"
+description: "Cloning each selected safetensors tensor before its CUDA copy loads all 11 Qwen3.8 shards in 598 seconds on both 64 KiB nodes."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, runtime, memory]
+verdict: accepted
+rocket: "#engine-status"
+supersedes: posts/runtime/2026-09-06-qwen38-loader-64k-pages
+---
+
+**Question.** Can bounded host staging load the exact NVIDIA Qwen3.8 checkpoint on the 64 KiB pair?
+
+| setup | |
+| --- | --- |
+| nodes | head and worker, two GB10 nodes |
+| kernel | `6.17.13-rocket64k`, 64 KiB pages, both nodes |
+| launcher | MiaAI-Lab `c2325b22602b51a5faf55fc2bebccc34f3f80b9f` with the patch below |
+| image | `vllm/vllm-openai:qwen38-flash-next`, vLLM `8e685d198` |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| Rocket commit | `f7384927114c5564d268a85c223690a1eddabb7a` |
+| replicates | 1 |
+| variance | unavailable |
+
+```bash
+python3 scripts/runtime/patch-vllm-64k-loader.py weight_utils.py
+EXTRA_VLLM_ARGS='--revision fc694b54fb0174e0913e6adf86691ef85a4ead47' \
+  ./start.sh --no-download
+docker logs --timestamps vllm-fn
+curl -fsS http://127.0.0.1:8888/health
+```
+
+```text
+Loading safetensors checkpoint shards: 100% Completed | 11/11 [09:58<00:00, 54.39s/it]
+Loading weights took 598.34 seconds
+Model loading took 62.72 GiB memory and 610.677650 seconds
+Available KV cache memory: 36.54 GiB
+GPU KV cache size: 5,198,936 tokens
+Application startup complete.
+GET /health HTTP/1.1 200 OK
+```
+
+| result | value | unit |
+| --- | ---: | --- |
+| shards loaded | 11 / 11 | shards |
+| weight loading | 598.34 | s |
+| model memory | 62.72 | GiB/node |
+| KV cache | 36.54 | GiB/node |
+| full-context concurrency | 19.83 | streams at 262,144 tokens |
+
+**Verdict.** Accepted. A single `.clone()` stages each selected tensor outside the safetensors mmap before CUDA copies it. Both ranks load and the endpoint returns HTTP 200.
+
+**Next.**
+
+- measure peak host memory during loading
+- replace whole-tensor staging where a tensor exceeds the safe host budget
+
+**Reopen if.**
+
+- vLLM ships an upstream bounded loader for 64 KiB hosts
+- a CUDA driver release makes direct copies from 64 KiB safetensors mappings reliable

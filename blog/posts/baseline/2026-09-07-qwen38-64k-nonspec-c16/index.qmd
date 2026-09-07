@@ -1,0 +1,56 @@
+---
+title: "Qwen3.8 reaches 163.40 tok/s at c16 without speculation on 64 KiB pages"
+description: "The exact NVIDIA checkpoint reaches 163.40 aggregate tok/s and 11.78 tok/s per stream at c16 on Rocket's two-node 64 KiB pair."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, baseline, runtime]
+verdict: accepted
+rocket: "#engine-status"
+---
+
+**Question.** What does the live general engine deliver on Rocket's pair before model changes?
+
+| setup | |
+| --- | --- |
+| nodes | head and worker, two GB10 nodes |
+| kernel | `6.17.13-rocket64k`, 64 KiB pages, both nodes |
+| engine | vLLM `8e685d198`, TP2, EP2, FP8 KV, `speculative_config=None` |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| Rocket commit | `f7384927114c5564d268a85c223690a1eddabb7a` |
+| workload | 64 KiB shared prefix, fixed 256-token prose continuations |
+| replicates | 1 per concurrency |
+| variance | unavailable |
+
+```bash
+scripts/baseline/openai-forked-prefix.py \
+  --concurrency 1,2,4,8,16 --decode 256 --prefix-bytes 65536
+```
+
+```text
+c= 1 aggregate=  19.82 tok/s stream= 19.82 tok/s ttft=9.314s
+c= 2 aggregate=  29.65 tok/s stream= 16.54 tok/s ttft=5.418s
+c= 4 aggregate=  61.43 tok/s stream= 15.90 tok/s ttft=0.902s
+c= 8 aggregate=  94.72 tok/s stream= 14.23 tok/s ttft=4.192s
+c=16 aggregate= 163.40 tok/s stream= 11.78 tok/s ttft=3.876s
+```
+
+| concurrency | aggregate tok/s | per-stream tok/s | mean TTFT s |
+| ---: | ---: | ---: | ---: |
+| 1 | 19.82 | 19.82 | 9.314 |
+| 2 | 29.65 | 16.54 | 5.418 |
+| 4 | 61.43 | 15.90 | 0.902 |
+| 8 | 94.72 | 14.23 | 4.192 |
+| 16 | 163.40 | 11.78 | 3.876 |
+
+**Verdict.** Accepted. The non-speculative c16 run exceeds 132.8 aggregate tok/s by 23.0% and misses 20 tok/s per stream by 41.1%. The published 207 tok/s c8 result uses MTP3 and is a separate baseline.
+
+**Next.**
+
+- capture expert union and device-byte counters at c16
+- repeat with MTP3 and record accepted drafts per concurrency
+- run three replicates after the workload is frozen
+
+**Reopen if.**
+
+- vLLM, FlashInfer, CUDA, or the checkpoint revision changes
+- a firmware release changes the measured hardware limits
