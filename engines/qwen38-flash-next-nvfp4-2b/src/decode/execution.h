@@ -56,6 +56,9 @@ class HiddenPartialReducer {
   virtual void reduce(const __nv_bfloat16* input, float* output, int m,
                       std::string_view trace_id, std::string_view request_id,
                       cudaStream_t stream) = 0;
+  virtual void complete(cudaStream_t stream, std::uint32_t reduction_count,
+                        std::string_view trace_id,
+                        std::string_view request_id) = 0;
 };
 
 class PairReduceAdapter final : public HiddenPartialReducer {
@@ -68,7 +71,12 @@ class PairReduceAdapter final : public HiddenPartialReducer {
   void reduce(const __nv_bfloat16* input, float* output, int m,
               std::string_view trace_id, std::string_view request_id,
               cudaStream_t stream) override {
-    reduction_.reduce(input, output, m, trace_id, request_id, stream);
+    reduction_.enqueue(input, output, m, trace_id, request_id, stream);
+  }
+  void complete(cudaStream_t stream, std::uint32_t reduction_count,
+                std::string_view trace_id,
+                std::string_view request_id) override {
+    reduction_.complete(stream, reduction_count, trace_id, request_id);
   }
 
  private:
@@ -118,6 +126,7 @@ class Tp2DecodeExecution final {
   int next_ordinal_ = 0;
   std::uint64_t active_generation_ = 0;
   std::uint64_t last_completed_generation_ = 0;
+  cudaStream_t active_stream_ = nullptr;
 };
 
 }  // namespace rocket::qwen38::decode

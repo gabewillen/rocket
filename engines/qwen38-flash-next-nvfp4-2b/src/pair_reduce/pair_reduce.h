@@ -6,18 +6,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
-#include <string>
 #include <string_view>
 
 #include "pair_reduce/otel.h"
-#include "pair_reduce/transport.h"
 
 namespace rocket::qwen38::pair_reduce {
 
 inline constexpr int kWorldSize = 2;
 inline constexpr int kHidden = 2'560;
-inline constexpr std::size_t kPageBytes = 65'536;
-inline constexpr int kAllowedM[] = {1, 2, 4, 8, 16};
+inline constexpr int kMaxRows = 128;
+inline constexpr int kAllowedM[] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16,
+    20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128};
 inline constexpr std::string_view kDtype = "bf16_fp32";
 
 constexpr bool allowed_m(int m) noexcept {
@@ -43,61 +43,60 @@ class PairReduceTransportError final : public PairReduceError {
   using PairReduceError::PairReduceError;
 };
 
-struct alignas(64) WireHeader {
-  std::uint64_t magic;
-  std::uint64_t sequence;
-  std::uint32_t schema;
-  std::uint32_t rank;
-  std::uint32_t world_size;
-  std::uint32_t page_bytes;
-  std::uint32_t hidden;
-  std::uint32_t m;
-  std::uint32_t dtype;
-  std::uint32_t payload_bytes;
-  std::uint64_t reserved[2];
+// enqueue_sum() enqueues an out-of-place BF16 sum on stream without allocating
+// or synchronizing and must be CUDA Graph capturable. health() and abort() are
+// host operations called only after capture at the transaction completion
+// boundary. Implementations are single-owner and non-reentrant.
+class DeviceCollective {
+ public:
+  virtual ~DeviceCollective() = default;
+  virtual int rank() const noexcept = 0;
+  virtual int world_size() const noexcept = 0;
+  virtual void enqueue_sum(const __nv_bfloat16* input,
+                           __nv_bfloat16* output, std::size_t elements,
+                           cudaStream_t stream) = 0;
+  virtual bool healthy() noexcept = 0;
+  virtual void abort() noexcept = 0;
 };
-static_assert(sizeof(WireHeader) == 64);
 
-// Owns one four-page anonymous cudaHostAlloc region registered with Transport.
-// reduce() borrows device input/output only until it returns. The object is
-// single-threaded and non-reentrant. This header is the canonical contract,
-// owned by this Qwen engine with no cross-engine compatibility promise.
-// Success leaves FP32 [M,2560] on output; both ranks perform rank-0 then rank-1
-// addition. Contract, transport, and CUDA failures use the corresponding typed
-// PairReduceError subtype and emit a failed OTEL stage; output is then unspecified.
+enum class Phase : std::uint8_t { kReady, kFaulted };
+
+// Owns one fixed device scratch tensor and completion event. enqueue() borrows
+// input/output until its stream reaches the enqueued conversion. Success leaves
+// FP32 [M,2560]. enqueue() performs no allocation, host payload copy, or stream
+// synchronization and can execute inside CUDA capture. complete() is the sole
+// transaction fence. It waits at most timeout_ms and terminally faults and
+// aborts on CUDA, transport, or timeout failure. Reconstruct before retry.
 class PairReduce final {
  public:
-  PairReduce(Transport& transport, OtelStageSink& telemetry);
+  PairReduce(DeviceCollective& collective, OtelStageSink& telemetry,
+             std::uint32_t timeout_ms = 120'000);
   ~PairReduce();
   PairReduce(const PairReduce&) = delete;
   PairReduce& operator=(const PairReduce&) = delete;
 
-  void reduce(const __nv_bfloat16* input, float* output, int m,
-              std::string_view trace_id, std::string_view request_id,
-              cudaStream_t stream = nullptr);
+  void enqueue(const __nv_bfloat16* input, float* output, int m,
+               std::string_view trace_id, std::string_view request_id,
+               cudaStream_t stream);
+  void complete(cudaStream_t stream, std::uint32_t reduction_count,
+                std::string_view trace_id, std::string_view request_id);
 
-  int rank() const noexcept { return transport_.rank(); }
-  int world_size() const noexcept { return transport_.world_size(); }
-
-  static constexpr std::size_t slot_bytes() noexcept { return 2 * kPageBytes; }
-  static constexpr std::size_t region_bytes() noexcept { return 2 * slot_bytes(); }
-  static constexpr std::size_t allocation_bytes() noexcept {
-    return region_bytes() + kPageBytes - 1;
-  }
-  static constexpr std::uintptr_t aligned_region_address(
-      std::uintptr_t base) noexcept {
-    return (base + kPageBytes - 1) & ~(kPageBytes - 1);
-  }
-  static constexpr std::size_t peer_offset() noexcept { return slot_bytes(); }
+  int rank() const noexcept { return collective_.rank(); }
+  int world_size() const noexcept { return collective_.world_size(); }
+  Phase phase() const noexcept { return phase_; }
+  std::uint64_t enqueued() const noexcept { return enqueued_; }
 
  private:
-  Transport& transport_;
+  void fault(Outcome outcome, int m, std::string_view trace_id,
+             std::string_view request_id, std::uint64_t duration_ns);
+
+  DeviceCollective& collective_;
   OtelStageSink& telemetry_;
-  void* allocation_ = nullptr;
-  void* region_ = nullptr;
-  void* device_region_ = nullptr;
-  int region_handle_ = -1;
-  std::uint64_t last_sequence_ = 0;
+  std::uint32_t timeout_ms_;
+  __nv_bfloat16* reduced_ = nullptr;
+  cudaEvent_t completion_ = nullptr;
+  Phase phase_ = Phase::kReady;
+  std::uint64_t enqueued_ = 0;
 };
 
 }  // namespace rocket::qwen38::pair_reduce

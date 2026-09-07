@@ -3,193 +3,153 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
-#include <cstring>
-#include <stdexcept>
 #include <string>
-#include <unistd.h>
+#include <thread>
 
 namespace rocket::qwen38::pair_reduce {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-constexpr std::uint64_t kMagic = 0x3152494150383351ull;  // Q38PAIR1
-constexpr std::uint32_t kSchema = 1;
-constexpr std::uint32_t kBf16 = 1;
 
 [[noreturn]] void contract_fail(const std::string& reason) {
   throw PairReduceContractError("qwen38 PairReduce contract: " + reason);
 }
 
-void cuda_check(cudaError_t status, const char* operation) {
-  if (status != cudaSuccess) {
-    throw PairReduceCudaError(std::string("qwen38 PairReduce CUDA ") + operation + ": " +
-                              cudaGetErrorString(status));
-  }
-}
-
-int metric_m_bucket(int m) noexcept { return allowed_m(m) ? m : 0; }
-
 std::uint64_t elapsed_ns(Clock::time_point start) noexcept {
   return static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start)
+          .count());
 }
 
-void validate_header(const WireHeader& header, int peer_rank, int m,
-                     std::size_t payload_bytes, std::uint64_t sequence) {
-  if (header.magic != kMagic || header.schema != kSchema)
-    contract_fail("peer wire schema drift");
-  if (header.rank != static_cast<std::uint32_t>(peer_rank) ||
-      header.world_size != kWorldSize)
-    contract_fail("peer topology drift");
-  if (header.page_bytes != kPageBytes)
-    contract_fail("peer page-size drift");
-  if (header.hidden != kHidden || header.m != static_cast<std::uint32_t>(m) ||
-      header.dtype != kBf16 || header.payload_bytes != payload_bytes)
-    contract_fail("peer message drift");
-  if (header.sequence != sequence)
-    contract_fail("peer sequence drift");
-}
-
-__global__ void accumulate_rank_order(const __nv_bfloat16* rank0,
-                                      const __nv_bfloat16* rank1,
-                                      float* output, std::size_t elements) {
-  const std::size_t index = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
-  if (index < elements) {
-    const float first = __bfloat162float(rank0[index]);
-    const float second = __bfloat162float(rank1[index]);
-    output[index] = first + second;
-  }
+__global__ void bf16_to_fp32(const __nv_bfloat16* input, float* output,
+                             std::size_t elements) {
+  const std::size_t index =
+      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+  if (index < elements) output[index] = __bfloat162float(input[index]);
 }
 
 }  // namespace
 
-PairReduce::PairReduce(Transport& transport, OtelStageSink& telemetry)
-    : transport_(transport), telemetry_(telemetry) {
-  if (transport_.world_size() != kWorldSize ||
-      (transport_.rank() != 0 && transport_.rank() != 1))
+PairReduce::PairReduce(DeviceCollective& collective, OtelStageSink& telemetry,
+                       std::uint32_t timeout_ms)
+    : collective_(collective), telemetry_(telemetry), timeout_ms_(timeout_ms) {
+  if (collective_.world_size() != kWorldSize ||
+      (collective_.rank() != 0 && collective_.rank() != 1))
     contract_fail("topology must be exactly ranks 0 and 1");
-  if (::sysconf(_SC_PAGESIZE) != static_cast<long>(kPageBytes))
-    contract_fail("host page size must be 65536 bytes");
-
-  int device = -1;
-  cudaDeviceProp properties{};
-  cuda_check(cudaGetDevice(&device), "get device");
-  cuda_check(cudaGetDeviceProperties(&properties, device), "get device properties");
-  if (properties.major != 12 || properties.minor != 1)
-    contract_fail("device must be GB10 sm_121");
-
-  cuda_check(cudaHostAlloc(&allocation_, allocation_bytes(),
-                           cudaHostAllocMapped),
-             "allocate anonymous pinned region");
-  const auto base = reinterpret_cast<std::uintptr_t>(allocation_);
-  const auto aligned = aligned_region_address(base);
-  region_ = reinterpret_cast<void*>(aligned);
-  std::memset(region_, 0, region_bytes());
-  try {
-    void* device_allocation = nullptr;
-    cuda_check(cudaHostGetDevicePointer(&device_allocation, allocation_, 0),
-               "map pinned allocation");
-    device_region_ = static_cast<std::byte*>(device_allocation) + (aligned - base);
-    region_handle_ = transport_.register_region(region_, region_bytes());
-  } catch (...) {
-    cudaFreeHost(allocation_);
-    allocation_ = nullptr;
-    region_ = nullptr;
-    device_region_ = nullptr;
-    throw;
+  if (timeout_ms_ < 100 || timeout_ms_ > 120'000)
+    contract_fail("timeout must be within 100..120000 milliseconds");
+  cudaError_t status = cudaMalloc(&reduced_,
+                                  static_cast<std::size_t>(kMaxRows) * kHidden *
+                                      sizeof(*reduced_));
+  if (status != cudaSuccess)
+    throw PairReduceCudaError("qwen38 PairReduce CUDA allocate scratch: " +
+                              std::string(cudaGetErrorString(status)));
+  status = cudaEventCreateWithFlags(&completion_, cudaEventDisableTiming);
+  if (status != cudaSuccess) {
+    cudaFree(reduced_);
+    reduced_ = nullptr;
+    throw PairReduceCudaError("qwen38 PairReduce CUDA create completion: " +
+                              std::string(cudaGetErrorString(status)));
   }
 }
 
 PairReduce::~PairReduce() {
-  if (allocation_ != nullptr) {
-    transport_.unregister_region(region_handle_);
-    cudaFreeHost(allocation_);
-  }
+  // A terminal collective fault can leave graph work owning both resources.
+  // Process replacement is the recovery contract, so destruction must not
+  // block while the detached communicator abort releases that work.
+  if (phase_ == Phase::kFaulted) return;
+  if (completion_) cudaEventDestroy(completion_);
+  if (reduced_) cudaFree(reduced_);
 }
 
-void PairReduce::reduce(const __nv_bfloat16* input, float* output, int m,
-                        std::string_view trace_id, std::string_view request_id,
-                        cudaStream_t stream) {
+void PairReduce::enqueue(const __nv_bfloat16* input, float* output, int m,
+                         std::string_view trace_id,
+                         std::string_view request_id, cudaStream_t stream) {
   const auto start = Clock::now();
-  Outcome outcome = Outcome::kOk;
-  std::size_t payload_bytes = 0;
-  auto emit = [&]() noexcept {
-    const std::uint64_t duration = elapsed_ns(start);
-    telemetry_.emit_span_and_log({"rocket.qwen38.pair_reduce", trace_id, request_id,
-                                  transport_.rank(), metric_m_bucket(m), kDtype, outcome, duration,
-                                  payload_bytes});
-    telemetry_.record_duration(
-        {transport_.rank(), metric_m_bucket(m), kDtype, outcome, duration});
-  };
-
+  if (phase_ != Phase::kReady) contract_fail("faulted instance cannot enqueue");
+  if (!input || !output || !stream)
+    contract_fail("device buffers and stream are required");
+  if (!allowed_m(m))
+    contract_fail("M must be a sequences*(K+1) verifier row bucket");
+  const std::size_t elements = static_cast<std::size_t>(m) * kHidden;
   try {
-    if (input == nullptr || output == nullptr) contract_fail("input and output are required");
-    if (!allowed_m(m)) contract_fail("M must be one of 1,2,4,8,16");
-    const std::size_t elements = static_cast<std::size_t>(m) * kHidden;
-    payload_bytes = elements * sizeof(__nv_bfloat16);
-    if (sizeof(WireHeader) + payload_bytes > slot_bytes())
-      contract_fail("message exceeds its two-page slot");
-
-    const std::uint64_t sequence = transport_.next_sequence();
-    if (sequence == 0 || sequence <= last_sequence_)
-      contract_fail("transport sequence is not strictly monotonic");
-    last_sequence_ = sequence;
-
-    auto* local = static_cast<std::byte*>(region_);
-    const WireHeader header{kMagic, sequence, kSchema,
-                            static_cast<std::uint32_t>(transport_.rank()),
-                            static_cast<std::uint32_t>(kWorldSize),
-                            static_cast<std::uint32_t>(kPageBytes),
-                            static_cast<std::uint32_t>(kHidden),
-                            static_cast<std::uint32_t>(m), kBf16,
-                            static_cast<std::uint32_t>(payload_bytes), {0, 0}};
-    std::memcpy(local, &header, sizeof(header));
-    cuda_check(cudaMemcpyAsync(local + sizeof(WireHeader), input, payload_bytes,
-                               cudaMemcpyDeviceToHost, stream),
-               "stage local BF16 partial");
-    cuda_check(cudaStreamSynchronize(stream), "publish local BF16 partial");
-
-    const std::size_t wire_bytes = sizeof(WireHeader) + payload_bytes;
-    transport_.post_unsignaled_write(region_handle_, 0, peer_offset(), wire_bytes);
-    transport_.signal_sequence(sequence);
-    transport_.wait_peer(sequence);
-    transport_.flush_signaled();
-
-    const auto* peer_header = reinterpret_cast<const WireHeader*>(local + peer_offset());
-    validate_header(*peer_header, 1 - transport_.rank(), m, payload_bytes, sequence);
-
-    const auto* mapped = static_cast<const std::byte*>(device_region_);
-    const auto* local_values = reinterpret_cast<const __nv_bfloat16*>(
-        mapped + sizeof(WireHeader));
-    const auto* peer_values = reinterpret_cast<const __nv_bfloat16*>(
-        mapped + peer_offset() + sizeof(WireHeader));
-    const __nv_bfloat16* rank0 = transport_.rank() == 0 ? local_values : peer_values;
-    const __nv_bfloat16* rank1 = transport_.rank() == 0 ? peer_values : local_values;
-    accumulate_rank_order<<<static_cast<unsigned>((elements + 255) / 256), 256, 0, stream>>>(
-        rank0, rank1, output, elements);
-    cuda_check(cudaGetLastError(), "launch deterministic accumulation");
-    cuda_check(cudaStreamSynchronize(stream), "complete deterministic accumulation");
-    transport_.acknowledge_consumed(sequence);
-    transport_.wait_peer_consumed(sequence);
-    transport_.flush_signaled();
-  } catch (const PairReduceContractError&) {
-    outcome = Outcome::kContractError;
-    emit();
-    throw;
+    collective_.enqueue_sum(input, reduced_, elements, stream);
+    bf16_to_fp32<<<static_cast<unsigned>((elements + 255) / 256), 256, 0,
+                   stream>>>(reduced_, output, elements);
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess)
+      throw PairReduceCudaError("qwen38 PairReduce CUDA launch conversion: " +
+                                std::string(cudaGetErrorString(status)));
+    ++enqueued_;
   } catch (const PairReduceCudaError&) {
-    outcome = Outcome::kCudaError;
-    emit();
+    fault(Outcome::kCudaError, m, trace_id, request_id, elapsed_ns(start));
     throw;
-  } catch (const std::exception& error) {
-    outcome = Outcome::kTransportError;
-    emit();
-    throw PairReduceTransportError(std::string("qwen38 PairReduce transport: ") + error.what());
   } catch (...) {
-    outcome = Outcome::kTransportError;
-    emit();
-    throw PairReduceTransportError("qwen38 PairReduce transport: unknown failure");
+    fault(Outcome::kTransportError, m, trace_id, request_id,
+          elapsed_ns(start));
+    throw;
   }
-  emit();
+  const auto duration = elapsed_ns(start);
+  const auto bytes = static_cast<std::uint64_t>(elements * sizeof(*input));
+  telemetry_.emit_span_and_log({"rocket.qwen38.pair_reduce.enqueue", trace_id,
+                                request_id, rank(), m, kDtype, Outcome::kOk,
+                                duration, bytes});
+  telemetry_.record_duration({rank(), m, kDtype, Outcome::kOk, duration});
+}
+
+void PairReduce::complete(cudaStream_t stream, std::uint32_t reduction_count,
+                          std::string_view trace_id,
+                          std::string_view request_id) {
+  const auto start = Clock::now();
+  if (phase_ != Phase::kReady) contract_fail("faulted instance cannot complete");
+  if (!stream) contract_fail("completion stream is required");
+  if (reduction_count == 0 || reduction_count > 96)
+    contract_fail("completion count must be within 1..96");
+  cudaError_t status = cudaEventRecord(completion_, stream);
+  if (status != cudaSuccess) {
+    fault(Outcome::kCudaError, 0, trace_id, request_id, elapsed_ns(start));
+    throw PairReduceCudaError("qwen38 PairReduce CUDA record completion: " +
+                              std::string(cudaGetErrorString(status)));
+  }
+  for (;;) {
+    status = cudaEventQuery(completion_);
+    if (status == cudaSuccess) break;
+    if (status != cudaErrorNotReady) {
+      fault(Outcome::kCudaError, 0, trace_id, request_id, elapsed_ns(start));
+      throw PairReduceCudaError("qwen38 PairReduce CUDA query completion: " +
+                                std::string(cudaGetErrorString(status)));
+    }
+    if (!collective_.healthy()) {
+      fault(Outcome::kTransportError, 0, trace_id, request_id,
+            elapsed_ns(start));
+      throw PairReduceTransportError("qwen38 PairReduce collective fault");
+    }
+    if (elapsed_ns(start) > static_cast<std::uint64_t>(timeout_ms_) * 1'000'000) {
+      const auto duration = elapsed_ns(start);
+      fault(Outcome::kTransportError, 0, trace_id, request_id, duration);
+      throw PairReduceTransportError(
+          "qwen38 PairReduce completion timed out after " +
+          std::to_string(duration) + " ns");
+    }
+    std::this_thread::yield();
+  }
+  const auto duration = elapsed_ns(start);
+  telemetry_.emit_span_and_log({"rocket.qwen38.pair_reduce.complete", trace_id,
+                                request_id, rank(), 0, kDtype, Outcome::kOk,
+                                duration, reduction_count});
+  telemetry_.record_duration({rank(), 0, kDtype, Outcome::kOk, duration});
+}
+
+void PairReduce::fault(Outcome outcome, int m, std::string_view trace_id,
+                       std::string_view request_id,
+                       std::uint64_t duration_ns) {
+  phase_ = Phase::kFaulted;
+  collective_.abort();
+  telemetry_.emit_span_and_log({"rocket.qwen38.pair_reduce.fault", trace_id,
+                                request_id, rank(), allowed_m(m) ? m : 0,
+                                kDtype, outcome, duration_ns, enqueued_});
+  telemetry_.record_duration(
+      {rank(), allowed_m(m) ? m : 0, kDtype, outcome, duration_ns});
 }
 
 }  // namespace rocket::qwen38::pair_reduce

@@ -58,7 +58,8 @@ void Tp2DecodeExecution::begin_step(std::uint64_t device_generation, int m,
     if (device_generation == 0 ||
         device_generation != last_completed_generation_ + 1)
       contract_fail("device generation must increase by one");
-    if (!pair_reduce::allowed_m(m)) contract_fail("M must be one of 1,2,4,8,16");
+    if (!pair_reduce::allowed_m(m))
+      contract_fail("M must be a sequences*(K+1) verifier row bucket");
   } catch (const DecodeExecutionContractError&) {
     emit("rocket.qwen38.decode.tp2.lifecycle",
          pair_reduce::Outcome::kContractError, m, trace_id, request_id,
@@ -89,6 +90,9 @@ void Tp2DecodeExecution::reduce_at(
       contract_fail("reduction point is out of layer-major order");
     if (local_partial == nullptr || reduced_hidden == nullptr)
       contract_fail("borrowed input and output device buffers are required");
+    if (stream == nullptr) contract_fail("one non-default transaction stream is required");
+    if (active_stream_ != nullptr && active_stream_ != stream)
+      contract_fail("all reductions must use the transaction stream");
   } catch (const DecodeExecutionContractError&) {
     emit(stage, pair_reduce::Outcome::kContractError, m_, trace_id, request_id,
          elapsed_ns(start));
@@ -96,6 +100,7 @@ void Tp2DecodeExecution::reduce_at(
   }
 
   try {
+    active_stream_ = stream;
     reducer_.reduce(local_partial, reduced_hidden, m_, trace_id, request_id, stream);
   } catch (const pair_reduce::PairReduceContractError& error) {
     phase_ = StepPhase::kFaulted;
@@ -142,11 +147,29 @@ void Tp2DecodeExecution::finish_step(std::uint64_t device_generation,
          elapsed_ns(start));
     throw;
   }
+  try {
+    reducer_.complete(active_stream_, kReductionPoints, trace_id, request_id);
+  } catch (const pair_reduce::PairReduceCudaError& error) {
+    phase_ = StepPhase::kFaulted;
+    emit("rocket.qwen38.decode.tp2.lifecycle",
+         pair_reduce::Outcome::kCudaError, m_, trace_id, request_id,
+         elapsed_ns(start));
+    throw DecodeExecutionCudaError(
+        std::string("qwen38 decode TP2 completion failed: ") + error.what());
+  } catch (const std::exception& error) {
+    phase_ = StepPhase::kFaulted;
+    emit("rocket.qwen38.decode.tp2.lifecycle",
+         pair_reduce::Outcome::kTransportError, m_, trace_id, request_id,
+         elapsed_ns(start));
+    throw DecodeExecutionTransportError(
+        std::string("qwen38 decode TP2 completion failed: ") + error.what());
+  }
   const int completed_m = m_;
   last_completed_generation_ = active_generation_;
   active_generation_ = 0;
   m_ = 0;
   next_ordinal_ = 0;
+  active_stream_ = nullptr;
   phase_ = StepPhase::kIdle;
   emit("rocket.qwen38.decode.tp2.lifecycle", pair_reduce::Outcome::kOk, completed_m,
        trace_id, request_id, elapsed_ns(start));

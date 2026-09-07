@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pair_reduce/pair_reduce.h"
-#include "pair_reduce/rdma.h"
+#include "pair_reduce/nccl_collective.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
@@ -32,7 +32,7 @@ class BoundedSink final : public pr::OtelStageSink {
 
 struct Plan {
   BoundedSink sink;
-  std::unique_ptr<pr::RdmaTransport> transport;
+  std::unique_ptr<pr::NcclCollective> transport;
   std::unique_ptr<pr::PairReduce> reduction;
 };
 
@@ -57,15 +57,15 @@ extern "C" int qwen38_layer_pair_reduce_create(
   if (!result || !bootstrap_host) return 1;
   *result = nullptr;
   return invoke([&] {
-    pr::RdmaConfig config;
+    pr::NcclConfig config;
     config.rank = rank;
     config.bootstrap_host = bootstrap_host;
     config.bootstrap_port = bootstrap_port;
     config.operation_timeout_ms = timeout_ms;
     auto plan = std::make_unique<Plan>();
-    plan->transport = std::make_unique<pr::RdmaTransport>(config);
+    plan->transport = std::make_unique<pr::NcclCollective>(config);
     plan->reduction = std::make_unique<pr::PairReduce>(*plan->transport,
-                                                       plan->sink);
+                                                       plan->sink, timeout_ms);
     *result = plan.release();
   });
 }
@@ -75,9 +75,11 @@ extern "C" int qwen38_layer_pair_reduce_launch(
     cudaStream_t stream) {
   if (!opaque) return 1;
   return invoke([&] {
-    static_cast<Plan*>(opaque)->reduction->reduce(
+    static_cast<Plan*>(opaque)->reduction->enqueue(
         input, output, m, "qwen38-layer3-full-attention", "fixed-bucket",
         stream);
+    static_cast<Plan*>(opaque)->reduction->complete(
+        stream, 1, "qwen38-layer3-full-attention", "fixed-bucket");
   });
 }
 

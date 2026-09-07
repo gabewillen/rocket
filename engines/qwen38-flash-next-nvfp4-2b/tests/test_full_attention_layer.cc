@@ -59,6 +59,8 @@ class Reducer final : public decode::HiddenPartialReducer {
           "reducer contract drift");
     calls.push_back("reduce");
   }
+  void complete(cudaStream_t, std::uint32_t, std::string_view,
+                std::string_view) override {}
   std::vector<std::string_view> calls;
 };
 

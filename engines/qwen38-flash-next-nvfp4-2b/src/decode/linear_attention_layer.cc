@@ -92,6 +92,7 @@ LinearAttentionResult LinearAttentionLayer::execute(
     start = Clock::now();
     reducer_.reduce(partial, reduced_attention, m, trace_id, request_id,
                     stream);
+    reducer_.complete(stream, 1, trace_id, request_id);
     emit("rocket.qwen38.layer0.linear.pair_reduce",
          pair_reduce::Outcome::kOk, m, trace_id, request_id,
          elapsed_ns(start), kHiddenBytesPerRow * m);

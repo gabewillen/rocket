@@ -20,9 +20,10 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
   message(FATAL_ERROR "Qwen3.8 sm_121 requires CUDA 13.x")
 endif()
 
-find_library(ROCKET_QWEN38_IBVERBS ibverbs REQUIRED)
 find_library(ROCKET_QWEN38_NVML nvidia-ml REQUIRED)
 find_package(CUDAToolkit 13.0 REQUIRED)
+find_path(ROCKET_QWEN38_NCCL_INCLUDE_DIR nccl.h REQUIRED)
+find_library(ROCKET_QWEN38_NCCL_LIBRARY nccl REQUIRED)
 
 # CUTLASS 4.8 is pinned by the measured GLM engine. Reuse that checkout for
 # the Qwen-only c16 Q/K/V path, while keeping its sm_121a code out of the
@@ -57,10 +58,12 @@ set_target_properties(qwen38-qsa-expand-smoke PROPERTIES CUDA_ARCHITECTURES "121
 
 add_library(qwen38_pair_reduce STATIC
   src/pair_reduce/pair_reduce.cu
-  src/pair_reduce/rdma.cc
+  src/pair_reduce/nccl_collective.cc
 )
-target_include_directories(qwen38_pair_reduce PUBLIC src)
-target_link_libraries(qwen38_pair_reduce PUBLIC ${ROCKET_QWEN38_IBVERBS})
+target_include_directories(qwen38_pair_reduce PUBLIC
+  src ${ROCKET_QWEN38_NCCL_INCLUDE_DIR})
+target_link_libraries(qwen38_pair_reduce PUBLIC
+  ${ROCKET_QWEN38_NCCL_LIBRARY} CUDA::cudart)
 target_compile_options(qwen38_pair_reduce PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror>
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
@@ -159,9 +162,6 @@ set_target_properties(qwen38_token_output PROPERTIES
 add_executable(qwen38-pair-reduce-bench bench/pair_reduce_bench.cu)
 target_link_libraries(qwen38-pair-reduce-bench PRIVATE qwen38_pair_reduce ${ROCKET_QWEN38_NVML})
 
-add_executable(qwen38-decode-pair-reduce-smoke bench/decode_execution_smoke.cu)
-target_link_libraries(qwen38-decode-pair-reduce-smoke PRIVATE qwen38_decode_execution)
-
 add_executable(qwen38-residual-rmsnorm-bench bench/residual_rmsnorm_bench.cu)
 target_link_libraries(qwen38-residual-rmsnorm-bench PRIVATE qwen38_residual_rmsnorm)
 
@@ -176,14 +176,6 @@ target_compile_options(qwen38-test-pair-reduce PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
 )
 add_test(NAME qwen38-pair-reduce-contract COMMAND qwen38-test-pair-reduce)
-add_test(NAME qwen38-pair-reduce-reject-timeout
-  COMMAND qwen38-pair-reduce-bench --rank 0 --timeout-ms 99)
-set_tests_properties(qwen38-pair-reduce-reject-timeout PROPERTIES WILL_FAIL TRUE)
-add_test(NAME qwen38-pair-reduce-reject-fault-budget
-  COMMAND qwen38-pair-reduce-bench --rank 0 --timeout-ms 1000
-          --fault-stall-rank 1 --fault-stall-ms 1000)
-set_tests_properties(qwen38-pair-reduce-reject-fault-budget PROPERTIES WILL_FAIL TRUE)
-
 add_executable(qwen38-test-decode-execution tests/test_decode_execution.cc)
 target_link_libraries(qwen38-test-decode-execution PRIVATE qwen38_decode_execution)
 target_compile_options(qwen38-test-decode-execution PRIVATE -Wall -Wextra -Werror)

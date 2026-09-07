@@ -57,12 +57,21 @@ class SyntheticReducer final : public decode::HiddenPartialReducer {
     if (calls == fail_at_) throw std::runtime_error("injected transport failure");
     ++calls;
   }
+  void complete(cudaStream_t stream, std::uint32_t reduction_count,
+                std::string_view trace_id,
+                std::string_view request_id) override {
+    check(stream == expected_stream_ && reduction_count == 96 &&
+              trace_id == "trace-1" && request_id == "request-1",
+          "completion fence contract drift");
+    ++completions;
+  }
 
   int rank_ = 0;
   int world_size_ = 2;
   int expected_m_ = 4;
   cudaStream_t expected_stream_ = reinterpret_cast<cudaStream_t>(0x3000);
   int calls = 0;
+  int completions = 0;
   int fail_at_ = -1;
 };
 
@@ -79,7 +88,8 @@ void test_complete_step_invokes_all_exact_points() {
   }
   execution.finish_step(1, "trace-1", "request-1");
 
-  check(reducer.calls == 96, "complete step did not invoke exactly 96 reductions");
+  check(reducer.calls == 96 && reducer.completions == 1,
+        "complete step did not invoke 96 reductions and one fence");
   check(execution.phase() == decode::StepPhase::kIdle &&
             execution.last_completed_generation() == 1 &&
             execution.next_ordinal() == 0,
@@ -185,7 +195,7 @@ void test_topology_and_shape_fail_closed() {
   reducer.world_size_ = 2;
   decode::Tp2DecodeExecution execution(reducer, telemetry);
   bool shape_threw = false;
-  try { execution.begin_step(1, 3, "trace-1", "request-1"); }
+  try { execution.begin_step(1, 9, "trace-1", "request-1"); }
   catch (const decode::DecodeExecutionContractError&) { shape_threw = true; }
   check(shape_threw && execution.phase() == decode::StepPhase::kIdle,
         "invalid M mutated execution state");

@@ -49,7 +49,8 @@ FullAttentionResult FullAttentionLayer::execute(
     require(!faulted_, "faulted transition cannot be retried");
     require(generation != 0 && generation == last_generation_ + 1,
             "generation must increase by one");
-    require(pair_reduce::allowed_m(m), "M must be one of 1,2,4,8,16");
+    require(pair_reduce::allowed_m(m),
+            "M must be a sequences*(K+1) verifier row bucket");
     require(hidden && block_input && injection && reduced_attention &&
                 updated_hidden && next_block_input && next_injection && stream,
             "all borrowed buffers and stream are required");
@@ -70,6 +71,7 @@ FullAttentionResult FullAttentionLayer::execute(
 
     start = Clock::now();
     reducer_.reduce(partial, reduced_attention, m, trace_id, request_id, stream);
+    reducer_.complete(stream, 1, trace_id, request_id);
     emit("rocket.qwen38.layer3.pair_reduce", pair_reduce::Outcome::kOk, m,
          trace_id, request_id, elapsed_ns(start), kHiddenBytesPerRow * m);
 
