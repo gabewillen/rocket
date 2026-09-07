@@ -1,0 +1,91 @@
+---
+title: "Register-resident verification cuts Qwen GDN K4 state traffic 83%"
+description: "The c16 K4 GDN stage falls from 252.56 MB and 1.46 ms to 43.37 MB and 0.74 ms while accepted-prefix replay preserves every FP32 state byte."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, attention, kernels, memory, numerics]
+verdict: accepted
+rocket: "#kernels"
+supersedes: posts/attention/2026-09-08-qwen38-gdn-verifier-batches-128-rows/
+---
+
+**Question.** Can GDN verification stop writing one full FP32 recurrent-state
+snapshot per draft position while preserving exact accepted-prefix publication?
+
+| setup | |
+| --- | --- |
+| node | gx10-5e36, GB10, sm_121, 6.17.13-rocket64k |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| slab | rank 0 target, `a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4` |
+| implementation | `b531460fbe2ad4ca99c9dcc6e2376c0ea4c2d292` |
+| samples | 100 CUDA-event measurements per stage and accepted width |
+| reference | FlashInfer `gdn_decode_mtp.py`, register-resident T loop and ILP4, Apache-2.0 |
+
+```bash
+cmake --build engines/qwen38-flash-next-nvfp4-2b/build -j 8
+ctest --test-dir engines/qwen38-flash-next-nvfp4-2b/build --output-on-failure
+engines/qwen38-flash-next-nvfp4-2b/build/qwen38-gdn-graph-smoke \
+  /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank0-target.slab 0
+```
+
+| stage shape | rows | verify bytes | median | p95 | prior mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| c1 K7 | 8 | 18,115,936 B | 0.299 ms | 0.343 ms | 0.330 ms |
+| c2 K7 | 16 | 19,832,160 B | 0.334 ms | 0.338 ms | 0.461 ms |
+| c4 K7 | 32 | 23,264,608 B | 0.444 ms | 0.501 ms | 0.662 ms |
+| c8 K7 | 64 | 30,129,504 B | 0.654 ms | 0.662 ms | 1.116 ms |
+| c16 K1 | 32 | 42,876,256 B | 0.440 ms | 0.467 ms | 0.929 ms |
+| c16 K4 | 80 | 43,367,776 B | 0.744 ms | 0.807 ms | 1.461 ms |
+| c16 K7 | 128 | 43,859,296 B | 1.052 ms | 1.108 ms | 2.018 ms |
+
+Stage reads each authenticated FP32 state tile once and keeps four V rows in
+registers across all draft positions. It retains compact Q/K/V, beta, and decay
+inputs for publication. It writes no recurrent snapshots and does not mutate
+accepted state.
+
+| accept shape | accepted width | replay bytes | median | p95 |
+| --- | ---: | ---: | ---: | ---: |
+| c1 K7 | 0 | 0 B | 0.008 ms | 0.008 ms |
+| c1 K7 | 1 | 3,285,088 B | 0.016 ms | 0.019 ms |
+| c1 K7 | 8 | 3,400,448 B | 0.049 ms | 0.049 ms |
+| c8 K7 | 1 | 26,280,704 B | 0.069 ms | 0.071 ms |
+| c8 K7 | 8 | 27,203,584 B | 0.246 ms | 0.246 ms |
+| c16 K1 | 1 | 52,561,408 B | 0.199 ms | 0.203 ms |
+| c16 K4 | 1 | 52,561,408 B | 0.208 ms | 0.211 ms |
+| c16 K4 | 5 | 53,616,128 B | 0.299 ms | 0.301 ms |
+| c16 K7 | 1 | 52,561,408 B | 0.214 ms | 0.218 ms |
+| c16 K7 | 8 | 54,407,168 B | 0.467 ms | 0.475 ms |
+
+The prior c16 K4 stage moved 252,558,688 B, including 16,399,712 B of weights.
+The new stage moves 43,367,776 B, an 82.8% total reduction and an 88.6%
+non-weight reduction. Across 36 GDN layers, stage non-weight traffic falls from
+8.50 GB to 0.97 GB per rank. Accepted replay is separate and scales with the
+published prefix.
+
+```text
+100% tests passed, 0 tests failed out of 10
+verifier_graph=captured replay=bit-exact accepted_state=unchanged
+verifier_k7_to_k0=exact inactive-output-zero
+verifier_reset=discarded replay=bit-exact
+slot0=null state=unchanged output=zero
+```
+
+The numeric oracle initializes nonzero BF16 convolution state and nonzero FP32
+recurrent state. Every staged output and mixed per-sequence accepted prefix is
+byte-identical to sequential K0 execution. The complete production stage
+boundary captures and replays twice with unchanged accepted pools.
+
+**Verdict.** Accepted for the GDN verifier primitive. Verification and accepted
+replay remain separate scheduler costs. This result does not claim whole-decoder
+throughput or quality acceptance.
+
+**Next.**
+
+- bind the compact verifier to the native 48-layer transaction on both ranks
+- profile the whole decoder across c1, c2, c4, c8, and c16 with measured acceptance
+- preserve the 17.863 s slab load-to-publish result as a cold-load regression gate
+
+**Reopen if.**
+
+- a CUDA, CUTLASS, FlashInfer, firmware, checkpoint, or GB10 revision changes
+  the FP32 recurrent arithmetic or captured-kernel behavior
