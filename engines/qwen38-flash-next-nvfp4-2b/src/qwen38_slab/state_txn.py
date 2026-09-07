@@ -4,8 +4,8 @@ This module owns a synchronous, externally serialized host protocol.  Callers
 must quiesce generation at an accepted token boundary before ``commit`` and
 must keep both rank stores on independent failure domains.  Payload inputs are
 borrowed for the call and copied to anonymous aligned staging buffers.  Restore
-returns owned byte snapshots to one publish callback only after both ranks have
-been authenticated in full.
+returns one opaque accepted boundary plus owned immutable family snapshots to a
+publish callback only after both ranks have been authenticated in full.
 
 Expected validation and I/O failures raise :class:`StateTransactionError`.
 Failed commits may leave PREPARED data, but such data is never restore-eligible.
@@ -27,6 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable, Iterator, Mapping, Protocol
 
 PAGE_BYTES = 65_536
@@ -86,6 +87,93 @@ class FamilyPayload:
     speculative_tail: bytes = b""
 
 
+_AUTHENTICATED_SEAL = object()
+
+
+class AuthenticatedState:
+    """Owned immutable state emitted only after complete restore authentication.
+
+    Construction is owned by :class:`StateTransactionStore`.  Consumers borrow
+    the read-only mappings and immutable family bytes.  The boundary and bytes
+    cannot be supplied independently to the runtime restore API.
+    """
+
+    __slots__ = ("_boundary", "_rank_payloads", "_seal")
+
+    def __init__(self) -> None:
+        raise TypeError("authenticated state is created only by StateTransactionStore")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise TypeError("authenticated state is immutable")
+
+    @classmethod
+    def _from_verified(
+        cls,
+        *,
+        token_count: int,
+        token_hash: str,
+        rank_payloads: Mapping[int, Mapping[str, FamilyPayload]],
+    ) -> "AuthenticatedState":
+        if (
+            isinstance(token_count, bool)
+            or not isinstance(token_count, int)
+            or token_count < 0
+            or not isinstance(token_hash, str)
+            or not _HEX_256.fullmatch(token_hash)
+            or tuple(rank_payloads) != (0, 1)
+        ):
+            raise StateTransactionError("verified state boundary or rank inventory is invalid")
+        frozen_ranks: dict[int, Mapping[str, FamilyPayload]] = {}
+        for rank in range(2):
+            payloads = rank_payloads[rank]
+            if tuple(payloads) != STATE_FAMILIES:
+                raise StateTransactionError("verified state family inventory is invalid")
+            copied: dict[str, FamilyPayload] = {}
+            for family in STATE_FAMILIES:
+                payload = payloads[family]
+                if (
+                    not isinstance(payload, FamilyPayload)
+                    or not isinstance(payload.accepted, bytes)
+                    or not payload.accepted
+                    or payload.speculative_tail != b""
+                ):
+                    raise StateTransactionError("verified family payload is invalid")
+                copied[family] = payload
+            frozen_ranks[rank] = MappingProxyType(copied)
+        instance = object.__new__(cls)
+        object.__setattr__(
+            instance,
+            "_boundary",
+            AcceptedBoundary(token_count, token_hash, quiesced=True),
+        )
+        object.__setattr__(instance, "_rank_payloads", MappingProxyType(frozen_ranks))
+        object.__setattr__(instance, "_seal", _AUTHENTICATED_SEAL)
+        return instance
+
+    @property
+    def boundary(self) -> AcceptedBoundary:
+        """Return the authenticated accepted-token boundary."""
+
+        return self._boundary
+
+    @property
+    def rank_payloads(self) -> Mapping[int, Mapping[str, FamilyPayload]]:
+        """Return the read-only two-rank payload snapshot."""
+
+        return self._rank_payloads
+
+    def rank_payload(self, rank: int) -> Mapping[str, FamilyPayload]:
+        """Return one borrowed canonical rank mapping, or fail validation."""
+
+        if isinstance(rank, bool) or rank not in (0, 1):
+            raise StateTransactionError("authenticated state rank must be 0 or 1")
+        return self._rank_payloads[rank]
+
+    def _is_store_authenticated(self) -> bool:
+        return getattr(self, "_seal", None) is _AUTHENTICATED_SEAL
+
+
 @dataclass(frozen=True)
 class StateIdentity:
     """Immutable restore identity for one Qwen revision and TP2 state layout."""
@@ -107,8 +195,7 @@ class OtelTracer(Protocol):
 
 
 FaultInjector = Callable[[Transition], None]
-RestoredState = dict[int, dict[str, bytes]]
-Publisher = Callable[[RestoredState], None]
+Publisher = Callable[[AuthenticatedState], None]
 
 
 class _AlignedBuffer:
@@ -222,11 +309,11 @@ class StateTransactionStore:
             self._fault(inject_fault, Transition(f"after_index_rank{rank}"))
         return commit_bytes
 
-    def restore(self, session_id: str, publish: Publisher) -> RestoredState:
+    def restore(self, session_id: str, publish: Publisher) -> AuthenticatedState:
         """Authenticate a complete transaction, then invoke one pointer swap.
 
-        The callback borrows the staged mapping for the duration of the call.
-        The returned mapping is the same owned immutable-byte snapshot.
+        The callback borrows the returned opaque authenticated snapshot.  Its
+        boundary and family bytes remain paired through one read-only object.
         """
         self._validate_ids(session_id, "validation-only")
         if not callable(publish):
@@ -253,7 +340,7 @@ class StateTransactionStore:
         commit = _decode_record(commit_bytes[0], "COMMITTED")
         self._validate_commit(commit, session_id, transaction_id)
 
-        staged: RestoredState = {}
+        staged: dict[int, dict[str, FamilyPayload]] = {}
         for rank in range(2):
             prepared_bytes = self._read_bounded(self._transaction_dir(rank, transaction_id) / "PREPARED.json")
             if hashlib.sha256(prepared_bytes).hexdigest() != commit["prepared_sha256"].get(str(rank)):
@@ -272,12 +359,17 @@ class StateTransactionStore:
                 if hashlib.sha256(payload).hexdigest() != extent.get("logical_sha256"):
                     raise StateTransactionError("family logical checksum mismatch")
                 rank_digest.update(expected_family.encode() + b"\0" + bytes.fromhex(padded_digest))
-                staged[rank][expected_family] = payload
+                staged[rank][expected_family] = FamilyPayload(payload)
             if rank_digest.hexdigest() != prepared.get("rank_sha256"):
                 raise StateTransactionError("whole-rank checksum mismatch")
+        authenticated = AuthenticatedState._from_verified(
+            token_count=commit["token_count"],
+            token_hash=commit["token_hash"],
+            rank_payloads=staged,
+        )
         with self._observed("publish", -1, "none"):
-            publish(staged)
-        return staged
+            publish(authenticated)
+        return authenticated
 
     def _prepare_rank(
         self,

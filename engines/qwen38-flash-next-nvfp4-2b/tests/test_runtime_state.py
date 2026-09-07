@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import hashlib
+import tempfile
 import unittest
+from pathlib import Path
 
 from qwen38_slab.runtime_state import (
     BindingPhase,
+    CudaQuiesceError,
     CudaStateBinding,
     DeviceState,
     QuiesceReceipt,
     RuntimeBoundary,
     RuntimeStateError,
 )
-from qwen38_slab.state_txn import AcceptedBoundary, FamilyPayload, STATE_FAMILIES
+from qwen38_slab.state_txn import (
+    AcceptedBoundary,
+    AuthenticatedState,
+    FamilyPayload,
+    STATE_FAMILIES,
+    StateIdentity,
+    StateTransactionStore,
+)
 
 
 class Span:
@@ -52,7 +62,9 @@ class SyntheticCudaRuntime:
             raise SyntheticCudaFailure(name)
 
     def quiesce(self, boundary):
-        self._event("quiesce", boundary.generation_epoch)
+        self.events.append(("quiesce", boundary.generation_epoch))
+        if self.fail_at == "quiesce":
+            raise CudaQuiesceError("synthetic safe quiesce failure", safe_to_retry=True)
         return QuiesceReceipt(boundary, compute_fenced=True, pending_launches=0)
 
     def copy_device_to_host(self, source, logical_bytes):
@@ -109,13 +121,15 @@ class RuntimeStateTests(unittest.TestCase):
             family: FamilyPayload(f"restored:{family}".encode())
             for family in STATE_FAMILIES
         }
+        self.authenticated = AuthenticatedState._from_verified(
+            token_count=37,
+            token_hash=self.boundary.token_hash,
+            rank_payloads={0: self.payloads, 1: self.payloads},
+        )
 
     def test_capture_fences_exact_nine_accepted_slices_then_resumes(self):
         accepted, payloads = self.binding.capture(self.boundary, self.sources)
-        self.assertEqual(
-            accepted,
-            AcceptedBoundary(37, self.boundary.token_hash, quiesced=True),
-        )
+        self.assertEqual(accepted, self.authenticated.boundary)
         self.assertEqual(tuple(payloads), STATE_FAMILIES)
         self.assertTrue(all(payloads[name].speculative_tail == b"" for name in STATE_FAMILIES))
         self.assertTrue(all(
@@ -131,8 +145,7 @@ class RuntimeStateTests(unittest.TestCase):
         self.assertEqual(self.binding.phase, BindingPhase.IDLE)
 
     def test_restore_stages_all_families_and_publishes_once_after_transfer_fence(self):
-        accepted = AcceptedBoundary(37, self.boundary.token_hash, quiesced=True)
-        self.binding.restore(accepted, generation_epoch=12, payloads=self.payloads)
+        self.binding.restore(self.authenticated, generation_epoch=12)
         names = [event[0] for event in self.runtime.events]
         self.assertEqual(names.count("publish"), 1)
         self.assertLess(names.index("finish_transfers"), names.index("publish"))
@@ -143,6 +156,30 @@ class RuntimeStateTests(unittest.TestCase):
         )
         self.assertNotIn("discard", names)
         self.assertEqual(self.binding.phase, BindingPhase.IDLE)
+
+    def test_authenticated_host_restore_flows_directly_into_rank_runtime(self):
+        payloads = {
+            rank: {
+                family: FamilyPayload(f"disk:{rank}:{family}".encode())
+                for family in STATE_FAMILIES
+            }
+            for rank in range(2)
+        }
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            store = StateTransactionStore(
+                (root / "rank0", root / "rank1"),
+                StateIdentity("fc694-integration", hashlib.sha256(b"map").hexdigest()),
+                Tracer(),
+            )
+            boundary = AcceptedBoundary(37, self.boundary.token_hash, quiesced=True)
+            store.commit("session", "transaction", boundary, payloads)
+            authenticated = store.restore("session", lambda _state: None)
+            self.binding.restore(authenticated, generation_epoch=12)
+        self.assertEqual(
+            self.runtime.published,
+            {family: payload.accepted for family, payload in payloads[0].items()},
+        )
 
     def test_validation_fails_before_quiesce_for_inventory_boundary_and_extent_drift(self):
         cases = []
@@ -161,11 +198,15 @@ class RuntimeStateTests(unittest.TestCase):
                     binding.capture(boundary, sources)
                 self.assertEqual(runtime.events, [])
 
+        forged = object.__new__(AuthenticatedState)
+        with self.assertRaisesRegex(RuntimeStateError, "host-authenticated"):
+            self.binding.restore(forged, generation_epoch=12)
+        self.assertEqual(self.runtime.events, [])
+
     def test_stage_failure_discards_private_allocations_never_publishes_and_resumes(self):
         self.runtime.fail_at = "copy_h2d"
-        accepted = AcceptedBoundary(37, self.boundary.token_hash, quiesced=True)
         with self.assertRaisesRegex(RuntimeStateError, "stage"):
-            self.binding.restore(accepted, generation_epoch=12, payloads=self.payloads)
+            self.binding.restore(self.authenticated, generation_epoch=12)
         names = [event[0] for event in self.runtime.events]
         self.assertNotIn("publish", names)
         self.assertIn("discard", names)
@@ -173,13 +214,12 @@ class RuntimeStateTests(unittest.TestCase):
         self.assertEqual(self.binding.phase, BindingPhase.IDLE)
 
     def test_each_prepublication_cuda_failure_discards_and_resumes(self):
-        accepted = AcceptedBoundary(37, self.boundary.token_hash, quiesced=True)
         for failure in ("allocate", "copy_h2d", "finish_transfers", "publish"):
             with self.subTest(failure=failure):
                 runtime = SyntheticCudaRuntime(); runtime.fail_at = failure
                 binding = CudaStateBinding(0, runtime, Tracer())
                 with self.assertRaises(RuntimeStateError):
-                    binding.restore(accepted, generation_epoch=12, payloads=self.payloads)
+                    binding.restore(self.authenticated, generation_epoch=12)
                 names = [event[0] for event in runtime.events]
                 self.assertIn("discard", names)
                 self.assertEqual(names[-1], "resume")
@@ -188,9 +228,8 @@ class RuntimeStateTests(unittest.TestCase):
 
     def test_resume_failure_after_publish_faults_without_discarding_owned_table(self):
         self.runtime.fail_at = "resume"
-        accepted = AcceptedBoundary(37, self.boundary.token_hash, quiesced=True)
         with self.assertRaisesRegex(RuntimeStateError, "resume"):
-            self.binding.restore(accepted, generation_epoch=12, payloads=self.payloads)
+            self.binding.restore(self.authenticated, generation_epoch=12)
         names = [event[0] for event in self.runtime.events]
         self.assertEqual(names.count("publish"), 1)
         self.assertNotIn("discard", names)
@@ -199,15 +238,14 @@ class RuntimeStateTests(unittest.TestCase):
 
     def test_discard_failure_still_attempts_resume_and_faults_binding(self):
         self.runtime.fail_at = {"copy_h2d", "discard"}
-        accepted = AcceptedBoundary(37, self.boundary.token_hash, quiesced=True)
         with self.assertRaisesRegex(RuntimeStateError, "discard"):
-            self.binding.restore(accepted, generation_epoch=12, payloads=self.payloads)
+            self.binding.restore(self.authenticated, generation_epoch=12)
         names = [event[0] for event in self.runtime.events]
         self.assertNotIn("publish", names)
         self.assertEqual(names[-2:], ["discard", "resume"])
         self.assertEqual(self.binding.phase, BindingPhase.FAULTED)
 
-    def test_quiesce_adapter_failure_before_receipt_leaves_binding_idle(self):
+    def test_typed_safe_quiesce_failure_before_receipt_leaves_binding_idle(self):
         self.runtime.fail_at = "quiesce"
         with self.assertRaisesRegex(RuntimeStateError, "before receipt"):
             self.binding.capture(self.boundary, self.sources)

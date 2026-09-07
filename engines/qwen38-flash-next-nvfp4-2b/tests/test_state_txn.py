@@ -12,6 +12,7 @@ from qwen38_slab.state_txn import (
     PAGE_BYTES,
     STATE_FAMILIES,
     AcceptedBoundary,
+    AuthenticatedState,
     FamilyPayload,
     StateIdentity,
     StateTransactionError,
@@ -85,11 +86,29 @@ class StateTransactionTests(unittest.TestCase):
         restored = self.store.restore("session-1", publications.append)
         self.assertEqual(len(publications), 1)
         self.assertIs(publications[0], restored)
+        self.assertEqual(restored.boundary, self.boundary)
         self.assertEqual(
-            restored,
-            {rank: {family: payload.accepted for family, payload in self.payloads[rank].items()}
-             for rank in range(2)},
+            {
+                rank: {
+                    family: payload.accepted
+                    for family, payload in restored.rank_payload(rank).items()
+                }
+                for rank in range(2)
+            },
+            {
+                rank: {
+                    family: payload.accepted
+                    for family, payload in self.payloads[rank].items()
+                }
+                for rank in range(2)
+            },
         )
+        with self.assertRaises(TypeError):
+            AuthenticatedState()
+        with self.assertRaises(TypeError):
+            restored._boundary = AcceptedBoundary(38, self.boundary.token_hash, True)
+        with self.assertRaises(TypeError):
+            restored.rank_payload(0)[STATE_FAMILIES[0]] = FamilyPayload(b"forged")
         allowed = {"phase", "rank", "family", "outcome"}
         self.assertTrue(self.tracer.spans)
         self.assertTrue(all(set(span.attributes) <= allowed for span in self.tracer.spans))
@@ -117,7 +136,7 @@ class StateTransactionTests(unittest.TestCase):
                 published = []
                 if transition is Transition.AFTER_INDEX_RANK1:
                     restored = store.restore("session", published.append)
-                    self.assertEqual(len(restored), 2)
+                    self.assertEqual(len(restored.rank_payloads), 2)
                     self.assertEqual(len(published), 1)
                 else:
                     with self.assertRaises(StateTransactionError):

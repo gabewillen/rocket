@@ -3,7 +3,8 @@
 The engine embedder owns one :class:`CudaStateBinding` per rank and serializes
 all calls.  The injected runtime adapter is the CUDA boundary: ``quiesce`` must
 stop new generation launches, fence every stream that can mutate state, and
-return a matching receipt.  A quiesce failure must leave launches enabled.  A
+return a matching receipt.  A quiesce failure faults the binding unless it is a
+typed :class:`CudaQuiesceError` proving that the launch gate reopened.  A
 successful receipt transfers responsibility for resuming generation to this
 binding.
 
@@ -34,6 +35,7 @@ from typing import Iterator, Protocol
 from .state_txn import (
     STATE_FAMILIES,
     AcceptedBoundary,
+    AuthenticatedState,
     FamilyPayload,
     OtelTracer,
 )
@@ -45,6 +47,23 @@ _HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
 
 class RuntimeStateError(RuntimeError):
     """Validation or CUDA-adapter failure at a stable runtime boundary."""
+
+
+class CudaQuiesceError(RuntimeError):
+    """Quiesce failure carrying launch-gate recovery evidence.
+
+    ``safe_to_retry`` may be true only when the adapter proved that its launch
+    gate reopened after the failed fence.  Untyped and unsafe failures
+    permanently fault the binding.
+    """
+
+    def __init__(self, message: str, *, safe_to_retry: bool):
+        super().__init__(message)
+        self.safe_to_retry = safe_to_retry
+
+
+class CudaRuntimeFatalError(RuntimeStateError):
+    """CUDA failure after which runtime ownership cannot be proven safe."""
 
 
 class BindingPhase(str, Enum):
@@ -188,6 +207,8 @@ class CudaStateBinding:
                         payload = self._runtime.copy_device_to_host(
                             source, source.accepted_bytes
                         )
+                    except CudaRuntimeFatalError:
+                        raise
                     except Exception as exc:
                         raise RuntimeStateError(
                             f"CUDA capture failed for family {family}"
@@ -203,6 +224,8 @@ class CudaStateBinding:
         if resume_error is not None:
             raise resume_error
         if operation_error is not None:
+            if isinstance(operation_error, CudaRuntimeFatalError):
+                self._phase = BindingPhase.FAULTED
             raise operation_error
         return (
             AcceptedBoundary(boundary.token_count, boundary.token_hash, quiesced=True),
@@ -211,23 +234,29 @@ class CudaStateBinding:
 
     def restore(
         self,
-        boundary: AcceptedBoundary,
+        authenticated: AuthenticatedState,
         generation_epoch: int,
-        payloads: Mapping[str, FamilyPayload],
     ) -> None:
         """Stage and atomically publish one authenticated nine-family snapshot.
 
-        The caller must pass the ``AcceptedBoundary`` authenticated alongside
-        these payloads by the host transaction layer.  Payloads are borrowed
+        ``authenticated`` is the opaque object returned by the host transaction
+        layer after both ranks pass authentication.  Its payloads are borrowed
         until return.  Validation fails before CUDA quiesce.  Before a
         successful publish, failures discard all allocated staging and resume.
-        A resume failure after publish raises and permanently faults the binding
-        while leaving the newly published table runtime-owned.
+        A resume failure after publish raises and permanently faults the
+        binding while leaving the newly published table runtime-owned.
         """
 
         with self._observed("validate", "none"):
             self._require_idle()
+            if (
+                not isinstance(authenticated, AuthenticatedState)
+                or not authenticated._is_store_authenticated()
+            ):
+                raise RuntimeStateError("restore requires host-authenticated state")
+            boundary = authenticated.boundary
             runtime_boundary = self._restore_boundary(boundary, generation_epoch)
+            payloads = authenticated.rank_payload(self._rank)
             self._validate_payloads(payloads)
         self._quiesce(runtime_boundary)
         staged: dict[str, object] = {}
@@ -256,6 +285,8 @@ class CudaStateBinding:
             with self._observed("sync", "none"):
                 try:
                     self._runtime.finish_transfers()
+                except CudaRuntimeFatalError:
+                    raise
                 except Exception as exc:
                     raise RuntimeStateError("CUDA staging fence failed") from exc
             self._transition(BindingPhase.SYNCHRONIZING, BindingPhase.PUBLISHING)
@@ -284,6 +315,8 @@ class CudaStateBinding:
                 resume_error or cleanup_error or operation_error
             )
         if operation_error is not None:
+            if isinstance(operation_error, CudaRuntimeFatalError):
+                self._phase = BindingPhase.FAULTED
             raise operation_error
 
     def _quiesce(self, boundary: RuntimeBoundary) -> None:
@@ -292,7 +325,13 @@ class CudaStateBinding:
             try:
                 receipt = self._runtime.quiesce(boundary)
             except BaseException as exc:
-                self._transition(BindingPhase.QUIESCING, BindingPhase.IDLE)
+                safe_to_retry = (
+                    isinstance(exc, CudaQuiesceError) and exc.safe_to_retry is True
+                )
+                self._transition(
+                    BindingPhase.QUIESCING,
+                    BindingPhase.IDLE if safe_to_retry else BindingPhase.FAULTED,
+                )
                 if not isinstance(exc, Exception):
                     raise
                 raise RuntimeStateError("CUDA quiesce failed before receipt") from exc
@@ -441,6 +480,8 @@ class CudaStateBinding:
 
 __all__ = [
     "BindingPhase",
+    "CudaQuiesceError",
+    "CudaRuntimeFatalError",
     "CudaRuntime",
     "CudaStateBinding",
     "DeviceState",
