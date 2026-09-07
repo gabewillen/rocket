@@ -1,0 +1,190 @@
+---
+title: "Qwen3.8 base routers and PLE pass all 12 quality cases in NVFP4"
+description: "All 48 base routers and both layer-2 PLE projections pass the fixed quality gate in NVFP4, freezing the eligible 278-matrix map before production measurement."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, numerics, moe, attention, memory, telemetry, baseline]
+verdict: accepted
+rocket: "#fuel"
+---
+
+## Question
+
+Can the 48 base router matrices and layer-2 PLE key/value projections serve as
+NVFP4 on top of the accepted 228 attention matrices?
+
+| setup | value |
+| --- | --- |
+| nodes | head GB10 and worker GB10, 6.17.13-rocket64k, 64 KiB pages |
+| checkpoint | [nvidia/Qwen3.8-Flash-Next-NVFP4 at fc694b54fb0174e0913e6adf86691ef85a4ead47](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/tree/fc694b54fb0174e0913e6adf86691ef85a4ead47) |
+| family implementation commit | `894d849216f994fce58ab6b6e85da8615f28133c` |
+| two-node launcher commit | `6a75c4dca2f82ca4da519e881044e3d72cd93152` |
+| vLLM image | `vllm/vllm-openai:qwen38-flash-next` at `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| runtime source | [MiaAI-Lab Qwen3.8 dual-Spark at c2325b22602b51a5faf55fc2bebccc34f3f80b9f](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks/tree/c2325b22602b51a5faf55fc2bebccc34f3f80b9f) |
+| source weight dtype | BF16 for all 278 selected matrices |
+| serving weight dtype | ModelOpt W4A4 NVFP4 for all 278 selected matrices |
+| unchanged serving families | routed experts in NVFP4; MTP experts in 128x128 block FP8 |
+| artifact | `23d2c39e9c2cf36a832cb1750f6542fa46f11f1befe195d80c082051a5a772b4` |
+
+Prior absence was a difficulty objection. PLE propagates its quantization
+configuration, while upstream Qwen hardcodes each router with
+`quant_config=None` and requires fail-closed reconstruction.
+
+## Commands
+
+```bash
+scripts/numerics/qwen38-expanded-calibration.sh \
+  --output-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01 \
+  --mia-source /home/glwillen/Development/Qwen3.8-Flash-Next-Dual-DGX-Sparks \
+  --nvfp4-artifact-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-artifacts/23d2c39e9c2cf36a832cb1750f6542fa46f11f1befe195d80c082051a5a772b4 \
+  --gpu-memory-utilization 0.60 \
+  --startup-timeout-seconds 3600 \
+  --launch \
+  --keep-running
+
+python3 scripts/numerics/qwen38-compare-precision.py \
+  --baseline /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/combined-activation-summary.json \
+  --candidate /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/combined-activation-summary.json \
+  --baseline-quality /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/quality.json \
+  --candidate-quality /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/quality.json \
+  --out /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/precision-comparison-combined-nvfp4.json
+```
+
+```text
+channels\t494
+answer_tail_equal\t10/12
+regressions\tnone
+```
+
+## Quality and mechanisms
+
+```bash
+jq -c '{quality:{answer_tail_equal:.quality.answer_tail_equal,cases:.quality.cases,regressions:.quality.regressions},router_input:.groups.router_logits_input,router_output:.groups.router_logits_output,router_topk:.groups.router_topk_output,ple_embedding:.groups.ple_embedding_output,ple_output:.groups.ple_output}' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/precision-comparison-combined-nvfp4.json
+
+jq -c '.summary | {executable:(.completed+.failed+.configured_but_unverified),completed,failed,configured_but_unverified,platform_unavailable:.unavailable}' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/attention-calibration.json
+```
+
+```text
+{"quality":{"answer_tail_equal":10,"cases":12,"regressions":[]},"router_input":{"channels":48,"max_histogram_tv":0.037109375,"max_rms_ratio":1.0636205738924815,"min_rms_ratio":0.9282700157175161},"router_output":{"channels":48,"max_histogram_tv":0.01123046875,"max_rms_ratio":1.013977585745241,"min_rms_ratio":0.9415044534621692},"router_topk":{"channels":48,"max_histogram_tv":0.01123046875,"max_rms_ratio":1.013977585745241,"min_rms_ratio":0.9415044534621692},"ple_embedding":{"channels":1,"max_histogram_tv":0.013671875,"max_rms_ratio":1.027409454600759,"min_rms_ratio":1.027409454600759},"ple_output":{"channels":1,"max_histogram_tv":0.07666015625,"max_rms_ratio":0.6500903174478592,"min_rms_ratio":0.6500903174478592}}
+{"executable":14,"completed":14,"failed":0,"configured_but_unverified":0,"platform_unavailable":1}
+```
+
+| metric | result | unit |
+| --- | ---: | --- |
+| fixed quality gate | 12/12 | cases |
+| answer tails matching 228-matrix control | 10/12 | cases |
+| regressions vs 228-matrix control | 0 | cases |
+| executable mechanisms completed | 14/14 | cases |
+| executable mechanism failures | 0 | cases |
+| paired telemetry | 494 | channels |
+| run-to-run variance | not measured |  |
+
+| telemetry family | channels | RMS ratio vs 228 matrices | max histogram TV |
+| --- | ---: | ---: | ---: |
+| router input | 48 | 0.928270x to 1.063621x | 0.037109375 |
+| router output | 48 | 0.941504x to 1.013978x | 0.011230469 |
+| router top-k output | 48 | 0.941504x to 1.013978x | 0.011230469 |
+| PLE embedding | 1 | 1.027409x | 0.013671875 |
+| PLE output | 1 | 0.650090x | 0.076660156 |
+
+## Token divergence
+
+```bash
+python3 scripts/numerics/qwen38-logit-trace.py \
+  --baseline /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logit-trace.json \
+  --candidate /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logit-trace-repeat.json \
+  --out /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logit-repeatability.json
+
+for report in \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logit-matched-{a-a,a-b,b-a,b-b}.json
+do
+  jq -r 'input_filename + "\\t" + (.token_parity | tostring)' "$report"
+done
+```
+
+```text
+token_parity\t0.17068889863975428
+/home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logit-matched-a-a.json\t0.14014661492022423
+/home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logit-matched-a-b.json\t0.16073781291172595
+/home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logit-matched-b-a.json\t0.16844444444444445
+/home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logit-matched-b-b.json\t0.12243033348560987
+```
+
+| comparison | token-position parity | unit |
+| --- | ---: | --- |
+| all-eligible repeat | 0.170689 | fraction |
+| four 228-to-278-matrix pairings | 0.122430 to 0.168444 | fraction |
+| interpretation | cascade-sensitive autoregressive divergence | scope |
+| aggregate parity acceptance | excluded | scope |
+
+## Bytes, residency, and MTP
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v "$PWD:/work:ro" \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface:ro" \
+  -v /home/glwillen/calibration:/calibration:ro \
+  -w /work --entrypoint python3 vllm/vllm-openai:qwen38-flash-next \
+  scripts/numerics/qwen38-materialize-linear-nvfp4.py \
+  --checkpoint /root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47 \
+  --trace /calibration/qwen38-attention-nvfp4-live-20260907-01/combined-activation-summary.json \
+  --source-quant-config /root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47/hf_quant_config.json \
+  --family linear_attention --family full_attention \
+  --family base_routers --family base_ple --plan-only \
+  | jq '{source_tensors,source_bytes,encoded_payload_bytes:(.source_bytes-.bytes_removed_per_c16_step),estimated_overlay_bytes,bytes_removed_per_c16_step}'
+
+jq -c '{accepted:.totals.accepted_tokens,drafted:.totals.drafted_tokens,rate:.totals.acceptance_rate,mean:.mean_acceptance_length}' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/mtp-runtime-evidence.json
+
+rg -o 'Model loading took [0-9.]+ GiB memory' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logs/{head,worker}.log
+```
+
+```text
+{
+  "source_tensors": 278,
+  "source_bytes": 5556797440,
+  "encoded_payload_bytes": 1562851504,
+  "estimated_overlay_bytes": 1562999336,
+  "bytes_removed_per_c16_step": 3993945936
+}
+{"accepted":2384,"drafted":4476,"rate":0.5326184092940125,"mean":{"max":3.33,"mean":2.6526666666666667,"min":2.17}}
+/home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logs/head.log:Model loading took 62.34 GiB memory
+/home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logs/worker.log:Model loading took 62.34 GiB memory
+```
+
+| metric | value | unit |
+| --- | ---: | --- |
+| eligible serving map | 278 | matrices |
+| source tensor payload | 5,556,797,440 | bytes |
+| encoded tensor payload | 1,562,851,504 | bytes |
+| safetensors artifact file | 1,562,999,336 | bytes |
+| total traffic removed | 3,993,945,936 | bytes per c16 step |
+| incremental traffic removed vs 228 matrices | 137,543,280 | bytes per c16 step |
+| model memory per node | 62.34 | GiB |
+| node memory spread | 0.00 | GiB |
+| MTP accepted tokens | 2,384/4,476 | tokens |
+| MTP acceptance rate | 53.2618 | % |
+| MTP mean accepted length | 2.652667 | tokens |
+| MTP mean-length range over 15 records | 2.17 to 3.33 | tokens |
+
+## Verdict
+
+Accepted. All 48 base routers and both layer-2 PLE projections move from BF16
+to NVFP4, freezing the eligible 278-matrix serving map for the production
+ladder.
+
+Cascade-sensitive token divergence remains a recorded risk. Acceptance uses
+the fixed 12-case quality gate, mechanism coverage, and family telemetry.
+
+## Next
+
+- run the healthy-clock production concurrency ladder with the 278-matrix artifact
+- retain the 228-matrix artifact as the production throughput control
+
+## Reopen if
+
+- NVIDIA publishes a new checkpoint revision or ModelOpt NVFP4 serialization ABI
+- an upstream evaluation release adds a different router or PLE test set
