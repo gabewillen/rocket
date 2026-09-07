@@ -1,0 +1,77 @@
+---
+title: "Rank-local E256 MoE misses the Qwen K1 and K4 step budgets"
+description: "The specialized E256-per-rank FlashInfer path reaches 88.3% of one GB10's read roof, but its 48-layer contribution already exceeds the >451 token/s K1 and K4 budgets."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, moe, kernels, numerics, telemetry]
+verdict: rejected
+rocket: "#kernels"
+---
+
+**Question.** Can an owner-local E256 MoE path leave enough step time for more than 451 aggregate token/s at c16?
+
+| setup | |
+| --- | --- |
+| node | head (`gx10-5e36`), rank slabs measured sequentially |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| GPU / CUDA | NVIDIA GB10, `sm_121` / 13.0.88 |
+| Rocket base | `bf1aa08636890e8ce491eab4f5f1079d783f402d` plus this entry's commit |
+| FlashInfer | [`91bda04c66f7cb851e1ab3b78b9fecea644b9844`](https://github.com/flashinfer-ai/flashinfer/commit/91bda04c66f7cb851e1ab3b78b9fecea644b9844), Apache-2.0 |
+| TensorRT-LLM audit | `c426264bc4d01930fad01426b81800e96fe19c2b`, Apache-2.0, `moe_kernels.h` and `cuda_graph_grouped_gemm.cu` |
+| shape | H2560, N640, global E512, local E256, top-k 10, ModelOpt group-16 NVFP4 |
+| slab | `a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4`, layer 0 |
+
+```bash
+for rank in 0 1; do
+  docker run --rm --name "rocket-qwen38-moe-r${rank}" --entrypoint python3 \
+    --gpus all --ipc=host -v "$PWD:/rocket:ro" \
+    -v /home/glwillen/calibration/qwen38-rank-slabs-fc694:/slabs:ro \
+    -v /home/glwillen/.cache/rocket-qwen38-b12x/n640-tail-workspace-91bda04c:/flashinfer:ro \
+    -v /home/glwillen/.cache/rocket-qwen38-b12x:/root/.cache/flashinfer \
+    -e PYTHONPATH=/flashinfer:/rocket/engines/qwen38-flash-next-nvfp4-2b/src \
+    vllm/vllm-openai:qwen38-flash-next \
+    /rocket/scripts/kernels/qwen38-routed-moe-graph.py \
+    /slabs/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4 \
+    "$rank" --layer 0 --iterations 5 --shared-parity
+done
+```
+
+| path | rows | rank 0 median | rank 1 median | rank 1 range | rank 1 σ | rank 1 traffic | rank 1 rate | rank 1 roof | unit |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| K0 | 16 | 1.091488 | 1.080256 | 1.076480–1.116992 | 0.015377 | 223,813,120 | 207.19 | 87.05 | ms / B / GB/s / % |
+| K1 | 32 | 2.124512 | 2.120640 | 2.101728–2.142560 | 0.013630 | 445,163,520 | 209.92 | 88.20 | ms / B / GB/s / % |
+| K3 | 64 | 3.393600 | 3.363392 | 3.359072–3.511584 | 0.059168 | 710,916,096 | 211.37 | 88.81 | ms / B / GB/s / % |
+| K4 | 80 | 3.408512 | 3.382560 | 3.378592–3.448160 | 0.026660 | 711,081,216 | 210.22 | 88.33 | ms / B / GB/s / % |
+| K7 | 128 | 3.663744 | 3.464064 | 3.461760–3.516672 | 0.021002 | 711,576,576 | 205.42 | 86.31 | ms / B / GB/s / % |
+
+| verifier path | local routes | unique local experts | routes per expert | MoE contribution, 48 layers | >451 required accepted length after 60.416 ms measured K0 non-MoE reserve |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| K1 | 160 | 160 | 1.0000 | 101.79–101.98 ms | 4.58, maximum is 2 |
+| K3 | 320 | 256 | 1.2500 | 161.44–162.89 ms | 6.29, maximum is 4 |
+| K4 | 400 | 256 | 1.5625 | 162.36–163.61 ms | 6.31, maximum is 5 |
+| K7 | 640 | 256 | 2.5000 | 166.28–175.86 ms | 6.39–6.66, maximum is 8 |
+
+Traffic and latency plateau once all 256 local experts are active. FlashInfer already groups routes by expert and reuses each FC1/FC2 plane across verifier rows. TensorRT-LLM uses the same expert-first offsets and TMA grouped-GEMM structure. A second grouped implementation would retain the 711 MB layer floor.
+
+| numeric check | rank 0 | rank 1 |
+| --- | ---: | ---: |
+| shared N160 + N160 versus full N320 max abs | 0.000007629 | 0.000003815 |
+| dynamic graph replay max abs, rows 8–128 | 0.001465–0.003906 | 0.001465–0.002930 |
+| dynamic graph replay relative RMS | 0.0068–0.0075 | 0.0067–0.0075 |
+| static rows 1/2/4 replay max abs | 0 | 0 |
+
+The dynamic kernel accumulates FC2 route contributions with BF16 atomics. Replays stay within the measured bound and produce different hashes. Token divergence and continuation parity remain unproven.
+
+Layer 47 materialized from both slabs and replayed c1 with zero error. Its rank-local layout digests are `13e62c6a…` and `b54153c0…`.
+
+**Verdict.** Reject this adapter as the K1 or K4 >451 path. Keep it as the authenticated E256 reference primitive. K7 remains conditional on a measured accepted length above 6.66 after exact rows128 non-MoE composition.
+
+**Next.**
+
+- Bind the lazy K7 graph to the full custom verifier and measure checkpoint acceptance with the steady-window metric.
+- Replace BF16 atomic route accumulation only if continuation evidence crosses the token-divergence gate.
+- Measure exact rows128 GDN and full-attention costs before selecting K7.
+
+**Reopen if.**
+
+- A FlashInfer, CUDA, TensorRT-LLM, or GB10 firmware release reduces the saturated E256 weight-traffic floor.
