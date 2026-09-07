@@ -42,6 +42,7 @@ RUNNER_SHA256 = {
     "bench/test.py": "c98f15bf14c62e1f1040aaff406a182b76bb3c982e8e430b9d1d39c8ad855b8d",
     "bench/pasture-text.txt": "4d502a3633efd6f81f74c1db102793481eb7976bed90c99d8f409b4743c8fb68",
 }
+RUNNER_REL = "bench/test.py"
 HEAD_CONTAINER = "rocket-qwen38-calibration-head"
 WORKER_CONTAINER = "rocket-qwen38-calibration-worker"
 HCA = ("rocep1s0f1", "roceP2p1s0f1")
@@ -135,6 +136,19 @@ def render_launch(source: str, cell: Cell) -> str:
     return output
 
 
+def render_runner(source: str) -> str:
+    """Keep a fixed c16 cohort alive after EOS so three windows remain valid."""
+
+    anchor = 'body = {"model": self.a.model, "temperature": self.a.temperature, "top_p": self.a.top_p,\n'
+    replacement = (
+        'body = {"model": self.a.model, "temperature": self.a.temperature, '
+        '"top_p": self.a.top_p, "ignore_eos": True,\n'
+    )
+    if source.count(anchor) != 1 or '"ignore_eos": True' in source:
+        raise ContractError("benchmark request anchor changed")
+    return source.replace(anchor, replacement)
+
+
 def prepare_cell(root: Path, cell: Cell) -> Path:
     cell_dir = root / f"cell-{cell.name}"
     if cell_dir.exists():
@@ -147,6 +161,9 @@ def prepare_cell(root: Path, cell: Cell) -> Path:
         target = cell_dir / f"launch-{side}.sh"
         target.write_text(rendered)
         target.chmod(0o755)
+    runner = cell_dir / "bench-test.py"
+    runner.write_text(render_runner((RUNNER / RUNNER_REL).read_text()))
+    runner.chmod(0o755)
     (cell_dir / "contract.json").write_text(
         json.dumps(
             {
@@ -402,7 +419,7 @@ def run_cell(root: Path, cell: Cell, timeout_seconds: int) -> dict[str, object]:
         telemetry_thread = threading.Thread(target=collect_telemetry, args=(cell_dir / "telemetry.jsonl", stop), daemon=True)
         telemetry_thread.start()
         command = [
-            "python3", str(RUNNER / "bench/test.py"), "--url", "http://127.0.0.1:8888",
+            "python3", str(cell_dir / "bench-test.py"), "--url", "http://127.0.0.1:8888",
             "--model", "qwen3.8-flash-next", "--c", "16", "--seconds", "30",
             "--warmup", "60", "--sample", "10", "--max-tokens", "32768",
             "--thinking", "off", "--prompt", str(RUNNER / "bench/pasture-text.txt"),

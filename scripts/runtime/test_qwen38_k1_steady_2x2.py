@@ -36,6 +36,15 @@ class Steady2x2ContractTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ContractError, "already modified"):
             MODULE.render_launch(source.replace("--ipc host", "--ipc host --cpuset-cpus 0"), MODULE.Cell("A", False, False))
 
+    def test_runner_overlay_keeps_fixed_cohort_after_eos(self):
+        source = (MODULE.RUNNER / MODULE.RUNNER_REL).read_text()
+        rendered = MODULE.render_runner(source)
+        compile(rendered, MODULE.RUNNER_REL, "exec")
+        self.assertNotIn('"ignore_eos": True', source)
+        self.assertEqual(rendered.count('"ignore_eos": True'), 1)
+        with self.assertRaisesRegex(MODULE.ContractError, "anchor changed"):
+            MODULE.render_runner(rendered)
+
     def test_sources_and_fixture_are_exact(self):
         record = MODULE.validate_sources()
         self.assertEqual(record["mtp_depth"], 1)
