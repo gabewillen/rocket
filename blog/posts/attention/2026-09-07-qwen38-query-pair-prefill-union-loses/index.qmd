@@ -1,0 +1,66 @@
+---
+title: "Query-pair KV union makes Qwen QSA prefill 6.1x slower than vLLM"
+description: "Reusing 49.98% of selected K/V reduced bytes but took 5.327 ms for 300 tokens and 110.721 ms for 8192 tokens, so the custom WMMA path is rejected."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, attention, kernels, cache, numerics, telemetry]
+verdict: rejected
+rocket: "#kernels"
+---
+
+**Question.** Does a fixed SM121 query-pair union beat the pinned vLLM QSA sparse-prefill kernel for Qwen Hq12/Hkv1/D256/top-k2051?
+
+| setup | |
+| --- | --- |
+| node | `gx10-5e36`, one GB10 |
+| kernel | 6.17.13-rocket64k, 64 KiB |
+| Rocket code | `3c2789eebc767a60eefbcc0b5b9d3a612b22680b` |
+| vLLM control | `8e685d198`, Apache-2.0 |
+| FlashInfer design reference | `91bda04c66f7cb851e1ab3b78b9fecea644b9844`, Apache-2.0 |
+| shapes | c1, 300-token tool burst after 8192 tokens; c1, 8192-token root prefix |
+
+```bash
+build-qwen38-attention/qwen38-qsa-prefill-smoke 1 300 overlap \
+  /home/glwillen/calibration/qwen38-qsa-prefill-20260907-01/native-c1-t300-overlap.bf16
+build-qwen38-attention/qwen38-qsa-prefill-smoke 1 300 disjoint \
+  /home/glwillen/calibration/qwen38-qsa-prefill-20260907-01/native-c1-t300-disjoint.bf16
+build-qwen38-attention/qwen38-qsa-prefill-smoke 1 8192 overlap \
+  /home/glwillen/calibration/qwen38-qsa-prefill-20260907-01/native-c1-t8192-overlap.bf16
+
+docker run --rm --gpus all --ipc host --entrypoint python3 \
+  -v "$PWD:/rocket:ro" \
+  -v /home/glwillen/calibration/qwen38-qsa-prefill-20260907-01:/calibration:rw \
+  vllm/vllm-openai:qwen38-flash-next \
+  /rocket/scripts/kernels/qwen38-qsa-prefill-vllm-reference.py 1 300 \
+  --native-output /calibration/native-c1-t300-overlap.bf16
+```
+
+```text
+T300 overlap: median_ms=5.32698 p95_ms=5.42054 union_tokens=307800 control_tokens=615300 max_abs=3.8147e-05 state_unchanged=yes
+T300 disjoint: median_ms=10.2357 p95_ms=10.3421 union_tokens=615300 control_tokens=615300 max_abs=3.43323e-05 state_unchanged=yes
+T8192 overlap: median_ms=110.721 p95_ms=111.005 union_tokens=7353342 control_tokens=14699517 max_abs=0.00390625 state_unchanged=yes
+vLLM T300: median_ms=0.878752 p95_ms=1.006080 native_max_abs=3.33786e-05 native_mean_abs=4.66274e-06
+vLLM T8192: median_ms=16.035200 p95_ms=16.064192 native_max_abs=0.0009765625 native_mean_abs=3.96747e-06
+```
+
+| shape | union median | vLLM median | union / vLLM | K/V reuse | union logical hot bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| c1, 300 overlap | 5.32698 ms | 0.878752 ms | 6.061x | 49.976% | 321,335,400 B |
+| c1, 300 disjoint | 10.2357 ms | | | 0% | 637,445,400 B |
+| c1, 8192 causal | 110.721 ms | 16.035200 ms | 6.905x | 49.976% | 7,689,308,156 B |
+
+The first launch deadlocked because thread 0 alone advanced thread-local merge cursors. Commit `3c2789e` moves cursor and termination state into CTA shared memory. The unchanged rerun produced the table. Diagnostic counters ran once outside every timed and captured sample.
+
+The union halved selected K/V traffic. Six CTA barriers per 16-token union tile and the custom WMMA schedule left the 300-token path at 60.32 GB/s of logical traffic. The measured vLLM control remained 6.061x faster.
+
+**Verdict.** Rejected on value. The fixed query-pair union loses at both workload anchors despite exact immutable-state hashes, deterministic graph replay, and bounded BF16 output error. This is a QSA sparse-attention substage result. It does not measure whole prefill.
+
+**Next.**
+
+- Hard-cut the production target to a fixed-shape fork of FlashInfer `sparse_prefill_sm12x.py`.
+- Remove general dispatch and index work for Hq12/Hkv1/D256/top-k2051.
+- Measure c1, c2, c4, c8, and c16 at 300 and 8192 tokens.
+
+**Reopen if.**
+
+- A newer SM121 FlashInfer or compiler release changes the query-pair union schedule.
