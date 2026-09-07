@@ -97,6 +97,11 @@ int qwen38_qsa_sparse_attention_external(
     const void* staged_main_rows_fp8,
     const std::int64_t* logical_positions,
     const std::int32_t* token_to_request, int rows, cudaStream_t stream);
+int qwen38_qsa_sparse_attention_external_control(
+    void* plan, const void* query_bf16, const void* main_state_fp8,
+    const void* staged_main_rows_fp8,
+    const std::int64_t* logical_positions,
+    const std::int32_t* token_to_request, int rows, cudaStream_t stream);
 int qwen38_qsa_output_project(void* plan, cudaStream_t stream);
 int qwen38_qsa_attention_output(void* plan, void** output_bf16,
                                std::size_t* elements);

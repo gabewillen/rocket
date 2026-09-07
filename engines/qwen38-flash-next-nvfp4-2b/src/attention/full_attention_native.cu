@@ -166,10 +166,16 @@ struct FullAttentionNativeProgram::Impl {
             config.token_to_request, stream))
       return fail("QSA select", qwen38_cutlass_qkv_last_error());
     cudaEventRecord(phase[6], stream);
-    if (qwen38_qsa_sparse_attention_external(
-            qsa_plan, query, config.active_state.main_state, main_rows,
-            config.logical_positions, config.token_to_request,
-            shape.token_rows, stream))
+    const int attention_status = config.use_scalar_attention_control
+        ? qwen38_qsa_sparse_attention_external_control(
+              qsa_plan, query, config.active_state.main_state, main_rows,
+              config.logical_positions, config.token_to_request,
+              shape.token_rows, stream)
+        : qwen38_qsa_sparse_attention_external(
+              qsa_plan, query, config.active_state.main_state, main_rows,
+              config.logical_positions, config.token_to_request,
+              shape.token_rows, stream);
+    if (attention_status)
       return fail("QSA attention", qwen38_cutlass_qkv_last_error());
     cudaEventRecord(phase[7], stream);
     void* attention = nullptr;

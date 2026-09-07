@@ -22,6 +22,7 @@ struct FullAttentionNativeConfig {
   const std::int64_t *rope_positions, *logical_positions;
   const std::int32_t *sequence_lengths, *token_to_request;
   std::uint64_t* active_state_generation;
+  bool use_scalar_attention_control = false;
 };
 
 struct FullAttentionNativeProfile {

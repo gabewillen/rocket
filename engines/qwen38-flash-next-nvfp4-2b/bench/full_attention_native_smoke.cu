@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
@@ -135,7 +136,7 @@ int main(int argc, char** argv) try {
       static_cast<std::int64_t*>(logical.p),static_cast<std::int32_t*>(lengths.p),
       static_cast<std::int32_t*>(requests.p)); check(cudaDeviceSynchronize(),"initialize");
   std::uint64_t generation=1;
-  attention::FullAttentionNativeProgram program({
+  attention::FullAttentionNativeConfig config{
       device, static_cast<std::uint8_t*>(qw.p),static_cast<std::uint8_t*>(qs.p),
       static_cast<std::uint8_t*>(kw.p),static_cast<std::uint8_t*>(ks.p),
       static_cast<std::uint8_t*>(vw.p),static_cast<std::uint8_t*>(vs.p),
@@ -148,9 +149,25 @@ int main(int argc, char** argv) try {
        static_cast<std::uint8_t*>(compressed_state.p),compressed_bytes},
       static_cast<std::int64_t*>(rope.p),static_cast<std::int64_t*>(logical.p),
       static_cast<std::int32_t*>(lengths.p),static_cast<std::int32_t*>(requests.p),
-      &generation});
+      &generation};
+  attention::FullAttentionNativeProgram program(config);
   auto callbacks=program.callbacks(); cudaStream_t stream; check(cudaStreamCreate(&stream),"stream");
+  auto control_config = config;
+  control_config.use_scalar_attention_control = true;
+  attention::FullAttentionNativeProgram control(control_config);
+  auto control_callbacks = control.callbacks();
+  if(control_callbacks.stage(control_callbacks.context,
+                             static_cast<__nv_bfloat16*>(input.p),{16,1,16},stream))
+    throw std::runtime_error(control.last_error());
+  check(cudaStreamSynchronize(stream),"control stage fence");
+  std::vector<__nv_bfloat16> control_output(16ULL*2560);
+  check(cudaMemcpy(control_output.data(),control.projected_output(),
+                   control_output.size()*sizeof(__nv_bfloat16),
+                   cudaMemcpyDeviceToHost),"control output");
+  if(control_callbacks.reset(control_callbacks.context,stream))
+    throw std::runtime_error(control.last_error());
   std::array<double,5> ms{}; std::uint64_t expected_hash=0;
+  double maximum_error=0.0, mean_error=0.0;
   attention::FullAttentionNativeProfile profile{};
   for (double& sample:ms) {
     const auto start=std::chrono::steady_clock::now();
@@ -164,6 +181,17 @@ int main(int argc, char** argv) try {
     const auto observed=hash(output);
     if(expected_hash && expected_hash!=observed) throw std::runtime_error("reset replay output changed");
     expected_hash=observed;
+    if (&sample == &ms[0]) {
+      const auto* selected_output =
+          reinterpret_cast<const __nv_bfloat16*>(output.data());
+      for (std::size_t index=0; index<control_output.size(); ++index) {
+        const double error=std::abs(
+            static_cast<double>(__bfloat162float(selected_output[index]))-
+            static_cast<double>(__bfloat162float(control_output[index])));
+        maximum_error=std::max(maximum_error,error);
+        mean_error+=error/control_output.size();
+      }
+    }
     if(callbacks.reset(callbacks.context,stream)) throw std::runtime_error(program.last_error());
   }
   if(callbacks.stage(callbacks.context,static_cast<__nv_bfloat16*>(input.p),{16,1,16},stream))
@@ -171,6 +199,31 @@ int main(int argc, char** argv) try {
   const std::array<std::int32_t,16> accepted={1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
   if(callbacks.accept(callbacks.context,accepted.data(),16,2,stream))
     throw std::runtime_error(program.last_error());
+  cudaGraph_t graph=nullptr;
+  cudaGraphExec_t graph_exec=nullptr;
+  check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),
+        "begin native graph capture");
+  if(callbacks.stage(callbacks.context,static_cast<__nv_bfloat16*>(input.p),
+                     {16,1,16},stream))
+    throw std::runtime_error(program.last_error());
+  check(cudaStreamEndCapture(stream,&graph),"end native graph capture");
+  if(callbacks.reset(callbacks.context,stream))
+    throw std::runtime_error(program.last_error());
+  check(cudaStreamSynchronize(stream),"capture reset fence");
+  check(cudaGraphInstantiate(&graph_exec,graph,0),"instantiate native graph");
+  std::uint64_t graph_hash=0;
+  for(int replay=0; replay<2; ++replay) {
+    check(cudaGraphLaunch(graph_exec,stream),"launch native graph");
+    check(cudaStreamSynchronize(stream),"native graph fence");
+    std::vector<std::uint8_t> replay_output(16ULL*2560*2);
+    check(cudaMemcpy(replay_output.data(),program.projected_output(),
+                     replay_output.size(),cudaMemcpyDeviceToHost),
+          "graph output");
+    const auto observed=hash(replay_output);
+    if(graph_hash && graph_hash!=observed)
+      throw std::runtime_error("CUDA graph replay output changed");
+    graph_hash=observed;
+  }
   std::vector<std::uint8_t> first_row(512);
   const auto* published = static_cast<std::uint8_t*>(main_state.p) +
       static_cast<std::size_t>(attention::kQsaStateContext - 1) * 512;
@@ -181,6 +234,7 @@ int main(int argc, char** argv) try {
             << *std::max_element(ms.begin(),ms.end()) << " output_hash="
             << expected_hash << " state_hash=" << hash(first_row)
             << " generation=" << generation
+            << " graph_hash=" << graph_hash
             << " qkv_ms=" << profile.qkv_ms
             << " preprocess_ms=" << profile.preprocess_ms
             << " state_format_ms=" << profile.state_format_ms
@@ -189,6 +243,10 @@ int main(int argc, char** argv) try {
             << " select_ms=" << profile.select_ms
             << " attention_ms=" << profile.attention_ms
             << " gate_output_ms=" << profile.gate_output_ms << "\n";
+  std::cout << "scalar_control_max_abs=" << maximum_error
+            << " scalar_control_mean_abs=" << mean_error << "\n";
+  check(cudaGraphExecDestroy(graph_exec),"destroy native graph exec");
+  check(cudaGraphDestroy(graph),"destroy native graph");
   check(cudaStreamDestroy(stream),"destroy stream"); return 0;
 } catch(const std::exception& error) {
   std::cerr << "FAIL: " << error.what() << "\n"; return 1;
