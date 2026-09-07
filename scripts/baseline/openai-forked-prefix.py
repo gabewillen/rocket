@@ -14,12 +14,12 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def request(endpoint, model, prefix, stream_id, tokens, timeout):
+def request(endpoint, model, prefix, user_prompt, stream_id, tokens, timeout):
     body = json.dumps({
         "model": model,
         "messages": [
             {"role": "system", "content": prefix},
-            {"role": "user", "content": f"Worker {stream_id}: write continuous technical prose about memory systems."},
+            {"role": "user", "content": f"Worker {stream_id}: {user_prompt}"},
         ],
         "max_tokens": tokens,
         "min_tokens": tokens,
@@ -78,6 +78,10 @@ def main():
     parser.add_argument("--decode", type=int, default=256)
     parser.add_argument("--prefix-bytes", type=int, default=65536)
     parser.add_argument("--timeout", type=int, default=3600)
+    parser.add_argument(
+        "--user-prompt",
+        default="write continuous technical prose about memory systems.",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     prefix = ("Rocket agent session memory. " * (args.prefix_bytes // 29 + 1))[:args.prefix_bytes]
@@ -87,7 +91,7 @@ def main():
         started_unix_ns = time.time_ns()
         started = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = [pool.submit(request, args.endpoint, args.model, prefix, i,
+            futures = [pool.submit(request, args.endpoint, args.model, prefix, args.user_prompt, i,
                                    args.decode, args.timeout) for i in range(concurrency)]
             rows = [future.result() for future in futures]
         result = summarize(concurrency, rows, time.perf_counter() - started)

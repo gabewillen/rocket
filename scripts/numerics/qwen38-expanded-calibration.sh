@@ -80,7 +80,7 @@ Options:
                          Health deadline in seconds (default: 3600)
   --gpu-memory-utilization F
                          vLLM device-memory fraction in (0,1] (default: 0.835)
-  --mtp-depth K          Fixed MTP depth 1..3 (default: 3); K0 fails closed
+  --mtp-depth K          Fixed MTP depth 1..7 (default: 3); K0 fails closed
   --help                 Show this help
 EOF
 }
@@ -131,11 +131,15 @@ done
 
 [[ -n "$OUTPUT_DIR" ]] || fail "--output-dir is required"
 [[ "$OUTPUT_DIR" == /* ]] || fail "--output-dir must be absolute"
-[[ "$MTP_DEPTH" =~ ^[0-3]$ ]] || fail "--mtp-depth must be one of 0,1,2,3"
+[[ "$MTP_DEPTH" =~ ^[0-7]$ ]] || fail "--mtp-depth must be one of 0,1,2,3,4,5,6,7"
 # Pinned image d464f3b4 declares SpeculativeConfig.num_speculative_tokens with
 # Pydantic Field(gt=0). Omitting speculative_config also omits the MTP model and
 # its cache path, so neither CLI shape represents K0 with synchronized MTP state.
 [[ "$MTP_DEPTH" != 0 ]] || fail "pinned vLLM requires num_speculative_tokens > 0; true K0 with loaded MTP state is unavailable"
+# The pinned Qwen path reuses its one MTP layer. Its GDN and PLE cache shapes add
+# num_speculative_tokens to their convolution history, while the model weights,
+# model revision, and persistent recurrent-state shapes remain unchanged. K7's
+# eight-token decode query is the largest shape covered by this launcher.
 [[ "$STARTUP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
     fail "--startup-timeout-seconds must be a positive integer"
 if ! GPU_MEMORY_UTILIZATION=$(python3 - "$GPU_MEMORY_UTILIZATION" <<'PY'
@@ -639,12 +643,20 @@ until curl -fsS "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; do
 done
 
 if [[ "$PRODUCTION" == true ]]; then
+    # Keep startup records out of the fixed-depth acceptance sample.
+    sleep 1
+    head_benchmark_since=$(date --iso-8601=seconds)
     python3 "$REPO_ROOT/scripts/hardware/qwen38-two-node-monitor.py" collect \
         --worker "$SSH_TARGET" --output "$OUTPUT_DIR/hardware-samples.jsonl" &
     hardware_monitor_pid=$!
     python3 "$REPO_ROOT/scripts/baseline/openai-forked-prefix.py" \
         --endpoint "http://127.0.0.1:$API_PORT" --concurrency 1,2,4,8,16 \
         --decode 256 --json > "$OUTPUT_DIR/throughput.json"
+    python3 "$REPO_ROOT/scripts/baseline/openai-forked-prefix.py" \
+        --endpoint "http://127.0.0.1:$API_PORT" --concurrency 1,2 \
+        --decode 256 \
+        --user-prompt "implement a lock-free bounded ring buffer in C++20; emit code and invariants." \
+        --json > "$OUTPUT_DIR/coding-throughput.json"
     kill -INT "$hardware_monitor_pid"
     wait "$hardware_monitor_pid" || fail "two-node hardware monitor failed"
     hardware_monitor_pid=""
@@ -652,8 +664,24 @@ if [[ "$PRODUCTION" == true ]]; then
         --samples "$OUTPUT_DIR/hardware-samples.jsonl" \
         --benchmark "$OUTPUT_DIR/throughput.json" \
         --output "$OUTPUT_DIR/hardware.json"
+    python3 "$REPO_ROOT/scripts/hardware/qwen38-two-node-monitor.py" summarize \
+        --samples "$OUTPUT_DIR/hardware-samples.jsonl" \
+        --benchmark "$OUTPUT_DIR/coding-throughput.json" \
+        --output "$OUTPUT_DIR/coding-hardware.json"
+    kill "$head_log_pid" "$worker_log_pid" >/dev/null 2>&1 || true
+    wait "$head_log_pid" "$worker_log_pid" 2>/dev/null || true
+    head_log_pid=""
+    worker_log_pid=""
+    python3 "$SCRIPT_DIR/qwen38-mtp-runtime-evidence.py" \
+        --log "$LOG_DIR/head.log" \
+        --not-before "$head_benchmark_since" \
+        --min-records 2 --positions "$MTP_DEPTH" \
+        > "$OUTPUT_DIR/mtp-runtime-evidence.json"
     cat "$OUTPUT_DIR/throughput.json"
+    cat "$OUTPUT_DIR/coding-throughput.json"
     cat "$OUTPUT_DIR/hardware.json"
+    cat "$OUTPUT_DIR/coding-hardware.json"
+    cat "$OUTPUT_DIR/mtp-runtime-evidence.json"
     printf 'Production benchmark complete: %s\n' "$OUTPUT_DIR"
     exit 0
 fi
@@ -698,7 +726,7 @@ cat "$LOG_DIR/head-workload.log" "$LOG_DIR/worker-workload.log" \
 python3 "$SCRIPT_DIR/qwen38-mtp-runtime-evidence.py" \
     --log "$LOG_DIR/head-workload.log" \
     --not-before "$head_workload_since" \
-    --min-records 2 --positions 3 \
+    --min-records 2 --positions "$MTP_DEPTH" \
     > "$OUTPUT_DIR/mtp-runtime-evidence.json"
 
 for node in head worker combined; do

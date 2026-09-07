@@ -33,6 +33,19 @@ class ForkedPrefixTest(unittest.TestCase):
         self.assertTrue(case["started_at"].endswith("Z"))
         self.assertTrue(case["finished_at"].endswith("Z"))
 
+    def test_user_prompt_is_an_explicit_workload_input(self):
+        row = {"prompt_tokens": 10, "completion_tokens": 4, "ttft_s": 0.1,
+               "decode_s": 0.5, "first_at": 10.0, "finished_at": 10.5}
+        output = io.StringIO()
+        with mock.patch.object(BENCHMARK, "request", return_value=row) as request, \
+             mock.patch.object(
+                 sys,
+                 "argv",
+                 [str(SCRIPT), "--concurrency", "1", "--user-prompt", "emit C++20", "--json"],
+             ), contextlib.redirect_stdout(output):
+            BENCHMARK.main()
+        self.assertEqual(request.call_args.args[3], "emit C++20")
+
 
 if __name__ == "__main__":
     unittest.main()

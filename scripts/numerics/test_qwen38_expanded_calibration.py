@@ -44,6 +44,18 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("openai-forked-prefix.py", self.source)
         self.assertIn("--concurrency 1,2,4,8,16", self.source)
         self.assertIn('$OUTPUT_DIR/throughput.json', self.source)
+        self.assertIn("--concurrency 1,2", self.source)
+        self.assertIn("lock-free bounded ring buffer in C++20", self.source)
+        self.assertIn('$OUTPUT_DIR/coding-throughput.json', self.source)
+        self.assertIn('$OUTPUT_DIR/coding-hardware.json', self.source)
+        self.assertIn('head_benchmark_since=$(date --iso-8601=seconds)', self.source)
+        self.assertIn('--not-before "$head_benchmark_since"', self.source)
+        production = self.source[
+            self.source.index('if [[ "$PRODUCTION" == true ]]', self.source.index("trap cleanup")):
+            self.source.index("# Move past the health-check second")
+        ]
+        self.assertIn('> "$OUTPUT_DIR/mtp-runtime-evidence.json"', production)
+        self.assertIn('--positions "$MTP_DEPTH"', production)
 
     def test_startup_timeout_requires_positive_integer(self):
         for invalid in ("0", "-1", "1.5", "nope"):
@@ -347,7 +359,8 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
             root = pathlib.Path(directory)
-            for depth in (1, 2, 3):
+            generated = []
+            for depth in range(1, 8):
                 destination = root / f"k{depth}.sh"
                 harness = root / f"generate-k{depth}.sh"
                 harness.write_text(
@@ -364,7 +377,16 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
                     f"--speculative-config '{{\"method\":\"mtp\",\"num_speculative_tokens\":{depth}}}'",
                     destination.read_text(),
                 )
-        for depth in ("0", "4", "-1", "x"):
+                generated.append(destination.read_text())
+            normalized = [
+                value.replace(
+                    f'"num_speculative_tokens\":{depth}',
+                    '"num_speculative_tokens\":K',
+                )
+                for depth, value in enumerate(generated, 1)
+            ]
+            self.assertEqual(len(set(normalized)), 1)
+        for depth in ("0", "8", "-1", "x", "01"):
             result = subprocess.run(
                 ["bash", str(SCRIPT), "--output-dir", "/unused/mtp-depth", "--mtp-depth", depth],
                 capture_output=True, text=True, check=False,
@@ -373,7 +395,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             if depth == "0":
                 self.assertIn("true K0 with loaded MTP state is unavailable", result.stderr)
             else:
-                self.assertIn("must be one of 0,1,2,3", result.stderr)
+                self.assertIn("must be one of 0,1,2,3,4,5,6,7", result.stderr)
 
     def test_production_hardware_monitor_is_cleaned_and_reduced(self):
         self.assertIn('hardware_monitor_pid=""', self.source)
@@ -464,12 +486,12 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("qwen38-mtp-runtime-evidence.py", self.source)
         self.assertIn('$OUTPUT_DIR/mtp-runtime-evidence.json', self.source)
         self.assertIn('--not-before "$head_workload_since"', self.source)
-        self.assertIn("--min-records 2 --positions 3", self.source)
+        self.assertIn('--min-records 2 --positions "$MTP_DEPTH"', self.source)
         workload = self.source.index(
             'python3 "$SCRIPT_DIR/qwen38-attention-calibration.py"'
         )
         mtp_proof = self.source.index(
-            'python3 "$SCRIPT_DIR/qwen38-mtp-runtime-evidence.py"'
+            'python3 "$SCRIPT_DIR/qwen38-mtp-runtime-evidence.py"', workload
         )
         self.assertLess(workload, mtp_proof)
         self.assertLess(
