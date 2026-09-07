@@ -152,7 +152,13 @@ def render_runner(source: str) -> str:
     )
     worker_start = "class Worker(threading.Thread):\n"
     worker_end = "\n\ndef sample_loop"
-    worker_replacement = '''async def stream_one(i, a, prompt, stop, log, client):
+    worker_replacement = '''def sdk_base_url(url):
+    """Add the OpenAI API prefix without changing the metrics host base."""
+    base = url.rstrip("/")
+    return base if base.endswith("/v1") else base + "/v1"
+
+
+async def stream_one(i, a, prompt, stop, log, client):
     """One official-SDK stream with cancellation-safe stream ownership."""
     nonce = f"{a.tag}-s{i}-{int(time.time()*1000)}"
     t0 = time.time()
@@ -206,7 +212,7 @@ def render_runner(source: str) -> str:
 async def run_stream_cohort(a, prompt, c, t_start, deadline, samples):
     """Run sampling beside c streams and bound teardown of every SDK task."""
     client = AsyncOpenAI(
-        base_url=a.url,
+        base_url=sdk_base_url(a.url),
         api_key=a.token or "rocket-benchmark-dummy",
         timeout=a.timeout,
         max_retries=0,

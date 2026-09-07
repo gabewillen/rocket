@@ -128,11 +128,13 @@ class Steady2x2ContractTest(unittest.TestCase):
                 "chat_template_kwargs": {"enable_thinking": False},
             })
         self.assertEqual(client.options, {
-            "base_url": "http://test",
+            "base_url": "http://test/v1",
             "api_key": "rocket-benchmark-dummy",
             "timeout": 30,
             "max_retries": 0,
         })
+        self.assertEqual(namespace["sdk_base_url"]("http://test/v1/"), "http://test/v1")
+        self.assertEqual(namespace["sdk_base_url"]("http://test"), "http://test/v1")
 
     def test_generated_runner_rejects_another_sdk_version(self):
         fake_openai = types.ModuleType("openai")
