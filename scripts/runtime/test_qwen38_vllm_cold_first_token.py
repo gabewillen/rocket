@@ -33,6 +33,18 @@ class ColdFirstTokenTests(unittest.TestCase):
             cold.first_generated_token(
                 [b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n']
             )
+        with self.assertRaisesRegex(RuntimeError, "without a generated token"):
+            cold.first_generated_token(
+                [b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n']
+            )
+
+    def test_probe_requests_enough_non_thinking_tokens_for_visible_output(self) -> None:
+        source = SCRIPT.read_text()
+        self.assertIn('"max_tokens": 8', source)
+        self.assertIn('"min_tokens": 8', source)
+        self.assertIn('"enable_thinking": False', source)
+        self.assertIn('output / "first-token-stream.sse"', source)
+        self.assertIn('"first-token-request.json"', source)
 
     def test_hardware_summary_requires_both_ranks_in_timed_window(self) -> None:
         rows = []

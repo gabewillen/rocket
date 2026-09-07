@@ -213,24 +213,47 @@ def wait_for_health(endpoint: str, deadline_ns: int) -> None:
 
 
 def request_first_token(
-    endpoint: str, timeout_seconds: float
+    endpoint: str, timeout_seconds: float, stream_path: Path
 ) -> tuple[str, str, int, int]:
-    body = json.dumps(
-        {
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "Reply with one digit."}],
-            "max_tokens": 1,
-            "temperature": 0.0,
-            "stream": True,
-        }
-    ).encode("utf-8")
+    payload = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "Reply with one digit."}],
+        "max_tokens": 8,
+        "min_tokens": 8,
+        "ignore_eos": True,
+        "temperature": 0.0,
+        "stream": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         endpoint.rstrip("/") + "/v1/chat/completions",
         body,
         {"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-        field, text = first_generated_token(response)
+        stream_path.with_name("first-token-request.json").write_text(
+            json.dumps(
+                {
+                    "endpoint_path": "/v1/chat/completions",
+                    "request": payload,
+                    "response_content_type": response.headers.get("Content-Type"),
+                    "response_status": response.status,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        with stream_path.open("wb") as stream:
+
+            def recorded_lines() -> Iterable[bytes]:
+                for line in response:
+                    stream.write(line)
+                    stream.flush()
+                    yield line
+
+            field, text = first_generated_token(recorded_lines())
         return field, text, time.monotonic_ns(), time.time_ns()
 
 
@@ -310,7 +333,7 @@ def one_run(
         model_ready_unix_ns = time.time_ns()
         remaining = max(1.0, (deadline_ns - model_ready_ns) / 1e9)
         token_field, token_text, first_token_ns, first_token_unix_ns = (
-            request_first_token(endpoint, remaining)
+            request_first_token(endpoint, remaining, output / "first-token-stream.sse")
         )
         collect_logs(worker, output)
     finally:
