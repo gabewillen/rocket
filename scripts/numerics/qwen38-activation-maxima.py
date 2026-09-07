@@ -6,7 +6,7 @@ import json
 import re
 import sys
 
-LINE = re.compile(r"ROCKET_NVFP4_CALIBRATION\\t(layer\.(\d+)\.linear_attn\.(in_proj_qkvz|in_proj_ba|out_proj))\\t([0-9.eE+-]+)")
+LINE = re.compile(r"ROCKET_NVFP4_CALIBRATION\t(layer\.(\d+)\.linear_attn\.(in_proj_qkvz|in_proj_ba|out_proj))\t([0-9.eE+-]+)")
 
 
 def main():
