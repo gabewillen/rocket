@@ -118,6 +118,7 @@ class FakeTorch:
         )
 
     def frombuffer(self, buffer, *, dtype):
+        self.events.append(("frombuffer", type(buffer).__name__))
         return FakeTensor(self, bytes(buffer), device="cpu", dtype=dtype)
 
 
@@ -238,6 +239,77 @@ class TorchCudaTests(unittest.TestCase):
         self.assertEqual(owner.phase, OwnerPhase.OPEN)
         self.assertEqual(tuple(owner.active_state), STATE_FAMILIES)
         self.assertEqual(owner.upload_and_launch(8).generation, 8)
+
+    def test_padded_plan_uses_eight_backings_for_nine_logical_views(self):
+        logical = {
+            family: len(self.authenticated.rank_payload(0)[family].accepted)
+            for family in STATE_FAMILIES
+        }
+        allocated = {family: size + 64 for family, size in logical.items()}
+        owners = {family: family for family in STATE_FAMILIES}
+        conv, recurrent = STATE_FAMILIES[3:5]
+        allocated[conv] = logical[conv] + logical[recurrent] + 64
+        allocated[recurrent] = allocated[conv]
+        owners[recurrent] = conv
+        runtime = TorchCudaRuntime(
+            owner=self.owner,
+            compute_streams=self.compute,
+            torch_api=self.torch,
+            device="cuda:0",
+            allocation_bytes=allocated,
+            allocation_owners=owners,
+        )
+
+        CudaStateBinding(0, runtime, Tracer()).restore(
+            self.authenticated, generation_epoch=8
+        )
+
+        cuda_allocations = [
+            event[2]
+            for event in self.torch.events
+            if event[0] == "empty" and event[1] == "cuda:0"
+        ]
+        self.assertEqual(len(cuda_allocations), 8)
+        self.assertEqual(
+            sum(cuda_allocations),
+            sum(allocated[family] for family in STATE_FAMILIES if owners[family] == family),
+        )
+        self.assertEqual(
+            [event[1] for event in self.torch.events if event[0] == "frombuffer"],
+            ["bytes"] * len(STATE_FAMILIES),
+        )
+        self.assertTrue(all(
+            self.owner.published[family].numel() == logical[family]
+            for family in STATE_FAMILIES
+        ))
+
+    def test_padded_plan_rejects_partial_inventory_and_undersized_backing(self):
+        partial = {family: 64 for family in STATE_FAMILIES[:-1]}
+        owners = {family: family for family in STATE_FAMILIES}
+        with self.assertRaisesRegex(TorchCudaRuntimeError, "nine-family"):
+            TorchCudaRuntime(
+                owner=self.owner,
+                compute_streams=self.compute,
+                torch_api=self.torch,
+                device="cuda:0",
+                allocation_bytes=partial,
+                allocation_owners=owners,
+            )
+
+        allocated = {family: 1 for family in STATE_FAMILIES}
+        runtime = TorchCudaRuntime(
+            owner=self.owner,
+            compute_streams=self.compute,
+            torch_api=self.torch,
+            device="cuda:0",
+            allocation_bytes=allocated,
+            allocation_owners=owners,
+        )
+        binding = CudaStateBinding(0, runtime, Tracer())
+        with self.assertRaisesRegex(RuntimeStateError, "stage failed"):
+            binding.restore(self.authenticated, generation_epoch=8)
+        self.assertEqual(binding.phase, BindingPhase.IDLE)
+        self.assertIsNone(self.owner.published)
 
     def test_tensor_contract_drift_fails_without_publication_and_reopens_gate(self):
         first = STATE_FAMILIES[0]

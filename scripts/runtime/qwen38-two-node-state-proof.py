@@ -44,16 +44,22 @@ PLAN_FAMILIES = (
 
 
 class _Span:
+    def __init__(self, tracer, name):
+        self.tracer = tracer
+        self.name = name
+        self.attributes = {}
     def __enter__(self): return self
-    def __exit__(self, exc_type, exc, traceback): return None
-    def set_attribute(self, key, value): del key, value
+    def __exit__(self, exc_type, exc, traceback):
+        self.tracer.spans.append(self)
+        return None
+    def set_attribute(self, key, value): self.attributes[key] = value
     def record_exception(self, exception): del exception
 
 
 class _Tracer:
+    def __init__(self): self.spans = []
     def start_as_current_span(self, name):
-        del name
-        return _Span()
+        return _Span(self, name)
 
 
 class _Decoder:
@@ -71,26 +77,49 @@ def _boundary() -> RuntimeBoundary:
     return RuntimeBoundary(262144, digest, 1)
 
 
-def _extents(plan_path: Path) -> dict[str, int]:
+def _layout(plan_path: Path):
     plan = json.loads(plan_path.read_text())
     families = plan["families"]
     if tuple(family["id"] for family in families) != PLAN_FAMILIES:
         raise RuntimeError("capacity plan family order changed")
-    measured = {
+    logical = {
         state_family: planned["logical_bytes_per_stream"] * 16
         for state_family, planned in zip(STATE_FAMILIES, families, strict=True)
     }
     if any(
         isinstance(value, bool) or not isinstance(value, int) or value <= 0
-        for value in measured.values()
+        for value in logical.values()
     ):
         raise RuntimeError("capacity plan does not contain the canonical extents")
-    return measured
+    allocated = {
+        state_family: planned["cuda_allocated_bytes_c16"]
+        for state_family, planned in zip(STATE_FAMILIES, families, strict=True)
+    }
+    id_to_state = dict(zip(PLAN_FAMILIES, STATE_FAMILIES, strict=True))
+    owners = {
+        state_family: id_to_state.get(
+            planned["shares_cuda_allocation_with"], state_family
+        )
+        for state_family, planned in zip(STATE_FAMILIES, families, strict=True)
+    }
+    counted = sum(
+        allocated[family] for family in STATE_FAMILIES if owners[family] == family
+    )
+    if counted != plan["totals_per_rank"]["cuda_allocated_bytes_c16"]:
+        raise RuntimeError("capacity plan counted allocation total changed")
+    return logical, allocated, owners, plan
 
 
-def _fixture(extents: dict[str, int]) -> AuthenticatedState:
+def _extents(plan_path: Path) -> dict[str, int]:
+    return _layout(plan_path)[0]
+
+
+def _fixture(extents: dict[str, int], *, full: bool = False) -> AuthenticatedState:
     payloads = {
-        family: FamilyPayload(bytes(len(family) + 1)) for family in extents
+        family: FamilyPayload(
+            bytes(((index + 1) % 251,)) * (size if full else len(family) + 1)
+        )
+        for index, (family, size) in enumerate(extents.items())
     }
     boundary = _boundary()
     return AuthenticatedState._from_verified(
@@ -100,7 +129,12 @@ def _fixture(extents: dict[str, int]) -> AuthenticatedState:
     )
 
 
-def _runtime(rank: int):
+def _runtime(
+    rank: int,
+    *,
+    allocation_bytes: dict[str, int] | None = None,
+    allocation_owners: dict[str, str] | None = None,
+):
     import torch
 
     tracer = _Tracer()
@@ -113,12 +147,90 @@ def _runtime(rank: int):
         compute_streams=(torch.cuda.Stream(device="cuda:0"),),
         torch_api=torch,
         device="cuda:0",
+        allocation_bytes=allocation_bytes,
+        allocation_owners=allocation_owners,
     )
-    return torch, owner, CudaStateBinding(rank, runtime, tracer), boundary
+    return torch, owner, CudaStateBinding(rank, runtime, tracer), boundary, tracer
+
+
+def _available_memory_bytes() -> int:
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) * 1024
+    raise RuntimeError("MemAvailable is unavailable")
+
+
+def full_restore(rank: int, plan_path: Path) -> dict[str, object]:
+    logical, allocated, owners, plan = _layout(plan_path)
+    logical_total = sum(logical.values())
+    allocated_total = plan["totals_per_rank"]["cuda_allocated_bytes_c16"]
+    reserve = 8 * 1024**3
+    required = allocated_total + 2 * logical_total + reserve
+    available = _available_memory_bytes()
+    if available < required:
+        raise RuntimeError(
+            f"full restore preflight requires {required} bytes, only {available} available"
+        )
+    fixture_start = time.perf_counter()
+    authenticated = _fixture(logical, full=True)
+    fixture_seconds = time.perf_counter() - fixture_start
+    torch, owner, binding, _boundary_value, tracer = _runtime(
+        rank,
+        allocation_bytes=allocated,
+        allocation_owners=owners,
+    )
+    before = torch.cuda.memory_allocated()
+    restore_start = time.perf_counter()
+    binding.restore(authenticated, generation_epoch=1)
+    torch.cuda.synchronize()
+    restore_seconds = time.perf_counter() - restore_start
+    allocation_delta = torch.cuda.memory_allocated() - before
+    storages = {
+        tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
+        for tensor in owner.active_state.values()
+    }
+    storage_bytes = sum(storages.values())
+    if storage_bytes != allocated_total:
+        raise RuntimeError(
+            f"CUDA backing storage {storage_bytes} does not match {allocated_total}"
+        )
+    if not allocated_total <= allocation_delta <= allocated_total + 16 * 1024**2:
+        raise RuntimeError("Torch allocator rounding exceeds the eight-backing bound")
+    for index, family in enumerate(STATE_FAMILIES):
+        tensor = owner.active_state[family]
+        if tensor.numel() != logical[family]:
+            raise RuntimeError(f"published logical view changed for {family}")
+        sentinel = (index + 1) % 251
+        sample_offsets = (0, logical[family] // 2, logical[family] - 1)
+        if any(int(tensor[offset].item()) != sentinel for offset in sample_offsets):
+            raise RuntimeError(f"restored sentinel changed for {family}")
+    publish_spans = [
+        span for span in tracer.spans
+        if span.name == "rocket.qwen38.state.owner"
+        and span.attributes.get("phase") == "publish"
+        and span.attributes.get("outcome") == "success"
+    ]
+    if len(publish_spans) != 1:
+        raise RuntimeError("full restore did not publish exactly once")
+    return {
+        "rank": rank,
+        "node": socket.gethostname(),
+        "device": torch.cuda.get_device_name(0),
+        "families": len(STATE_FAMILIES),
+        "logical_bytes": logical_total,
+        "planner_cuda_bytes": allocated_total,
+        "cuda_backing_storage_bytes": storage_bytes,
+        "cuda_allocation_delta_bytes": allocation_delta,
+        "preflight_available_bytes": available,
+        "preflight_required_bytes": required,
+        "fixture_seconds": round(fixture_seconds, 6),
+        "restore_seconds": round(restore_seconds, 6),
+        "successful_publishes": len(publish_spans),
+    }
 
 
 def full_capture(rank: int, plan_path: Path) -> dict[str, object]:
-    torch, owner, binding, boundary = _runtime(rank)
+    torch, owner, binding, boundary, _tracer_value = _runtime(rank)
     extents = _extents(plan_path)
     start = time.perf_counter()
     tensors = {}
@@ -156,7 +268,7 @@ def full_capture(rank: int, plan_path: Path) -> dict[str, object]:
 
 
 def worker(rank: int, plan_path: Path) -> None:
-    torch, owner, binding, boundary = _runtime(rank)
+    torch, owner, binding, boundary, _tracer_value = _runtime(rank)
     extents = _extents(plan_path)
     authenticated = _fixture(extents)
     print(json.dumps({
@@ -361,6 +473,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--full-capture", action="store_true")
+    parser.add_argument("--full-restore", action="store_true")
+    parser.add_argument("--nvme-crash-plan", action="store_true")
     parser.add_argument("--rank", type=int, choices=(0, 1))
     parser.add_argument("--plan", type=Path, default=Path(PLAN))
     parser.add_argument("--repo", type=Path, default=Path.cwd())
@@ -368,6 +482,31 @@ def parse_args():
     parser.add_argument("--remote")
     parser.add_argument("--fault-rank", type=int, choices=(0, 1))
     return parser.parse_args()
+
+
+def nvme_crash_plan(plan_path: Path) -> dict[str, object]:
+    plan = _layout(plan_path)[3]
+    record_bytes = plan["totals_per_rank"]["nvme_padded_bytes_c16"]
+    return {
+        "writes_payloads": False,
+        "record_bytes_per_rank": record_bytes,
+        "minimum_free_bytes_per_owner": record_bytes + 8 * 1024**3,
+        "rank_records": (
+            {"rank": 0, "node": "head", "path": "/var/lib/rocket/qwen38-state/rank0"},
+            {"rank": 1, "node": "worker", "path": "/var/lib/rocket/qwen38-state/rank1"},
+        ),
+        "fault_points": (
+            "after_prepare_rank0", "after_prepare_rank1",
+            "after_commit_rank0", "after_commit_rank1",
+            "after_index_rank0", "after_index_rank1",
+        ),
+        "payload_transport": "owner-local only; exchange authenticated receipts and digests",
+        "blocker": "StateTransactionStore currently requires both rank directories in one process",
+        "policy_state_contract": (
+            "authenticate active K0-K7 depth, residency epoch, and lazy-taper counters; "
+            "do not allocate seven additional c16 verifier-state copies"
+        ),
+    }
 
 
 def main() -> None:
@@ -378,6 +517,11 @@ def main() -> None:
     elif args.full_capture:
         if args.rank is None: raise SystemExit("--full-capture requires --rank")
         print(json.dumps(full_capture(args.rank, args.plan), sort_keys=True))
+    elif args.full_restore:
+        if args.rank is None: raise SystemExit("--full-restore requires --rank")
+        print(json.dumps(full_restore(args.rank, args.plan), sort_keys=True))
+    elif args.nvme_crash_plan:
+        print(json.dumps(nvme_crash_plan(args.plan), sort_keys=True))
     else:
         if not args.remote: raise SystemExit("coordinator requires --remote")
         print(json.dumps(coordinate(args.repo.resolve(), args.image, args.remote, args.fault_rank), sort_keys=True))

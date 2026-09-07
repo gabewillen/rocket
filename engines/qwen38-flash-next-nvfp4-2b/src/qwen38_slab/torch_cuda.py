@@ -30,6 +30,7 @@ from .runtime_state import (
 from .state_txn import STATE_FAMILIES
 
 MAX_COMPUTE_STREAMS = 16
+MAX_ALLOCATION_BYTES = 32 * 1024**3
 _CUDA_DEVICE = re.compile(r"cuda:[0-9]+\Z")
 
 
@@ -112,6 +113,8 @@ class TorchCudaRuntime:
         compute_streams: tuple[TorchStream, ...],
         torch_api: TorchApi,
         device: str,
+        allocation_bytes: Mapping[str, int] | None = None,
+        allocation_owners: Mapping[str, str] | None = None,
     ) -> None:
         if owner is None or any(
             not callable(getattr(owner, method, None))
@@ -146,9 +149,15 @@ class TorchCudaRuntime:
         self._streams = compute_streams
         self._torch = torch_api
         self._device = device
+        self._allocation_bytes, self._allocation_owners = _allocation_plan(
+            allocation_bytes, allocation_owners
+        )
         self._copy_stream = torch_api.cuda.Stream(device=device)
         self._gate_boundary: RuntimeBoundary | None = None
         self._pinned_staging: list[TorchTensor] = []
+        self._stage_views: dict[str, TorchTensor] = {}
+        self._stage_backings: dict[str, TorchTensor] = {}
+        self._stage_offsets: dict[str, int] = {}
 
     @property
     def owner(self) -> TorchStateOwner:
@@ -229,11 +238,34 @@ class TorchCudaRuntime:
         self._require_quiesced()
         if family not in STATE_FAMILIES or logical_bytes <= 0:
             raise TorchCudaRuntimeError("invalid staging family or extent")
+        if family in self._stage_views:
+            raise TorchCudaRuntimeError("staging family was allocated twice")
+        owner = self._allocation_owners.get(family, family)
+        allocated_bytes = self._allocation_bytes.get(family, logical_bytes)
+        if allocated_bytes < logical_bytes:
+            raise TorchCudaRuntimeError("planned CUDA allocation is below logical extent")
         with self._torch.cuda.stream(self._copy_stream):
-            tensor = self._torch.empty(
-                logical_bytes, dtype=self._torch.uint8, device=self._device
-            )
-        return self._validated_tensor(tensor, logical_bytes)
+            if owner == family:
+                backing = self._torch.empty(
+                    allocated_bytes, dtype=self._torch.uint8, device=self._device
+                )
+                self._stage_backings[owner] = self._validated_tensor(
+                    backing, allocated_bytes
+                )
+                self._stage_offsets[owner] = 0
+            elif owner not in self._stage_backings:
+                raise TorchCudaRuntimeError(
+                    "shared CUDA allocation owner must be staged first"
+                )
+            backing = self._stage_backings[owner]
+            offset = self._stage_offsets[owner]
+            if offset + logical_bytes > backing.numel():
+                raise TorchCudaRuntimeError("shared CUDA allocation is too small")
+            tensor = backing.narrow(0, offset, logical_bytes)
+            self._stage_offsets[owner] = offset + logical_bytes
+        validated = self._validated_tensor(tensor, logical_bytes)
+        self._stage_views[family] = validated
+        return validated
 
     def copy_host_to_device(self, destination: object, payload: bytes) -> None:
         """Queue one borrowed host payload into a private staging tensor."""
@@ -245,7 +277,9 @@ class TorchCudaRuntime:
         pinned = self._torch.empty(
             len(payload), dtype=self._torch.uint8, device="cpu", pin_memory=True
         )
-        source = self._torch.frombuffer(bytearray(payload), dtype=self._torch.uint8)
+        if not any(value is tensor for value in self._stage_views.values()):
+            raise TorchCudaRuntimeError("destination is not private staging")
+        source = self._torch.frombuffer(payload, dtype=self._torch.uint8)
         pinned.copy_(source)
         self._pinned_staging.append(pinned)
         with self._torch.cuda.stream(self._copy_stream):
@@ -272,12 +306,19 @@ class TorchCudaRuntime:
         validated: dict[str, TorchTensor] = {}
         for family in STATE_FAMILIES:
             tensor = staged[family]
+            if self._stage_views.get(family) is not tensor:
+                raise TorchCudaRuntimeError(
+                    f"staged tensor ownership changed for family {family}"
+                )
             if not isinstance(getattr(tensor, "is_cuda", None), bool):
                 raise TorchCudaRuntimeError(f"invalid staged tensor for family {family}")
             validated[family] = self._validated_tensor(
                 tensor, int(getattr(tensor, "numel")())
             )
         self._owner.publish_state(MappingProxyType(validated), boundary)
+        self._stage_views.clear()
+        self._stage_backings.clear()
+        self._stage_offsets.clear()
 
     def discard(self, staged: tuple[object, ...]) -> None:
         """Release adapter-owned host references; caller releases CUDA tensors."""
@@ -290,6 +331,9 @@ class TorchCudaRuntime:
         except BaseException as exc:
             raise CudaRuntimeFatalError("CUDA discard stream could not be fenced") from exc
         self._pinned_staging.clear()
+        self._stage_views.clear()
+        self._stage_backings.clear()
+        self._stage_offsets.clear()
 
     def resume(self, boundary: RuntimeBoundary) -> None:
         """Reopen the launch gate after capture, discard, or publication."""
@@ -339,6 +383,7 @@ class TorchCudaRuntime:
 
 
 __all__ = [
+    "MAX_ALLOCATION_BYTES",
     "MAX_COMPUTE_STREAMS",
     "TorchApi",
     "TorchCudaRuntime",
@@ -347,3 +392,44 @@ __all__ = [
     "TorchStream",
     "TorchTensor",
 ]
+
+
+def _allocation_plan(
+    allocation_bytes: Mapping[str, int] | None,
+    allocation_owners: Mapping[str, str] | None,
+) -> tuple[Mapping[str, int], Mapping[str, str]]:
+    if allocation_bytes is None and allocation_owners is None:
+        return MappingProxyType({}), MappingProxyType({})
+    if (
+        not isinstance(allocation_bytes, Mapping)
+        or tuple(allocation_bytes) != STATE_FAMILIES
+        or not isinstance(allocation_owners, Mapping)
+        or tuple(allocation_owners) != STATE_FAMILIES
+    ):
+        raise TorchCudaRuntimeError(
+            "allocation plan requires canonical nine-family mappings"
+        )
+    copied_bytes: dict[str, int] = {}
+    copied_owners: dict[str, str] = {}
+    seen: set[str] = set()
+    for family in STATE_FAMILIES:
+        size = allocation_bytes[family]
+        owner = allocation_owners[family]
+        if (
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or not 0 < size <= MAX_ALLOCATION_BYTES
+            or owner not in STATE_FAMILIES
+            or owner not in seen | {family}
+        ):
+            raise TorchCudaRuntimeError("CUDA allocation plan entry is invalid")
+        if owner != family and allocation_owners[owner] != owner:
+            raise TorchCudaRuntimeError("CUDA allocation owner must own its backing")
+        if owner != family and size != copied_bytes[owner]:
+            raise TorchCudaRuntimeError(
+                "shared family must name its owner's complete allocation"
+            )
+        copied_bytes[family] = size
+        copied_owners[family] = owner
+        seen.add(family)
+    return MappingProxyType(copied_bytes), MappingProxyType(copied_owners)
