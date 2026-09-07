@@ -86,6 +86,17 @@ set_target_properties(qwen38_qsa_preprocess PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+add_library(qwen38_qsa_prefill STATIC src/attention/qsa_prefill.cu)
+target_include_directories(qwen38_qsa_prefill PUBLIC src)
+target_link_libraries(qwen38_qsa_prefill PUBLIC CUDA::cudart)
+target_compile_options(qwen38_qsa_prefill PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
+)
+set_target_properties(qwen38_qsa_prefill PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
 add_executable(qwen38-qsa-expand-smoke bench/qsa_expand_smoke.cu)
 target_include_directories(qwen38-qsa-expand-smoke PRIVATE src)
 target_link_libraries(qwen38-qsa-expand-smoke PRIVATE qwen38_cutlass_qkv CUDA::cudart)
@@ -97,6 +108,13 @@ target_include_directories(qwen38-full-attention-native-smoke PRIVATE src)
 target_link_libraries(qwen38-full-attention-native-smoke PRIVATE
   qwen38_full_attention_native CUDA::cudart)
 set_target_properties(qwen38-full-attention-native-smoke PROPERTIES
+  CUDA_ARCHITECTURES "121")
+
+add_executable(qwen38-qsa-prefill-smoke bench/qsa_prefill_smoke.cu)
+target_include_directories(qwen38-qsa-prefill-smoke PRIVATE src)
+target_link_libraries(qwen38-qsa-prefill-smoke PRIVATE
+  qwen38_qsa_prefill CUDA::cudart)
+set_target_properties(qwen38-qsa-prefill-smoke PROPERTIES
   CUDA_ARCHITECTURES "121")
 
 add_library(qwen38_pair_reduce STATIC
