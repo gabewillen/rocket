@@ -10,6 +10,7 @@
 namespace rocket::qwen38::linear_attention {
 
 inline constexpr int kMaxRows = 16;
+inline constexpr int kMaxVerifierRows = 128;
 inline constexpr int kKeyHeads = 8;
 inline constexpr int kValueHeads = 24;
 inline constexpr int kHeadDim = 128;
@@ -39,6 +40,12 @@ class CorePlan final {
               float* recurrent_state, std::size_t recurrent_slot_stride,
               const std::int32_t* state_indices, int m,
               cudaStream_t stream);
+  void launch_verifier(
+      const __nv_bfloat16* position_major_qkvz,
+      const __nv_bfloat16* position_major_ba, __nv_bfloat16* dense_conv_state,
+      float* dense_recurrent_state, __nv_bfloat16* prefix_conv_state,
+      float* prefix_recurrent_state, int sequences, int verify_width,
+      cudaStream_t stream);
   const __nv_bfloat16* output() const noexcept;
 
  private:
