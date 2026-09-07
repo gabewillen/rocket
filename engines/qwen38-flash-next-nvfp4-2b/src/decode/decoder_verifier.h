@@ -42,6 +42,9 @@ struct VerificationOutput {
   std::array<std::int32_t, kDecoderMaxSequences> tokens{};
   std::array<std::int32_t, kDecoderMaxSequences> accepted_prefixes{};
   int sequences = 0;
+  // Runtime-owned device result used by same-stream accepted-state publishers.
+  // Its values are identical to accepted_prefixes and include the target token.
+  const std::int32_t* accepted_prefixes_device = nullptr;
 };
 
 class DecoderVerifierError : public std::runtime_error {

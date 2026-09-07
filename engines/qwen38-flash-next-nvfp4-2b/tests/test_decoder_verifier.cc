@@ -152,6 +152,7 @@ class Runtime final : public decode::DecoderStepRuntime {
     events.push_back("sample");
     decode::VerificationOutput output;
     output.sequences = shape.sequences;
+    output.accepted_prefixes_device = pointer<const std::int32_t>(0xb000);
     for (int i = 0; i < shape.sequences; ++i) {
       output.tokens[i] = 100 + i;
       output.accepted_prefixes[i] = shape.verify_width;

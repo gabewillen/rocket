@@ -186,6 +186,16 @@ target_link_libraries(qwen38_mtp_executor PUBLIC CUDA::cudart)
 target_compile_options(qwen38_mtp_executor PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
 )
+
+add_library(qwen38_mtp_decoder_step SHARED
+  src/mtp/decoder_step.cc
+  src/mtp/decoder_step_c_api.cc
+)
+target_include_directories(qwen38_mtp_decoder_step PUBLIC src)
+target_link_libraries(qwen38_mtp_decoder_step PRIVATE
+  qwen38_mtp_executor qwen38_decoder_verifier CUDA::cudart)
+target_compile_options(qwen38_mtp_decoder_step PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38_mtp_decoder_step PROPERTIES LINKER_LANGUAGE CUDA)
 set_target_properties(qwen38_mtp_executor PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
   POSITION_INDEPENDENT_CODE ON

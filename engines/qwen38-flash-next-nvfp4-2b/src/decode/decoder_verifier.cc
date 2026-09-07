@@ -125,7 +125,8 @@ VerificationOutput DecoderVerifier::step(
 
     runtime_.produce_logits(hidden, shape, stream_);
     VerificationOutput output = runtime_.sample_and_verify(shape, stream_);
-    if (output.sequences != shape.sequences)
+    if (output.sequences != shape.sequences ||
+        !output.accepted_prefixes_device)
       throw DecoderVerifierError("verification output sequence count changed");
     for (int sequence = 0; sequence < shape.sequences; ++sequence) {
       if (output.tokens[sequence] < 0 || output.tokens[sequence] >= 248'320 ||
