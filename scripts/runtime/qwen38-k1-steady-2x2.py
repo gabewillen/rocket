@@ -139,20 +139,34 @@ def render_launch(source: str, cell: Cell) -> str:
 def render_runner(source: str) -> str:
     """Keep a fixed c16 cohort alive after EOS so three windows remain valid."""
 
+    import_anchor = "import argparse, json, os, re, sys, threading, time, urllib.request\n"
+    import_replacement = "import argparse, json, os, re, socket, sys, threading, time, urllib.request\n"
     request_anchor = 'body = {"model": self.a.model, "temperature": self.a.temperature, "top_p": self.a.top_p,\n'
     request_replacement = (
         'body = {"model": self.a.model, "temperature": self.a.temperature, '
         '"top_p": self.a.top_p, "ignore_eos": True,\n'
     )
     init_anchor = "        self.i, self.a, self.prompt, self.stop, self.log = i, a, prompt, stop, log\n"
-    init_replacement = init_anchor + "        self.response = None\n"
+    init_replacement = init_anchor + "        self.response = None\n        self.socket = None\n"
     response_anchor = "            with urllib.request.urlopen(req, timeout=self.a.timeout) as r:\n"
-    response_replacement = response_anchor + "                self.response = r\n"
+    response_replacement = (
+        response_anchor
+        + "                self.response = r\n"
+        + "                self.socket = r.fp.raw._sock\n"
+    )
     class_end_anchor = "        self.log.append(rec)\n\n\ndef sample_loop"
     class_end_replacement = (
+        "        if self.stop.is_set() and rec['finish'] is None:\n"
+        "            rec['finish'] = 'aborted'\n"
         "        self.log.append(rec)\n\n"
         "    def abort(self):\n"
+        "        sock = self.socket\n"
         "        response = self.response\n"
+        "        if sock is not None:\n"
+        "            try:\n"
+        "                sock.shutdown(socket.SHUT_RDWR)\n"
+        "            except OSError:\n"
+        "                pass\n"
         "        if response is not None:\n"
         "            response.close()\n\n\n"
         "def sample_loop"
@@ -173,6 +187,7 @@ def render_runner(source: str) -> str:
         "        raise RuntimeError('stream cancellation exceeded 30 seconds')\n"
     )
     replacements = (
+        (import_anchor, import_replacement),
         (request_anchor, request_replacement),
         (init_anchor, init_replacement),
         (response_anchor, response_replacement),

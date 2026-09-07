@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import socket
 import sys
 import tempfile
 import threading
@@ -56,9 +57,12 @@ class Steady2x2ContractTest(unittest.TestCase):
         worker_type = namespace["Worker"]
         opened = threading.Event()
 
+        peers = []
+
         class BlockedResponse:
-            def __init__(self):
-                self.closed = threading.Event()
+            def __init__(self, client):
+                self.socket = client
+                self.fp = client.makefile("rb")
 
             def __enter__(self):
                 opened.set()
@@ -68,17 +72,18 @@ class Steady2x2ContractTest(unittest.TestCase):
                 self.close()
 
             def __iter__(self):
-                self.closed.wait(5)
-                raise OSError("response closed")
-                yield b""  # pragma: no cover
+                return iter(self.fp)
 
             def close(self):
-                self.closed.set()
+                self.fp.close()
+                self.socket.close()
 
         responses = []
 
         def fake_urlopen(*_, **__):
-            response = BlockedResponse()
+            client, peer = socket.socketpair()
+            peers.append(peer)
+            response = BlockedResponse(client)
             responses.append(response)
             return response
 
@@ -110,6 +115,8 @@ class Steady2x2ContractTest(unittest.TestCase):
             self.assertEqual({record["finish"] for record in log}, {"aborted"})
         finally:
             namespace["urllib"].request.urlopen = original_urlopen
+            for peer in peers:
+                peer.close()
 
     def test_sources_and_fixture_are_exact(self):
         record = MODULE.validate_sources()
