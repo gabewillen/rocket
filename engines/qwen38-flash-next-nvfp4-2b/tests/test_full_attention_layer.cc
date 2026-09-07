@@ -32,18 +32,23 @@ class Graph final : public decode::FullAttentionGraph {
  public:
   int rank() const noexcept override { return 0; }
   int layer() const noexcept override { return 3; }
-  void launch(const __nv_bfloat16* block_input, int m,
+  void launch(const __nv_bfloat16* block_input,
+              decode::FullAttentionLaunchShape shape,
               cudaStream_t stream) override {
-    check(block_input != nullptr && m == expected_m && stream == expected_stream,
+    check(block_input != nullptr && shape.sequences == expected_m &&
+              shape.verify_width == 1 && shape.token_rows == expected_m &&
+              stream == expected_stream,
           "graph launch contract drift");
     calls.push_back("attention");
   }
   const __nv_bfloat16* projected_output() const noexcept override {
     return &partial;
   }
+  void fault() noexcept override { faulted = true; }
   int expected_m = 4;
   cudaStream_t expected_stream = reinterpret_cast<cudaStream_t>(0x1230);
   __nv_bfloat16 partial{};
+  bool faulted = false;
   std::vector<std::string_view> calls;
 };
 
@@ -58,7 +63,9 @@ class Reducer final : public decode::HiddenPartialReducer {
               stream == reinterpret_cast<cudaStream_t>(0x1230),
           "reducer contract drift");
     calls.push_back("reduce");
+    if (fail) throw std::runtime_error("injected reduction failure");
   }
+  bool fail = false;
   std::vector<std::string_view> calls;
 };
 
@@ -136,7 +143,8 @@ int main() {
                          std::string_view::npos;
     }
     check(deferred_failure && failing_trace.stages.size() == 1 &&
-              failing_trace.stages[0] == "rocket.qwen38.layer3.lifecycle" &&
+              failing_trace.stages[0] ==
+                  "rocket.qwen38.full_attention.lifecycle" &&
               failing_trace.outcomes[0] != pr::Outcome::kOk,
           "deferred completion failure was published");
     bool retried_fault = false;
@@ -149,6 +157,26 @@ int main() {
       retried_fault = true;
     }
     check(retried_fault, "deferred completion failure did not fault transition");
+
+    Graph launched_graph;
+    Reducer failing_reducer;
+    failing_reducer.fail = true;
+    HyperConnection launched_hc;
+    Trace launched_trace;
+    decode::FullAttentionLayer launched_layer(
+        launched_graph, failing_reducer, launched_hc, launched_trace);
+    bool launched_failure = false;
+    try {
+      launched_layer.execute(
+          1, 4, &hidden, &block_input, &injection, &reduced, &updated,
+          &moe_input, &next_injection, "trace-reduce", "request-reduce",
+          graph.expected_stream);
+    } catch (const std::runtime_error& error) {
+      launched_failure = std::string_view(error.what()).find("reduction") !=
+                         std::string_view::npos;
+    }
+    check(launched_failure && launched_graph.faulted,
+          "post-launch uncertainty did not fault the native graph");
     std::puts("qwen38 full-attention layer order and publication contract passed");
     return 0;
   } catch (const std::exception& error) {

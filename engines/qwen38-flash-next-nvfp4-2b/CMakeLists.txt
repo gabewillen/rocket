@@ -50,10 +50,54 @@ set_target_properties(qwen38_cutlass_qkv PROPERTIES
 )
 target_link_libraries(qwen38_cutlass_qkv PRIVATE CUDA::cudart)
 
+add_library(qwen38_qsa_state_fork STATIC src/attention/qsa_state_fork.cu)
+target_include_directories(qwen38_qsa_state_fork PUBLIC src)
+target_link_libraries(qwen38_qsa_state_fork PUBLIC CUDA::cudart)
+target_compile_options(qwen38_qsa_state_fork PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
+)
+set_target_properties(qwen38_qsa_state_fork PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
+add_library(qwen38_qsa_preprocess STATIC src/attention/qsa_preprocess.cu)
+target_include_directories(qwen38_qsa_preprocess PUBLIC src)
+target_link_libraries(qwen38_qsa_preprocess PUBLIC CUDA::cudart)
+target_compile_options(qwen38_qsa_preprocess PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
+)
+
+add_library(qwen38_full_attention_native SHARED
+  src/attention/full_attention_native.cu)
+target_include_directories(qwen38_full_attention_native PUBLIC src)
+target_link_libraries(qwen38_full_attention_native PUBLIC
+  qwen38_cutlass_qkv qwen38_qsa_preprocess qwen38_qsa_state_fork
+  qwen38_decode_execution CUDA::cudart)
+target_compile_options(qwen38_full_attention_native PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
+)
+set_target_properties(qwen38_full_attention_native PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+set_target_properties(qwen38_qsa_preprocess PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
 add_executable(qwen38-qsa-expand-smoke bench/qsa_expand_smoke.cu)
 target_include_directories(qwen38-qsa-expand-smoke PRIVATE src)
 target_link_libraries(qwen38-qsa-expand-smoke PRIVATE qwen38_cutlass_qkv CUDA::cudart)
 set_target_properties(qwen38-qsa-expand-smoke PROPERTIES CUDA_ARCHITECTURES "121")
+
+add_executable(qwen38-full-attention-native-smoke
+  bench/full_attention_native_smoke.cu)
+target_include_directories(qwen38-full-attention-native-smoke PRIVATE src)
+target_link_libraries(qwen38-full-attention-native-smoke PRIVATE
+  qwen38_full_attention_native CUDA::cudart)
+set_target_properties(qwen38-full-attention-native-smoke PROPERTIES
+  CUDA_ARCHITECTURES "121")
 
 add_library(qwen38_pair_reduce STATIC
   src/pair_reduce/pair_reduce.cu
@@ -73,6 +117,7 @@ set_target_properties(qwen38_pair_reduce PROPERTIES
 
 add_library(qwen38_decode_execution STATIC
   src/decode/execution.cc
+  src/decode/full_attention_graph.cc
   src/decode/full_attention_layer.cc
   src/decode/linear_attention_layer.cc
 )
@@ -198,6 +243,33 @@ target_link_libraries(qwen38-test-full-attention-layer PRIVATE qwen38_decode_exe
 target_compile_options(qwen38-test-full-attention-layer PRIVATE -Wall -Wextra -Werror)
 set_target_properties(qwen38-test-full-attention-layer PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-full-attention-layer-contract COMMAND qwen38-test-full-attention-layer)
+
+add_executable(qwen38-test-concrete-full-attention-graph
+  tests/test_concrete_full_attention_graph.cc)
+target_link_libraries(qwen38-test-concrete-full-attention-graph PRIVATE
+  qwen38_decode_execution CUDA::cudart)
+target_compile_options(qwen38-test-concrete-full-attention-graph PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-concrete-full-attention-graph PROPERTIES
+  LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-concrete-full-attention-graph-contract
+  COMMAND qwen38-test-concrete-full-attention-graph)
+
+add_executable(qwen38-test-qsa-state-fork tests/test_qsa_state_fork.cu)
+target_link_libraries(qwen38-test-qsa-state-fork PRIVATE
+  qwen38_qsa_state_fork CUDA::cudart)
+target_compile_options(qwen38-test-qsa-state-fork PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
+)
+add_test(NAME qwen38-qsa-state-fork-contract COMMAND qwen38-test-qsa-state-fork)
+
+add_executable(qwen38-test-qsa-preprocess tests/test_qsa_preprocess.cu)
+target_link_libraries(qwen38-test-qsa-preprocess PRIVATE
+  qwen38_qsa_preprocess CUDA::cudart)
+target_compile_options(qwen38-test-qsa-preprocess PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
+)
+add_test(NAME qwen38-qsa-preprocess-contract COMMAND qwen38-test-qsa-preprocess)
 
 add_executable(qwen38-test-linear-attention-layer tests/test_linear_attention_layer.cc)
 target_link_libraries(qwen38-test-linear-attention-layer PRIVATE qwen38_decode_execution)

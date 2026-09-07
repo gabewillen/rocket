@@ -20,7 +20,7 @@ std::uint64_t elapsed_ns(Clock::time_point start) noexcept {
 
 void require(bool condition, const char* message) {
   if (!condition) throw DecodeExecutionContractError(
-      std::string("qwen38 layer-3 full attention: ") + message);
+      std::string("qwen38 full attention: ") + message);
 }
 
 }  // namespace
@@ -31,10 +31,12 @@ FullAttentionLayer::FullAttentionLayer(
     pair_reduce::OtelStageSink& telemetry)
     : graph_(graph), reducer_(reducer), hyperconnection_(hyperconnection),
       telemetry_(telemetry) {
-  require(graph_.rank() == 0 && graph_.layer() == 3,
-          "graph must bind authenticated rank 0 layer 3");
-  require(reducer_.rank() == 0 && reducer_.world_size() == 2,
-          "reducer must bind rank 0 of TP2");
+  require(graph_.rank() >= 0 && graph_.rank() < 2 &&
+              graph_.layer() >= 3 && graph_.layer() <= 47 &&
+              graph_.layer() % 4 == 3,
+          "graph must bind an authenticated TP rank and full-attention layer");
+  require(reducer_.rank() == graph_.rank() && reducer_.world_size() == 2,
+          "reducer must bind the same rank of TP2");
 }
 
 FullAttentionResult FullAttentionLayer::execute(
@@ -45,6 +47,7 @@ FullAttentionResult FullAttentionLayer::execute(
     std::string_view trace_id, std::string_view request_id,
     cudaStream_t stream) {
   const auto lifecycle_start = Clock::now();
+  bool graph_started = false;
   try {
     require(!faulted_, "faulted transition cannot be retried");
     require(generation != 0 && generation == last_generation_ + 1,
@@ -57,20 +60,21 @@ FullAttentionResult FullAttentionLayer::execute(
     auto start = Clock::now();
     hyperconnection_.mix(hidden, block_input, injection, m, stream);
     hyperconnection_.synchronize(stream);
-    emit("rocket.qwen38.layer3.attn_hc_mix", pair_reduce::Outcome::kOk, m,
+    emit("rocket.qwen38.full_attention.attn_hc_mix", pair_reduce::Outcome::kOk, m,
          trace_id, request_id, elapsed_ns(start), kHyperBytesPerRow * m);
 
     start = Clock::now();
-    graph_.launch(block_input, m, stream);
+    graph_started = true;
+    graph_.launch(block_input, {m, 1, m}, stream);
     hyperconnection_.synchronize(stream);
     const __nv_bfloat16* partial = graph_.projected_output();
     require(partial != nullptr, "attention graph returned no projected output");
-    emit("rocket.qwen38.layer3.qsa_attention", pair_reduce::Outcome::kOk, m,
+    emit("rocket.qwen38.full_attention.qsa_attention", pair_reduce::Outcome::kOk, m,
          trace_id, request_id, elapsed_ns(start), kHiddenBytesPerRow * m);
 
     start = Clock::now();
     reducer_.reduce(partial, reduced_attention, m, trace_id, request_id, stream);
-    emit("rocket.qwen38.layer3.pair_reduce", pair_reduce::Outcome::kOk, m,
+    emit("rocket.qwen38.full_attention.pair_reduce", pair_reduce::Outcome::kOk, m,
          trace_id, request_id, elapsed_ns(start), kHiddenBytesPerRow * m);
 
     start = Clock::now();
@@ -78,17 +82,18 @@ FullAttentionResult FullAttentionLayer::execute(
         hidden, reduced_attention, injection, updated_hidden, next_block_input,
         next_injection, m, stream);
     hyperconnection_.synchronize(stream);
-    emit("rocket.qwen38.layer3.mlp_hc_combine_mix", pair_reduce::Outcome::kOk,
+    emit("rocket.qwen38.full_attention.mlp_hc_combine_mix", pair_reduce::Outcome::kOk,
          m, trace_id, request_id, elapsed_ns(start), kHyperBytesPerRow * m);
   } catch (...) {
+    if (graph_started) graph_.fault();
     faulted_ = true;
-    emit("rocket.qwen38.layer3.lifecycle",
+    emit("rocket.qwen38.full_attention.lifecycle",
          pair_reduce::Outcome::kTransportError, m, trace_id, request_id,
          elapsed_ns(lifecycle_start), 0);
     throw;
   }
   last_generation_ = generation;
-  emit("rocket.qwen38.layer3.lifecycle", pair_reduce::Outcome::kOk, m,
+  emit("rocket.qwen38.full_attention.lifecycle", pair_reduce::Outcome::kOk, m,
        trace_id, request_id, elapsed_ns(lifecycle_start), 0);
   return {generation, m};
 }
@@ -97,7 +102,7 @@ void FullAttentionLayer::emit(
     std::string_view stage, pair_reduce::Outcome outcome, int m,
     std::string_view trace_id, std::string_view request_id,
     std::uint64_t duration_ns, std::uint64_t bytes) noexcept {
-  telemetry_.emit_span_and_log({stage, trace_id, request_id, 0,
+  telemetry_.emit_span_and_log({stage, trace_id, request_id, graph_.rank(),
                                 pair_reduce::allowed_m(m) ? m : 0,
                                 pair_reduce::kDtype, outcome, duration_ns,
                                 bytes});

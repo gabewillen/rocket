@@ -53,6 +53,13 @@ int qwen38_qsa_indexer_score(void* plan,
                             const std::int32_t* sequence_lengths,
                             const std::int32_t* token_to_request,
                             cudaStream_t stream);
+int qwen38_qsa_indexer_score_external(
+    void* plan, const void* index_query_bf16,
+    const void* compressed_state_bf16,
+    const void* staged_compressed_rows_bf16,
+    const std::int64_t* logical_positions,
+    const std::int32_t* sequence_lengths,
+    const std::int32_t* token_to_request, int rows, cudaStream_t stream);
 int qwen38_qsa_indexer_select_expand(void* plan,
                                     const std::int64_t* logical_positions,
                                     const std::int32_t* sequence_lengths,
@@ -85,6 +92,11 @@ int qwen38_qsa_sparse_attention_control(
     void* plan, const void* qkv_output_bf16,
     const std::int64_t* logical_positions,
     const std::int32_t* token_to_request, cudaStream_t stream);
+int qwen38_qsa_sparse_attention_external(
+    void* plan, const void* query_bf16, const void* main_state_fp8,
+    const void* staged_main_rows_fp8,
+    const std::int64_t* logical_positions,
+    const std::int32_t* token_to_request, int rows, cudaStream_t stream);
 int qwen38_qsa_output_project(void* plan, cudaStream_t stream);
 int qwen38_qsa_attention_output(void* plan, void** output_bf16,
                                std::size_t* elements);

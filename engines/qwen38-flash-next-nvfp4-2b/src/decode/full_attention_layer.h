@@ -11,16 +11,26 @@
 
 namespace rocket::qwen38::decode {
 
-// Borrowed adapter for the already captured rank-local layer-3 graph. The
+struct FullAttentionLaunchShape {
+  int sequences;
+  int verify_width;
+  int token_rows;
+};
+
+// Borrowed adapter for one captured rank-local full-attention graph. The
 // concrete adapter binds QKV, QSA score/radix/attention, and output projection.
 class FullAttentionGraph {
  public:
   virtual ~FullAttentionGraph() = default;
   virtual int rank() const noexcept = 0;
   virtual int layer() const noexcept = 0;
-  virtual void launch(const __nv_bfloat16* block_input, int m,
+  virtual void launch(const __nv_bfloat16* block_input,
+                      FullAttentionLaunchShape shape,
                       cudaStream_t stream) = 0;
   virtual const __nv_bfloat16* projected_output() const noexcept = 0;
+  // A downstream fence can surface an asynchronous launch failure. Once this
+  // is called the implementation must reject every later launch.
+  virtual void fault() noexcept = 0;
 };
 
 // Exact Qwen HyperConnection boundaries around one full-attention block:
@@ -46,7 +56,7 @@ struct FullAttentionResult {
   int m_bucket;
 };
 
-// Single-owner exact layer-3 attention transition. A result is returned only
+// Single-owner exact full-attention transition. A result is returned only
 // after every ordered stage succeeds; borrowed output buffers are unpublished
 // until then. Reconstruct after an exception because remote reduction writes
 // or output buffers may have changed.
