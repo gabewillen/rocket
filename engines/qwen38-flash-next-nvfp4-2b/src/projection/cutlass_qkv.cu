@@ -629,6 +629,129 @@ __global__ void score_qsa_external_gather64(
   }
 }
 
+// K4 c16 specialization. Five verifier rows share each 16-key active-state
+// tile. Two tensor-core warps cover the 20 query heads; the at-most-two newly
+// completed compressed rows are corrected from private staged state before
+// their scores become visible.
+__global__ void score_qsa_external_k4_c16(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ active_keys,
+    const __nv_bfloat16* __restrict__ staged_keys,
+    const std::int64_t* logical_positions,
+    const std::int32_t* sequence_lengths,
+    const std::int32_t* token_to_request,
+    float* __restrict__ logits, std::int32_t* __restrict__ visible_blocks) {
+  using namespace nvcuda;
+  constexpr int width = 5;
+  __shared__ __align__(16) __nv_bfloat16 query_tile[32 * kQsaDim];
+  __shared__ __align__(16) __nv_bfloat16 key_tile[16 * kQsaDim];
+  __shared__ __align__(16) float products[2][16 * 16];
+  const int sequence = blockIdx.x;
+  const int tile = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid / 32;
+  const int lane = tid % 32;
+  const int first_row = sequence * width;
+  const int request = token_to_request[first_row];
+
+  auto* query_vectors = reinterpret_cast<uint4*>(query_tile);
+  for (int vector = tid; vector < 32 * kQsaDim * 2 / sizeof(uint4);
+       vector += blockDim.x) {
+    const int flat_head = vector / 16;
+    const int chunk = vector % 16;
+    query_vectors[vector] =
+        flat_head < width * kQsaHeads
+            ? reinterpret_cast<const uint4*>(
+                  query + (first_row * kQsaHeads + flat_head) * kQsaDim)[chunk]
+            : make_uint4(0, 0, 0, 0);
+  }
+  auto* key_vectors = reinterpret_cast<uint4*>(key_tile);
+  for (int vector = tid; vector < 16 * kQsaDim * 2 / sizeof(uint4);
+       vector += blockDim.x) {
+    const int token = vector / 16;
+    const int chunk = vector % 16;
+    const int column = tile * 16 + token;
+    const __nv_bfloat16* key =
+        active_keys +
+        (static_cast<std::size_t>(min(max(request, 0), kM - 1)) *
+             kQsaColumns +
+         column) *
+            kQsaDim;
+    key_vectors[vector] = request >= 0 && request < kM
+                              ? reinterpret_cast<const uint4*>(key)[chunk]
+                              : make_uint4(0, 0, 0, 0);
+  }
+  __syncthreads();
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> product;
+  wmma::fill_fragment(product, 0.0F);
+#pragma unroll
+  for (int k = 0; k < kQsaDim; k += 16) {
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
+                   wmma::row_major> q_fragment;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
+                   wmma::col_major> k_fragment;
+    wmma::load_matrix_sync(q_fragment, query_tile + warp * 16 * kQsaDim + k,
+                           kQsaDim);
+    wmma::load_matrix_sync(k_fragment, key_tile + k, kQsaDim);
+    wmma::mma_sync(product, q_fragment, k_fragment, product);
+  }
+  wmma::store_matrix_sync(products[warp], product, 16,
+                          wmma::mem_row_major);
+  __syncwarp();
+  if (lane < 16) {
+    const int column = tile * 16 + lane;
+    const int first_verifier = warp * 4;
+    const int verifier_end = min(first_verifier + 4, width);
+    for (int verifier = first_verifier; verifier < verifier_end; ++verifier) {
+      const int row = first_row + verifier;
+      const bool valid_request = request >= 0 && request < kM &&
+                                 token_to_request[row] == request;
+      int visible = 0;
+      if (valid_request) {
+        visible = min(static_cast<int>((logical_positions[row] + 1) /
+                                       kCompressRatio),
+                      sequence_lengths[request] / kCompressRatio);
+        visible = max(0, min(visible, kQsaColumns));
+      }
+      if (tile == 0 && lane == 0) visible_blocks[row] = visible;
+      float score = -INFINITY;
+      if (column < visible) {
+        score = 0.0F;
+#pragma unroll
+        for (int head = 0; head < kQsaHeads; ++head)
+          score += fmaxf(
+              products[warp][(verifier - first_verifier) * kQsaHeads * 16 +
+                             head * 16 + lane],
+              0.0F);
+        const __nv_bfloat16* staged = nullptr;
+        for (int candidate = first_row; candidate <= row; ++candidate)
+          if (token_to_request[candidate] == request &&
+              logical_positions[candidate] % kCompressRatio ==
+                  kCompressRatio - 1 &&
+              logical_positions[candidate] / kCompressRatio == column)
+            staged = staged_keys +
+                     static_cast<std::size_t>(candidate) * kQsaDim;
+        if (staged) {
+          score = 0.0F;
+#pragma unroll
+          for (int head = 0; head < kQsaHeads; ++head) {
+            float dot = 0.0F;
+#pragma unroll
+            for (int dim = 0; dim < kQsaDim; ++dim)
+              dot = fmaf(__bfloat162float(
+                             query[(row * kQsaHeads + head) * kQsaDim + dim]),
+                         __bfloat162float(staged[dim]), dot);
+            score += fmaxf(dot, 0.0F);
+          }
+        }
+        score *= 0.08838834764831845F;
+      }
+      logits[static_cast<std::size_t>(row) * kQsaColumns + column] = score;
+    }
+  }
+}
+
 __global__ void extract_qsa_topk(const float* sorted_logits,
                                  const std::int32_t* sorted_indices,
                                  const std::int32_t* visible_blocks,
@@ -1758,13 +1881,22 @@ extern "C" int qwen38_qsa_indexer_score_external(
     return 1;
   }
   auto* plan = static_cast<QsaPlan*>(opaque);
-  score_qsa_external_gather64<<<dim3(rows, kQsaColumns / 64), 128, 0,
-                                stream>>>(
-      static_cast<const __nv_bfloat16*>(index_query),
-      static_cast<const __nv_bfloat16*>(compressed_state),
-      static_cast<const __nv_bfloat16*>(staged_compressed_rows),
-      logical_positions, sequence_lengths, token_to_request, rows,
-      plan->logits, plan->visible);
+  if (rows == 80) {
+    score_qsa_external_k4_c16<<<dim3(kM, kQsaColumns / 16), 64, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(index_query),
+        static_cast<const __nv_bfloat16*>(compressed_state),
+        static_cast<const __nv_bfloat16*>(staged_compressed_rows),
+        logical_positions, sequence_lengths, token_to_request, plan->logits,
+        plan->visible);
+  } else {
+    score_qsa_external_gather64<<<dim3(rows, kQsaColumns / 64), 128, 0,
+                                  stream>>>(
+        static_cast<const __nv_bfloat16*>(index_query),
+        static_cast<const __nv_bfloat16*>(compressed_state),
+        static_cast<const __nv_bfloat16*>(staged_compressed_rows),
+        logical_positions, sequence_lengths, token_to_request, rows,
+        plan->logits, plan->visible);
+  }
   return cuda_ok(cudaGetLastError(), "score external QSA state") ? 0 : 1;
 }
 
