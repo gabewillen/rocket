@@ -14,6 +14,7 @@ import json
 import math
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
@@ -347,53 +348,208 @@ def build_plan(
         "totals_per_rank": {"logical_bytes_per_stream": logical, "cuda_allocated_bytes_per_stream": allocated, "cuda_allocated_bytes_c16": allocated * concurrency, "nvme_padded_bytes_per_stream": padded, "nvme_padded_bytes_c16": padded * concurrency, "cuda_double_count_exclusion": "target.linear.recurrent shares the target.linear.conv GDN Mamba page"},
         "restore_contract": {"boundary": "one accepted target-token count shared by target, MTP, QSA, GDN, and PLE records", "publication": "write and checksum every family record before atomically publishing the boundary manifest", "partial_restore": "forbidden", "host_io_alignment_bytes": host_page},
         "parity_exclusions": [{"state": "MTP multi_hidden, logits, top-k indices, and forward metadata", "reason": "step-local scratch is recomputed after restore; pinned mtp.py persists sequence history only through its full-attention QSA caches"}],
-        "proof": {"cuda_allocation": "not-run", "remaining_gap": "allocate and bind every listed tensor inside one model-resident rank, then report allocator deltas and an evict/restore parity trace at the shared accepted-token boundary"},
-        "next_allocation_command": "docker exec \"$MODEL_CONTAINER\" python3 /rocket/scripts/memory/qwen38-state-capacity.py --cuda-allocate-plan /rocket/scripts/memory/qwen38-state-capacity-plan.json --cuda-proof-output /rocket/run/qwen38-state-capacity-cuda-proof.json",
+        "proof": {"cuda_allocation": "not-run", "acceptance": "v2 status=passed after GPU fill, deterministic readback from every 65536-byte page, and allocator/resident deltas each cover the full extent", "remaining_gap": "allocate and bind every listed tensor inside one model-resident rank, then report allocator deltas and an evict/restore parity trace at the shared accepted-token boundary"},
+        "next_allocation_command": "docker cp scripts/memory/qwen38-state-capacity.py rocket-qwen38-calibration-head:/rocket/run/qwen38-state-capacity.py && docker cp scripts/memory/qwen38-state-capacity-plan.json rocket-qwen38-calibration-head:/rocket/run/qwen38-state-capacity-plan.json && { rc=0; docker exec rocket-qwen38-calibration-head python3 /rocket/run/qwen38-state-capacity.py --cuda-allocate-plan /rocket/run/qwen38-state-capacity-plan.json --cuda-proof-output /rocket/run/qwen38-state-capacity-cuda-proof-v2.json --cuda-timeout-seconds 900 || rc=$?; docker cp rocket-qwen38-calibration-head:/rocket/run/qwen38-state-capacity-cuda-proof-v2.json /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/qwen38-state-capacity-cuda-proof-v2.json; exit $rc; }",
     }
 
 
-def cuda_allocate_plan(plan_path: Path, output: Path, device: str) -> None:
+def validate_cuda_proof(proof: dict[str, Any], expected_bytes: int) -> None:
+    if proof.get("schema") != "rocket.qwen38.state-capacity.cuda-allocation.v2":
+        raise PlanError("CUDA proof must use touched-allocation schema v2")
+    if proof.get("status") != "passed":
+        raise PlanError(f"CUDA proof did not pass: {proof.get('status')!r}")
+    for name in (
+        "requested_bytes", "storage_bytes", "allocator_allocated_delta_bytes",
+        "resident_delta_bytes", "touched_bytes", "verified_pages",
+        "expected_pages",
+    ):
+        if type(proof.get(name)) is not int or proof[name] <= 0:
+            raise PlanError(f"CUDA proof lacks positive {name}")
+    if proof["requested_bytes"] != expected_bytes:
+        raise PlanError("CUDA proof requested-byte total does not match the plan")
+    if proof["storage_bytes"] != expected_bytes:
+        raise PlanError("CUDA proof storage-byte total does not match the plan")
+    if proof["touched_bytes"] != expected_bytes:
+        raise PlanError("CUDA proof did not write the full byte extent")
+    if proof["allocator_allocated_delta_bytes"] < expected_bytes:
+        raise PlanError("CUDA allocator delta does not cover the full plan")
+    if proof["resident_delta_bytes"] < expected_bytes:
+        raise PlanError("CUDA resident-memory delta does not cover the full plan")
+    if proof["verified_pages"] != proof["expected_pages"]:
+        raise PlanError("CUDA proof did not read back every touched page")
+    if not proof.get("deterministic_readback"):
+        raise PlanError("CUDA proof lacks deterministic readback")
+
+
+def _readback_pages(
+    tensor: Any, pattern: int, page_bytes: int, chunk_pages: int,
+) -> int:
+    """Read one deterministic byte from every touched page using small copies."""
+    size = tensor.numel()
+    pages = ceil_div(size, page_bytes)
+    for first_page in range(0, pages, chunk_pages):
+        last_page = min(first_page + chunk_pages, pages)
+        start = first_page * page_bytes
+        stop = min(last_page * page_bytes, size)
+        sample = tensor[start:stop:page_bytes].cpu().tolist()
+        if len(sample) != last_page - first_page or any(x != pattern for x in sample):
+            raise PlanError(f"CUDA deterministic page readback failed at page {first_page}")
+    if int(tensor[-1].cpu().item()) != pattern:
+        raise PlanError("CUDA deterministic tail-byte readback failed")
+    return pages
+
+
+def cuda_allocate_plan(
+    plan_path: Path, output: Path, device: str, timeout_seconds: int,
+    touch_page_bytes: int = 65536, readback_chunk_pages: int = 4096,
+) -> None:
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     if plan.get("schema") != "rocket.qwen38.state-capacity.v1":
         raise PlanError("CUDA probe requires a Qwen3.8 state-capacity v1 plan")
     if plan.get("status") != "allocation-plan-only":
         raise PlanError("CUDA probe refuses an unknown plan status")
+    if timeout_seconds <= 0:
+        raise PlanError("CUDA probe timeout must be positive")
+    if touch_page_bytes != plan.get("serving", {}).get("host_page_bytes"):
+        raise PlanError("CUDA touch page must match the plan host-page contract")
+    if readback_chunk_pages <= 0:
+        raise PlanError("CUDA readback chunk must contain at least one page")
     try:
         import torch
     except ImportError as exc:
         raise PlanError("CUDA probe requires PyTorch in the model image") from exc
     if not torch.cuda.is_available():
         raise PlanError("CUDA probe requires an available CUDA device")
+    torch.cuda.synchronize(device)
     free_before, total = torch.cuda.mem_get_info(device)
+    allocated_before = torch.cuda.memory_allocated(device)
+    reserved_before = torch.cuda.memory_reserved(device)
+    requested_total = sum(
+        row["cuda_allocated_bytes_c16"] for row in plan["families"]
+        if row.get("cuda_allocation_accounted", True)
+    )
     allocations = []
     held = []
-    for row in plan["families"]:
-        if not row.get("cuda_allocation_accounted", True):
-            continue
-        requested = row.get("cuda_allocated_bytes_c16")
-        if type(requested) is not int or requested <= 0:
-            raise PlanError(f"invalid CUDA byte count for {row.get('id')}")
-        tensor = torch.empty(requested, dtype=torch.uint8, device=device)
-        held.append(tensor)
-        allocations.append({
-            "id": row["id"], "requested_bytes": requested,
-            "storage_bytes": tensor.untyped_storage().nbytes(),
-        })
-    torch.cuda.synchronize(device)
+    started = time.monotonic()
+    failure: Exception | None = None
+    final_verified_pages = 0
+    try:
+        for family_index, row in enumerate(plan["families"]):
+            if not row.get("cuda_allocation_accounted", True):
+                continue
+            requested = row.get("cuda_allocated_bytes_c16")
+            if type(requested) is not int or requested <= 0:
+                raise PlanError(f"invalid CUDA byte count for {row.get('id')}")
+            pattern = (family_index * 37 + 17) % 251 + 1
+            family_started = time.monotonic()
+            tensor = torch.empty(requested, dtype=torch.uint8, device=device)
+            held.append(tensor)
+            allocation = {
+                "id": row["id"], "requested_bytes": requested,
+                "storage_bytes": tensor.untyped_storage().nbytes(),
+                "fill_pattern_uint8": pattern,
+                "full_extent_gpu_write": False,
+            }
+            allocations.append(allocation)
+            tensor.fill_(pattern)
+            torch.cuda.synchronize(device)
+            allocation["full_extent_gpu_write"] = True
+            verified_pages = _readback_pages(
+                tensor, pattern, touch_page_bytes, readback_chunk_pages
+            )
+            torch.cuda.synchronize(device)
+            allocation["initial_verified_pages"] = verified_pages
+            allocation["elapsed_seconds"] = time.monotonic() - family_started
+            if time.monotonic() - started > timeout_seconds:
+                raise PlanError("CUDA allocation probe exceeded its time bound")
+        # Re-read every allocation after the last fill. Immediate per-family
+        # checks alone can pass while later allocations evict or corrupt older
+        # unified-memory pages.
+        for tensor, allocation in zip(held, allocations):
+            verified_pages = _readback_pages(
+                tensor, allocation["fill_pattern_uint8"],
+                touch_page_bytes, readback_chunk_pages,
+            )
+            allocation["final_verified_pages"] = verified_pages
+            final_verified_pages += verified_pages
+            if time.monotonic() - started > timeout_seconds:
+                raise PlanError("CUDA allocation probe exceeded its time bound")
+        torch.cuda.synchronize(device)
+    except Exception as exc:  # Preserve an actionable artifact on CUDA OOM/fault.
+        failure = exc
+    try:
+        torch.cuda.synchronize(device)
+    except Exception as exc:
+        failure = failure or exc
     free_after, total_after = torch.cuda.mem_get_info(device)
-    if total_after != total:
-        raise PlanError("CUDA device total changed during allocation probe")
+    allocated_after = torch.cuda.memory_allocated(device)
+    reserved_after = torch.cuda.memory_reserved(device)
+    storage_total = sum(x["storage_bytes"] for x in allocations)
+    touched_total = sum(
+        x["requested_bytes"] for x in allocations
+        if x["full_extent_gpu_write"]
+    )
+    expected_pages = sum(
+        ceil_div(
+            row["cuda_allocated_bytes_c16"], touch_page_bytes
+        ) for row in plan["families"]
+        if row.get("cuda_allocation_accounted", True)
+    )
+    deterministic_readback = (
+        failure is None
+        and storage_total == requested_total
+        and touched_total == requested_total
+        and final_verified_pages == expected_pages
+    )
+    resident_delta = free_before - free_after
+    allocated_delta = allocated_after - allocated_before
+    reserved_delta = reserved_after - reserved_before
+    status = "passed"
+    error = None
+    if failure is not None:
+        status = "failed"
+        error = f"{type(failure).__name__}: {failure}"
+    elif total_after != total:
+        status, error = "failed", "CUDA device total changed during allocation probe"
+    elif storage_total != requested_total:
+        status, error = "failed", "not every planned allocation completed"
+    elif touched_total != requested_total:
+        status, error = "failed", "GPU writes did not touch the full byte extent"
+    elif not deterministic_readback:
+        status, error = "failed", "deterministic readback did not cover every touched page"
+    elif allocated_delta < requested_total:
+        status, error = "failed", "CUDA allocator delta does not cover the full byte extent"
+    elif resident_delta < requested_total:
+        status, error = "failed", "device-free memory did not fall by the full touched byte extent"
     result = {
-        "schema": "rocket.qwen38.state-capacity.cuda-allocation.v1",
+        "schema": "rocket.qwen38.state-capacity.cuda-allocation.v2",
+        "status": status,
         "plan_sha256": sha256(plan_path.read_bytes()),
         "device": str(device), "free_bytes_before": free_before,
         "free_bytes_after": free_after, "total_bytes": total,
-        "requested_bytes": sum(x["requested_bytes"] for x in allocations),
-        "storage_bytes": sum(x["storage_bytes"] for x in allocations),
+        "resident_delta_bytes": resident_delta,
+        "allocator_allocated_bytes_before": allocated_before,
+        "allocator_allocated_bytes_after": allocated_after,
+        "allocator_allocated_delta_bytes": allocated_delta,
+        "allocator_reserved_bytes_before": reserved_before,
+        "allocator_reserved_bytes_after": reserved_after,
+        "allocator_reserved_delta_bytes": reserved_delta,
+        "requested_bytes": requested_total,
+        "storage_bytes": storage_total,
+        "touched_bytes": touched_total,
+        "touch_page_bytes": touch_page_bytes,
+        "verified_pages": final_verified_pages,
+        "expected_pages": expected_pages,
+        "deterministic_readback": deterministic_readback,
+        "elapsed_seconds": time.monotonic() - started,
         "allocations": allocations,
-        "scope": "raw CUDA capacity beside the resident model process; engine binding and restore parity remain separate proof gates",
+        "error": error,
+        "scope": "fully touched CUDA capacity beside the resident model process; engine binding and restore parity remain separate proof gates",
     }
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if status != "passed":
+        raise PlanError(error or "CUDA allocation proof failed")
+    validate_cuda_proof(result, requested_total)
 
 
 def parse_args() -> argparse.Namespace:
@@ -401,6 +557,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cuda-allocate-plan", type=Path)
     parser.add_argument("--cuda-proof-output", type=Path)
     parser.add_argument("--cuda-device", default="cuda:0")
+    parser.add_argument("--cuda-timeout-seconds", type=int, default=900)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--revision")
     parser.add_argument("--image", default=IMAGE)
@@ -425,7 +582,10 @@ def main() -> int:
         if args.cuda_allocate_plan is not None:
             if args.cuda_proof_output is None:
                 raise PlanError("--cuda-allocate-plan requires --cuda-proof-output")
-            cuda_allocate_plan(args.cuda_allocate_plan, args.cuda_proof_output, args.cuda_device)
+            cuda_allocate_plan(
+                args.cuda_allocate_plan, args.cuda_proof_output, args.cuda_device,
+                args.cuda_timeout_seconds,
+            )
             return 0
         required = {
             "config": args.config, "revision": args.revision,

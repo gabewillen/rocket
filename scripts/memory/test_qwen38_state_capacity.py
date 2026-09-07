@@ -102,6 +102,69 @@ class StateCapacityTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.PlanError, "image ID drift"):
             MODULE.validate_sources("sha256:wrong", sources)
 
+    def test_original_lazy_allocation_artifact_is_rejected(self) -> None:
+        old_proof = {
+            "schema": "rocket.qwen38.state-capacity.cuda-allocation.v1",
+            "requested_bytes": 33420083200,
+            "storage_bytes": 33420083200,
+            "free_bytes_before": 1846018048,
+            "free_bytes_after": 1237516288,
+        }
+        with self.assertRaisesRegex(MODULE.PlanError, "touched-allocation schema v2"):
+            MODULE.validate_cuda_proof(old_proof, 33420083200)
+        deceptive_v2 = {
+            "schema": "rocket.qwen38.state-capacity.cuda-allocation.v2",
+            "status": "passed", "requested_bytes": 33420083200,
+            "storage_bytes": 33420083200,
+            "touched_bytes": 33420083200,
+            "allocator_allocated_delta_bytes": 33420083200,
+            "resident_delta_bytes": 1846018048 - 1237516288,
+            "verified_pages": 509950, "expected_pages": 509950,
+            "deterministic_readback": True,
+        }
+        with self.assertRaisesRegex(MODULE.PlanError, "resident-memory delta"):
+            MODULE.validate_cuda_proof(deceptive_v2, 33420083200)
+
+    def test_cuda_proof_requires_full_residency_and_readback(self) -> None:
+        proof = {
+            "schema": "rocket.qwen38.state-capacity.cuda-allocation.v2",
+            "status": "passed", "requested_bytes": 100, "storage_bytes": 100,
+            "touched_bytes": 100,
+            "allocator_allocated_delta_bytes": 100, "resident_delta_bytes": 99,
+            "verified_pages": 1, "expected_pages": 1,
+            "deterministic_readback": True,
+        }
+        with self.assertRaisesRegex(MODULE.PlanError, "resident-memory delta"):
+            MODULE.validate_cuda_proof(proof, 100)
+        proof["resident_delta_bytes"] = 100
+        proof["deterministic_readback"] = False
+        with self.assertRaisesRegex(MODULE.PlanError, "deterministic readback"):
+            MODULE.validate_cuda_proof(proof, 100)
+
+    def test_page_readback_is_chunked_and_checks_tail(self) -> None:
+        class FakeSlice:
+            def __init__(self, values): self.values = values
+            def cpu(self): return self
+            def tolist(self): return self.values
+
+        class FakeScalar:
+            def __init__(self, value): self.value = value
+            def cpu(self): return self
+            def item(self): return self.value
+
+        class FakeTensor:
+            def __init__(self, size, pattern):
+                self.size, self.pattern, self.slices = size, pattern, []
+            def numel(self): return self.size
+            def __getitem__(self, key):
+                if key == -1: return FakeScalar(self.pattern)
+                self.slices.append(key)
+                return FakeSlice([self.pattern] * len(range(*key.indices(self.size))))
+
+        tensor = FakeTensor(4 * 65536 + 7, 19)
+        self.assertEqual(MODULE._readback_pages(tensor, 19, 65536, 2), 5)
+        self.assertEqual(len(tensor.slices), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -252,7 +252,7 @@
       "qsa_cache.py": "e3460b06cd7ed309e47ad5dfd3d4250890539b912385503133bd98a003f73ba8"
     }
   },
-  "next_allocation_command": "docker exec \"$MODEL_CONTAINER\" python3 /rocket/scripts/memory/qwen38-state-capacity.py --cuda-allocate-plan /rocket/scripts/memory/qwen38-state-capacity-plan.json --cuda-proof-output /rocket/run/qwen38-state-capacity-cuda-proof.json",
+  "next_allocation_command": "docker cp scripts/memory/qwen38-state-capacity.py rocket-qwen38-calibration-head:/rocket/run/qwen38-state-capacity.py && docker cp scripts/memory/qwen38-state-capacity-plan.json rocket-qwen38-calibration-head:/rocket/run/qwen38-state-capacity-plan.json && { rc=0; docker exec rocket-qwen38-calibration-head python3 /rocket/run/qwen38-state-capacity.py --cuda-allocate-plan /rocket/run/qwen38-state-capacity-plan.json --cuda-proof-output /rocket/run/qwen38-state-capacity-cuda-proof-v2.json --cuda-timeout-seconds 900 || rc=$?; docker cp rocket-qwen38-calibration-head:/rocket/run/qwen38-state-capacity-cuda-proof-v2.json /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/qwen38-state-capacity-cuda-proof-v2.json; exit $rc; }",
   "parity_exclusions": [
     {
       "reason": "step-local scratch is recomputed after restore; pinned mtp.py persists sequence history only through its full-attention QSA caches",
@@ -260,6 +260,7 @@
     }
   ],
   "proof": {
+    "acceptance": "v2 status=passed after GPU fill, deterministic readback from every 65536-byte page, and allocator/resident deltas each cover the full extent",
     "cuda_allocation": "not-run",
     "remaining_gap": "allocate and bind every listed tensor inside one model-resident rank, then report allocator deltas and an evict/restore parity trace at the shared accepted-token boundary"
   },
