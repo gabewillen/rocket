@@ -27,6 +27,7 @@ using namespace cute;
 namespace rocket::qwen {
 
 constexpr int kM = 16;
+constexpr int kMaxTokenRows = 128;
 constexpr int kK = 2560;
 constexpr int kNq = 6144;
 constexpr int kNk = 256;
@@ -1014,10 +1015,11 @@ __global__ void qsa_sparse_splitk_external(
   for (int head = 0; head < kAttentionHeads; ++head) {
     const float norm = normalizers[head];
     partial_output[
-        ((split * kM + row) * kAttentionHeads + head) * kAttentionDim + dim] =
+        ((split * kMaxTokenRows + row) * kAttentionHeads + head) *
+            kAttentionDim + dim] =
         norm > 0.0F ? accumulator[head] / norm : 0.0F;
     if (dim == 0)
-      partial_lse[(split * kM + row) * kAttentionHeads + head] =
+      partial_lse[(split * kMaxTokenRows + row) * kAttentionHeads + head] =
           norm > 0.0F ? maxima[head] + logf(norm) : -INFINITY;
   }
 }
@@ -1193,12 +1195,13 @@ __global__ void qsa_sparse_splitk_external_block16(
     const int dim = index % kAttentionDim;
     const float norm = normalizers[head];
     partial_output[
-        ((split * kM + row) * kAttentionHeads + head) * kAttentionDim + dim] =
+        ((split * kMaxTokenRows + row) * kAttentionHeads + head) *
+            kAttentionDim + dim] =
         norm > 0.0F ? accumulator[head * kAttentionDim + dim] / norm : 0.0F;
   }
   if (tid < kAttentionHeads) {
     const float norm = normalizers[tid];
-    partial_lse[(split * kM + row) * kAttentionHeads + tid] =
+    partial_lse[(split * kMaxTokenRows + row) * kAttentionHeads + tid] =
         norm > 0.0F ? maxima[tid] + logf(norm) : -INFINITY;
   }
 }
@@ -1384,6 +1387,31 @@ __global__ void qsa_merge_splitk(const float* partial_output,
   }
   output[(row * kAttentionHeads + head) * kAttentionDim + dim] =
       __float2bfloat16(total > 0.0f ? value / total : 0.0f);
+}
+
+__global__ void qsa_merge_splitk_external(const float* partial_output,
+                                          const float* partial_lse,
+                                          __nv_bfloat16* output) {
+  const int row = blockIdx.x;
+  const int head = blockIdx.y;
+  const int dim = threadIdx.x;
+  float maximum = -INFINITY;
+  for (int split = 0; split < kAttentionSplits; ++split)
+    maximum = fmaxf(
+        maximum,
+        partial_lse[(split * kMaxTokenRows + row) * kAttentionHeads + head]);
+  float total = 0.0F, value = 0.0F;
+  for (int split = 0; split < kAttentionSplits; ++split) {
+    const float lse =
+        partial_lse[(split * kMaxTokenRows + row) * kAttentionHeads + head];
+    const float weight = isfinite(lse) ? expf(lse - maximum) : 0.0F;
+    total += weight;
+    value += weight * partial_output[
+        ((split * kMaxTokenRows + row) * kAttentionHeads + head) *
+            kAttentionDim + dim];
+  }
+  output[(row * kAttentionHeads + head) * kAttentionDim + dim] =
+      __float2bfloat16(total > 0.0F ? value / total : 0.0F);
 }
 
 __global__ void scale_qkv_families(__nv_bfloat16* output, float q_scale,
@@ -1617,14 +1645,17 @@ extern "C" int qwen38_qsa_indexer_create(const std::uint8_t* output_weight,
   }
   *result = nullptr;
   auto plan = std::make_unique<QsaPlan>();
-  const std::size_t entries = static_cast<std::size_t>(kM) * kQsaColumns;
-  const std::size_t query_bytes = static_cast<std::size_t>(kM) * kQsaHeads * kQsaDim * 2;
+  const std::size_t entries =
+      static_cast<std::size_t>(kMaxTokenRows) * kQsaColumns;
+  const std::size_t query_bytes =
+      static_cast<std::size_t>(kMaxTokenRows) * kQsaHeads * kQsaDim * 2;
   const std::size_t key_bytes = static_cast<std::size_t>(kQsaColumns) * kQsaDim * 2;
   const std::size_t table_bytes = static_cast<std::size_t>(kM) * kQsaPages * 4;
   const std::size_t attention_elements =
       static_cast<std::size_t>(kQsaColumns) * kCompressRatio * kAttentionDim;
-  const std::size_t partial_elements = static_cast<std::size_t>(kAttentionSplits) *
-                                       kM * kAttentionHeads * kAttentionDim;
+  const std::size_t partial_elements =
+      static_cast<std::size_t>(kAttentionSplits) * kMaxTokenRows *
+      kAttentionHeads * kAttentionDim;
   if (!cuda_ok(cudaSetDevice(device), "cudaSetDevice") ||
       !cuda_ok(cudaMalloc(&plan->query, query_bytes), "cudaMalloc QSA query") ||
       !cuda_ok(cudaMalloc(&plan->keys, key_bytes), "cudaMalloc QSA keys") ||
@@ -1634,15 +1665,15 @@ extern "C" int qwen38_qsa_indexer_create(const std::uint8_t* output_weight,
       !cuda_ok(cudaMalloc(&plan->indices, entries * 4), "cudaMalloc QSA indices") ||
       !cuda_ok(cudaMalloc(&plan->sorted_indices, entries * 4), "cudaMalloc sorted QSA indices") ||
       !cuda_ok(cudaMalloc(&plan->offsets, (kM + 1) * 4), "cudaMalloc QSA offsets") ||
-      !cuda_ok(cudaMalloc(&plan->visible, kM * 4), "cudaMalloc QSA visible") ||
-      !cuda_ok(cudaMalloc(&plan->selected, kM * kBlockTopk * 4), "cudaMalloc QSA selected") ||
-      !cuda_ok(cudaMalloc(&plan->output, kM * kExpandedWidth * 4), "cudaMalloc QSA output") ||
+      !cuda_ok(cudaMalloc(&plan->visible, kMaxTokenRows * 4), "cudaMalloc QSA visible") ||
+      !cuda_ok(cudaMalloc(&plan->selected, kMaxTokenRows * kBlockTopk * 4), "cudaMalloc QSA selected") ||
+      !cuda_ok(cudaMalloc(&plan->output, static_cast<std::size_t>(kMaxTokenRows) * kExpandedWidth * 4), "cudaMalloc QSA output") ||
       !cuda_ok(cudaMalloc(&plan->attention_keys, attention_elements * 2), "cudaMalloc attention keys") ||
       !cuda_ok(cudaMalloc(&plan->attention_values, attention_elements * 2), "cudaMalloc attention values") ||
       !cuda_ok(cudaMalloc(&plan->attention_table, kM * kQsaPages * kCompressRatio * 4), "cudaMalloc attention table") ||
       !cuda_ok(cudaMalloc(&plan->partial_output, partial_elements * 4), "cudaMalloc attention partial output") ||
-      !cuda_ok(cudaMalloc(&plan->partial_lse, static_cast<std::size_t>(kAttentionSplits) * kM * kAttentionHeads * 4), "cudaMalloc attention partial LSE") ||
-      !cuda_ok(cudaMalloc(&plan->attention_output, static_cast<std::size_t>(kM) * kAttentionHeads * kAttentionDim * 2), "cudaMalloc attention output"))
+      !cuda_ok(cudaMalloc(&plan->partial_lse, static_cast<std::size_t>(kAttentionSplits) * kMaxTokenRows * kAttentionHeads * 4), "cudaMalloc attention partial LSE") ||
+      !cuda_ok(cudaMalloc(&plan->attention_output, static_cast<std::size_t>(kMaxTokenRows) * kAttentionHeads * kAttentionDim * 2), "cudaMalloc attention output"))
     return 1;
   if (!cuda_ok(cudaMalloc(&plan->output_packed, kM * kOutputK / 2), "cudaMalloc output packed A") ||
       !cuda_ok(cudaMalloc(&plan->output_sfa, kOutputSfaBytes), "cudaMalloc output SFA") ||
@@ -1696,7 +1727,8 @@ extern "C" int qwen38_qsa_indexer_launch(
   if (qwen38_qsa_indexer_score(opaque, logical_positions, sequence_lengths,
                                token_to_request, stream) != 0) return 1;
   return qwen38_qsa_indexer_select_expand(
-      opaque, logical_positions, sequence_lengths, token_to_request, stream);
+      opaque, logical_positions, sequence_lengths, token_to_request, kM,
+      stream);
 }
 
 extern "C" int qwen38_qsa_indexer_score(
@@ -1721,7 +1753,7 @@ extern "C" int qwen38_qsa_indexer_score_external(
   last_error.clear();
   if (!opaque || !index_query || !compressed_state ||
       !staged_compressed_rows || !logical_positions || !sequence_lengths ||
-      !token_to_request || rows < 1 || rows > kM || !stream) {
+      !token_to_request || rows < 1 || rows > kMaxTokenRows || !stream) {
     last_error = "invalid external QSA score arguments";
     return 1;
   }
@@ -1739,16 +1771,18 @@ extern "C" int qwen38_qsa_indexer_score_external(
 extern "C" int qwen38_qsa_indexer_select_expand(
     void* opaque, const std::int64_t* logical_positions,
     const std::int32_t* sequence_lengths,
-    const std::int32_t* token_to_request, cudaStream_t stream) {
-  if (!opaque || !logical_positions || !sequence_lengths || !token_to_request)
+    const std::int32_t* token_to_request, int rows, cudaStream_t stream) {
+  if (!opaque || !logical_positions || !sequence_lengths ||
+      !token_to_request || rows < 1 || rows > kMaxTokenRows)
     return 1;
   auto* plan = static_cast<QsaPlan*>(opaque);
-  select_qsa_topk_radix512<<<kM, 512, 0, stream>>>(
+  select_qsa_topk_radix512<<<rows, 512, 0, stream>>>(
       plan->logits, plan->visible, plan->selected);
   if (!cuda_ok(cudaGetLastError(), "fixed QSA radix-512 selection")) return 1;
-  expand_qsa_topk<<<dim3(kM, (kExpandedWidth + 255) / 256), 256, 0, stream>>>(
+  expand_qsa_topk<<<dim3(rows, (kExpandedWidth + 255) / 256), 256, 0,
+                    stream>>>(
       plan->selected, logical_positions, sequence_lengths, token_to_request,
-      plan->output, kM);
+      plan->output, rows);
   return cuda_ok(cudaGetLastError(), "expand radix-selected QSA blocks") ? 0 : 1;
 }
 
@@ -1861,7 +1895,8 @@ extern "C" int qwen38_qsa_sparse_attention_external(
     const std::int32_t* token_to_request, int rows, cudaStream_t stream) {
   last_error.clear();
   if (!opaque || !query || !main_state || !staged_main_rows ||
-      !logical_positions || !token_to_request || rows < 1 || rows > kM ||
+      !logical_positions || !token_to_request || rows < 1 ||
+      rows > kMaxTokenRows ||
       !stream) {
     last_error = "invalid external QSA attention arguments";
     return 1;
@@ -1869,7 +1904,7 @@ extern "C" int qwen38_qsa_sparse_attention_external(
   auto* plan = static_cast<QsaPlan*>(opaque);
   if (!cuda_ok(cudaMemsetAsync(
                    plan->attention_output, 0,
-                   static_cast<std::size_t>(kM) * kAttentionHeads *
+                   static_cast<std::size_t>(rows) * kAttentionHeads *
                        kAttentionDim * sizeof(__nv_bfloat16),
                    stream),
                "clear external attention output"))
@@ -1883,7 +1918,8 @@ extern "C" int qwen38_qsa_sparse_attention_external(
       plan->partial_lse);
   if (!cuda_ok(cudaGetLastError(), "external FP8 QSA BLOCK_N=16 split-K"))
     return 1;
-  qsa_merge_splitk<<<dim3(rows, kAttentionHeads), kAttentionDim, 0, stream>>>(
+  qsa_merge_splitk_external<<<dim3(rows, kAttentionHeads), kAttentionDim, 0,
+                               stream>>>(
       plan->partial_output, plan->partial_lse, plan->attention_output);
   return cuda_ok(cudaGetLastError(), "merge external QSA split-K") ? 0 : 1;
 }
@@ -1894,7 +1930,8 @@ extern "C" int qwen38_qsa_sparse_attention_external_control(
     const std::int32_t* token_to_request, int rows, cudaStream_t stream) {
   last_error.clear();
   if (!opaque || !query || !main_state || !staged_main_rows ||
-      !logical_positions || !token_to_request || rows < 1 || rows > kM ||
+      !logical_positions || !token_to_request || rows < 1 ||
+      rows > kMaxTokenRows ||
       !stream) {
     last_error = "invalid external QSA attention control arguments";
     return 1;
@@ -1902,7 +1939,7 @@ extern "C" int qwen38_qsa_sparse_attention_external_control(
   auto* plan = static_cast<QsaPlan*>(opaque);
   if (!cuda_ok(cudaMemsetAsync(
                    plan->attention_output, 0,
-                   static_cast<std::size_t>(kM) * kAttentionHeads *
+                   static_cast<std::size_t>(rows) * kAttentionHeads *
                        kAttentionDim * sizeof(__nv_bfloat16),
                    stream),
                "clear external attention control output"))
@@ -1916,7 +1953,8 @@ extern "C" int qwen38_qsa_sparse_attention_external_control(
       plan->partial_lse);
   if (!cuda_ok(cudaGetLastError(), "external scalar FP8 QSA split-K"))
     return 1;
-  qsa_merge_splitk<<<dim3(rows, kAttentionHeads), kAttentionDim, 0, stream>>>(
+  qsa_merge_splitk_external<<<dim3(rows, kAttentionHeads), kAttentionDim, 0,
+                               stream>>>(
       plan->partial_output, plan->partial_lse, plan->attention_output);
   return cuda_ok(cudaGetLastError(), "merge external scalar QSA split-K")
              ? 0
@@ -1939,6 +1977,44 @@ extern "C" int qwen38_qsa_output_project(void* opaque, cudaStream_t stream) {
   scale_output_projection<<<(kM * kOutputN + 255) / 256, 256, 0, stream>>>(
       plan->projected_output, plan->output_global * kOutputActivationGlobal);
   return cuda_ok(cudaGetLastError(), "scale attention output projection") ? 0 : 1;
+}
+
+extern "C" int qwen38_qsa_output_project_rows(
+    void* opaque, int rows, void* output, cudaStream_t stream) {
+  last_error.clear();
+  if (!opaque || !output || !stream || rows < 1 ||
+      rows > kMaxTokenRows || rows % kM != 0) {
+    last_error = "output rows must be complete fixed-M16 tiles";
+    return 1;
+  }
+  auto* plan = static_cast<QsaPlan*>(opaque);
+  auto* destination = static_cast<__nv_bfloat16*>(output);
+  for (int first = 0; first < rows; first += kM) {
+    quantize_c16_fixed<kOutputK><<<kM, 256, 0, stream>>>(
+        plan->output_packed, plan->output_sfa,
+        plan->attention_output + static_cast<std::size_t>(first) * kOutputK,
+        kOutputActivationGlobal);
+    if (!cuda_ok(cudaGetLastError(), "quantize tiled attention output"))
+      return 1;
+    if (plan->output_projection.gemm.run(stream) != cutlass::Status::kSuccess) {
+      last_error = "CUTLASS tiled attention output projection failed";
+      return 1;
+    }
+    scale_output_projection<<<(kM * kOutputN + 255) / 256, 256, 0, stream>>>(
+        plan->projected_output,
+        plan->output_global * kOutputActivationGlobal);
+    if (!cuda_ok(cudaGetLastError(), "scale tiled attention output"))
+      return 1;
+    if (!cuda_ok(cudaMemcpyAsync(
+                     destination + static_cast<std::size_t>(first) * kOutputN,
+                     plan->projected_output,
+                     static_cast<std::size_t>(kM) * kOutputN *
+                         sizeof(__nv_bfloat16),
+                     cudaMemcpyDeviceToDevice, stream),
+                 "copy tiled attention output"))
+      return 1;
+  }
+  return 0;
 }
 
 extern "C" int qwen38_qsa_attention_output(void* opaque, void** output,

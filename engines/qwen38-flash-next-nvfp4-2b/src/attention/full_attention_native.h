@@ -30,10 +30,8 @@ struct FullAttentionNativeProfile {
       select_ms, attention_ms, gate_output_ms;
 };
 
-// Current native body proves K0 buckets (verify_width=1, rows<=16). The owner
-// ABI remains sequences*verify_width<=128; wider verifier bodies fail closed
-// until the QKV/output CUTLASS plans are generalized beyond their measured
-// c16 shape.
+// The native body tiles c16 verifier launches through fixed-M16 QKV/output
+// plans while QSA and speculative state remain one rows<=128 transaction.
 class FullAttentionNativeProgram final {
  public:
   explicit FullAttentionNativeProgram(FullAttentionNativeConfig config);

@@ -83,18 +83,22 @@ int open_slab(const char* path) {
 }
 __global__ void initialize(__nv_bfloat16* input, std::int64_t* rope,
                            std::int64_t* logical, std::int32_t* lengths,
-                           std::int32_t* requests) {
+                           std::int32_t* requests, int rows,
+                           int verify_width) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index < 16 * 2560)
+  if (index < rows * 2560)
     input[index] = __float2bfloat16(static_cast<float>((index % 31) - 15) / 32.0F);
-  if (index < 16) {
-    logical[index] = attention::kQsaStateContext - 1;
-    lengths[index] = attention::kQsaStateContext;
-    requests[index] = index;
-    rope[index] = attention::kQsaStateContext - 1;
-    rope[128 + index] = attention::kQsaStateContext - 1;
-    rope[256 + index] = attention::kQsaStateContext - 1;
+  if (index < rows) {
+    const int request = index / verify_width;
+    const std::int64_t position = attention::kQsaStateContext - verify_width +
+                                  index % verify_width;
+    logical[index] = position;
+    requests[index] = request;
+    rope[index] = position;
+    rope[128 + index] = position;
+    rope[256 + index] = position;
   }
+  if (index < 16) lengths[index] = attention::kQsaStateContext;
 }
 std::uint64_t hash(const std::vector<std::uint8_t>& bytes) {
   std::uint64_t value = 14695981039346656037ULL;
@@ -104,9 +108,13 @@ std::uint64_t hash(const std::vector<std::uint8_t>& bytes) {
 }  // namespace
 
 int main(int argc, char** argv) try {
-  if (argc != 4)
-    throw std::invalid_argument("usage: qwen38-full-attention-native-smoke LOCAL_SLAB PEER_SLAB DEVICE");
+  if (argc != 4 && argc != 5)
+    throw std::invalid_argument("usage: qwen38-full-attention-native-smoke LOCAL_SLAB PEER_SLAB DEVICE [VERIFY_WIDTH]");
   const int device = std::stoi(argv[3]); check(cudaSetDevice(device), "device");
+  const int verify_width = argc == 5 ? std::stoi(argv[4]) : 1;
+  if (verify_width < 1 || verify_width > 8)
+    throw std::invalid_argument("VERIFY_WIDTH must be 1..8");
+  const int rows = 16 * verify_width;
   const int local = open_slab(argv[1]), peer = open_slab(argv[2]);
   Blob qw(kQWeight.bytes), qs(kQScale.bytes), kw(kKWeight.bytes), ks(kKScale.bytes),
       vw(kVWeight.bytes), vs(kVScale.bytes), ow(kOWeight.bytes), os(kOScale.bytes),
@@ -127,14 +135,15 @@ int main(int argc, char** argv) try {
   constexpr std::size_t main_bytes=2147483648ULL, raw_bytes=35840,
                         compressed_bytes=268435456;
   Blob main_state(main_bytes), raw_state(raw_bytes), compressed_state(compressed_bytes),
-      input(16ULL*2560*2), rope(3ULL*128*8), logical(128*8), lengths(16*4), requests(128*4);
+      input(128ULL*2560*2), rope(3ULL*128*8), logical(128*8), lengths(16*4), requests(128*4);
   check(cudaMemset(main_state.p,0,main_state.bytes),"clear main");
   check(cudaMemset(raw_state.p,0,raw_state.bytes),"clear raw");
   check(cudaMemset(compressed_state.p,0,compressed_state.bytes),"clear compressed");
-  initialize<<<(16*2560+255)/256,256>>>(
+  initialize<<<(rows*2560+255)/256,256>>>(
       static_cast<__nv_bfloat16*>(input.p),static_cast<std::int64_t*>(rope.p),
       static_cast<std::int64_t*>(logical.p),static_cast<std::int32_t*>(lengths.p),
-      static_cast<std::int32_t*>(requests.p)); check(cudaDeviceSynchronize(),"initialize");
+      static_cast<std::int32_t*>(requests.p),rows,verify_width);
+  check(cudaDeviceSynchronize(),"initialize");
   std::uint64_t generation=1;
   attention::FullAttentionNativeConfig config{
       device, static_cast<std::uint8_t*>(qw.p),static_cast<std::uint8_t*>(qs.p),
@@ -157,10 +166,12 @@ int main(int argc, char** argv) try {
   attention::FullAttentionNativeProgram control(control_config);
   auto control_callbacks = control.callbacks();
   if(control_callbacks.stage(control_callbacks.context,
-                             static_cast<__nv_bfloat16*>(input.p),{16,1,16},stream))
+                             static_cast<__nv_bfloat16*>(input.p),
+                             {16,verify_width,rows},stream))
     throw std::runtime_error(control.last_error());
   check(cudaStreamSynchronize(stream),"control stage fence");
-  std::vector<__nv_bfloat16> control_output(16ULL*2560);
+  std::vector<__nv_bfloat16> control_output(
+      static_cast<std::size_t>(rows)*2560);
   check(cudaMemcpy(control_output.data(),control.projected_output(),
                    control_output.size()*sizeof(__nv_bfloat16),
                    cudaMemcpyDeviceToHost),"control output");
@@ -171,12 +182,14 @@ int main(int argc, char** argv) try {
   attention::FullAttentionNativeProfile profile{};
   for (double& sample:ms) {
     const auto start=std::chrono::steady_clock::now();
-    if(callbacks.stage(callbacks.context,static_cast<__nv_bfloat16*>(input.p),{16,1,16},stream))
+    if(callbacks.stage(callbacks.context,static_cast<__nv_bfloat16*>(input.p),
+                       {16,verify_width,rows},stream))
       throw std::runtime_error(program.last_error());
     check(cudaStreamSynchronize(stream),"stage fence");
     profile=program.profile();
     sample=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
-    std::vector<std::uint8_t> output(16ULL*2560*2);
+    std::vector<std::uint8_t> output(
+        static_cast<std::size_t>(rows)*2560*2);
     check(cudaMemcpy(output.data(),program.projected_output(),output.size(),cudaMemcpyDeviceToHost),"output");
     const auto observed=hash(output);
     if(expected_hash && expected_hash!=observed) throw std::runtime_error("reset replay output changed");
@@ -194,9 +207,11 @@ int main(int argc, char** argv) try {
     }
     if(callbacks.reset(callbacks.context,stream)) throw std::runtime_error(program.last_error());
   }
-  if(callbacks.stage(callbacks.context,static_cast<__nv_bfloat16*>(input.p),{16,1,16},stream))
+  if(callbacks.stage(callbacks.context,static_cast<__nv_bfloat16*>(input.p),
+                     {16,verify_width,rows},stream))
     throw std::runtime_error(program.last_error());
-  const std::array<std::int32_t,16> accepted={1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
+  std::array<std::int32_t,16> accepted{};
+  accepted.fill(verify_width);
   if(callbacks.accept(callbacks.context,accepted.data(),16,2,stream))
     throw std::runtime_error(program.last_error());
   cudaGraph_t graph=nullptr;
@@ -204,7 +219,7 @@ int main(int argc, char** argv) try {
   check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),
         "begin native graph capture");
   if(callbacks.stage(callbacks.context,static_cast<__nv_bfloat16*>(input.p),
-                     {16,1,16},stream))
+                     {16,verify_width,rows},stream))
     throw std::runtime_error(program.last_error());
   check(cudaStreamEndCapture(stream,&graph),"end native graph capture");
   if(callbacks.reset(callbacks.context,stream))
@@ -215,7 +230,8 @@ int main(int argc, char** argv) try {
   for(int replay=0; replay<2; ++replay) {
     check(cudaGraphLaunch(graph_exec,stream),"launch native graph");
     check(cudaStreamSynchronize(stream),"native graph fence");
-    std::vector<std::uint8_t> replay_output(16ULL*2560*2);
+    std::vector<std::uint8_t> replay_output(
+        static_cast<std::size_t>(rows)*2560*2);
     check(cudaMemcpy(replay_output.data(),program.projected_output(),
                      replay_output.size(),cudaMemcpyDeviceToHost),
           "graph output");
@@ -229,7 +245,8 @@ int main(int argc, char** argv) try {
       static_cast<std::size_t>(attention::kQsaStateContext - 1) * 512;
   check(cudaMemcpy(first_row.data(),published,first_row.size(),cudaMemcpyDeviceToHost),"published row");
   const double mean=std::accumulate(ms.begin(),ms.end(),0.0)/ms.size();
-  std::cout << "rows=16 mean_ms=" << mean << " min_ms="
+  std::cout << "rows=" << rows << " verify_width=" << verify_width
+            << " mean_ms=" << mean << " min_ms="
             << *std::min_element(ms.begin(),ms.end()) << " max_ms="
             << *std::max_element(ms.begin(),ms.end()) << " output_hash="
             << expected_hash << " state_hash=" << hash(first_row)

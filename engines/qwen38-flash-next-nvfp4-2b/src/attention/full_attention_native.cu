@@ -12,7 +12,7 @@
 
 namespace rocket::qwen38::attention {
 namespace {
-constexpr int kRows = 16, kHidden = 2560, kQkv = 6656;
+constexpr int kTileRows = 16, kMaxRows = 128, kHidden = 2560, kQkv = 6656;
 constexpr int kQuery = 3072, kKv = 256, kIndexQuery = 512, kIndex = 128;
 
 void check(cudaError_t status, const char* operation) {
@@ -27,7 +27,8 @@ struct FullAttentionNativeProgram::Impl {
   void* qkv_plan = nullptr;
   void* qsa_plan = nullptr;
   std::unique_ptr<QsaStateFork> state_fork;
-  __nv_bfloat16 *query = nullptr, *key = nullptr, *value = nullptr,
+  __nv_bfloat16 *qkv_rows = nullptr, *query = nullptr, *key = nullptr,
+                 *value = nullptr,
                  *gate = nullptr, *index_query = nullptr,
                  *index_raw_key = nullptr, *index_scratch = nullptr,
                  *compressed_rows = nullptr, *projected = nullptr;
@@ -58,19 +59,21 @@ struct FullAttentionNativeProgram::Impl {
     if (qwen38_qsa_indexer_create(config.o_weight, config.o_scale,
                                   config.o_global, config.device, &qsa_plan))
       throw std::runtime_error(qwen38_cutlass_qkv_last_error());
-    check(cudaMalloc(&query, kRows * kQuery * 2), "allocate native query");
-    check(cudaMalloc(&key, kRows * kKv * 2), "allocate native key");
-    check(cudaMalloc(&value, kRows * kKv * 2), "allocate native value");
-    check(cudaMalloc(&gate, kRows * kQuery * 2), "allocate output gate");
-    check(cudaMalloc(&index_query, kRows * kIndexQuery * 2),
+    check(cudaMalloc(&qkv_rows, static_cast<std::size_t>(kMaxRows) * kQkv * 2),
+          "allocate tiled QKV rows");
+    check(cudaMalloc(&query, kMaxRows * kQuery * 2), "allocate native query");
+    check(cudaMalloc(&key, kMaxRows * kKv * 2), "allocate native key");
+    check(cudaMalloc(&value, kMaxRows * kKv * 2), "allocate native value");
+    check(cudaMalloc(&gate, kMaxRows * kQuery * 2), "allocate output gate");
+    check(cudaMalloc(&index_query, kMaxRows * kIndexQuery * 2),
           "allocate index query");
-    check(cudaMalloc(&index_raw_key, kRows * kIndex * 2),
+    check(cudaMalloc(&index_raw_key, kMaxRows * kIndex * 2),
           "allocate raw index key");
-    check(cudaMalloc(&index_scratch, kRows * 640 * 2),
+    check(cudaMalloc(&index_scratch, kMaxRows * 640 * 2),
           "allocate index projection scratch");
-    check(cudaMalloc(&main_rows, kRows * 512), "allocate main state rows");
-    check(cudaMalloc(&raw_rows, kRows * 280), "allocate raw state rows");
-    check(cudaMalloc(&compressed_rows, kRows * 256),
+    check(cudaMalloc(&main_rows, kMaxRows * 512), "allocate main state rows");
+    check(cudaMalloc(&raw_rows, kMaxRows * 280), "allocate raw state rows");
+    check(cudaMalloc(&compressed_rows, kMaxRows * 256),
           "allocate compressed state rows");
     check(cudaMalloc(&projected, 128ULL * kHidden * 2),
           "allocate verifier projected output");
@@ -94,7 +97,7 @@ struct FullAttentionNativeProgram::Impl {
     cudaFree(projected); cudaFree(compressed_rows); cudaFree(raw_rows);
     cudaFree(main_rows); cudaFree(index_scratch); cudaFree(index_raw_key);
     cudaFree(index_query); cudaFree(gate); cudaFree(value); cudaFree(key);
-    cudaFree(query);
+    cudaFree(query); cudaFree(qkv_rows);
     for (auto& event : phase) {
       if (event) cudaEventDestroy(event);
       event = nullptr;
@@ -104,7 +107,7 @@ struct FullAttentionNativeProgram::Impl {
     projected = nullptr; compressed_rows = nullptr; raw_rows = nullptr;
     main_rows = nullptr; index_scratch = nullptr; index_raw_key = nullptr;
     index_query = nullptr; gate = nullptr; value = nullptr; key = nullptr;
-    query = nullptr; qsa_plan = nullptr; qkv_plan = nullptr;
+    query = nullptr; qkv_rows = nullptr; qsa_plan = nullptr; qkv_plan = nullptr;
   }
 
   int fail(const char* operation, const char* detail) noexcept {
@@ -116,21 +119,33 @@ struct FullAttentionNativeProgram::Impl {
   int stage(const __nv_bfloat16* hidden,
             decode::FullAttentionLaunchShape shape, cudaStream_t stream) {
     error.clear();
-    if (!hidden || !stream || shape.verify_width != 1 ||
-        shape.token_rows != shape.sequences || shape.token_rows < 1 ||
-        shape.token_rows > kRows)
-      return fail("stage", "native QKV body currently admits K0 rows only");
+    if (!hidden || !stream || shape.sequences != kTileRows ||
+        shape.verify_width < 1 || shape.verify_width > 8 ||
+        shape.token_rows != shape.sequences * shape.verify_width ||
+        shape.token_rows > kMaxRows || shape.token_rows % kTileRows != 0)
+      return fail("stage", "native body requires complete c16 verifier tiles");
     cudaEventRecord(phase[0], stream);
-    if (qwen38_cutlass_qkv_launch(qkv_plan, hidden, stream))
-      return fail("QKV", qwen38_cutlass_qkv_last_error());
+    for (int first = 0; first < shape.token_rows; first += kTileRows) {
+      if (qwen38_cutlass_qkv_launch(
+              qkv_plan, hidden + static_cast<std::size_t>(first) * kHidden,
+              stream))
+        return fail("QKV", qwen38_cutlass_qkv_last_error());
+      void* qkv_tile = nullptr;
+      std::size_t tile_elements = 0;
+      if (qwen38_cutlass_qkv_output(qkv_plan, &qkv_tile, &tile_elements) ||
+          tile_elements != static_cast<std::size_t>(kTileRows) * kQkv)
+        return fail("QKV output", qwen38_cutlass_qkv_last_error());
+      const cudaError_t copy = cudaMemcpyAsync(
+          qkv_rows + static_cast<std::size_t>(first) * kQkv, qkv_tile,
+          static_cast<std::size_t>(kTileRows) * kQkv *
+              sizeof(__nv_bfloat16),
+          cudaMemcpyDeviceToDevice, stream);
+      if (copy != cudaSuccess)
+        return fail("QKV tile copy", cudaGetErrorString(copy));
+    }
     cudaEventRecord(phase[1], stream);
-    void* qkv = nullptr;
-    std::size_t elements = 0;
-    if (qwen38_cutlass_qkv_output(qkv_plan, &qkv, &elements) ||
-        elements != static_cast<std::size_t>(kRows) * kQkv)
-      return fail("QKV output", qwen38_cutlass_qkv_last_error());
     if (qwen38_qsa_preprocess(
-            hidden, static_cast<const __nv_bfloat16*>(qkv), config.q_norm,
+            hidden, qkv_rows, config.q_norm,
             config.k_norm, config.index_qk_first, config.index_qk_second,
             config.index_q_norm, config.index_k_norm, config.rope_positions,
             shape.token_rows, query, key, value, gate, index_query,
@@ -163,7 +178,7 @@ struct FullAttentionNativeProgram::Impl {
     cudaEventRecord(phase[5], stream);
     if (qwen38_qsa_indexer_select_expand(
             qsa_plan, config.logical_positions, config.sequence_lengths,
-            config.token_to_request, stream))
+            config.token_to_request, shape.token_rows, stream))
       return fail("QSA select", qwen38_cutlass_qkv_last_error());
     cudaEventRecord(phase[6], stream);
     const int attention_status = config.use_scalar_attention_control
@@ -179,22 +194,14 @@ struct FullAttentionNativeProgram::Impl {
       return fail("QSA attention", qwen38_cutlass_qkv_last_error());
     cudaEventRecord(phase[7], stream);
     void* attention = nullptr;
+    std::size_t elements = 0;
     if (qwen38_qsa_attention_output(qsa_plan, &attention, &elements) ||
         qwen38_qsa_apply_output_gate(
             static_cast<__nv_bfloat16*>(attention), gate, shape.token_rows,
             stream) ||
-        qwen38_qsa_output_project(qsa_plan, stream))
+        qwen38_qsa_output_project_rows(qsa_plan, shape.token_rows, projected,
+                                       stream))
       return fail("gated output", qwen38_cutlass_qkv_last_error());
-    void* internal_output = nullptr;
-    if (qwen38_qsa_projected_output(qsa_plan, &internal_output, &elements) ||
-        elements != static_cast<std::size_t>(kRows) * kHidden)
-      return fail("projected output", qwen38_cutlass_qkv_last_error());
-    const cudaError_t copy = cudaMemcpyAsync(
-        projected, internal_output,
-        static_cast<std::size_t>(shape.token_rows) * kHidden * 2,
-        cudaMemcpyDeviceToDevice, stream);
-    if (copy != cudaSuccess)
-      return fail("projected output", cudaGetErrorString(copy));
     cudaEventRecord(phase[8], stream);
     return 0;
   }
