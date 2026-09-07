@@ -1,0 +1,54 @@
+---
+title: "Removing display power restores the head's normal GPU clock range"
+description: "The head returned to the peer's 208 MHz idle and 3003 MHz maximum clock range after its powered display was disconnected and input power renegotiated."
+date: 2026-09-08
+author: "agent"
+categories: [incident, hardware, baseline]
+verdict: open
+rocket: "#boosters"
+supersedes: posts/hardware/2026-09-08-head-gpu-clock-not-page-reclaim
+---
+
+**Question.** What held the head at 728 MHz while the peer reached 2437 MHz?
+
+| setup | |
+| --- | --- |
+| nodes | gx10-5e36 (head), gx10-2a13 / 192.168.100.11 (peer), GB10 |
+| kernel | 6.17.13-rocket64k, 64 KiB pages, both nodes |
+| driver | 580.173.02 |
+| commit | 6ba463e1485c57e9c990583f21fc7b353860eeb9 |
+| physical change | powered display disconnected from head; PDU input renegotiated |
+
+```bash
+nvidia-smi --query-gpu=pstate,clocks.current.graphics,clocks.current.sm,clocks.max.graphics,power.draw,utilization.gpu --format=csv,noheader
+ssh glwillen@192.168.100.11 'nvidia-smi --query-gpu=pstate,clocks.current.graphics,clocks.current.sm,clocks.max.graphics,power.draw,utilization.gpu --format=csv,noheader'
+```
+
+```text
+head:   P8, 208 MHz, 208 MHz, 3003 MHz, 4.22 W, 0 %
+peer:   P8, 208 MHz, 208 MHz, 3003 MHz, 4.50 W, 0 %
+```
+
+| metric after renegotiation | head | peer | delta |
+| --- | ---: | ---: | ---: |
+| idle SM clock | 208 MHz | 208 MHz | 0 MHz |
+| reported maximum graphics clock | 3003 MHz | 3003 MHz | 0 MHz |
+| idle power | 4.22 W | 4.50 W | -0.28 W |
+
+The display supplied power as well as video. Disconnecting it allowed the head
+and PDU to renegotiate the intended input-power path. The previous thermal and
+page-reclaim hypotheses did not change the 728 MHz ceiling.
+
+**Verdict.** Open. Idle state and advertised maximum now match the peer. The
+active-load clock must match during the production Qwen3.8 benchmark before
+the power renegotiation is accepted as the cause of the measured slowdown.
+
+**Next.**
+
+- capture both nodes' SM clock, power, and throughput during the same c16 run
+- change this verdict to accepted if the head leaves 728 MHz and tracks the peer
+
+**Reopen if.**
+
+- a firmware release changes GB10 input-power arbitration or USB-C power-role negotiation
+- the PDU firmware or powered-display hardware changes
