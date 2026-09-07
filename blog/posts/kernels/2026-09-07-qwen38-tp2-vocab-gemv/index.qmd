@@ -1,0 +1,84 @@
+---
+title: "A TP2 vocab GEMV cuts Qwen3.8 M1 head latency by 31%"
+description: "The fixed 124160 by 2560 BF16 GEMV takes 2.63 ms on GB10 and preserves the FP32 cuBLAS greedy token."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, kernels, numerics, telemetry]
+verdict: accepted
+rocket: "#kernels"
+---
+
+**Question.** Does the myllmbox M1 vocab GEMV still win after adapting it from TP1 BF16 output to Rocket's TP2 FP32-logit contract?
+
+| setup | |
+| --- | --- |
+| node | head (`gx10-5e36`) |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| CUDA | 13.0.88, `sm_121` |
+| Rocket base | `97e30d9891a7c396a15463753a2d53478f44b8ca` plus this entry's commit |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| slab plan | `a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4` |
+
+```bash
+cmake -S engines/qwen38-flash-next-nvfp4-2b \
+  -B engines/qwen38-flash-next-nvfp4-2b/build -DCMAKE_BUILD_TYPE=Release
+cmake --build engines/qwen38-flash-next-nvfp4-2b/build -j2 \
+  --target qwen38-test-token-output qwen38-token-output-bench
+engines/qwen38-flash-next-nvfp4-2b/build/qwen38-test-token-output
+compute-sanitizer --tool memcheck --error-exitcode 99 \
+  engines/qwen38-flash-next-nvfp4-2b/build/qwen38-test-token-output
+engines/qwen38-flash-next-nvfp4-2b/build/qwen38-token-output-bench 100
+```
+
+| path | M | latency run 1 | latency run 2 | unit |
+| --- | ---: | ---: | ---: | --- |
+| adapted GEMV | 1 | 2.641630 | 2.634440 | ms |
+| cuBLAS control | 1 | 3.819431 | 3.802182 | ms |
+| cuBLAS GEMM | 2 | 2.750045 | 2.731164 | ms |
+| cuBLAS GEMM | 4 | 2.752203 | 2.743501 | ms |
+| cuBLAS GEMM | 8 | 2.784491 | 2.763446 | ms |
+| cuBLAS GEMM | 16 | 2.810462 | 2.795316 | ms |
+| local argmax | 16 | 0.038887 | 0.038899 | ms |
+| rank-local embedding | 16 | 0.004144 | 0.004145 | ms |
+| final grouped Gemma RMSNorm | 16 | 0.006054 | 0.006038 | ms |
+
+| validation | value |
+| --- | ---: |
+| M1 latency reduction against matched cuBLAS control | 30.712417% |
+| M1 specialized versus cuBLAS maximum absolute logit difference | 0.000000000 |
+| M1 greedy-token match | true |
+| c16 head effective bandwidth | 230.288 GB/s |
+| c16 fraction of measured 241.3 GB/s read roofline | 95.4363% |
+| graph-captured buckets | 1, 2, 4, 8, 16 |
+| compute-sanitizer errors | 0 |
+| bounded OTEL metric-series ceiling | 270 |
+
+## References
+
+| implementation | identity | lesson used | license |
+| --- | --- | --- | --- |
+| myllmbox runner | `5bc4c2b6f483f3a8f422ca8a8d8aac58c1a7c061` | M1 row-loop GEMV, `BLOCK_K=1024`, eight warps | vendored source declares Apache-2.0 and attributes b12x |
+| cluster recipe | `c7f69055e9ca572d0c562708a2cd68ea9a1af42b` | `MBX_VOCAB_GEMV=1` control configuration | not stated in checkout |
+| vLLM image | `sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8` | vocab-parallel embedding, local `(value,index)` winner gather, greedy argmax | Apache-2.0 |
+| FlashInfer | `91bda04c66f7cb851e1ab3b78b9fecea644b9844` | pair-with-index block reduction | Apache-2.0 |
+| TensorRT-LLM | `c426264bc4d01930fad01426b81800e96fe19c2b` | bounded top-k reduction and explicit sampling configuration | Apache-2.0 |
+| CUTLASS | vendored 4.8.0 at Rocket base above | row/column layout and FP32 accumulator contract | BSD-3-Clause |
+
+| comparison scope | myllmbox/recipe | Rocket measurement |
+| --- | --- | --- |
+| head geometry | TP1 `[248320,2560]` | TP2 `[124160,2560]` per rank |
+| logits | BF16 | FP32 through greedy reduction |
+| reported metric | 417 average, 451 peak c16 end-to-end steps | output kernels only |
+| PLE/checkpoint | resident NVFP4 PLE, recipe checkpoint | pinned NVIDIA NVFP4 checkpoint above |
+
+**Verdict.** Use the adapted GEMV at M1 and cuBLAS at M2 through M16. The output slice proves local kernels and deterministic TP2 winner selection, not full-model first-token parity.
+
+**Next.**
+
+- Bind the final HC skinny GEMMs and gated stream reduction before the LM head.
+- Transport two eight-byte winner records per row through the rank coordinator.
+- Add counter-based temperature and top-p sampling before accepting non-greedy requests.
+
+**Reopen if.**
+
+- A CUDA, cuBLAS, CUTLASS, or GB10 firmware release changes the M1 crossover.

@@ -87,6 +87,17 @@ set_target_properties(qwen38_residual_rmsnorm PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+add_library(qwen38_token_output STATIC src/output/token_output.cu)
+target_include_directories(qwen38_token_output PUBLIC src)
+target_link_libraries(qwen38_token_output PUBLIC CUDA::cudart CUDA::cublas)
+target_compile_options(qwen38_token_output PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
+)
+set_target_properties(qwen38_token_output PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
 add_executable(qwen38-pair-reduce-bench bench/pair_reduce_bench.cu)
 target_link_libraries(qwen38-pair-reduce-bench PRIVATE qwen38_pair_reduce ${ROCKET_QWEN38_NVML})
 
@@ -95,6 +106,9 @@ target_link_libraries(qwen38-decode-pair-reduce-smoke PRIVATE qwen38_decode_exec
 
 add_executable(qwen38-residual-rmsnorm-bench bench/residual_rmsnorm_bench.cu)
 target_link_libraries(qwen38-residual-rmsnorm-bench PRIVATE qwen38_residual_rmsnorm)
+
+add_executable(qwen38-token-output-bench bench/token_output_bench.cu)
+target_link_libraries(qwen38-token-output-bench PRIVATE qwen38_token_output)
 
 enable_testing()
 add_test(NAME qwen38-qsa-expand-smoke COMMAND qwen38-qsa-expand-smoke)
@@ -127,3 +141,10 @@ target_compile_options(qwen38-test-residual-rmsnorm PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
 )
 add_test(NAME qwen38-residual-rmsnorm-contract COMMAND qwen38-test-residual-rmsnorm)
+
+add_executable(qwen38-test-token-output tests/test_token_output.cu)
+target_link_libraries(qwen38-test-token-output PRIVATE qwen38_token_output)
+target_compile_options(qwen38-test-token-output PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
+)
+add_test(NAME qwen38-token-output-contract COMMAND qwen38-test-token-output)
