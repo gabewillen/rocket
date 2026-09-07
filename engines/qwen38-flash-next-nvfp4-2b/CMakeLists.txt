@@ -111,7 +111,10 @@ set_target_properties(qwen38_gdn_core PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-add_library(qwen38_gdn_graph SHARED src/linear_attention/gdn_cutlass.cu)
+add_library(qwen38_gdn_graph SHARED
+  src/linear_attention/gdn_cutlass.cu
+  src/linear_attention/gdn_verifier.cu
+)
 target_include_directories(qwen38_gdn_graph PUBLIC
   src
   "${ROCKET_QWEN38_CUTLASS_DIR}/include"
@@ -133,6 +136,27 @@ add_executable(qwen38-gdn-graph-smoke bench/gdn_graph_smoke.cu)
 target_include_directories(qwen38-gdn-graph-smoke PRIVATE src)
 target_link_libraries(qwen38-gdn-graph-smoke PRIVATE qwen38_gdn_graph CUDA::cudart)
 set_target_properties(qwen38-gdn-graph-smoke PROPERTIES CUDA_ARCHITECTURES "121")
+
+add_library(qwen38_decoder_verifier STATIC src/decode/decoder_verifier.cc)
+target_include_directories(qwen38_decoder_verifier PUBLIC src)
+target_link_libraries(qwen38_decoder_verifier PUBLIC
+  qwen38_gdn_graph qwen38_decode_execution CUDA::cudart
+)
+target_compile_options(qwen38_decoder_verifier PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38_decoder_verifier PROPERTIES
+  LINKER_LANGUAGE CUDA
+  POSITION_INDEPENDENT_CODE ON
+)
+
+add_library(qwen38_decoder_verifier_c_api SHARED
+  src/decode/decoder_verifier_c_api.cc
+)
+target_include_directories(qwen38_decoder_verifier_c_api PUBLIC src)
+target_link_libraries(qwen38_decoder_verifier_c_api PRIVATE
+  qwen38_decoder_verifier CUDA::cudart
+)
+target_compile_options(qwen38_decoder_verifier_c_api PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38_decoder_verifier_c_api PROPERTIES LINKER_LANGUAGE CUDA)
 
 add_library(qwen38_hyperconnection SHARED src/hyperconnection/hyperconnection.cu)
 target_include_directories(qwen38_hyperconnection PUBLIC src)
@@ -215,6 +239,20 @@ target_link_libraries(qwen38-test-linear-attention-layer PRIVATE qwen38_decode_e
 target_compile_options(qwen38-test-linear-attention-layer PRIVATE -Wall -Wextra -Werror)
 set_target_properties(qwen38-test-linear-attention-layer PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-linear-attention-layer-contract COMMAND qwen38-test-linear-attention-layer)
+
+add_executable(qwen38-test-decoder-verifier tests/test_decoder_verifier.cc)
+target_link_libraries(qwen38-test-decoder-verifier PRIVATE
+  qwen38_decoder_verifier qwen38_decoder_verifier_c_api
+)
+target_compile_options(qwen38-test-decoder-verifier PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-decoder-verifier PROPERTIES LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-decoder-verifier-contract COMMAND qwen38-test-decoder-verifier)
+
+add_executable(qwen38-test-gdn-verifier tests/test_gdn_verifier_contract.cc)
+target_include_directories(qwen38-test-gdn-verifier PRIVATE src)
+target_link_libraries(qwen38-test-gdn-verifier PRIVATE CUDA::cudart)
+target_compile_options(qwen38-test-gdn-verifier PRIVATE -Wall -Wextra -Werror)
+add_test(NAME qwen38-gdn-verifier-contract COMMAND qwen38-test-gdn-verifier)
 
 add_executable(qwen38-test-hyperconnection tests/test_hyperconnection.cu)
 target_link_libraries(qwen38-test-hyperconnection PRIVATE qwen38_hyperconnection CUDA::cudart)

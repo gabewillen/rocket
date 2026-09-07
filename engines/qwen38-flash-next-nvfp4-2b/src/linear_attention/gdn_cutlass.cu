@@ -182,16 +182,16 @@ struct FixedGemm {
   cutlass::DeviceAllocation<std::uint8_t> workspace;
   Gemm gemm;
 
-  void init(int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
+  void init(int m, int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
             const std::uint8_t* b, const std::uint8_t* sfb,
             __nv_bfloat16* output) {
-    StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {kM, k, 1});
+    StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
     StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
-    StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {kM, n, 1});
-    LayoutSFA la = ScaleConfig::tile_atom_to_shape_SFA(make_shape(kM, n, k, 1));
-    LayoutSFB lb = ScaleConfig::tile_atom_to_shape_SFB(make_shape(kM, n, k, 1));
+    StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
+    LayoutSFA la = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+    LayoutSFB lb = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
     typename Gemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm, {kM, n, k, 1},
+        cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1},
         {reinterpret_cast<const ElementInput*>(a), sa,
          reinterpret_cast<const ElementInput*>(b), sb,
          reinterpret_cast<const ElementSF*>(sfa), la,
@@ -228,10 +228,18 @@ struct CutlassGdnGraph::Impl {
   std::uint8_t *output_weight = nullptr, *output_scale = nullptr;
   __nv_bfloat16 *qkvz = nullptr, *ba = nullptr, *projected = nullptr;
   FixedGemm qkvz_gemm, ba_gemm, output_gemm;
+  std::uint8_t *verify_input_packed = nullptr, *verify_input_sfa = nullptr;
+  std::uint8_t *verify_output_packed = nullptr, *verify_output_sfa = nullptr;
+  __nv_bfloat16 *verify_qkvz = nullptr, *verify_ba = nullptr,
+                 *verify_projected = nullptr;
+  FixedGemm verify_qkvz_gemm, verify_ba_gemm, verify_output_gemm;
   std::unique_ptr<CorePlan> core;
 
   ~Impl() {
     cudaSetDevice(device);
+    cudaFree(verify_projected); cudaFree(verify_ba); cudaFree(verify_qkvz);
+    cudaFree(verify_output_sfa); cudaFree(verify_output_packed);
+    cudaFree(verify_input_sfa); cudaFree(verify_input_packed);
     cudaFree(projected); cudaFree(ba); cudaFree(qkvz);
     cudaFree(output_scale); cudaFree(output_weight);
     cudaFree(output_sfa); cudaFree(output_packed);
@@ -290,6 +298,28 @@ CutlassGdnGraph::CutlassGdnGraph(int device, GdnWeights weights)
     cuda_check(cudaMalloc(&impl_->projected,
                           static_cast<std::size_t>(kM) * kOutputN * 2),
                "malloc projected output");
+    cuda_check(cudaMalloc(&impl_->verify_input_packed,
+                          kMaxVerifierRows * kInputK / 2),
+               "malloc verifier input A");
+    cuda_check(cudaMalloc(&impl_->verify_input_sfa, kInputSfaBytes),
+               "malloc verifier input SFA");
+    cuda_check(cudaMalloc(&impl_->verify_output_packed,
+                          kMaxVerifierRows * kOutputK / 2),
+               "malloc verifier output A");
+    cuda_check(cudaMalloc(&impl_->verify_output_sfa, kOutputSfaBytes),
+               "malloc verifier output SFA");
+    cuda_check(cudaMalloc(&impl_->verify_qkvz,
+                          static_cast<std::size_t>(kMaxVerifierRows) *
+                              kQkvzN * 2),
+               "malloc verifier QKVZ output");
+    cuda_check(cudaMalloc(&impl_->verify_ba,
+                          static_cast<std::size_t>(kMaxVerifierRows) * kBaN *
+                              2),
+               "malloc verifier BA output");
+    cuda_check(cudaMalloc(&impl_->verify_projected,
+                          static_cast<std::size_t>(kMaxVerifierRows) *
+                              kOutputN * 2),
+               "malloc verifier projected output");
 
     const std::size_t qkv_w = static_cast<std::size_t>(kQkvN) * kInputK / 2;
     const std::size_t qkv_s = static_cast<std::size_t>(kQkvN) * kInputK / 16;
@@ -313,17 +343,29 @@ CutlassGdnGraph::CutlassGdnGraph(int device, GdnWeights weights)
          "copy output scale");
     cuda_check(cudaDeviceSynchronize(), "synchronize immutable GDN weights");
 
-    impl_->qkvz_gemm.init(kQkvzN, kInputK, impl_->input_packed,
+    impl_->qkvz_gemm.init(kM, kQkvzN, kInputK, impl_->input_packed,
                           impl_->input_sfa, impl_->qkvz_weight,
                           impl_->qkvz_scale, impl_->qkvz);
-    impl_->ba_gemm.init(kBaN, kInputK, impl_->input_packed,
+    impl_->ba_gemm.init(kM, kBaN, kInputK, impl_->input_packed,
                         impl_->input_sfa, impl_->ba_weight,
                         impl_->ba_scale, impl_->ba);
     impl_->core = std::make_unique<CorePlan>(
         device, weights.conv, weights.a_log, weights.dt_bias, weights.norm);
-    impl_->output_gemm.init(kOutputN, kOutputK, impl_->output_packed,
+    impl_->output_gemm.init(kM, kOutputN, kOutputK, impl_->output_packed,
                             impl_->output_sfa, impl_->output_weight,
                             impl_->output_scale, impl_->projected);
+    impl_->verify_qkvz_gemm.init(
+        kMaxVerifierRows, kQkvzN, kInputK, impl_->verify_input_packed,
+        impl_->verify_input_sfa, impl_->qkvz_weight, impl_->qkvz_scale,
+        impl_->verify_qkvz);
+    impl_->verify_ba_gemm.init(
+        kMaxVerifierRows, kBaN, kInputK, impl_->verify_input_packed,
+        impl_->verify_input_sfa, impl_->ba_weight, impl_->ba_scale,
+        impl_->verify_ba);
+    impl_->verify_output_gemm.init(
+        kMaxVerifierRows, kOutputN, kOutputK, impl_->verify_output_packed,
+        impl_->verify_output_sfa, impl_->output_weight, impl_->output_scale,
+        impl_->verify_projected);
   } catch (...) {
     delete impl_; impl_ = nullptr;
     throw;
@@ -387,6 +429,57 @@ void CutlassGdnGraph::launch(
 
 const __nv_bfloat16* CutlassGdnGraph::projected_output() const noexcept {
   return impl_ ? impl_->projected : nullptr;
+}
+
+void CutlassGdnGraph::launch_verifier(
+    const __nv_bfloat16* input, __nv_bfloat16* dense_conv_state,
+    float* dense_recurrent_state, __nv_bfloat16* prefix_conv_state,
+    float* prefix_recurrent_state, int sequences, int verify_width,
+    cudaStream_t stream) {
+  const int rows = sequences * verify_width;
+  if (!input || !dense_conv_state || !dense_recurrent_state ||
+      !prefix_conv_state || !prefix_recurrent_state || !allowed_m(sequences) ||
+      verify_width < 1 || verify_width > 8 || rows > kMaxVerifierRows ||
+      !stream) {
+    throw decode::DecodeExecutionContractError(
+        "fixed Qwen GDN verifier arguments changed");
+  }
+  // The input owner zeroes the inactive tail. One M128 projection is cheaper
+  // than verify_width M16 projections and leaves causal order to the core.
+  quantize_fixed<kInputK><<<kMaxVerifierRows, 256, 0, stream>>>(
+      impl_->verify_input_packed, impl_->verify_input_sfa, input, 1.0F);
+  if (impl_->verify_qkvz_gemm.gemm.run(stream) != cutlass::Status::kSuccess ||
+      impl_->verify_ba_gemm.gemm.run(stream) != cutlass::Status::kSuccess) {
+    throw std::runtime_error("fixed Qwen GDN verifier input projection failed");
+  }
+  scale_projection<<<dim3((kQkvzN + 255) / 256, kMaxVerifierRows), 256, 0,
+                     stream>>>(
+      impl_->verify_qkvz, kQkvzN, kQkvN, impl_->globals.qkv.global_scale,
+      impl_->globals.z.global_scale);
+  scale_projection<<<dim3((kBaN + 255) / 256, kMaxVerifierRows), 256, 0,
+                     stream>>>(
+      impl_->verify_ba, kBaN, kBN, impl_->globals.b.global_scale,
+      impl_->globals.a.global_scale);
+  impl_->core->launch_verifier(
+      impl_->verify_qkvz, impl_->verify_ba, dense_conv_state,
+      dense_recurrent_state, prefix_conv_state, prefix_recurrent_state,
+      sequences, verify_width, stream);
+  quantize_fixed<kOutputK><<<kMaxVerifierRows, 256, 0, stream>>>(
+      impl_->verify_output_packed, impl_->verify_output_sfa,
+      impl_->core->output(), kOutputActivationGlobal);
+  if (impl_->verify_output_gemm.gemm.run(stream) != cutlass::Status::kSuccess) {
+    throw std::runtime_error("fixed Qwen GDN verifier output projection failed");
+  }
+  scale_projection<<<dim3((kOutputN + 255) / 256, kMaxVerifierRows), 256, 0,
+                     stream>>>(
+      impl_->verify_projected, kOutputN, kOutputN,
+      impl_->globals.output.global_scale * kOutputActivationGlobal,
+      impl_->globals.output.global_scale * kOutputActivationGlobal);
+  cuda_check(cudaGetLastError(), "fixed Qwen GDN verifier launch");
+}
+
+const __nv_bfloat16* CutlassGdnGraph::verifier_output() const noexcept {
+  return impl_ ? impl_->verify_projected : nullptr;
 }
 
 }  // namespace rocket::qwen38::linear_attention
