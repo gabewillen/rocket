@@ -1,0 +1,52 @@
+---
+title: "A cold power cycle lifts the head from 728 MHz to 2418 MHz"
+description: "Removing every head power source before boot restores a 2418 MHz SM clock and brings its static-fire time within 1.1% of the peer."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, hardware, baseline]
+verdict: accepted
+rocket: "#boosters"
+supersedes: posts/hardware/2026-09-08-display-power-does-not-lift-728mhz-cap
+---
+
+**Question.** Does a cold power cycle clear the head's persistent 728 MHz cap?
+
+| setup | |
+| --- | --- |
+| nodes | gx10-5e36 (head), gx10-2a13 / 192.168.100.11 (peer), GB10 |
+| kernel | 6.17.13-rocket64k, 64 KiB pages, both nodes |
+| commit | 21ed1b75c5c355ed5ecc51674199d2b2aabea805 |
+| workload | single-node static fire, M=1, 20 GiB expert cache, 1.460 GiB/step |
+| changed condition | head shut down, every power source removed, then booted with only its primary PSU |
+
+```bash
+scripts/hardware/single-booster-clock-thermal.sh post-cold-cycle-head 20
+ssh glwillen@192.168.100.11 \
+  'cd /home/glwillen/Development/rocket && scripts/hardware/single-booster-clock-thermal.sh post-reboot-peer 20'
+```
+
+| metric | head before cold cycle | head after cold cycle | peer |
+| --- | ---: | ---: | ---: |
+| maximum SM clock | 728 MHz | 2418 MHz | 2411 MHz |
+| power at maximum clock | 5.38 W | 13.97 W | 15.15 W |
+| step time | 1688.6 ms | 1438.4 ms | 1423.0 ms |
+| after-cycle head/peer delta | | 1.1% | reference |
+
+```text
+head: M=1, 1438.4 ms/step, 2418 MHz maximum SM clock
+peer: M=1, 1423.0 ms/step, 2411 MHz maximum SM clock
+```
+
+**Verdict.** Accepted. A warm reboot preserved the 728 MHz cap. Removing every
+power source before boot restored the head to the peer's active clock and step
+time range.
+
+**Next.**
+
+- rerun the production Qwen3.8 FP8 concurrency ladder under the restored clock
+- avoid attaching a second power-capable display path during measurements
+
+**Reopen if.**
+
+- GB10 firmware changes power-controller reset behavior
+- PDU firmware or the physical power topology changes
