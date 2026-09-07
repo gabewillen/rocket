@@ -44,6 +44,7 @@ KEEP_RUNNING=false
 PRODUCTION=false
 TWO_NODE_PREFLIGHT=false
 STARTUP_TIMEOUT_SECONDS=3600
+GPU_MEMORY_UTILIZATION="0.835"
 
 usage() {
     cat <<'EOF'
@@ -74,6 +75,8 @@ Options:
   --worker-hf-volume V   Worker read-only HF volume (default: vllm-fn-hf)
   --startup-timeout-seconds N
                          Health deadline in seconds (default: 3600)
+  --gpu-memory-utilization F
+                         vLLM device-memory fraction in (0,1] (default: 0.835)
   --help                 Show this help
 EOF
 }
@@ -112,6 +115,10 @@ while (($#)); do
             STARTUP_TIMEOUT_SECONDS=${2:?missing value}
             shift 2
             ;;
+        --gpu-memory-utilization)
+            GPU_MEMORY_UTILIZATION=${2:?missing value}
+            shift 2
+            ;;
         --help|-h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
@@ -121,6 +128,21 @@ done
 [[ "$OUTPUT_DIR" == /* ]] || fail "--output-dir must be absolute"
 [[ "$STARTUP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
     fail "--startup-timeout-seconds must be a positive integer"
+if ! GPU_MEMORY_UTILIZATION=$(python3 - "$GPU_MEMORY_UTILIZATION" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+if not math.isfinite(value) or not 0.0 < value <= 1.0:
+    raise SystemExit(1)
+print(format(value, ".15g"))
+PY
+); then
+    fail "--gpu-memory-utilization must be a finite number in (0,1]"
+fi
 if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
     [[ "$FP8_ARTIFACT_DIR" == /* ]] || fail "--fp8-artifact-dir must be absolute"
     [[ -d "$FP8_ARTIFACT_DIR" ]] || fail "FP8 artifact directory missing: $FP8_ARTIFACT_DIR"
@@ -368,7 +390,7 @@ fi
     sha256sum ./* > SHA256SUMS
 )
 cat > "$OUTPUT_DIR/run.json" <<EOF
-{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size,"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS}
+{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size,"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS,"gpu_memory_utilization":$GPU_MEMORY_UTILIZATION}
 EOF
 
 printf 'Prepared and verified pinned calibration artifacts in %s\n' "$ARTIFACT_DIR"
@@ -449,7 +471,7 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   -v \$HOME/.cache/vllm:/root/.cache/vllm \\
   $IMAGE_TAG $MODEL_ID \\
   --revision $MODEL_REVISION --served-model-name qwen3.8-flash-next \\
-  --tensor-parallel-size 2 --gpu-memory-utilization 0.835 \\
+  --tensor-parallel-size 2 --gpu-memory-utilization $(printf '%q' "$GPU_MEMORY_UTILIZATION") \\
   --max-num-seqs 16 --max-num-batched-tokens 8192 --max-model-len 262144 \\
   --kv-cache-dtype fp8 --load-format safetensors --safetensors-load-strategy lazy \\
   --enable-chunked-prefill --reasoning-parser qwen3 --enable-auto-tool-choice \\

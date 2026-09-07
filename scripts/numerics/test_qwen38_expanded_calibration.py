@@ -200,20 +200,23 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             default_script = root / "default.sh"
             fp8_script = root / "fp8.sh"
             nvfp4_script = root / "nvfp4.sh"
+            low_memory_script = root / "low-memory.sh"
             harness = root / "generate.sh"
             harness.write_text(
                 "set -euo pipefail\n"
                 'HEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n'
                 'CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n'
                 'MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n'
-                'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\n'
+                'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\n'
                 + function
                 + f'\nwrite_launch_script {default_script} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" ""\n'
                 + f'write_launch_script {fp8_script} 1 10.0.0.2 eth1 hca /cache /generated --headless ro /durable/fp8 ""\n'
                 + f'write_launch_script {nvfp4_script} 1 10.0.0.2 eth1 hca /cache /generated --headless ro "" /durable/nvfp4\n'
+                + 'GPU_MEMORY_UTILIZATION=0.60\n'
+                + f'write_launch_script {low_memory_script} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" /durable/nvfp4\n'
             )
             subprocess.run(["bash", str(harness)], check=True)
-            for generated in (default_script, fp8_script, nvfp4_script):
+            for generated in (default_script, fp8_script, nvfp4_script, low_memory_script):
                 parsed = subprocess.run(
                     ["bash", "-n", str(generated)], capture_output=True, text=True
                 )
@@ -226,6 +229,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             default = default_script.read_text()
             self.assertNotIn("/rocket/qwen38-linear-fp8", default)
             self.assertIn("/generated/hf_quant_config_patched.json", default)
+            self.assertIn("--gpu-memory-utilization 0.835", default)
             fp8 = fp8_script.read_text()
             self.assertIn("-v /durable/fp8:/rocket/qwen38-linear-fp8:ro", fp8)
             self.assertIn(
@@ -252,6 +256,33 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
                 "/generated/config_nvfp4_patched.json:/root/.cache/huggingface/hub/model-cache/snapshots/revision/config.json:ro",
                 nvfp4,
             )
+            self.assertIn(
+                "--gpu-memory-utilization 0.60", low_memory_script.read_text()
+            )
+
+    def test_gpu_memory_utilization_is_validated_before_external_work(self):
+        validation = 'fail "--gpu-memory-utilization must be a finite number in (0,1]"'
+        external = "actual_image_id=$(docker image inspect"
+        self.assertIn('GPU_MEMORY_UTILIZATION="0.835"', self.source)
+        self.assertIn('"gpu_memory_utilization":$GPU_MEMORY_UTILIZATION', self.source)
+        self.assertIn("--gpu-memory-utilization)", self.source)
+        self.assertIn(validation, self.source)
+        self.assertLess(self.source.index(validation), self.source.index(external))
+        for invalid in ("0", "1.01", "nan", "not-a-number"):
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(SCRIPT),
+                    "--output-dir",
+                    "/unused-qwen38-invalid-memory-test",
+                    "--gpu-memory-utilization",
+                    invalid,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("finite number in (0,1]", result.stderr)
 
     def test_real_artifact_passes_accepted_runtime_preflight(self):
         artifact = pathlib.Path(
