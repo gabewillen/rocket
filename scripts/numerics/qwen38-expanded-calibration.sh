@@ -256,7 +256,7 @@ verify_sha() {
         "overlay checksum mismatch for $(basename "$file"): expected $expected, got $actual"
 }
 verify_sha fae9fd5242748e8cdb314445a25ad628a0ce335cf26f794623f8679497a65186 "$ARTIFACT_DIR/ple_layer_patched.py"
-verify_sha 89c54b49756e3fe9def912e22c6721e576c03b93d0238cbe061c029d8a6c84e0 "$ARTIFACT_DIR/modelopt_patched.py"
+verify_sha 6b1a1eb03c66dd51e239001be551f60ec1115681b1804e28d732c19b87b75228 "$ARTIFACT_DIR/modelopt_patched.py"
 if [[ -z "$FP8_ARTIFACT_DIR" && -z "$NVFP4_ARTIFACT_DIR" ]]; then
     verify_sha 6cbca7f793403b0d169e0d8a60f100a4c721d3ec008404eab0ddfa0b81389c0e "$ARTIFACT_DIR/weight_utils_64k.py"
 fi

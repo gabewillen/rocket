@@ -111,6 +111,11 @@ PREFIX_CANDIDATE_PATCH = '''        if prefix.startswith("model.language_model.m
             candidates.append(
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
+
+        # Qwen3.8 stores its single MTP layer as mtp.layers.0, while the
+        # runtime numbers that layer after the 48 target layers.
+        if prefix.startswith("mtp.layers.48."):
+            candidates.append("mtp.layers.0." + prefix[len("mtp.layers.48.") :])
 '''
 
 

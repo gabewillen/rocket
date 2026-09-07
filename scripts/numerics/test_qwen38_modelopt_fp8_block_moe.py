@@ -145,6 +145,20 @@ class BlockFp8DispatchTest(unittest.TestCase):
                 methods.append(type(method))
             self.assertEqual(methods[0], methods[1])
 
+    def test_runtime_mtp_layer_48_resolves_checkpoint_layer_zero(self):
+        with self.patched_namespace() as namespace:
+            layer = namespace["RoutedExperts"]()
+            config = namespace["Config"]("FP8_PB_WO", 128)
+            config.quantized_layers = {
+                "mtp.layers.0.mlp.experts": {
+                    "quant_algo": "FP8_PB_WO",
+                    "group_size": 128,
+                }
+            }
+            method = config.get_quant_method(layer, "mtp.layers.48.mlp.experts")
+            self.assertIsInstance(method, FakeFp8MoEMethod)
+            self.assertEqual(method.quant_config.weight_block_size, [128, 128])
+
     def test_group_size_must_be_exactly_128(self):
         with self.patched_namespace() as namespace:
             layer = namespace["RoutedExperts"]()

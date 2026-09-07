@@ -106,7 +106,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             self.source.index("patch-qwen38-fp8-overlay-loader.py"),
         )
 
-    def test_fp8_launch_is_opt_in_read_only_and_keeps_default_config(self):
+    def test_precision_overlays_are_opt_in_read_only_and_keep_default_config(self):
         self.assertIn('if [[ -n "$FP8_ARTIFACT_DIR" ]]', self.source)
         self.assertIn("/rocket/qwen38-linear-fp8:ro", self.source)
         self.assertIn("ROCKET_QWEN38_FP8_OVERLAY_MANIFEST", self.source)
@@ -114,7 +114,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn('quant_config_source="$artifact_dir/hf_quant_config_patched.json"', self.source)
         self.assertIn('quant_config_source="$fp8_host_dir/hf_quant_config.json"', self.source)
         self.assertIn("assert len(result['selected']) == 180", self.source)
-        self.assertIn('if [[ -z "$FP8_ARTIFACT_DIR" ]]', self.source)
+        self.assertIn('if [[ -z "$FP8_ARTIFACT_DIR" && -z "$NVFP4_ARTIFACT_DIR" ]]', self.source)
         self.assertEqual(self.source.count("linear-attention-fp8.safetensors"), 1)
         self.assertIn('basename "$FP8_ARTIFACT_DIR"', self.source)
         self.assertNotIn('\n$fp8_options\n', self.source)
@@ -136,8 +136,8 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
                 'MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n'
                 'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\n'
                 + function
-                + f'\nwrite_launch_script {default_script} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro ""\n'
-                + f'write_launch_script {fp8_script} 1 10.0.0.2 eth1 hca /cache /generated --headless ro /durable/fp8\n'
+                + f'\nwrite_launch_script {default_script} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" ""\n'
+                + f'write_launch_script {fp8_script} 1 10.0.0.2 eth1 hca /cache /generated --headless ro /durable/fp8 ""\n'
             )
             subprocess.run(["bash", str(harness)], check=True)
             for generated in (default_script, fp8_script):
@@ -218,7 +218,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
 
     def test_modelopt_checksum_matches_dual_spelling_generator(self):
         self.assertIn(
-            "89c54b49756e3fe9def912e22c6721e576c03b93d0238cbe061c029d8a6c84e0",
+            "6b1a1eb03c66dd51e239001be551f60ec1115681b1804e28d732c19b87b75228",
             self.source,
         )
         self.assertNotIn(

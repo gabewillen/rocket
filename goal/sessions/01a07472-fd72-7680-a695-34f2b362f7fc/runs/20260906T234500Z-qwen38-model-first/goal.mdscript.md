@@ -92,6 +92,8 @@ current_state:
   - NVFP4 materialization uses the installed scaled_fp4_quant kernel with unswizzled group-16 checkpoint scales, source-hash identity, activation global scales from the accepted v2 trace, and bounded one-matrix GPU staging
   - 11 focused tests pass, including actual ModelOptNvFp4LinearMethod construction and fused QKV shard loading; full two-node preflight /home/glwillen/calibration/qwen38-linear-nvfp4-preflight-20260907-01 validates all 180 replacements before first yield
   - the next expensive residency is one expanded-telemetry NVFP4 launch; run the unchanged quality and interaction gates, then retain NVFP4 wholesale or bisect qkv, z, ba, and out projection families from that single structural result
+  - first NVFP4 live load reached all 11 target shards in 113 seconds, then failed because runtime MTP layer 48 did not resolve checkpoint MTP layer 0 and inherited the target expert NVFP4 method
+  - the corrected mixed-precision overlay resolves mtp.layers.48.mlp.experts to NVIDIA FP8_BLOCK_SCALES with a 128x128 block while retaining NVFP4 for all 180 target linear-attention projections; 28 focused tests and pinned preflight pass
 next_owner: root orchestrator
 ---
 
