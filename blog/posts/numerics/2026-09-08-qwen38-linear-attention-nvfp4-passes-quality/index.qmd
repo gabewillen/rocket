@@ -1,0 +1,145 @@
+---
+title: "Qwen3.8 base linear attention passes all 12 quality cases in NVFP4"
+description: "All 180 base linear-attention projections pass 12 quality cases in NVFP4 with zero regressions and remove 2,997,226,080 bytes per c16 step."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, numerics, attention, telemetry, baseline]
+verdict: accepted
+rocket: "#fuel"
+---
+
+## Question
+
+Can the whole `base_linear_attention` weight family serve as NVFP4 after its
+FP8 control passed?
+
+| setup | value |
+| --- | --- |
+| nodes | head GB10 and worker GB10, 6.17.13-rocket64k, 64 KiB pages |
+| checkpoint | [nvidia/Qwen3.8-Flash-Next-NVFP4 at fc694b54fb0174e0913e6adf86691ef85a4ead47](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/tree/fc694b54fb0174e0913e6adf86691ef85a4ead47) |
+| Rocket commit | `9b0c50013077e8a27f8db9960f1cf1117070d68a` |
+| vLLM image | `vllm/vllm-openai:qwen38-flash-next` at `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| runtime source | [MiaAI-Lab Qwen3.8 dual-Spark at c2325b22602b51a5faf55fc2bebccc34f3f80b9f](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks/tree/c2325b22602b51a5faf55fc2bebccc34f3f80b9f) |
+| source weight dtype | BF16 for all 180 selected projections |
+| serving weight dtype | ModelOpt W4A4 NVFP4 for all 180 selected projections |
+| artifact | [`64539e4a...56c4e5`](../2026-09-07-qwen38-linear-attention-nvfp4-artifact/) |
+
+Prior absence was a difficulty constraint: this model needs a 180-tensor
+overlay plus a separate block-FP8 dispatch for its MTP experts on two GB10s.
+
+## Commands
+
+```bash
+scripts/numerics/qwen38-expanded-calibration.sh \
+  --output-dir /home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04 \
+  --nvfp4-artifact-dir /home/glwillen/calibration/qwen38-linear-nvfp4-artifacts/64539e4a5a4b533aa143d20e055ae73ebd10b21f05dbd422847a9be30e56c4e5 \
+  --launch
+
+python3 scripts/numerics/qwen38-compare-precision.py \
+  --baseline /home/glwillen/calibration/qwen38-expanded-mtp3-20260907-03/combined-activation-summary.json \
+  --candidate /home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/combined-activation-summary.json \
+  --baseline-quality /home/glwillen/calibration/qwen38-baseline-quality.json \
+  --candidate-quality /home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/quality.json \
+  --out /home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/precision-comparison-bf16.json
+
+python3 scripts/numerics/qwen38-compare-precision.py \
+  --baseline /home/glwillen/calibration/qwen38-linear-fp8-live-20260907-08/combined-activation-summary.json \
+  --candidate /home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/combined-activation-summary.json \
+  --baseline-quality /home/glwillen/calibration/qwen38-linear-fp8-live-20260907-08/quality.json \
+  --candidate-quality /home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/quality.json \
+  --out /home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/precision-comparison-fp8.json
+```
+
+```text
+channels	494
+answer_tail_equal	10/12
+regressions	none
+channels	494
+answer_tail_equal	10/12
+regressions	none
+```
+
+## Quality
+
+| metric | NVFP4 | unit |
+| --- | ---: | --- |
+| quality gate | 12/12 | cases |
+| byte-identical answer tails vs BF16 | 10/12 | cases |
+| byte-identical answer tails vs FP8 | 10/12 | cases |
+| regressions vs BF16 | 0 | cases |
+| regressions vs FP8 | 0 | cases |
+| paired telemetry | 494 | channels |
+| changed tails vs BF16 | `arith_chain`, `negation` | cases |
+
+## Interaction telemetry
+
+| output family | channels | RMS ratio vs BF16 | max histogram TV vs BF16 | max histogram TV vs FP8 |
+| --- | ---: | ---: | ---: | ---: |
+| linear-attention projection output | 108 | 0.703x to 2.370x | 0.312500000 | 0.187500000 |
+| linear-attention output | 36 | 0.703x to 1.311x | 0.133300781 | 0.130859375 |
+| recurrent state | 36 | 0.494x to 1.807x | 0.111816406 | 0.083984375 |
+| full-attention QKV output | 12 | 0.803x to 1.023x | 0.071777344 | 0.112792969 |
+| full-attention output | 12 | 0.924x to 1.244x | 0.127441406 | 0.109863281 |
+| router logits output | 48 | 0.893x to 1.014x | 0.009765625 | 0.012695312 |
+
+## Residency and MTP
+
+```bash
+python3 scripts/numerics/qwen38-mtp-runtime-evidence.py \
+  --log /home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/logs/head-workload.log \
+  --not-before 2026-09-07T07:51:54Z --min-records 2 --positions 3 \
+  | jq '{records:.evidence.records, accepted:.totals.accepted_tokens, drafted:.totals.drafted_tokens, acceptance_rate:.totals.acceptance_rate, mean_length:.mean_acceptance_length}'
+
+rg 'Model loading took' \
+  /home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/logs/{head,worker}.log
+```
+
+```text
+{
+  "records": 15,
+  "accepted": 2458,
+  "drafted": 4965,
+  "acceptance_rate": 0.4950654582074522,
+  "mean_length": {
+    "max": 2.99,
+    "mean": 2.493333333333333,
+    "min": 2.11
+  }
+}
+/home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/logs/worker.log:2026-09-07T07:49:34.101135822Z (Worker_TP1_EP1 pid=196) INFO 09-07 07:49:34 [model_runner.py:407] Model loading took 62.88 GiB memory and 192.568486 seconds
+/home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/logs/head.log:2026-09-07T07:49:34.249269392Z (Worker_TP0_EP0 pid=253) INFO 09-07 07:49:34 [model_runner.py:407] Model loading took 62.88 GiB memory and 192.762584 seconds
+```
+
+| metric | value | unit |
+| --- | ---: | --- |
+| model memory per node | 62.88 | GiB |
+| accepted MTP tokens | 2,458/4,965 | tokens |
+| MTP acceptance rate | 49.51 | % |
+| mean accepted length | 2.4933 | tokens |
+| mean-length range over 15 records | 2.11 to 2.99 | tokens |
+| [traffic removed per c16 step](../2026-09-07-qwen38-linear-attention-nvfp4-artifact/) | 2,997,226,080 | bytes |
+
+One quality and telemetry run was measured. Model-memory spread was 0.00 GiB
+at two-decimal precision. MTP mean length ranged from 2.11 to 2.99 across 15
+runtime records. Run-to-run variance was not measured.
+
+## Verdict
+
+Accepted. All 180 `base_linear_attention` projections move from BF16 to NVFP4
+in the serving-weight map. Existing routed experts stay NVFP4, and MTP experts
+stay 128x128 block FP8.
+
+This vLLM measurement is a comparison baseline. The Rocket engine target stays
+above 20 generated tok/s per stream at concurrency 16 and above 320 aggregate
+tok/s.
+
+## Next
+
+- run the healthy-clock production concurrency ladder with this NVFP4 artifact
+- rank the remaining BF16 and FP8 families from measured c16 traffic
+- retain family-isolated telemetry for each serving-weight conversion
+
+## Reopen if
+
+- NVIDIA publishes a new checkpoint revision or ModelOpt NVFP4 serialization ABI
+- an upstream evaluation release adds a different attention test set
