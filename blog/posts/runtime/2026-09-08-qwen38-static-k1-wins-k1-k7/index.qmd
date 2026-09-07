@@ -1,0 +1,66 @@
+---
+title: "K1 wins the matched Qwen3.8 K1 to K7 general-engine sweep"
+description: "K1 leads four of five generic concurrency points, K6 narrowly leads c4, and every c16 result remains below Rocket's serving floors."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, runtime, scheduler, hardware, baseline]
+verdict: rejected
+rocket: "#engine-status"
+supersedes: posts/runtime/2026-09-08-qwen38-static-mtp1-wins-general-engine
+---
+
+**Question.** Does any fixed K1 to K7 depth clear more than 320 aggregate tok/s and more than 20 tok/s/stream at c16?
+
+| setup | value |
+| --- | --- |
+| nodes | gx10-5e36 and gx10-2a13, GB10, 64 KiB pages |
+| checkpoint/image | `fc694b54fb0174e0913e6adf86691ef85a4ead47` / `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| launcher | `scripts/numerics/qwen38-expanded-calibration.sh` at `09390a4` |
+| runs | one per depth, no run-to-run variance |
+
+```bash
+for spec in 1:01 2:02 3:01 4:01 5:04 6:02 7:01; do
+  k=${spec%:*}; run=${spec#*:}
+  scripts/numerics/qwen38-expanded-calibration.sh \
+    --output-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp${k}-20260907-${run} \
+    --mia-source /home/glwillen/Development/Qwen3.8-Flash-Next-Dual-DGX-Sparks \
+    --nvfp4-artifact-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-artifacts/23d2c39e9c2cf36a832cb1750f6542fa46f11f1befe195d80c082051a5a772b4 \
+    --production --mtp-depth "$k"
+done
+```
+
+| depth | c1 | c2 | c4 | c8 | c16 aggregate | c16 per stream |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| K1 | 47.91 | 82.08 | 80.24 | 100.65 | 108.76 | 12.46 |
+| K2 | 47.15 | 81.51 | 81.04 | 83.21 | 106.56 | 12.36 |
+| K3 | 42.95 | 79.32 | 73.13 | 92.44 | 101.81 | 11.59 |
+| K4 | 39.97 | 70.04 | 72.19 | 88.66 | 100.74 | 11.38 |
+| K5 | 38.51 | 56.81 | 47.20 | 56.28 | 94.47 | 9.13 |
+| K6 | 34.00 | 63.18 | 82.25 | 80.25 | 92.83 | 9.76 |
+| K7 | 35.49 | 54.99 | 66.23 | 54.80 | 89.53 | 9.24 |
+
+Units are tok/s. K1 wins c1, c2, c8, and c16. K6 leads K1 by 2.50% at c4. K2's hardware sample pairing has a 2.906 s maximum span.
+
+The K7 coding-speed prompt produced 33.18 tok/s at c1. One prompt's throughput does not test coding quality. K7 remains available as a lazy low-concurrency coding probe, promoted only by measured accepted-token value.
+
+[The hibrid47 recipe at `c7f6905`](https://github.com/bilikaz/qwen38-flash-next-cluster-recipe/tree/c7f69055e9ca572d0c562708a2cd68ea9a1af42b) reports 6.2 steps/s and 4.17 to 4.21 accepted tokens at c16, or about 414 to 418 tok/s from step rate times accepted length times 16. Its 415 to 421 average and 451 peak use zero-prefill 10 s decode windows, a different checkpoint at `7b83fa0d`, K4, and four runs. Those numbers are the steady-decode comparison baseline, not a matched result for this prompt-inclusive sweep.
+
+| hibrid47 control | value |
+| --- | --- |
+| image | `sha256:ba28f473c766919afac75a898014d1dbe18a0929a7f55c0588512f27ee365513` |
+| checkpoint | `myllmbox/Qwen3.8-Flash-Next-hibrid47` at `7b83fa0d` |
+| serving knobs | async scheduling, resident NVFP4 PLE, BF16 KV, dual-HCA RDMA, fast-core cpuset, `MBX_VOCAB_GEMV`, Marlin atomic add, compaction 0 |
+| metric | four zero-prefill steady 10 s decode windows |
+
+**Verdict.** Fixed-depth general-engine serving is value-rejected. K1 reaches 34.0% of the 320 aggregate floor and 62.3% of the 20 tok/s/stream floor at c16.
+
+**Next.**
+
+- compare K1 and K7 coding quality on matched tasks
+- bind lazy K7 probing and measured-value tapering into the specialized runtime
+- measure a metric-parity whole-decode roofline and maximize its achieved fraction above both floors
+
+**Reopen if.**
+
+- an upstream vLLM release changes Qwen3.8 speculative scheduling
+- the checkpoint, image, firmware, or GB10 hardware changes
