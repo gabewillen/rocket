@@ -227,7 +227,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
                 'HEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n'
                 'CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n'
                 'MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n'
-                'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\n'
+                'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\nMTP_DEPTH=3\n'
                 f'OUTPUT_DIR={root}\nPRODUCTION=true\nNVFP4_HAS_BASE_ROUTERS=true\n'
                 + function
                 + f'\nwrite_launch_script {root / "launch-worker.sh"} 1 10.0.0.2 eth1 hca /cache /generated --headless ro "" /durable/nvfp4\n'
@@ -263,7 +263,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
                 'HEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n'
                 'CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n'
                 'MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n'
-                'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\n'
+                'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\nMTP_DEPTH=3\n'
                 + function
                 + f'\nwrite_launch_script {default_script} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" ""\n'
                 + f'write_launch_script {fp8_script} 1 10.0.0.2 eth1 hca /cache /generated --headless ro /durable/fp8 ""\n'
@@ -339,6 +339,50 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("finite number in (0,1]", result.stderr)
+
+    def test_fixed_mtp_depths_generate_exact_configs_and_k0_fails_closed(self):
+        function = self.source[
+            self.source.index("write_launch_script() {"):
+            self.source.index('\nREMOTE_FP8_ARTIFACT=""')
+        ]
+        with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+            root = pathlib.Path(directory)
+            for depth in (1, 2, 3):
+                destination = root / f"k{depth}.sh"
+                harness = root / f"generate-k{depth}.sh"
+                harness.write_text(
+                    "set -euo pipefail\n"
+                    'HEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n'
+                    'CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n'
+                    'MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n'
+                    f'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\nMTP_DEPTH={depth}\n'
+                    + function
+                    + f'\nwrite_launch_script {destination} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" ""\n'
+                )
+                subprocess.run(["bash", str(harness)], check=True)
+                self.assertIn(
+                    f"--speculative-config '{{\"method\":\"mtp\",\"num_speculative_tokens\":{depth}}}'",
+                    destination.read_text(),
+                )
+        for depth in ("0", "4", "-1", "x"):
+            result = subprocess.run(
+                ["bash", str(SCRIPT), "--output-dir", "/unused/mtp-depth", "--mtp-depth", depth],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            if depth == "0":
+                self.assertIn("true K0 with loaded MTP state is unavailable", result.stderr)
+            else:
+                self.assertIn("must be one of 0,1,2,3", result.stderr)
+
+    def test_production_hardware_monitor_is_cleaned_and_reduced(self):
+        self.assertIn('hardware_monitor_pid=""', self.source)
+        self.assertIn('kill "$hardware_monitor_pid"', self.source)
+        self.assertIn('wait "$hardware_monitor_pid"', self.source)
+        self.assertIn('fail "two-node hardware monitor failed"', self.source)
+        self.assertIn("qwen38-two-node-monitor.py\" collect", self.source)
+        self.assertIn("qwen38-two-node-monitor.py\" summarize", self.source)
+        self.assertIn('$OUTPUT_DIR/hardware.json', self.source)
 
     def test_real_artifact_passes_accepted_runtime_preflight(self):
         artifact = pathlib.Path(

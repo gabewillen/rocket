@@ -47,6 +47,7 @@ PRODUCTION=false
 TWO_NODE_PREFLIGHT=false
 STARTUP_TIMEOUT_SECONDS=3600
 GPU_MEMORY_UTILIZATION="0.835"
+MTP_DEPTH="3"
 
 usage() {
     cat <<'EOF'
@@ -79,6 +80,7 @@ Options:
                          Health deadline in seconds (default: 3600)
   --gpu-memory-utilization F
                          vLLM device-memory fraction in (0,1] (default: 0.835)
+  --mtp-depth K          Fixed MTP depth 1..3 (default: 3); K0 fails closed
   --help                 Show this help
 EOF
 }
@@ -121,6 +123,7 @@ while (($#)); do
             GPU_MEMORY_UTILIZATION=${2:?missing value}
             shift 2
             ;;
+        --mtp-depth) MTP_DEPTH=${2:?missing value}; shift 2 ;;
         --help|-h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
@@ -128,6 +131,11 @@ done
 
 [[ -n "$OUTPUT_DIR" ]] || fail "--output-dir is required"
 [[ "$OUTPUT_DIR" == /* ]] || fail "--output-dir must be absolute"
+[[ "$MTP_DEPTH" =~ ^[0-3]$ ]] || fail "--mtp-depth must be one of 0,1,2,3"
+# Pinned image d464f3b4 declares SpeculativeConfig.num_speculative_tokens with
+# Pydantic Field(gt=0). Omitting speculative_config also omits the MTP model and
+# its cache path, so neither CLI shape represents K0 with synchronized MTP state.
+[[ "$MTP_DEPTH" != 0 ]] || fail "pinned vLLM requires num_speculative_tokens > 0; true K0 with loaded MTP state is unavailable"
 [[ "$STARTUP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
     fail "--startup-timeout-seconds must be a positive integer"
 if ! GPU_MEMORY_UTILIZATION=$(python3 - "$GPU_MEMORY_UTILIZATION" <<'PY'
@@ -416,7 +424,7 @@ fi
     sha256sum ./* > SHA256SUMS
 )
 cat > "$OUTPUT_DIR/run.json" <<EOF
-{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size,"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS,"gpu_memory_utilization":$GPU_MEMORY_UTILIZATION}
+{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size,"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS,"gpu_memory_utilization":$GPU_MEMORY_UTILIZATION,"mtp_depth":$MTP_DEPTH}
 EOF
 
 printf 'Prepared and verified pinned calibration artifacts in %s\n' "$ARTIFACT_DIR"
@@ -504,7 +512,7 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   --tool-call-parser qwen3_coder --distributed-executor-backend mp \\
   --mm-encoder-tp-mode data --nnodes 2 --master-addr $HEAD_IP --master-port $MASTER_PORT \\
   --enable-expert-parallel --all2all-backend allgather_reducescatter \\
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \\
+  --speculative-config '{"method":"mtp","num_speculative_tokens":$MTP_DEPTH}' \\
   --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' \\
   --hf-overrides '{"text_config":{"ple_embedding_dtype":"float8_e4m3fn"}}' \\
   --enforce-eager --node-rank $node_rank $mode
@@ -593,11 +601,14 @@ head_log_pid=""
 worker_log_pid=""
 head_workload_log_pid=""
 worker_workload_log_pid=""
+hardware_monitor_pid=""
 cleanup() {
     [[ -n "$head_log_pid" ]] && kill "$head_log_pid" >/dev/null 2>&1 || true
     [[ -n "$worker_log_pid" ]] && kill "$worker_log_pid" >/dev/null 2>&1 || true
     [[ -n "$head_workload_log_pid" ]] && kill "$head_workload_log_pid" >/dev/null 2>&1 || true
     [[ -n "$worker_workload_log_pid" ]] && kill "$worker_workload_log_pid" >/dev/null 2>&1 || true
+    [[ -n "$hardware_monitor_pid" ]] && kill "$hardware_monitor_pid" >/dev/null 2>&1 || true
+    [[ -n "$hardware_monitor_pid" ]] && wait "$hardware_monitor_pid" 2>/dev/null || true
     if [[ "$KEEP_RUNNING" != true ]]; then
         docker rm -f "$HEAD_CONTAINER" >/dev/null 2>&1 || true
         ssh -o BatchMode=yes "$SSH_TARGET" \
@@ -628,10 +639,21 @@ until curl -fsS "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; do
 done
 
 if [[ "$PRODUCTION" == true ]]; then
+    python3 "$REPO_ROOT/scripts/hardware/qwen38-two-node-monitor.py" collect \
+        --worker "$SSH_TARGET" --output "$OUTPUT_DIR/hardware-samples.jsonl" &
+    hardware_monitor_pid=$!
     python3 "$REPO_ROOT/scripts/baseline/openai-forked-prefix.py" \
         --endpoint "http://127.0.0.1:$API_PORT" --concurrency 1,2,4,8,16 \
         --decode 256 --json > "$OUTPUT_DIR/throughput.json"
+    kill -INT "$hardware_monitor_pid"
+    wait "$hardware_monitor_pid" || fail "two-node hardware monitor failed"
+    hardware_monitor_pid=""
+    python3 "$REPO_ROOT/scripts/hardware/qwen38-two-node-monitor.py" summarize \
+        --samples "$OUTPUT_DIR/hardware-samples.jsonl" \
+        --benchmark "$OUTPUT_DIR/throughput.json" \
+        --output "$OUTPUT_DIR/hardware.json"
     cat "$OUTPUT_DIR/throughput.json"
+    cat "$OUTPUT_DIR/hardware.json"
     printf 'Production benchmark complete: %s\n' "$OUTPUT_DIR"
     exit 0
 fi

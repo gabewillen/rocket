@@ -7,6 +7,11 @@ import json
 import statistics
 import time
 import urllib.request
+from datetime import datetime, timezone
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def request(endpoint, model, prefix, stream_id, tokens, timeout):
@@ -78,12 +83,20 @@ def main():
     prefix = ("Rocket agent session memory. " * (args.prefix_bytes // 29 + 1))[:args.prefix_bytes]
     results = []
     for concurrency in map(int, args.concurrency.split(",")):
+        started_at = utc_now()
+        started_unix_ns = time.time_ns()
         started = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = [pool.submit(request, args.endpoint, args.model, prefix, i,
                                    args.decode, args.timeout) for i in range(concurrency)]
             rows = [future.result() for future in futures]
         result = summarize(concurrency, rows, time.perf_counter() - started)
+        result.update({
+            "started_at": started_at,
+            "started_unix_ns": started_unix_ns,
+            "finished_at": utc_now(),
+            "finished_unix_ns": time.time_ns(),
+        })
         results.append(result)
         if not args.json:
             print("c={concurrency:2d} aggregate={aggregate_tok_s:7.2f} tok/s "
