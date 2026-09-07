@@ -31,6 +31,15 @@ Only M 1, 2, 4, 8, and 16 is accepted. The embedder must supply an OpenTelemetry
 sink. Metric labels are limited to rank, M bucket, dtype, and outcome. Trace and
 request IDs are confined to spans and logs.
 
+`qwen38-pair-reduce-bench` samples NVML SM clock and GPU utilization on an
+owned thread during each timed M window. Each result carries UTC nanosecond
+bounds so the two rank logs can be intersected without assuming simultaneous
+process launch. `--timeout-ms` sets the matching 100..120000 ms peer and send
+completion budget on both ranks. A physical silent-peer proof uses matching
+`--fault-stall-rank` and `--fault-stall-ms` flags; the stall must exceed the
+timeout. A timed-out instance is discarded because its remote writes may have
+committed.
+
 ```bash
 cmake -S engines/qwen38-flash-next-nvfp4-2b \
   -B engines/qwen38-flash-next-nvfp4-2b/build -DCMAKE_BUILD_TYPE=Release

@@ -1,4 +1,5 @@
 #include "pair_reduce/pair_reduce.h"
+#include "pair_reduce/rdma.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -277,6 +278,14 @@ void test_transport_failure_is_typed_and_observed() {
   cudaFree(input);
 }
 
+void test_operation_timeout_bounds() {
+  check(!pr::valid_operation_timeout_ms(0), "zero operation timeout was accepted");
+  check(!pr::valid_operation_timeout_ms(99), "sub-floor operation timeout was accepted");
+  check(pr::valid_operation_timeout_ms(100), "minimum operation timeout was rejected");
+  check(pr::valid_operation_timeout_ms(120'000), "maximum operation timeout was rejected");
+  check(!pr::valid_operation_timeout_ms(120'001), "over-ceiling timeout was accepted");
+}
+
 }  // namespace
 
 int main() {
@@ -285,7 +294,8 @@ int main() {
     test_invalid_m_and_peer_drift_fail_closed();
     test_topology_and_sequence_drift_fail_closed();
     test_transport_failure_is_typed_and_observed();
-    std::puts("qwen38 PairReduce: 5 shapes bit-identical; protocol and drift contracts passed");
+    test_operation_timeout_bounds();
+    std::puts("qwen38 PairReduce: 5 shapes bit-identical; protocol, drift, and timeout contracts passed");
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "FAIL: %s\n", error.what());

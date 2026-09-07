@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -22,12 +23,20 @@ struct RdmaConfig {
   std::vector<std::string> devices{"rocep1s0f1", "roceP2p1s0f1"};
   int gid_index = 3;
   std::size_t rail_split_bytes = 65'536;
+  std::uint32_t operation_timeout_ms = 120'000;
 };
+
+constexpr bool valid_operation_timeout_ms(std::uint32_t timeout_ms) noexcept {
+  return timeout_ms >= 100 && timeout_ms <= 120'000;
+}
 
 // Fixed two-rank, two-rail RC transport. Registered regions must match in size
 // and registration order across ranks. Payload writes are unsignaled. A
 // signaled inline sequence write on every rail is the ordered publication
-// boundary. All operations are single-owner and synchronous.
+// boundary. All operations are single-owner and synchronous. Peer doorbell and
+// send-completion waits either finish or throw RdmaError within
+// operation_timeout_ms. A timeout can leave peer-visible writes committed; the
+// caller must discard the failed PairReduce instance rather than retry it.
 class RdmaTransport final : public Transport {
  public:
   explicit RdmaTransport(const RdmaConfig& config);

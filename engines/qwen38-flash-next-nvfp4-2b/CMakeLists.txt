@@ -21,6 +21,7 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
 endif()
 
 find_library(ROCKET_QWEN38_IBVERBS ibverbs REQUIRED)
+find_library(ROCKET_QWEN38_NVML nvidia-ml REQUIRED)
 
 add_library(qwen38_pair_reduce STATIC
   src/pair_reduce/pair_reduce.cu
@@ -38,7 +39,7 @@ set_target_properties(qwen38_pair_reduce PROPERTIES
 )
 
 add_executable(qwen38-pair-reduce-bench bench/pair_reduce_bench.cu)
-target_link_libraries(qwen38-pair-reduce-bench PRIVATE qwen38_pair_reduce)
+target_link_libraries(qwen38-pair-reduce-bench PRIVATE qwen38_pair_reduce ${ROCKET_QWEN38_NVML})
 
 enable_testing()
 add_executable(qwen38-test-pair-reduce tests/test_pair_reduce.cu)
@@ -47,3 +48,10 @@ target_compile_options(qwen38-test-pair-reduce PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
 )
 add_test(NAME qwen38-pair-reduce-contract COMMAND qwen38-test-pair-reduce)
+add_test(NAME qwen38-pair-reduce-reject-timeout
+  COMMAND qwen38-pair-reduce-bench --rank 0 --timeout-ms 99)
+set_tests_properties(qwen38-pair-reduce-reject-timeout PROPERTIES WILL_FAIL TRUE)
+add_test(NAME qwen38-pair-reduce-reject-fault-budget
+  COMMAND qwen38-pair-reduce-bench --rank 0 --timeout-ms 1000
+          --fault-stall-rank 1 --fault-stall-ms 1000)
+set_tests_properties(qwen38-pair-reduce-reject-fault-budget PROPERTIES WILL_FAIL TRUE)

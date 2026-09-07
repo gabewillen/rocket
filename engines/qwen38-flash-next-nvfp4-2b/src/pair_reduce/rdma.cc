@@ -23,8 +23,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 constexpr int kRails = 2;
 constexpr std::size_t kDoorStride = 64;
-constexpr int kTimeoutSeconds = 120;
-constexpr std::uint32_t kBootstrapSchema = 1;
+constexpr std::uint32_t kBootstrapSchema = 2;
 constexpr std::array<std::string_view, kRails> kDevices{"rocep1s0f1", "roceP2p1s0f1"};
 
 [[noreturn]] void fail(const std::string& reason) {
@@ -134,6 +133,8 @@ struct RailWire {
   std::uint32_t psn;
   std::uint32_t door_rkey;
   std::uint32_t page_bytes;
+  std::uint32_t operation_timeout_ms;
+  std::uint32_t reserved;
   std::uint64_t door_address;
   std::uint8_t gid[16];
 };
@@ -210,6 +211,8 @@ RdmaTransport::RdmaTransport(const RdmaConfig& config) : impl_(new Impl(config))
     fail("bootstrap port is outside 1..65535");
   if (config.rail_split_bytes != 65'536)
     fail("rail split must equal one 65536-byte host page");
+  if (!valid_operation_timeout_ms(config.operation_timeout_ms))
+    fail("operation timeout must be within 100..120000 milliseconds");
 
   impl_->door = static_cast<std::byte*>(std::aligned_alloc(kDoorStride, kRails * kDoorStride));
   if (impl_->door == nullptr) fail("doorbell allocation failed");
@@ -258,6 +261,7 @@ RdmaTransport::RdmaTransport(const RdmaConfig& config) : impl_(new Impl(config))
     wire.psn = static_cast<std::uint32_t>(0x3800 + 0x100 * index + config.rank);
     wire.door_rkey = rail.door_mr->rkey;
     wire.page_bytes = 65'536;
+    wire.operation_timeout_ms = config.operation_timeout_ms;
     wire.door_address = reinterpret_cast<std::uint64_t>(impl_->door);
     std::memcpy(wire.gid, gid.raw, sizeof(wire.gid));
   }
@@ -272,7 +276,8 @@ RdmaTransport::RdmaTransport(const RdmaConfig& config) : impl_(new Impl(config))
     auto& rail = impl_->rails[static_cast<std::size_t>(index)];
     const auto& remote = peer[static_cast<std::size_t>(index)];
     if (remote.schema != kBootstrapSchema || remote.rank != static_cast<std::uint32_t>(1 - config.rank) ||
-        remote.world_size != 2 || remote.rails != kRails || remote.page_bytes != 65'536)
+        remote.world_size != 2 || remote.rails != kRails || remote.page_bytes != 65'536 ||
+        remote.operation_timeout_ms != config.operation_timeout_ms)
       fail("peer bootstrap topology or page contract drift");
     rail.peer_door_address = remote.door_address;
     rail.peer_door_rkey = remote.door_rkey;
@@ -446,7 +451,8 @@ void RdmaTransport::wait_peer(std::uint64_t sequence) {
     volatile std::uint64_t* word = impl_->door_word(index);
     std::uint64_t spins = 0;
     while (*word < sequence) {
-      if ((++spins & 0x3ffu) == 0 && elapsed_ms(start) > kTimeoutSeconds * 1000.0)
+      if ((++spins & 0x3ffu) == 0 &&
+          elapsed_ms(start) > impl_->config.operation_timeout_ms)
         fail("peer doorbell timed out");
 #if defined(__aarch64__)
       asm volatile("yield" ::: "memory");
@@ -468,7 +474,7 @@ void RdmaTransport::flush_signaled() {
           fail("send completion failed on " + rail.name + ": " +
                ibv_wc_status_str(completions[index].status));
       rail.outstanding -= count;
-      if (count == 0 && elapsed_ms(start) > kTimeoutSeconds * 1000.0)
+      if (count == 0 && elapsed_ms(start) > impl_->config.operation_timeout_ms)
         fail("send completion timed out on " + rail.name);
     }
   }
