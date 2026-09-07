@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import statistics
 from collections import defaultdict
@@ -17,6 +18,7 @@ GLOBAL_EXPERTS = 512
 LOCAL_EXPERTS = 256
 EXPECTED_LAYERS = 48
 EXPECTED_TOP_K = 10
+EXPECTED_CALLS = (1, 2, 3, 4)
 HIDDEN = 2560
 INTERMEDIATE = 640
 SHARED_INTERMEDIATE = 640
@@ -48,6 +50,56 @@ def records(path: Path):
             yield int(match.group(1)), record
 
 
+def validate_record(record: dict) -> None:
+    sequences = record.get("sequences")
+    verify_width = record.get("verify_width")
+    rows = record.get("route_rows")
+    if not isinstance(sequences, int) or sequences < 1:
+        raise ValueError("router cohort sequences is invalid")
+    if verify_width != 5:
+        raise ValueError("router cohort verify_width is not 5")
+    if not isinstance(rows, list) or len(rows) != sequences * verify_width:
+        raise ValueError("router cohort row count is incomplete")
+    if record.get("selected_expert_count") != len(rows) * EXPECTED_TOP_K:
+        raise ValueError("router cohort selected_expert_count is incomplete")
+    for index, row in enumerate(rows):
+        expected_position = index % verify_width
+        expected_kind = "target" if expected_position == 0 else "speculative"
+        if (
+            row.get("row") != index
+            or row.get("sequence") != index // verify_width
+            or row.get("position") != expected_position
+            or row.get("position_kind") != expected_kind
+        ):
+            raise ValueError("router cohort row-major metadata is invalid")
+        expert_ids = row.get("expert_ids")
+        weights = row.get("weights")
+        if (
+            not isinstance(expert_ids, list)
+            or not isinstance(weights, list)
+            or len(expert_ids) != EXPECTED_TOP_K
+            or len(weights) != EXPECTED_TOP_K
+        ):
+            raise ValueError("router cohort top-k row is incomplete")
+        if any(
+            not isinstance(expert_id, int)
+            or not 0 <= expert_id < GLOBAL_EXPERTS
+            for expert_id in expert_ids
+        ):
+            raise ValueError("global expert id is outside E512")
+        if len(set(expert_ids)) != EXPECTED_TOP_K:
+            raise ValueError("router cohort top-k expert ids are not unique")
+        if any(
+            not isinstance(weight, (int, float))
+            or not math.isfinite(weight)
+            or weight < 0
+            for weight in weights
+        ):
+            raise ValueError("router cohort route weight is invalid")
+        if not math.isclose(sum(weights), 1.0, rel_tol=0.0, abs_tol=2e-6):
+            raise ValueError("router cohort route weights are not normalized")
+
+
 def reduce(paths: list[Path]) -> dict:
     grouped = defaultdict(list)
     for path in paths:
@@ -59,6 +111,7 @@ def reduce(paths: list[Path]) -> dict:
             rank = record.get("rank")
             if rank not in (0, 1):
                 raise ValueError("router cohort rank is invalid")
+            validate_record(record)
             grouped[(record["cohort"], rank, layer)].append(record)
     if not grouped:
         raise ValueError("no exact router cohort records found")
@@ -71,8 +124,21 @@ def reduce(paths: list[Path]) -> dict:
         if layers != list(range(EXPECTED_LAYERS)):
             raise ValueError(f"{cohort} rank {rank} has {len(layers)}/48 layers")
         for layer in layers:
+            layer_records = grouped[(cohort, rank, layer)]
+            if sorted(record.get("cohort_call") for record in layer_records) != list(
+                EXPECTED_CALLS
+            ):
+                raise ValueError(
+                    f"{cohort} rank {rank} layer {layer} does not have calls 1..4"
+                )
+            metadata = {
+                (record["sequences"], record["verify_width"])
+                for record in layer_records
+            }
+            if len(metadata) != 1:
+                raise ValueError("router cohort layer metadata changed within capture")
             samples = []
-            for record in grouped[(cohort, rank, layer)]:
+            for record in layer_records:
                 first = rank * LOCAL_EXPERTS
                 last = first + LOCAL_EXPERTS
                 target_ids = set()
