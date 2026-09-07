@@ -42,6 +42,18 @@ completion budget on both ranks. A physical silent-peer proof uses matching
 timeout. A timed-out instance is discarded because its remote writes may have
 committed.
 
+The decode execution contract places `PairReduce` at the two Qwen TP2 output
+boundaries in every layer. One externally serialized step accepts exactly 96
+layer-major points: attention output, then routed/shared MoE output, for layers
+0 through 47. Each point reduces rank-local BF16 `[M,2560]` after its local
+projection or expert aggregation and returns FP32 `[M,2560]` before residual or
+next-layer work. Point and step sequence drift fails before transport. A
+reducer failure enters a terminal faulted phase because peer-visible writes may
+have committed. The object must then be reconstructed. The adapter invokes the
+real `PairReduce`; target and QSA kernels supply its borrowed device buffers.
+The step sequence must equal the published K0 device metadata generation, so a
+stale or skipped graph publication cannot reach a TP2 exchange.
+
 ```bash
 cmake -S engines/qwen38-flash-next-nvfp4-2b \
   -B engines/qwen38-flash-next-nvfp4-2b/build -DCMAKE_BUILD_TYPE=Release

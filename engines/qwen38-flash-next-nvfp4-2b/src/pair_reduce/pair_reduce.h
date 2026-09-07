@@ -20,6 +20,12 @@ inline constexpr std::size_t kPageBytes = 65'536;
 inline constexpr int kAllowedM[] = {1, 2, 4, 8, 16};
 inline constexpr std::string_view kDtype = "bf16_fp32";
 
+constexpr bool allowed_m(int m) noexcept {
+  for (const int allowed : kAllowedM)
+    if (m == allowed) return true;
+  return false;
+}
+
 class PairReduceError : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
@@ -69,6 +75,9 @@ class PairReduce final {
   void reduce(const __nv_bfloat16* input, float* output, int m,
               std::string_view trace_id, std::string_view request_id,
               cudaStream_t stream = nullptr);
+
+  int rank() const noexcept { return transport_.rank(); }
+  int world_size() const noexcept { return transport_.world_size(); }
 
   static constexpr std::size_t slot_bytes() noexcept { return 2 * kPageBytes; }
   static constexpr std::size_t region_bytes() noexcept { return 2 * slot_bytes(); }

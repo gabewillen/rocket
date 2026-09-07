@@ -27,12 +27,6 @@ void cuda_check(cudaError_t status, const char* operation) {
   }
 }
 
-bool allowed_m(int m) noexcept {
-  for (const int allowed : kAllowedM)
-    if (m == allowed) return true;
-  return false;
-}
-
 int metric_m_bucket(int m) noexcept { return allowed_m(m) ? m : 0; }
 
 std::uint64_t elapsed_ns(Clock::time_point start) noexcept {

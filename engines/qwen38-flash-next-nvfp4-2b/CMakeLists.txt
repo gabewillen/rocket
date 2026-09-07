@@ -22,6 +22,7 @@ endif()
 
 find_library(ROCKET_QWEN38_IBVERBS ibverbs REQUIRED)
 find_library(ROCKET_QWEN38_NVML nvidia-ml REQUIRED)
+find_package(CUDAToolkit 13.0 REQUIRED)
 
 add_library(qwen38_pair_reduce STATIC
   src/pair_reduce/pair_reduce.cu
@@ -35,11 +36,20 @@ target_compile_options(qwen38_pair_reduce PRIVATE
 )
 set_target_properties(qwen38_pair_reduce PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
+  CUDA_RESOLVE_DEVICE_SYMBOLS ON
   POSITION_INDEPENDENT_CODE ON
 )
 
+add_library(qwen38_decode_execution STATIC src/decode/execution.cc)
+target_include_directories(qwen38_decode_execution PUBLIC src)
+target_link_libraries(qwen38_decode_execution PUBLIC qwen38_pair_reduce CUDA::cudart)
+target_compile_options(qwen38_decode_execution PRIVATE -Wall -Wextra -Werror)
+
 add_executable(qwen38-pair-reduce-bench bench/pair_reduce_bench.cu)
 target_link_libraries(qwen38-pair-reduce-bench PRIVATE qwen38_pair_reduce ${ROCKET_QWEN38_NVML})
+
+add_executable(qwen38-decode-pair-reduce-smoke bench/decode_execution_smoke.cu)
+target_link_libraries(qwen38-decode-pair-reduce-smoke PRIVATE qwen38_decode_execution)
 
 enable_testing()
 add_executable(qwen38-test-pair-reduce tests/test_pair_reduce.cu)
@@ -55,3 +65,12 @@ add_test(NAME qwen38-pair-reduce-reject-fault-budget
   COMMAND qwen38-pair-reduce-bench --rank 0 --timeout-ms 1000
           --fault-stall-rank 1 --fault-stall-ms 1000)
 set_tests_properties(qwen38-pair-reduce-reject-fault-budget PROPERTIES WILL_FAIL TRUE)
+
+add_executable(qwen38-test-decode-execution tests/test_decode_execution.cc)
+target_link_libraries(qwen38-test-decode-execution PRIVATE qwen38_decode_execution)
+target_compile_options(qwen38-test-decode-execution PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-decode-execution PROPERTIES
+  LINKER_LANGUAGE CUDA
+  CUDA_SEPARABLE_COMPILATION ON
+)
+add_test(NAME qwen38-decode-pair-reduce-contract COMMAND qwen38-test-decode-execution)
