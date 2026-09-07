@@ -59,7 +59,8 @@ int qwen38_qsa_indexer_score_external(
     const void* staged_compressed_rows_bf16,
     const std::int64_t* logical_positions,
     const std::int32_t* sequence_lengths,
-    const std::int32_t* token_to_request, int rows, cudaStream_t stream);
+    const std::int32_t* token_to_request, int sequences, int verify_width,
+    int rows, cudaStream_t stream);
 int qwen38_qsa_indexer_select_expand(void* plan,
                                     const std::int64_t* logical_positions,
                                     const std::int32_t* sequence_lengths,

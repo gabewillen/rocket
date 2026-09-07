@@ -1872,17 +1872,21 @@ extern "C" int qwen38_qsa_indexer_score_external(
     const void* compressed_state, const void* staged_compressed_rows,
     const std::int64_t* logical_positions,
     const std::int32_t* sequence_lengths,
-    const std::int32_t* token_to_request, int rows, cudaStream_t stream) {
+    const std::int32_t* token_to_request, int sequences, int verify_width,
+    int rows, cudaStream_t stream) {
   last_error.clear();
   if (!opaque || !index_query || !compressed_state ||
       !staged_compressed_rows || !logical_positions || !sequence_lengths ||
-      !token_to_request || rows < 1 || rows > kMaxTokenRows || !stream) {
+      !token_to_request || sequences < 1 || sequences > kM ||
+      verify_width < 1 || verify_width > 8 ||
+      rows != sequences * verify_width || rows > kMaxTokenRows || !stream) {
     last_error = "invalid external QSA score arguments";
     return 1;
   }
   auto* plan = static_cast<QsaPlan*>(opaque);
-  if (rows == 80) {
-    score_qsa_external_k4_c16<<<dim3(kM, kQsaColumns / 16), 64, 0, stream>>>(
+  if (verify_width == 5) {
+    score_qsa_external_k4_c16<<<dim3(sequences, kQsaColumns / 16), 64, 0,
+                                   stream>>>(
         static_cast<const __nv_bfloat16*>(index_query),
         static_cast<const __nv_bfloat16*>(compressed_state),
         static_cast<const __nv_bfloat16*>(staged_compressed_rows),
@@ -2034,9 +2038,10 @@ extern "C" int qwen38_qsa_sparse_attention_external(
     return 1;
   }
   auto* plan = static_cast<QsaPlan*>(opaque);
+  const int clear_rows = (rows + kM - 1) / kM * kM;
   if (!cuda_ok(cudaMemsetAsync(
                    plan->attention_output, 0,
-                   static_cast<std::size_t>(rows) * kAttentionHeads *
+                   static_cast<std::size_t>(clear_rows) * kAttentionHeads *
                        kAttentionDim * sizeof(__nv_bfloat16),
                    stream),
                "clear external attention output"))
@@ -2069,9 +2074,10 @@ extern "C" int qwen38_qsa_sparse_attention_external_control(
     return 1;
   }
   auto* plan = static_cast<QsaPlan*>(opaque);
+  const int clear_rows = (rows + kM - 1) / kM * kM;
   if (!cuda_ok(cudaMemsetAsync(
                    plan->attention_output, 0,
-                   static_cast<std::size_t>(rows) * kAttentionHeads *
+                   static_cast<std::size_t>(clear_rows) * kAttentionHeads *
                        kAttentionDim * sizeof(__nv_bfloat16),
                    stream),
                "clear external attention control output"))
@@ -2114,14 +2120,14 @@ extern "C" int qwen38_qsa_output_project(void* opaque, cudaStream_t stream) {
 extern "C" int qwen38_qsa_output_project_rows(
     void* opaque, int rows, void* output, cudaStream_t stream) {
   last_error.clear();
-  if (!opaque || !output || !stream || rows < 1 ||
-      rows > kMaxTokenRows || rows % kM != 0) {
-    last_error = "output rows must be complete fixed-M16 tiles";
+  if (!opaque || !output || !stream || rows < 1 || rows > kMaxTokenRows) {
+    last_error = "invalid tiled attention output rows";
     return 1;
   }
   auto* plan = static_cast<QsaPlan*>(opaque);
   auto* destination = static_cast<__nv_bfloat16*>(output);
-  for (int first = 0; first < rows; first += kM) {
+  const int padded_rows = (rows + kM - 1) / kM * kM;
+  for (int first = 0; first < padded_rows; first += kM) {
     quantize_c16_fixed<kOutputK><<<kM, 256, 0, stream>>>(
         plan->output_packed, plan->output_sfa,
         plan->attention_output + static_cast<std::size_t>(first) * kOutputK,
@@ -2137,10 +2143,11 @@ extern "C" int qwen38_qsa_output_project_rows(
         plan->output_global * kOutputActivationGlobal);
     if (!cuda_ok(cudaGetLastError(), "scale tiled attention output"))
       return 1;
-    if (!cuda_ok(cudaMemcpyAsync(
+    const int copy_rows = min(kM, rows - first);
+    if (copy_rows > 0 && !cuda_ok(cudaMemcpyAsync(
                      destination + static_cast<std::size_t>(first) * kOutputN,
                      plan->projected_output,
-                     static_cast<std::size_t>(kM) * kOutputN *
+                     static_cast<std::size_t>(copy_rows) * kOutputN *
                          sizeof(__nv_bfloat16),
                      cudaMemcpyDeviceToDevice, stream),
                  "copy tiled attention output"))

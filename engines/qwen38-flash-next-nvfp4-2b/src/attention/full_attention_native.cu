@@ -27,8 +27,8 @@ struct FullAttentionNativeProgram::Impl {
   void* qkv_plan = nullptr;
   void* qsa_plan = nullptr;
   std::unique_ptr<QsaStateFork> state_fork;
-  __nv_bfloat16 *qkv_rows = nullptr, *query = nullptr, *key = nullptr,
-                 *value = nullptr,
+  __nv_bfloat16 *hidden_rows = nullptr, *qkv_rows = nullptr, *query = nullptr,
+                 *key = nullptr, *value = nullptr,
                  *gate = nullptr, *index_query = nullptr,
                  *index_raw_key = nullptr, *index_scratch = nullptr,
                  *compressed_rows = nullptr, *projected = nullptr;
@@ -59,6 +59,9 @@ struct FullAttentionNativeProgram::Impl {
     if (qwen38_qsa_indexer_create(config.o_weight, config.o_scale,
                                   config.o_global, config.device, &qsa_plan))
       throw std::runtime_error(qwen38_cutlass_qkv_last_error());
+    check(cudaMalloc(&hidden_rows,
+                     static_cast<std::size_t>(kMaxRows) * kHidden * 2),
+          "allocate padded hidden rows");
     check(cudaMalloc(&qkv_rows, static_cast<std::size_t>(kMaxRows) * kQkv * 2),
           "allocate tiled QKV rows");
     check(cudaMalloc(&query, kMaxRows * kQuery * 2), "allocate native query");
@@ -97,7 +100,7 @@ struct FullAttentionNativeProgram::Impl {
     cudaFree(projected); cudaFree(compressed_rows); cudaFree(raw_rows);
     cudaFree(main_rows); cudaFree(index_scratch); cudaFree(index_raw_key);
     cudaFree(index_query); cudaFree(gate); cudaFree(value); cudaFree(key);
-    cudaFree(query); cudaFree(qkv_rows);
+    cudaFree(query); cudaFree(qkv_rows); cudaFree(hidden_rows);
     for (auto& event : phase) {
       if (event) cudaEventDestroy(event);
       event = nullptr;
@@ -107,7 +110,8 @@ struct FullAttentionNativeProgram::Impl {
     projected = nullptr; compressed_rows = nullptr; raw_rows = nullptr;
     main_rows = nullptr; index_scratch = nullptr; index_raw_key = nullptr;
     index_query = nullptr; gate = nullptr; value = nullptr; key = nullptr;
-    query = nullptr; qkv_rows = nullptr; qsa_plan = nullptr; qkv_plan = nullptr;
+    query = nullptr; qkv_rows = nullptr; hidden_rows = nullptr;
+    qsa_plan = nullptr; qkv_plan = nullptr;
   }
 
   int fail(const char* operation, const char* detail) noexcept {
@@ -119,15 +123,37 @@ struct FullAttentionNativeProgram::Impl {
   int stage(const __nv_bfloat16* hidden,
             decode::FullAttentionLaunchShape shape, cudaStream_t stream) {
     error.clear();
-    if (!hidden || !stream || shape.sequences != kTileRows ||
+    const int padded_rows =
+        (shape.token_rows + kTileRows - 1) / kTileRows * kTileRows;
+    if (!hidden || !stream ||
+        (shape.sequences != 1 && shape.sequences != 2 &&
+         shape.sequences != 4 && shape.sequences != 8 &&
+         shape.sequences != 16) ||
         shape.verify_width < 1 || shape.verify_width > 8 ||
         shape.token_rows != shape.sequences * shape.verify_width ||
-        shape.token_rows > kMaxRows || shape.token_rows % kTileRows != 0)
-      return fail("stage", "native body requires complete c16 verifier tiles");
+        shape.token_rows > kMaxRows || padded_rows > kMaxRows)
+      return fail("stage", "native body requires a fixed verifier bucket");
     cudaEventRecord(phase[0], stream);
-    for (int first = 0; first < shape.token_rows; first += kTileRows) {
+    cudaError_t copy = cudaMemcpyAsync(
+        hidden_rows, hidden,
+        static_cast<std::size_t>(shape.token_rows) * kHidden *
+            sizeof(__nv_bfloat16),
+        cudaMemcpyDeviceToDevice, stream);
+    if (copy != cudaSuccess)
+      return fail("hidden row copy", cudaGetErrorString(copy));
+    if (padded_rows != shape.token_rows) {
+      copy = cudaMemsetAsync(
+          hidden_rows + static_cast<std::size_t>(shape.token_rows) * kHidden,
+          0, static_cast<std::size_t>(padded_rows - shape.token_rows) *
+                 kHidden * sizeof(__nv_bfloat16),
+          stream);
+      if (copy != cudaSuccess)
+        return fail("hidden row padding", cudaGetErrorString(copy));
+    }
+    for (int first = 0; first < padded_rows; first += kTileRows) {
       if (qwen38_cutlass_qkv_launch(
-              qkv_plan, hidden + static_cast<std::size_t>(first) * kHidden,
+              qkv_plan,
+              hidden_rows + static_cast<std::size_t>(first) * kHidden,
               stream))
         return fail("QKV", qwen38_cutlass_qkv_last_error());
       void* qkv_tile = nullptr;
@@ -135,7 +161,7 @@ struct FullAttentionNativeProgram::Impl {
       if (qwen38_cutlass_qkv_output(qkv_plan, &qkv_tile, &tile_elements) ||
           tile_elements != static_cast<std::size_t>(kTileRows) * kQkv)
         return fail("QKV output", qwen38_cutlass_qkv_last_error());
-      const cudaError_t copy = cudaMemcpyAsync(
+      copy = cudaMemcpyAsync(
           qkv_rows + static_cast<std::size_t>(first) * kQkv, qkv_tile,
           static_cast<std::size_t>(kTileRows) * kQkv *
               sizeof(__nv_bfloat16),
@@ -173,7 +199,7 @@ struct FullAttentionNativeProgram::Impl {
             qsa_plan, index_query, config.active_state.compressed_state,
             compressed_rows, config.logical_positions,
             config.sequence_lengths, config.token_to_request,
-            shape.token_rows, stream))
+            shape.sequences, shape.verify_width, shape.token_rows, stream))
       return fail("QSA score", qwen38_cutlass_qkv_last_error());
     cudaEventRecord(phase[5], stream);
     if (qwen38_qsa_indexer_select_expand(

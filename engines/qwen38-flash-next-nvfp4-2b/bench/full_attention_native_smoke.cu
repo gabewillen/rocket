@@ -108,13 +108,17 @@ std::uint64_t hash(const std::vector<std::uint8_t>& bytes) {
 }  // namespace
 
 int main(int argc, char** argv) try {
-  if (argc != 4 && argc != 5)
-    throw std::invalid_argument("usage: qwen38-full-attention-native-smoke LOCAL_SLAB PEER_SLAB DEVICE [VERIFY_WIDTH]");
+  if (argc < 4 || argc > 6)
+    throw std::invalid_argument("usage: qwen38-full-attention-native-smoke LOCAL_SLAB PEER_SLAB DEVICE [VERIFY_WIDTH] [SEQUENCES]");
   const int device = std::stoi(argv[3]); check(cudaSetDevice(device), "device");
-  const int verify_width = argc == 5 ? std::stoi(argv[4]) : 1;
+  const int verify_width = argc >= 5 ? std::stoi(argv[4]) : 1;
+  const int sequences = argc == 6 ? std::stoi(argv[5]) : 16;
   if (verify_width < 1 || verify_width > 8)
     throw std::invalid_argument("VERIFY_WIDTH must be 1..8");
-  const int rows = 16 * verify_width;
+  if (sequences != 1 && sequences != 2 && sequences != 4 &&
+      sequences != 8 && sequences != 16)
+    throw std::invalid_argument("SEQUENCES must be 1,2,4,8,16");
+  const int rows = sequences * verify_width;
   const int local = open_slab(argv[1]), peer = open_slab(argv[2]);
   Blob qw(kQWeight.bytes), qs(kQScale.bytes), kw(kKWeight.bytes), ks(kKScale.bytes),
       vw(kVWeight.bytes), vs(kVScale.bytes), ow(kOWeight.bytes), os(kOScale.bytes),
@@ -167,7 +171,7 @@ int main(int argc, char** argv) try {
   auto control_callbacks = control.callbacks();
   if(control_callbacks.stage(control_callbacks.context,
                              static_cast<__nv_bfloat16*>(input.p),
-                             {16,verify_width,rows},stream))
+                             {sequences,verify_width,rows},stream))
     throw std::runtime_error(control.last_error());
   check(cudaStreamSynchronize(stream),"control stage fence");
   std::vector<__nv_bfloat16> control_output(
@@ -183,7 +187,7 @@ int main(int argc, char** argv) try {
   for (double& sample:ms) {
     const auto start=std::chrono::steady_clock::now();
     if(callbacks.stage(callbacks.context,static_cast<__nv_bfloat16*>(input.p),
-                       {16,verify_width,rows},stream))
+                       {sequences,verify_width,rows},stream))
       throw std::runtime_error(program.last_error());
     check(cudaStreamSynchronize(stream),"stage fence");
     profile=program.profile();
@@ -208,18 +212,18 @@ int main(int argc, char** argv) try {
     if(callbacks.reset(callbacks.context,stream)) throw std::runtime_error(program.last_error());
   }
   if(callbacks.stage(callbacks.context,static_cast<__nv_bfloat16*>(input.p),
-                     {16,verify_width,rows},stream))
+                     {sequences,verify_width,rows},stream))
     throw std::runtime_error(program.last_error());
   std::array<std::int32_t,16> accepted{};
   accepted.fill(verify_width);
-  if(callbacks.accept(callbacks.context,accepted.data(),16,2,stream))
+  if(callbacks.accept(callbacks.context,accepted.data(),sequences,2,stream))
     throw std::runtime_error(program.last_error());
   cudaGraph_t graph=nullptr;
   cudaGraphExec_t graph_exec=nullptr;
   check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),
         "begin native graph capture");
   if(callbacks.stage(callbacks.context,static_cast<__nv_bfloat16*>(input.p),
-                     {16,verify_width,rows},stream))
+                     {sequences,verify_width,rows},stream))
     throw std::runtime_error(program.last_error());
   check(cudaStreamEndCapture(stream,&graph),"end native graph capture");
   if(callbacks.reset(callbacks.context,stream))
@@ -245,7 +249,10 @@ int main(int argc, char** argv) try {
       static_cast<std::size_t>(attention::kQsaStateContext - 1) * 512;
   check(cudaMemcpy(first_row.data(),published,first_row.size(),cudaMemcpyDeviceToHost),"published row");
   const double mean=std::accumulate(ms.begin(),ms.end(),0.0)/ms.size();
-  std::cout << "rows=" << rows << " verify_width=" << verify_width
+  auto ordered_ms=ms;
+  std::sort(ordered_ms.begin(),ordered_ms.end());
+  std::cout << "sequences=" << sequences << " rows=" << rows
+            << " verify_width=" << verify_width
             << " mean_ms=" << mean << " min_ms="
             << *std::min_element(ms.begin(),ms.end()) << " max_ms="
             << *std::max_element(ms.begin(),ms.end()) << " output_hash="
@@ -260,6 +267,11 @@ int main(int argc, char** argv) try {
             << " select_ms=" << profile.select_ms
             << " attention_ms=" << profile.attention_ms
             << " gate_output_ms=" << profile.gate_output_ms << "\n";
+  std::cout << "samples_ms=";
+  for(std::size_t index=0; index<ms.size(); ++index)
+    std::cout << (index ? "," : "") << ms[index];
+  std::cout << " median_ms=" << ordered_ms[2]
+            << " p95_ms=" << ordered_ms[4] << "\n";
   std::cout << "scalar_control_max_abs=" << maximum_error
             << " scalar_control_mean_abs=" << mean_error << "\n";
   check(cudaGraphExecDestroy(graph_exec),"destroy native graph exec");
