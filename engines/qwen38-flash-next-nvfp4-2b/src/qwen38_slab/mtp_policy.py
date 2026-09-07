@@ -6,9 +6,12 @@ before demotion, exploration every 64 eligible rounds, and a 2,698,026,496-byte
 cold MTP charge amortized over 64 rounds.
 
 Depth support extends to K7. Maximum depth is configured for exact concurrency
-values only. Unconfigured decode concurrency fails closed. Current records
-establish K7 availability at c1 and a K1 cap at c16, without establishing a c1
-optimum or any cap for c2 through c15.
+values only. Unconfigured decode concurrency fails closed. Matched K1 through
+K7 controls establish K7 execution availability at c1, c2, and c4. One run is
+not enough to turn the narrow c4 K6 throughput lead into a fixed K6 choice, so
+those cohorts retain K7 as a lazy probe. Measured c8 and c16 controls cap both
+cohorts at K1 and forbid deeper residency. No result from the single coding
+prompt is treated as a coding-quality verdict.
 
 Inputs and outputs are immutable. The policy retains no mutable state and
 performs no I/O or residency mutation. Ordered prefix residency commands request
@@ -152,6 +155,25 @@ class PolicyConfig:
         }
         canonical = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii")
         return hashlib.sha256(canonical).hexdigest()
+
+
+def matched_live_policy_config() -> PolicyConfig:
+    """Return the exact-concurrency envelope supported by matched live controls.
+
+    K7 remains available only to measured low-concurrency cohorts. Selection
+    still requires the existing Wilson, byte-cost, roofline, and demotion gates.
+    Missing concurrency points remain absent and therefore fail closed.
+    """
+
+    return PolicyConfig(
+        (
+            ConcurrencyCeiling(1, MtpDepth.K7),
+            ConcurrencyCeiling(2, MtpDepth.K7),
+            ConcurrencyCeiling(4, MtpDepth.K7),
+            ConcurrencyCeiling(8, MtpDepth.K1),
+            ConcurrencyCeiling(16, MtpDepth.K1),
+        )
+    )
 
 
 @dataclass(frozen=True)

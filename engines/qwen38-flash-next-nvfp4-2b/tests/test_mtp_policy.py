@@ -25,6 +25,7 @@ from qwen38_slab.mtp_policy import (
     PolicyState,
     ResidencyAction,
     SessionPhase,
+    matched_live_policy_config,
 )
 
 
@@ -155,6 +156,43 @@ class AdaptiveMtpPolicyTests(unittest.TestCase):
                 forged,
                 PolicyEvent(SessionPhase.EARLY_DECODE, 16, 100, MtpDepth.K0),
             )
+
+    def test_matched_k1_k7_envelope_keeps_low_depth_lazy_and_tapers_high(self) -> None:
+        config = matched_live_policy_config()
+        self.assertEqual(
+            tuple((item.concurrency, item.max_depth) for item in config.ceilings),
+            (
+                (1, MtpDepth.K7),
+                (2, MtpDepth.K7),
+                (4, MtpDepth.K7),
+                (8, MtpDepth.K1),
+                (16, MtpDepth.K1),
+            ),
+        )
+        policy = AdaptiveMtpPolicy(Tracer(), config)
+        with self.assertRaisesRegex(MtpPolicyError, "c3 has no exact ceiling"):
+            policy.decide(
+                policy.initial_state(),
+                PolicyEvent(SessionPhase.EARLY_DECODE, 3, 100, MtpDepth.K0),
+            )
+
+        for concurrency in (8, 16):
+            state = policy.initial_state()
+            for _ in PROBE_DEPTHS:
+                decision = policy.decide(
+                    state,
+                    PolicyEvent(
+                        SessionPhase.EARLY_DECODE,
+                        concurrency,
+                        100,
+                        MtpDepth.K0,
+                    ),
+                )
+                self.assertLessEqual(decision.selected_depth, MtpDepth.K1)
+                self.assertTrue(
+                    all(command.depth <= MtpDepth.K1 for command in decision.residency_commands)
+                )
+                state = decision.next_state
 
     def test_c1_can_explore_k7_without_claiming_it_is_optimal(self) -> None:
         state = self.policy.initial_state()
