@@ -1,0 +1,71 @@
+---
+title: "Qwen3.8 linear-attention FP8 passes 12 of 12 quality cases"
+description: "Converting all 180 base linear-attention projections from BF16 to FP8 removes 1.942 GiB per c16 step with zero quality regressions across 494 telemetry channels."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, numerics, attention, telemetry, baseline]
+verdict: accepted
+rocket: "#fuel"
+supersedes: posts/numerics/2026-09-07-qwen38-linear-attention-first-fp8
+---
+
+**Question.** Can all 180 base linear-attention projections serve in FP8 without
+failing the quality and interaction gates?
+
+| setup | |
+| --- | --- |
+| nodes | two GB10s, 6.17.13-rocket64k, 64 KiB pages |
+| checkpoint | nvidia/Qwen3.8-Flash-Next-NVFP4 at fc694b54fb0174e0913e6adf86691ef85a4ead47 |
+| commit | c03d310529edcf686e2d314bc714a0796877fdc0 |
+| artifact | dbefeae04f00118080ce821909786b0c84941b3ac39f1854941a2d2bf4cd516d |
+
+```bash
+python3 scripts/numerics/qwen38-compare-precision.py \
+  --baseline /home/glwillen/calibration/qwen38-expanded-mtp3-20260907-03/combined-activation-summary.json \
+  --candidate /home/glwillen/calibration/qwen38-linear-fp8-live-20260907-08/combined-activation-summary.json \
+  --baseline-quality /tmp/qwen38-baseline-quality.json \
+  --candidate-quality /home/glwillen/calibration/qwen38-linear-fp8-live-20260907-08/quality.json \
+  --out /home/glwillen/calibration/qwen38-linear-fp8-live-20260907-08/precision-comparison.json
+```
+
+| result | value |
+| --- | ---: |
+| selected matrices | 180 |
+| source family | 3.884 GiB BF16 |
+| traffic removed per c16 step | 1.942 GiB |
+| paired telemetry channels | 494 |
+| quality | 12/12 |
+| regressions | 0 |
+| byte-identical answer tails | 11/12 |
+| router-logit RMS ratio | 0.977x to 1.024x |
+| maximum router histogram TV | 0.0059 |
+| recurrent-state RMS ratio | 0.731x to 1.322x |
+| maximum selected-output histogram TV | 0.2865 |
+
+| production concurrency | aggregate tok/s | per-stream tok/s |
+| ---: | ---: | ---: |
+| 1 | 44.51 | 44.51 |
+| 2 | 73.22 | 37.23 |
+| 4 | 72.92 | 28.07 |
+| 8 | 98.28 | 19.36 |
+| 16 | 101.40 | 11.58 |
+
+One production ladder was measured after loaded head and peer clocks matched.
+Run-to-run throughput variance was not measured.
+
+**Verdict.** Accepted for this family. The 180 linear-attention projections
+remain FP8 while model optimization continues. This vLLM run is a comparison
+baseline. No Qwen Rocket engine has been built. Static MTP3 does not meet the
+engine target at c16.
+
+**Next.**
+
+- rank and isolate the remaining BF16 and FP8 weight families
+- freeze the complete serving-weight map before engine implementation
+- taper MTP depth from measured acceptance instead of drafting three positions every step
+- preserve per-family telemetry so later NVFP4 moves remain bisectable
+
+**Reopen if.**
+
+- NVIDIA publishes a new checkpoint revision or quantization ABI
+- an upstream evaluation release adds a materially different attention test set

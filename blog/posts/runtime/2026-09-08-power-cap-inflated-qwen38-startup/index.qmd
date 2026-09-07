@@ -1,0 +1,50 @@
+---
+title: "The 728 MHz power state inflated Qwen3.8 loading by 5.1x"
+description: "A cold power cycle cuts identical Qwen3.8 FP8 model loading from 997.7 seconds to 193.8 seconds, superseding the low-power startup diagnosis."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, runtime, hardware, baseline]
+verdict: accepted
+rocket: "#fuel"
+supersedes: posts/runtime/2026-09-07-qwen38-tensor-dispatch-dominates-startup
+---
+
+**Question.** How much of the measured Qwen3.8 startup time came from the head's
+latched 728 MHz power state?
+
+| setup | |
+| --- | --- |
+| nodes | two GB10s, 6.17.13-rocket64k, 64 KiB pages |
+| checkpoint | nvidia/Qwen3.8-Flash-Next-NVFP4 at fc694b54fb0174e0913e6adf86691ef85a4ead47 |
+| commit | 6ba463e1485c57e9c990583f21fc7b353860eeb9 |
+| command | `scripts/numerics/qwen38-expanded-calibration.sh --production --keep-running` |
+
+| phase | 728 MHz run | cold-cycle run | speedup |
+| --- | ---: | ---: | ---: |
+| target weights | 659.81 s | 114.07 s | 5.78x |
+| MTP weights | 313.75 s | 70.86 s | 4.43x |
+| total model loading | 997.71 s | 193.80 s | 5.15x |
+| model residency | 63.29 GiB | 63.29 GiB | 1.00x |
+
+```text
+Loading weights took 114.07 seconds
+Loading weights took 70.86 seconds
+Model loading took 63.29 GiB memory and 193.803748 seconds
+```
+
+One run was measured in each power state. The checkpoint, runtime, FP8 overlay,
+64 KiB loader, and two-pass target/MTP path were unchanged.
+
+**Verdict.** Accepted. The latched power state owned most of the earlier
+997.7-second load. The healthy 193.8-second result remains long enough to keep
+the prepacked one-pass slab on Rocket's engine path.
+
+**Next.**
+
+- eliminate the second full checkpoint traversal with rank-local target and MTP slabs
+- load final-layout slabs through 64 KiB-aligned bulk reads
+
+**Reopen if.**
+
+- GB10 firmware changes power-controller reset behavior
+- vLLM replaces per-tensor checkpoint dispatch with bulk final-layout loading
