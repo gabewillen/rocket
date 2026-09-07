@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("qwen38-router-cohort-reduce.py")
+LIVE = Path(__file__).with_name("qwen38-router-cohort-live.py")
 SPEC = importlib.util.spec_from_file_location("router_cohort_reduce", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -15,6 +16,15 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ReducerTests(unittest.TestCase):
+    def test_driver_publishes_complete_cohort_only_after_engine_init(self):
+        source = LIVE.read_text()
+        engine = source.index("engine = LLM(")
+        metadata = source.index('"ROCKET_ROUTER_RANK": str(rank)')
+        cohort = source.index('"ROCKET_ROUTER_COHORT": "forked-prefix-c1-k4"')
+        self.assertLess(engine, metadata)
+        self.assertLess(engine, cohort)
+        self.assertNotIn("ROCKET_ROUTER_", source[:engine])
+
     def test_exact_target_and_speculative_rank_unions(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = []

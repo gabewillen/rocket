@@ -25,10 +25,6 @@ def main() -> None:
     from vllm import LLM, SamplingParams
 
     rank = int(os.environ["RANK"])
-    os.environ["ROCKET_ROUTER_RANK"] = str(rank)
-    os.environ["ROCKET_ROUTER_VERIFY_WIDTH"] = "5"
-    os.environ["ROCKET_ROUTER_MAX_COHORTS"] = "4"
-
     engine = LLM(
         model=MODEL,
         revision=REVISION,
@@ -47,6 +43,17 @@ def main() -> None:
         safetensors_load_strategy="lazy",
         enable_chunked_prefill=True,
         hf_overrides={"text_config": {"ple_embedding_dtype": "float8_e4m3fn"}},
+    )
+    # Publish cohort metadata as one initialization-boundary transition. Any
+    # partial state is terminal inside the telemetry hook.
+    os.environ.update(
+        {
+            "ROCKET_ROUTER_RANK": str(rank),
+            "ROCKET_ROUTER_VERIFY_WIDTH": "5",
+            "ROCKET_ROUTER_MAX_COHORTS": "4",
+            "ROCKET_ROUTER_COHORT": "forked-prefix-c1-k4",
+            "ROCKET_ROUTER_SEQUENCES": "1",
+        }
     )
     prefix = ("Rocket agent session memory. " * (args.prefix_bytes // 29 + 1))[
         : args.prefix_bytes
@@ -78,8 +85,12 @@ def main() -> None:
         )
     for concurrency in CONCURRENCY:
         cohort = f"forked-prefix-c{concurrency}-k4"
-        os.environ["ROCKET_ROUTER_COHORT"] = cohort
-        os.environ["ROCKET_ROUTER_SEQUENCES"] = str(concurrency)
+        os.environ.update(
+            {
+                "ROCKET_ROUTER_COHORT": cohort,
+                "ROCKET_ROUTER_SEQUENCES": str(concurrency),
+            }
+        )
         prompts = [
             prefix
             + f"\nWorker {stream}: write continuous technical prose about memory systems."
