@@ -68,6 +68,21 @@ DISPATCH = '''            if quant_algo == "MXFP8":
 '''
 PATCH_MARKER = 'quant_algo in ("FP8_BLOCK_SCALES", "FP8_PB_WO")'
 
+FUSED_SHARDS_ANCHOR = '''        fused_projection_shards = {
+            "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+            "gate_up_proj": ("gate_proj", "up_proj"),
+        }
+'''
+FUSED_SHARDS = '''        fused_projection_shards = {
+            "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+            "gate_up_proj": ("gate_proj", "up_proj"),
+            # Qwen3.8 stores these projections separately but constructs two
+            # MergedColumnParallelLinear modules at runtime.
+            "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+            "in_proj_ba": ("in_proj_b", "in_proj_a"),
+        }
+'''
+
 
 def replace_once(source: str, old: str, new: str, label: str) -> str:
     count = source.count(old)
@@ -81,6 +96,9 @@ def patch(target: Path) -> None:
     if PATCH_MARKER in source:
         raise SystemExit("already patched")
     source = replace_once(source, HELPER_ANCHOR, HELPER + HELPER_ANCHOR, "helper")
+    source = replace_once(
+        source, FUSED_SHARDS_ANCHOR, FUSED_SHARDS, "Qwen3.8 fused projections"
+    )
     source = replace_once(source, DISPATCH_ANCHOR, DISPATCH, "dispatch")
     ast.parse(source, filename=str(target))
     target.write_text(source)

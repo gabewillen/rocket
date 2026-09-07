@@ -44,6 +44,26 @@ class Config:
                     moe_config=layer.moe_config,
                 )
             return None
+
+    def _resolve_quant_algo(self, prefix):
+        proj_name = prefix.rsplit(".", 1)[-1]
+        fused_projection_shards = {
+            "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+            "gate_up_proj": ("gate_proj", "up_proj"),
+        }
+        shard_names = fused_projection_shards.get(proj_name)
+        if shard_names is not None:
+            parent_dot = prefix.rsplit(".", 1)[0] + "."
+            shard_algos = {
+                self.quantized_layers[parent_dot + name]["quant_algo"].upper()
+                for name in shard_names
+                if parent_dot + name in self.quantized_layers
+            }
+            if len(shard_algos) == 1:
+                return shard_algos.pop()
+            if len(shard_algos) > 1:
+                raise ValueError("Mixed quant_algo within fused layer")
+        return None
 '''
 
 
@@ -138,6 +158,42 @@ class BlockFp8DispatchTest(unittest.TestCase):
                 )
                 outputs.append(hashlib.sha256(target.read_bytes()).hexdigest())
         self.assertEqual(outputs[0], outputs[1])
+
+    def test_qwen38_packed_linear_attention_resolves_fp8(self):
+        with self.patched_namespace() as namespace:
+            for fused, shards in {
+                "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+                "in_proj_ba": ("in_proj_b", "in_proj_a"),
+            }.items():
+                config = namespace["Config"]("FP8_PB_WO", 128)
+                config.quantized_layers = {
+                    f"language_model.model.layers.0.linear_attn.{shard}": {
+                        "quant_algo": "FP8"
+                    }
+                    for shard in shards
+                }
+                self.assertEqual(
+                    config._resolve_quant_algo(
+                        f"language_model.model.layers.0.linear_attn.{fused}"
+                    ),
+                    "FP8",
+                )
+
+    def test_qwen38_packed_linear_attention_rejects_mixed_algorithms(self):
+        with self.patched_namespace() as namespace:
+            config = namespace["Config"]("FP8_PB_WO", 128)
+            config.quantized_layers = {
+                "language_model.model.layers.0.linear_attn.in_proj_qkv": {
+                    "quant_algo": "FP8"
+                },
+                "language_model.model.layers.0.linear_attn.in_proj_z": {
+                    "quant_algo": "NVFP4"
+                },
+            }
+            with self.assertRaisesRegex(ValueError, "Mixed quant_algo"):
+                config._resolve_quant_algo(
+                    "language_model.model.layers.0.linear_attn.in_proj_qkvz"
+                )
 
 
 if __name__ == "__main__":

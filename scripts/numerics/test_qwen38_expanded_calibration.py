@@ -205,7 +205,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
 
     def test_modelopt_checksum_matches_dual_spelling_generator(self):
         self.assertIn(
-            "3f75c2ca00048a2ca5db24bc440e0a2210a115fda0e8a953bcb98072779ef2d7",
+            "50fac3b1025bb7cb5910c0f19e707f23da41758bd41cb3560b96bd5e25bec406",
             self.source,
         )
         self.assertNotIn(
