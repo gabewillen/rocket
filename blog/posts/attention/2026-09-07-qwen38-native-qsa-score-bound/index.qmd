@@ -28,13 +28,11 @@ cmake --build build-qwen38-attention -j2
 build-qwen38-attention/qwen38-full-attention-native-smoke \
   /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank0-target.slab \
   /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank1-target.slab \
-  0 262144
+  0
 ```
 
 ```text
-rows=16 generation=2 mean_ms=3.33246 min_ms=3.23911 max_ms=3.70111
-phase_ms qkv=0.087808 preprocess=0.098304 format=0.012416 fork=0.012128 score=2.02138 select=0.268288 attention=0.706688 gate_o=0.046752
-output_fnv64=2578894206285321241 state_fnv64=2686608471708731264 reset_replay=exact
+rows=16 mean_ms=3.33246 min_ms=3.23911 max_ms=3.70111 output_hash=2578894206285321241 state_hash=2686608471708731264 generation=2 qkv_ms=0.087808 preprocess_ms=0.098304 state_format_ms=0.012416 state_fork_ms=0.012128 score_ms=2.02138 select_ms=0.268288 attention_ms=0.706688 gate_output_ms=0.046752
 ```
 
 | BLOCK_N16 measurement | value | unit |
