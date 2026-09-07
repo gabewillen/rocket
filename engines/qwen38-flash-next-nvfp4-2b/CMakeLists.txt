@@ -76,11 +76,25 @@ target_include_directories(qwen38_decode_execution PUBLIC src)
 target_link_libraries(qwen38_decode_execution PUBLIC qwen38_pair_reduce CUDA::cudart)
 target_compile_options(qwen38_decode_execution PRIVATE -Wall -Wextra -Werror)
 
+add_library(qwen38_residual_rmsnorm STATIC src/norm/residual_rmsnorm.cu)
+target_include_directories(qwen38_residual_rmsnorm PUBLIC src)
+target_link_libraries(qwen38_residual_rmsnorm PUBLIC CUDA::cudart)
+target_compile_options(qwen38_residual_rmsnorm PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
+)
+set_target_properties(qwen38_residual_rmsnorm PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
 add_executable(qwen38-pair-reduce-bench bench/pair_reduce_bench.cu)
 target_link_libraries(qwen38-pair-reduce-bench PRIVATE qwen38_pair_reduce ${ROCKET_QWEN38_NVML})
 
 add_executable(qwen38-decode-pair-reduce-smoke bench/decode_execution_smoke.cu)
 target_link_libraries(qwen38-decode-pair-reduce-smoke PRIVATE qwen38_decode_execution)
+
+add_executable(qwen38-residual-rmsnorm-bench bench/residual_rmsnorm_bench.cu)
+target_link_libraries(qwen38-residual-rmsnorm-bench PRIVATE qwen38_residual_rmsnorm)
 
 enable_testing()
 add_test(NAME qwen38-qsa-expand-smoke COMMAND qwen38-qsa-expand-smoke)
@@ -106,3 +120,10 @@ set_target_properties(qwen38-test-decode-execution PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
 )
 add_test(NAME qwen38-decode-pair-reduce-contract COMMAND qwen38-test-decode-execution)
+
+add_executable(qwen38-test-residual-rmsnorm tests/test_residual_rmsnorm.cu)
+target_link_libraries(qwen38-test-residual-rmsnorm PRIVATE qwen38_residual_rmsnorm)
+target_compile_options(qwen38-test-residual-rmsnorm PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
+)
+add_test(NAME qwen38-residual-rmsnorm-contract COMMAND qwen38-test-residual-rmsnorm)
