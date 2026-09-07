@@ -47,6 +47,7 @@ from .state_txn import (
 
 DISTRIBUTED_SCHEMA = "rocket.qwen38-distributed-state.v1"
 MAX_POLICY_BYTES = 65_536
+_LOCAL_AUTHENTICATED_SEAL = object()
 _FAMILY_FILES = {
     family: f"{index:02d}-{family}.state"
     for index, family in enumerate(STATE_FAMILIES)
@@ -127,15 +128,42 @@ class AuthenticatedFamilyExtent:
     padded_sha256: str
 
 
-@dataclass(frozen=True)
 class LocalAuthenticatedState:
     """Local immutable descriptor; payload paths never enter a receipt."""
 
-    rank: int
-    boundary: AcceptedBoundary
-    policy_digest: str
-    policy_state: bytes
-    families: Mapping[str, AuthenticatedFamilyExtent]
+    __slots__ = (
+        "_rank", "_boundary", "_policy_digest", "_policy_state", "_families", "_seal"
+    )
+
+    def __init__(self):
+        raise TypeError("local authenticated state is created only by RankStateStore")
+
+    def __setattr__(self, name, value):
+        del name, value
+        raise TypeError("local authenticated state is immutable")
+
+    @classmethod
+    def _from_verified(cls, rank, boundary, policy_digest, policy_state, families):
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_rank", rank)
+        object.__setattr__(instance, "_boundary", boundary)
+        object.__setattr__(instance, "_policy_digest", policy_digest)
+        object.__setattr__(instance, "_policy_state", policy_state)
+        object.__setattr__(instance, "_families", MappingProxyType(dict(families)))
+        object.__setattr__(instance, "_seal", _LOCAL_AUTHENTICATED_SEAL)
+        return instance
+
+    @property
+    def rank(self): return self._rank
+    @property
+    def boundary(self): return self._boundary
+    @property
+    def policy_digest(self): return self._policy_digest
+    @property
+    def policy_state(self): return self._policy_state
+    @property
+    def families(self): return self._families
+    def _is_store_authenticated(self): return self._seal is _LOCAL_AUTHENTICATED_SEAL
 
 
 @dataclass(frozen=True)
@@ -396,10 +424,9 @@ class RankStateStore:
             extents[family] = authenticated
         if rank_digest.hexdigest() != inspection.rank_sha256:
             raise StateTransactionError("local whole-rank checksum changed")
-        return LocalAuthenticatedState(
+        return LocalAuthenticatedState._from_verified(
             self.rank, inspection.boundary, inspection.policy_digest,
-            self._read_policy(inspection),
-            MappingProxyType(extents),
+            self._read_policy(inspection), extents,
         )
 
     def _read_policy(self, inspection):

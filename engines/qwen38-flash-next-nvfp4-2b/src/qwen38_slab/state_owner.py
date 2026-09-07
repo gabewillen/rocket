@@ -125,6 +125,7 @@ class DecoderStateOwner:
         self._runtime_hold = False
         self._coordinator_hold = False
         self._active_state: Mapping[str, object] | None = None
+        self._active_policy_state: bytes | None = None
 
     @property
     def rank(self) -> int:
@@ -145,6 +146,10 @@ class DecoderStateOwner:
     @property
     def active_state(self) -> Mapping[str, object] | None:
         return self._active_state
+
+    @property
+    def active_policy_state(self) -> bytes | None:
+        return self._active_policy_state
 
     def upload_and_launch(self, prepared: PreparedDecode) -> DevicePublication:
         """Launch only while open; success awaits explicit boundary acceptance."""
@@ -238,6 +243,33 @@ class DecoderStateOwner:
                     "state publication contains an invalid family pointer"
                 )
             self._active_state = MappingProxyType(copied)
+
+    def publish_state_with_policy(
+        self, staged: Mapping[str, object], policy_state: bytes,
+        boundary: RuntimeBoundary,
+    ) -> None:
+        """Publish pointers and canonical policy while the same gate is closed."""
+
+        with self._observed("publish"):
+            if self._phase is OwnerPhase.FAULTED:
+                raise DecoderStateOwnerError("decoder launch gate is faulted")
+            if not self._runtime_hold or self._closed_boundary != boundary:
+                raise DecoderStateOwnerError(
+                    "state publication requires the matching closed runtime gate"
+                )
+            if not isinstance(staged, Mapping) or tuple(staged) != STATE_FAMILIES:
+                raise DecoderStateOwnerError(
+                    "state publication requires the canonical nine-family table"
+                )
+            copied = {family: staged[family] for family in STATE_FAMILIES}
+            if any(value is None for value in copied.values()):
+                raise DecoderStateOwnerError(
+                    "state publication contains an invalid family pointer"
+                )
+            if not isinstance(policy_state, bytes) or not 0 < len(policy_state) <= 65_536:
+                raise DecoderStateOwnerError("canonical adaptive policy state is required")
+            self._active_state = MappingProxyType(copied)
+            self._active_policy_state = policy_state
 
     def open_launch_gate(self, boundary: RuntimeBoundary) -> None:
         """Release the runtime hold; a coordinator hold may remain active."""

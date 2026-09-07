@@ -15,6 +15,8 @@ which wraps every method on this adapter with bounded dimensions.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 from collections.abc import Mapping
 from types import MappingProxyType
@@ -27,6 +29,8 @@ from .runtime_state import (
     QuiesceReceipt,
     RuntimeBoundary,
 )
+from .distributed_state_txn import AuthenticatedFamilyExtent, _AlignedBuffer
+from .state_txn import IO_CHUNK_BYTES
 from .state_txn import STATE_FAMILIES
 
 MAX_COMPUTE_STREAMS = 16
@@ -285,6 +289,68 @@ class TorchCudaRuntime:
         with self._torch.cuda.stream(self._copy_stream):
             tensor.copy_(pinned, non_blocking=True)
 
+    def copy_extent_to_device(
+        self, destination: object, extent: AuthenticatedFamilyExtent
+    ) -> None:
+        """Stream one authenticated O_DIRECT extent into private CUDA staging."""
+
+        self._require_quiesced()
+        if not isinstance(extent, AuthenticatedFamilyExtent):
+            raise TorchCudaRuntimeError("authenticated family extent is required")
+        tensor = self._validated_tensor(destination, extent.logical_bytes)
+        if not any(value is tensor for value in self._stage_views.values()):
+            raise TorchCudaRuntimeError("destination is not private staging")
+        logical_digest = hashlib.sha256()
+        padded_digest = hashlib.sha256()
+        fd = -1
+        try:
+            fd = os.open(extent.path, os.O_RDONLY | os.O_DIRECT)
+            if os.fstat(fd).st_size != extent.length_bytes:
+                raise TorchCudaRuntimeError("authenticated family extent size changed")
+            for offset in range(0, extent.length_bytes, IO_CHUNK_BYTES):
+                size = min(IO_CHUNK_BYTES, extent.length_bytes - offset)
+                accepted = min(size, max(0, extent.logical_bytes - offset))
+                with _AlignedBuffer(size) as direct:
+                    if os.preadv(fd, [direct.view], offset) != size:
+                        raise TorchCudaRuntimeError("short O_DIRECT CUDA restore read")
+                    if any(direct.view[accepted:]):
+                        raise TorchCudaRuntimeError("CUDA restore padding changed")
+                    logical_digest.update(direct.view[:accepted])
+                    padded_digest.update(direct.view)
+                    if accepted:
+                        pinned = self._torch.empty(
+                            accepted, dtype=self._torch.uint8,
+                            device="cpu", pin_memory=True,
+                        )
+                        source = self._torch.frombuffer(
+                            direct.view[:accepted], dtype=self._torch.uint8
+                        )
+                        pinned.copy_(source)
+                        with self._torch.cuda.stream(self._copy_stream):
+                            try:
+                                tensor.narrow(0, offset, accepted).copy_(
+                                    pinned, non_blocking=True
+                                )
+                            except BaseException as exc:
+                                self._drain_after_copy_failure(exc)
+                                raise
+                        try:
+                            self._copy_stream.synchronize()
+                        except BaseException as exc:
+                            raise CudaRuntimeFatalError(
+                                "CUDA extent restore stream could not be fenced"
+                            ) from exc
+            if (
+                logical_digest.hexdigest() != extent.logical_sha256
+                or padded_digest.hexdigest() != extent.padded_sha256
+            ):
+                raise TorchCudaRuntimeError("CUDA restore extent digest changed")
+        except OSError as exc:
+            raise TorchCudaRuntimeError("O_DIRECT CUDA restore read failed") from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
     def finish_transfers(self) -> None:
         """Fence all queued host-to-device copies and release pinned sources."""
 
@@ -316,6 +382,31 @@ class TorchCudaRuntime:
                 tensor, int(getattr(tensor, "numel")())
             )
         self._owner.publish_state(MappingProxyType(validated), boundary)
+        self._stage_views.clear()
+        self._stage_backings.clear()
+        self._stage_offsets.clear()
+
+    def publish_local(
+        self, staged: Mapping[str, object], boundary: RuntimeBoundary,
+        policy_state: bytes,
+    ) -> None:
+        """Publish a complete pointer table and authenticated adaptive policy."""
+
+        self._require_boundary(boundary)
+        if tuple(staged) != STATE_FAMILIES or self._pinned_staging:
+            raise TorchCudaRuntimeError("staged pointer table is incomplete or unfenced")
+        validated = {}
+        for family in STATE_FAMILIES:
+            tensor = staged[family]
+            if self._stage_views.get(family) is not tensor:
+                raise TorchCudaRuntimeError(
+                    f"staged tensor ownership changed for family {family}"
+                )
+            validated[family] = self._validated_tensor(tensor, tensor.numel())
+        publish = getattr(self._owner, "publish_state_with_policy", None)
+        if not callable(publish):
+            raise TorchCudaRuntimeError("owner lacks adaptive policy publication")
+        publish(MappingProxyType(validated), policy_state, boundary)
         self._stage_views.clear()
         self._stage_backings.clear()
         self._stage_offsets.clear()

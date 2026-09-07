@@ -28,11 +28,14 @@ from qwen38_slab.distributed_state_txn import (
     RestoreInspection,
 )
 from qwen38_slab.decode import Depth
+from qwen38_slab.device_decode import DevicePhase, DevicePublication
+from qwen38_slab.local_cuda_restore import LocalCudaStateBinding
 from qwen38_slab.mtp_policy import (
     AdaptiveMtpPolicy,
     ConcurrencyCeiling,
     PolicyConfig,
 )
+from qwen38_slab.runtime_state import RuntimeBoundary
 from qwen38_slab.state_txn import (
     STATE_FAMILIES,
     AcceptedBoundary,
@@ -40,6 +43,8 @@ from qwen38_slab.state_txn import (
     StateTransactionError,
     Transition,
 )
+from qwen38_slab.state_owner import DecoderStateOwner, OwnerPhase
+from qwen38_slab.torch_cuda import TorchCudaRuntime
 
 IMAGE = "vllm/vllm-openai:qwen38-flash-next"
 CONTAINER_REPO = "/rocket"
@@ -114,6 +119,42 @@ def _sources(plan_path: Path, rank: int):
     return sources, expected
 
 
+def _cuda_layout(plan_path: Path):
+    plan = json.loads(plan_path.read_text())
+    logical = {
+        family: item["logical_bytes_per_stream"] * 16
+        for family, item in zip(STATE_FAMILIES, plan["families"], strict=True)
+    }
+    allocated = {
+        family: item["cuda_allocated_bytes_c16"]
+        for family, item in zip(STATE_FAMILIES, plan["families"], strict=True)
+    }
+    identifiers = {
+        item["id"]: family
+        for family, item in zip(STATE_FAMILIES, plan["families"], strict=True)
+    }
+    owners = {
+        family: identifiers.get(item["shares_cuda_allocation_with"], family)
+        for family, item in zip(STATE_FAMILIES, plan["families"], strict=True)
+    }
+    counted = sum(
+        allocated[family] for family in STATE_FAMILIES if owners[family] == family
+    )
+    if counted != plan["totals_per_rank"]["cuda_allocated_bytes_c16"]:
+        raise RuntimeError("capacity plan CUDA allocation changed")
+    return logical, allocated, owners, counted
+
+
+class _Decoder:
+    def __init__(self):
+        self.phase = DevicePhase.IDLE
+        self.publication = None
+
+    def upload_and_launch(self, generation):
+        self.publication = DevicePublication(generation, 16, generation % 2)
+        return self.publication
+
+
 def _encode(value):
     result = asdict(value)
     if "boundary" in result:
@@ -141,7 +182,7 @@ def _footprint(store: Path) -> int:
     return sum(path.stat().st_size for path in store.rglob("*.state"))
 
 
-def worker(rank: int, store_path: Path, plan_path: Path) -> None:
+def worker(rank: int, store_path: Path, plan_path: Path, cuda_restore: bool) -> None:
     store_path.mkdir(parents=True, exist_ok=True)
     sources, record_bytes = _sources(plan_path, rank)
     available = shutil.disk_usage(store_path).free
@@ -149,10 +190,39 @@ def worker(rank: int, store_path: Path, plan_path: Path) -> None:
     if available + reclaimable < record_bytes + RESERVE_BYTES:
         raise RuntimeError("owner-local NVMe preflight failed")
     publications = []
+    owner = None
+    cuda_bytes = 0
+    publisher = publications.append
+    if cuda_restore:
+        import torch
+
+        logical, allocated, owners, cuda_bytes = _cuda_layout(plan_path)
+        owner = DecoderStateOwner(rank=rank, decoder=_Decoder(), tracer=_Tracer())
+        runtime_boundary = RuntimeBoundary(
+            _boundary().token_count, _boundary().token_hash, 1
+        )
+        owner.accept_boundary(owner.upload_and_launch(1), runtime_boundary)
+        runtime = TorchCudaRuntime(
+            owner=owner,
+            compute_streams=(torch.cuda.Stream(device="cuda:0"),),
+            torch_api=torch,
+            device="cuda:0",
+            allocation_bytes=allocated,
+            allocation_owners=owners,
+        )
+        binding = LocalCudaStateBinding(
+            rank, runtime, _policy(), logical, _Tracer()
+        )
+
+        def publish_cuda(state):
+            binding.restore_local(state, 1)
+            publications.append(state)
+
+        publisher = publish_cuda
     endpoint = LocalRankEndpoint(
         RankStateStore(rank, store_path, _identity(), _Tracer(), _policy()),
         sources,
-        publications.append,
+        publisher,
     )
     print(json.dumps({
         "ok": True, "event": "ready", "rank": rank,
@@ -187,12 +257,56 @@ def worker(rank: int, store_path: Path, plan_path: Path) -> None:
             elif command == "publish":
                 endpoint.publish(_authentication(request["receipt"]))
                 result = {"publications": len(publications)}
+            elif command == "hold":
+                if owner is None: raise RuntimeError("CUDA owner is unavailable")
+                owner.hold_launch_gate(RuntimeBoundary(
+                    _boundary().token_count, _boundary().token_hash, 1
+                ))
+                result = {"phase": owner.phase.value}
+            elif command == "release":
+                if owner is None: raise RuntimeError("CUDA owner is unavailable")
+                owner.release_launch_gate(RuntimeBoundary(
+                    _boundary().token_count, _boundary().token_hash, 1
+                ))
+                result = {"phase": owner.phase.value}
+            elif command == "fault":
+                if owner is None: raise RuntimeError("CUDA owner is unavailable")
+                owner.fault_closed(RuntimeBoundary(
+                    _boundary().token_count, _boundary().token_hash, 1
+                ))
+                result = {"phase": owner.phase.value}
             elif command == "status":
                 result = {
                     "publications": len(publications),
                     "payload_bytes": _footprint(store_path),
                     "free_bytes": shutil.disk_usage(store_path).free,
                 }
+                if owner is not None:
+                    import torch
+
+                    samples = []
+                    if owner.active_state is not None:
+                        for index, family in enumerate(STATE_FAMILIES):
+                            tensor = owner.active_state[family]
+                            expected = rank * len(STATE_FAMILIES) + index + 1
+                            offsets = (0, tensor.numel() // 2, tensor.numel() - 1)
+                            samples.append(all(
+                                int(tensor[offset].item()) == expected
+                                for offset in offsets
+                            ))
+                    result.update({
+                        "owner_phase": owner.phase.value,
+                        "cuda_bytes": cuda_bytes,
+                        "cuda_storage_bytes": 0 if owner.active_state is None else sum({
+                            tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
+                            for tensor in owner.active_state.values()
+                        }.values()),
+                        "policy_digest": None if owner.active_policy_state is None else hashlib.sha256(
+                            owner.active_policy_state
+                        ).hexdigest(),
+                        "sentinels": samples,
+                        "device": torch.cuda.get_device_name(0),
+                    })
             elif command == "cleanup":
                 for child in (store_path / "transactions", store_path / "sessions"):
                     if child.exists(): shutil.rmtree(child)
@@ -275,7 +389,8 @@ class _EndpointProxy:
 
 
 def _command(
-    repo: Path, rank: int, remote: str | None, container_name: str
+    repo: Path, rank: int, remote: str | None, container_name: str,
+    cuda_restore: bool = False,
 ):
     owner_path = f"/var/lib/rocket/qwen38-state/rank{rank}"
     command = [
@@ -286,6 +401,9 @@ def _command(
         IMAGE, f"{CONTAINER_REPO}/{SCRIPT}", "--worker", "--rank", str(rank),
         "--store", "/state", "--plan", f"{CONTAINER_REPO}/{PLAN}",
     ]
+    if cuda_restore:
+        command[2:2] = ["--gpus", "all"]
+        command.append("--cuda-restore")
     return command if remote is None else ["ssh", "-o", "BatchMode=yes", remote, shlex.join(command)]
 
 
@@ -293,6 +411,13 @@ def _start_processes(repo: Path, remote: str, prefix: str):
     return (
         _Process(_command(repo, 0, None, f"{prefix}-rank0")),
         _Process(_command(repo, 1, remote, f"{prefix}-rank1")),
+    )
+
+
+def _start_cuda_processes(repo: Path, remote: str, prefix: str):
+    return (
+        _Process(_command(repo, 0, None, f"{prefix}-rank0", True)),
+        _Process(_command(repo, 1, remote, f"{prefix}-rank1", True)),
     )
 
 
@@ -418,9 +543,61 @@ def matrix(repo: Path, remote: str):
     return {"signal": "SIGKILL", "cases": cases}
 
 
+def cuda_restore(repo: Path, remote: str):
+    prefix = "qwen38-state-cuda-restore"
+    cleanup_processes = _start_processes(repo, remote, f"{prefix}-preflight")
+    try:
+        for process in cleanup_processes: process.request("cleanup")
+    finally:
+        for process in cleanup_processes: process.close()
+    processes = _start_cuda_processes(repo, remote, prefix)
+    try:
+        endpoints = (
+            _EndpointProxy(0, processes[0]), _EndpointProxy(1, processes[1])
+        )
+        coordinator = DistributedStateCoordinator(endpoints, _Tracer())
+        policy = _policy_state()
+        coordinator.commit(
+            "physical", "txn-cuda-restore", _boundary(), policy_state=policy
+        )
+        for process in processes: process.request("hold")
+        start = time.perf_counter()
+        try:
+            coordinator.restore("physical")
+            for process in processes: process.request("release")
+        except BaseException:
+            for process in processes:
+                try: process.request("fault")
+                except BaseException: pass
+            raise
+        seconds = time.perf_counter() - start
+        status = tuple(process.request("status") for process in processes)
+        if any(
+            value["owner_phase"] != OwnerPhase.OPEN.value
+            or value["cuda_storage_bytes"] != value["cuda_bytes"]
+            or value["policy_digest"] != hashlib.sha256(policy).hexdigest()
+            or value["sentinels"] != [True] * len(STATE_FAMILIES)
+            for value in status
+        ):
+            raise RuntimeError("two-rank CUDA restore publication changed")
+        cleanup = tuple(process.request("cleanup") for process in processes)
+        return {
+            "restore_seconds": round(seconds, 6),
+            "policy_bytes": len(policy),
+            "policy_digest": hashlib.sha256(policy).hexdigest(),
+            "workers": tuple(process.ready for process in processes),
+            "status": status,
+            "cleanup": cleanup,
+        }
+    finally:
+        for process in processes: process.close()
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--cuda-restore", action="store_true")
+    parser.add_argument("--cuda-final", action="store_true")
     parser.add_argument("--crash-case", choices=tuple(value.value for value in Transition))
     parser.add_argument("--container-prefix")
     parser.add_argument("--rank", type=int, choices=(0, 1))
@@ -435,7 +612,7 @@ def main():
     args = parse_args()
     if args.worker:
         if args.rank is None or args.store is None: raise SystemExit("worker requires rank/store")
-        worker(args.rank, args.store, args.plan)
+        worker(args.rank, args.store, args.plan, args.cuda_restore)
     elif args.crash_case:
         if not args.remote or not args.container_prefix:
             raise SystemExit("crash case requires remote/container-prefix")
@@ -443,6 +620,9 @@ def main():
             args.repo.resolve(), args.remote, Transition(args.crash_case),
             args.container_prefix,
         )
+    elif args.cuda_final:
+        if not args.remote: raise SystemExit("CUDA restore requires remote")
+        print(json.dumps(cuda_restore(args.repo.resolve(), args.remote), sort_keys=True))
     else:
         if not args.remote: raise SystemExit("matrix requires remote")
         print(json.dumps(matrix(args.repo.resolve(), args.remote), sort_keys=True))
