@@ -10,8 +10,9 @@ after ``publish`` faults the binding because device ownership is then unknown.
 ``Cuda13GraphRuntime`` is the GB10 adapter. It loads one explicit CUDA 13
 Runtime library, owns a nonblocking stream, one pinned host staging set, two
 device banks, and one graph executable for each bank and captured batch size.
-Graph nodes currently upload metadata only. Target and QSA kernel nodes remain
-the next integration boundary.
+Each graph then runs the Qwen3.8 TP2 K0 target prologue, which consumes all
+seven metadata fields and writes deterministic row descriptors. Projection,
+index top-k, sparse paged attention, and slab-weight reads remain excluded.
 
 OpenTelemetry span attributes are ``phase`` (six values), ``depth`` (k0),
 ``graph_batch`` (1, 2, 4, 8, or 16), and ``outcome`` (success or failure).
@@ -21,6 +22,7 @@ Generations, stream slots, CUDA pointers, and error strings are excluded.
 from __future__ import annotations
 
 import ctypes
+import struct
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -36,6 +38,18 @@ from .decode import (
     OtelTracer,
     PreparedDecode,
     QsaBuffers,
+)
+from .k0_target import (
+    DEFAULT_CUDA_DRIVER,
+    DEFAULT_NVRTC,
+    K0_TARGET_SCHEMA,
+    TARGET_BINDING_BYTES,
+    TARGET_OUTPUT_BYTES,
+    TARGET_ROW_WORDS,
+    TARGET_ROWS,
+    K0TargetBinding,
+    K0TargetKernel,
+    K0TargetRow,
 )
 
 DEFAULT_CUDART = Path("/usr/local/cuda/lib64/libcudart.so")
@@ -57,6 +71,7 @@ BUFFER_FORMATS = {
     "raw_ring_offsets": ("i", 4),
     "compressed_positions": ("q", 8),
 }
+TARGET_GRAPH_NODES = len(BUFFER_LAYOUT) + 1
 
 
 class DeviceDecodeError(RuntimeError):
@@ -347,6 +362,10 @@ class _Cuda13Api:
         )
         self._bind("cudaGraphDestroy", [pointer])
         self._bind("cudaGraphExecDestroy", [pointer])
+        self._bind(
+            "cudaGraphGetNodes",
+            [pointer, ctypes.POINTER(pointer), ctypes.POINTER(size)],
+        )
         self._bind("cudaGraphLaunch", [pointer, pointer])
         self._bind("cudaStreamSynchronize", [pointer])
         self.lib.cudaGetErrorString.argtypes = [integer]
@@ -369,7 +388,7 @@ class _Cuda13Api:
 
 
 class Cuda13GraphRuntime:
-    """CUDA 13 double-buffered K0 metadata graph runtime for one GB10 device.
+    """CUDA 13 double-buffered K0 target graph runtime for one GB10 device.
 
     Construction allocates every resource and captures ten upload graphs. Public
     operations are synchronous, single-owner, and not thread-safe. ``close``
@@ -378,17 +397,27 @@ class Cuda13GraphRuntime:
     lifetime ends at ``close``.
     """
 
-    def __init__(self, device: int = 0, library: Path = DEFAULT_CUDART):
+    def __init__(
+        self,
+        device: int = 0,
+        library: Path = DEFAULT_CUDART,
+        nvrtc: Path = DEFAULT_NVRTC,
+        driver: Path = DEFAULT_CUDA_DRIVER,
+        target_binding: K0TargetBinding = K0TargetBinding(),
+    ):
         if isinstance(device, bool) or not isinstance(device, int) or device < 0:
             raise DeviceDecodeError("CUDA device must be a nonnegative integer")
         if not isinstance(library, Path):
             raise DeviceDecodeError("CUDA Runtime library must be an explicit Path")
+        if not isinstance(target_binding, K0TargetBinding):
+            raise DeviceDecodeError("K0 target binding ABI is invalid")
         self._api = _Cuda13Api(library)
         self._stream = ctypes.c_void_p()
         self._host: dict[str, ctypes.c_void_p] = {}
         self._device: list[dict[str, ctypes.c_void_p]] = [{}, {}]
         self._graphs: dict[tuple[int, int], ctypes.c_void_p] = {}
         self._execs: dict[tuple[int, int], ctypes.c_void_p] = {}
+        self._target_kernel: K0TargetKernel | None = None
         self._active_bank = -1
         self._staged: _CudaStage | None = None
         self._launched_batch: int | None = None
@@ -401,6 +430,7 @@ class Cuda13GraphRuntime:
             if device >= count.value:
                 raise DeviceDecodeError("CUDA device index is outside the visible set")
             self._api.call("cudaSetDevice", device)
+            self._target_kernel = K0TargetKernel(nvrtc=nvrtc, driver=driver)
             self._api.call(
                 "cudaStreamCreateWithFlags", ctypes.byref(self._stream), 1
             )
@@ -413,6 +443,29 @@ class Cuda13GraphRuntime:
                     destination = ctypes.c_void_p()
                     self._api.call("cudaMalloc", ctypes.byref(destination), length)
                     self._device[bank][name] = destination
+            binding_bytes = struct.pack(
+                "<QQ",
+                target_binding.slab_weight_table,
+                target_binding.slab_weight_generation,
+            )
+            for bank in range(2):
+                binding = ctypes.c_void_p()
+                output = ctypes.c_void_p()
+                self._api.call(
+                    "cudaMalloc", ctypes.byref(binding), TARGET_BINDING_BYTES
+                )
+                self._api.call(
+                    "cudaMalloc", ctypes.byref(output), TARGET_OUTPUT_BYTES
+                )
+                self._api.call(
+                    "cudaMemcpy",
+                    binding,
+                    ctypes.c_char_p(binding_bytes),
+                    TARGET_BINDING_BYTES,
+                    1,
+                )
+                self._device[bank]["target_binding"] = binding
+                self._device[bank]["target_rows"] = output
             for bank in range(2):
                 for graph_batch in GRAPH_BATCHES:
                     self._capture(bank, graph_batch)
@@ -478,7 +531,7 @@ class Cuda13GraphRuntime:
 
     @property
     def active_device_pointers(self) -> Mapping[str, int]:
-        """Return borrowed pointers for the active complete metadata bank."""
+        """Return borrowed pointers for the active metadata and target bank."""
 
         self._require_open()
         if self._active_bank not in (0, 1):
@@ -506,6 +559,38 @@ class Cuda13GraphRuntime:
             2,
         )
         return output.raw
+
+    def read_target_rows(self) -> tuple[K0TargetRow, ...]:
+        """Copy the active deterministic target-prologue descriptors."""
+
+        self._require_open()
+        if self._active_bank not in (0, 1):
+            raise DeviceDecodeError("no CUDA target output has been published")
+        output = ctypes.create_string_buffer(TARGET_OUTPUT_BYTES)
+        self._api.call(
+            "cudaMemcpy",
+            ctypes.addressof(output),
+            self._device[self._active_bank]["target_rows"],
+            TARGET_OUTPUT_BYTES,
+            2,
+        )
+        words = struct.unpack(f"<{TARGET_ROWS * TARGET_ROW_WORDS}q", output.raw)
+        return tuple(
+            K0TargetRow(*words[row : row + TARGET_ROW_WORDS])
+            for row in range(0, len(words), TARGET_ROW_WORDS)
+        )
+
+    @property
+    def target_schema(self) -> str:
+        """Return the immutable model-specific target interface identifier."""
+
+        return K0_TARGET_SCHEMA
+
+    @property
+    def graph_nodes_per_exec(self) -> int:
+        """Return the validated fixed node count for each captured graph."""
+
+        return TARGET_GRAPH_NODES
 
     def close(self) -> None:
         """Synchronize and release all owned CUDA resources exactly once."""
@@ -537,8 +622,23 @@ class Cuda13GraphRuntime:
                 1,
                 self._stream,
             )
+        if self._target_kernel is None:
+            raise DeviceDecodeError("K0 target kernel is unavailable")
+        self._target_kernel.capture_launch(
+            self._device[bank],
+            self._device[bank]["target_binding"],
+            self._device[bank]["target_rows"],
+            graph_batch,
+            self._stream,
+        )
         self._api.call("cudaStreamEndCapture", self._stream, ctypes.byref(graph))
         self._graphs[(bank, graph_batch)] = graph
+        nodes = ctypes.c_size_t()
+        self._api.call("cudaGraphGetNodes", graph, None, ctypes.byref(nodes))
+        if nodes.value != TARGET_GRAPH_NODES:
+            raise DeviceDecodeError(
+                f"K0 target graph has {nodes.value} nodes, expected {TARGET_GRAPH_NODES}"
+            )
         self._api.call(
             "cudaGraphInstantiate", ctypes.byref(executable), graph, 0
         )
@@ -574,6 +674,12 @@ class Cuda13GraphRuntime:
             release("cudaGraphExecDestroy", handle)
         for handle in self._graphs.values():
             release("cudaGraphDestroy", handle)
+        if self._target_kernel is not None:
+            try:
+                self._target_kernel.close()
+            except Exception as exc:
+                errors.append(str(exc))
+            self._target_kernel = None
         for bank in self._device:
             for handle in bank.values():
                 release("cudaFree", handle)
