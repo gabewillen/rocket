@@ -63,6 +63,7 @@ Options:
   --launch               Launch both nodes, run the corpus, reduce telemetry
   --two-node-preflight   Transfer and verify both nodes without launching
   --production           Launch without telemetry/eager mode and benchmark throughput
+  --production-preflight Prepare/deploy production launch scripts without launching
   --keep-running         Leave containers running after a successful calibration
   --mia-source DIR       Existing checkout at the pinned MiaAI-Lab commit
   --fp8-artifact-dir DIR Immutable linear-attention FP8 artifact directory
@@ -96,6 +97,12 @@ while (($#)); do
         --launch) LAUNCH=true; shift ;;
         --two-node-preflight) TWO_NODE_PREFLIGHT=true; shift ;;
         --production) PRODUCTION=true; LAUNCH=true; shift ;;
+        --production-preflight)
+            PRODUCTION=true
+            TWO_NODE_PREFLIGHT=true
+            LAUNCH=false
+            shift
+            ;;
         --keep-running) KEEP_RUNNING=true; shift ;;
         --mia-source) MIA_SOURCE=${2:?missing value}; shift 2 ;;
         --fp8-artifact-dir) FP8_ARTIFACT_DIR=${2:?missing value}; shift 2 ;;

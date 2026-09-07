@@ -112,6 +112,28 @@ def variance_summary(runs: list[dict[str, object]]) -> dict[str, object]:
     return output
 
 
+def validate_production_prepared(prepared: Path) -> dict[str, object]:
+    """Reject calibration/eager launch scripts before any cold timer starts."""
+
+    run_record = json.loads(prepared.joinpath("run.json").read_text())
+    if run_record.get("mtp_depth") != 1:
+        raise ValueError("cold c16 control requires the measured K1 ceiling")
+    for name in ("launch-head.sh", "launch-worker.sh"):
+        source = prepared.joinpath(name).read_text()
+        forbidden = (
+            "--enforce-eager",
+            "ROCKET_NVFP4_CALIBRATE",
+            "ROCKET_NVFP4_SAMPLE_ELEMENTS",
+            "ROCKET_NVFP4_MAX_EMISSIONS",
+            "ROCKET_QWEN38_LOAD_TRACE",
+            "model_telemetry.py",
+        )
+        present = [item for item in forbidden if item in source]
+        if present:
+            raise ValueError(f"{name} is not a production launch: {present}")
+    return run_record
+
+
 def run_checked(command: list[str], *, timeout: float | None = None) -> str:
     result = subprocess.run(
         command, capture_output=True, text=True, check=False, timeout=timeout
@@ -338,6 +360,10 @@ def main() -> int:
     for name in ("launch-head.sh", "launch-worker.sh", "run.json"):
         if not args.prepared_dir.joinpath(name).is_file():
             parser.error(f"prepared directory is missing {name}")
+    try:
+        prepared_run = validate_production_prepared(args.prepared_dir)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(str(error))
     if args.output_dir.exists():
         parser.error("--output-dir must not already exist")
     args.output_dir.mkdir(parents=True)
@@ -368,7 +394,7 @@ def main() -> int:
             "excluded": "artifact construction and two-node deployment",
             "model_ready_observation_resolution_seconds": 1,
         },
-        "prepared_run": json.loads(args.prepared_dir.joinpath("run.json").read_text()),
+        "prepared_run": prepared_run,
         "runs": runs,
         "variance": variance_summary(runs),
     }

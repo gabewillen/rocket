@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -81,6 +82,21 @@ class ColdFirstTokenTests(unittest.TestCase):
             }
         )
         self.assertIn("first_token_monotonic_ns", payload)
+
+    def test_prepared_contract_requires_k1_production_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.joinpath("run.json").write_text(json.dumps({"mtp_depth": 1}))
+            for name in ("launch-head.sh", "launch-worker.sh"):
+                root.joinpath(name).write_text("docker run --gpus all image --mtp K1\n")
+            self.assertEqual(cold.validate_production_prepared(root)["mtp_depth"], 1)
+            root.joinpath("launch-head.sh").write_text("docker run --enforce-eager\n")
+            with self.assertRaisesRegex(ValueError, "not a production launch"):
+                cold.validate_production_prepared(root)
+            root.joinpath("launch-head.sh").write_text("docker run image\n")
+            root.joinpath("run.json").write_text(json.dumps({"mtp_depth": 7}))
+            with self.assertRaisesRegex(ValueError, "K1 ceiling"):
+                cold.validate_production_prepared(root)
 
 
 if __name__ == "__main__":

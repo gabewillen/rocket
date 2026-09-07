@@ -57,6 +57,16 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn('> "$OUTPUT_DIR/mtp-runtime-evidence.json"', production)
         self.assertIn('--positions "$MTP_DEPTH"', production)
 
+    def test_production_preflight_builds_production_scripts_without_launching(self):
+        self.assertIn("--production-preflight", self.source)
+        option = self.source[
+            self.source.index("--production-preflight)"):
+            self.source.index("--mia-source)")
+        ]
+        self.assertIn("PRODUCTION=true", option)
+        self.assertIn("TWO_NODE_PREFLIGHT=true", option)
+        self.assertIn("LAUNCH=false", option)
+
     def test_startup_timeout_requires_positive_integer(self):
         for invalid in ("0", "-1", "1.5", "nope"):
             with self.subTest(value=invalid):
