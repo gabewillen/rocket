@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from array import array
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Iterable, Iterator, Protocol, Sequence
 
@@ -263,7 +263,8 @@ class QsaContinuationMetadata:
             memoryview(self._raw_ring_offsets).toreadonly(),
             memoryview(self._compressed_positions).toreadonly(),
         )
-        self._generation = 0
+        self._lease: QsaMetadataLease | None = None
+        self._bucket: DepthBucket | None = None
 
     @property
     def buffers(self) -> QsaBuffers:
@@ -271,7 +272,18 @@ class QsaContinuationMetadata:
 
     @property
     def generation(self) -> int:
-        return self._generation
+        return self._lease.generation if self._lease is not None else 0
+
+    def owns(
+        self, bucket: DepthBucket, lease: QsaMetadataLease, buffers: QsaBuffers
+    ) -> bool:
+        """Return whether all borrowed values name the current completed update."""
+
+        return (
+            bucket is self._bucket
+            and lease is self._lease
+            and buffers is self._buffers
+        )
 
     def update(self, bucket: DepthBucket) -> QsaMetadataLease:
         """Rewrite retained arrays for ``bucket`` and return their new lease.
@@ -307,15 +319,17 @@ class QsaContinuationMetadata:
                     row += 1
             for request in range(bucket.actual_batch, bucket.graph_batch + 1):
                 self._query_start_loc[request] = actual_rows
-            self._generation += 1
-            return QsaMetadataLease(
-                self._generation,
+            lease = QsaMetadataLease(
+                self.generation + 1,
                 bucket.depth,
                 bucket.actual_batch,
                 bucket.graph_batch,
                 actual_rows,
                 graph_rows,
             )
+            self._bucket = bucket
+            self._lease = lease
+            return lease
 
     @staticmethod
     def _validate_bucket(bucket: DepthBucket) -> None:
@@ -387,12 +401,25 @@ class QsaContinuationMetadata:
 
 @dataclass(frozen=True)
 class PreparedDecode:
-    """Borrowed metadata plus immutable graph selection for one K0 launch."""
+    """Borrowed metadata plus immutable graph selection for one K0 launch.
+
+    The private owner reference exists only so a device binding can reject a
+    lease after the reusable metadata has advanced to another generation.
+    """
 
     schedule: DecodeSchedule
     bucket: DepthBucket
     lease: QsaMetadataLease
     buffers: QsaBuffers
+    _owner: QsaContinuationMetadata = field(repr=False, compare=False)
+
+    def is_current(self) -> bool:
+        """Return whether the borrowed views still describe this generation."""
+
+        return (
+            isinstance(self._owner, QsaContinuationMetadata)
+            and self._owner.owns(self.bucket, self.lease, self.buffers)
+        )
 
 
 class DepthZeroDecodeExecutor:
@@ -416,7 +443,9 @@ class DepthZeroDecodeExecutor:
             raise DecodeContractError("K0 executor requires exactly one K0 bucket")
         bucket = schedule.buckets[0]
         lease = self._metadata.update(bucket)
-        return PreparedDecode(schedule, bucket, lease, self._metadata.buffers)
+        return PreparedDecode(
+            schedule, bucket, lease, self._metadata.buffers, self._metadata
+        )
 
 
 def _graph_batch(actual: int) -> int:
