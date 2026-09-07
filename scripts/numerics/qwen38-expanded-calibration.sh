@@ -222,7 +222,7 @@ verify_sha() {
         "overlay checksum mismatch for $(basename "$file"): expected $expected, got $actual"
 }
 verify_sha fae9fd5242748e8cdb314445a25ad628a0ce335cf26f794623f8679497a65186 "$ARTIFACT_DIR/ple_layer_patched.py"
-verify_sha 50fac3b1025bb7cb5910c0f19e707f23da41758bd41cb3560b96bd5e25bec406 "$ARTIFACT_DIR/modelopt_patched.py"
+verify_sha 89c54b49756e3fe9def912e22c6721e576c03b93d0238cbe061c029d8a6c84e0 "$ARTIFACT_DIR/modelopt_patched.py"
 if [[ -z "$FP8_ARTIFACT_DIR" ]]; then
     verify_sha 6cbca7f793403b0d169e0d8a60f100a4c721d3ec008404eab0ddfa0b81389c0e "$ARTIFACT_DIR/weight_utils_64k.py"
 fi
@@ -302,6 +302,7 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
   -e VLLM_HOST_IP=$(printf '%q' "$node_ip") -e HF_HOME=/root/.cache/huggingface \\
   -e ROCKET_NVFP4_CALIBRATE=1 -e ROCKET_NVFP4_SAMPLE_ELEMENTS=2048 \\
+  -e ROCKET_QWEN38_LOAD_TRACE=1 \\
   -e ROCKET_NVFP4_MAX_EMISSIONS=12 \\$fp8_options
   -v $(printf '%q' "$artifact_dir/ple_layer_patched.py"):$CONTAINER_MODEL_DIR/ple_layer.py:ro \\
   -v $(printf '%q' "$artifact_dir/modelopt_patched.py"):$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro \\

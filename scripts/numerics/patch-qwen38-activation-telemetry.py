@@ -12,6 +12,40 @@ _ROCKET_TELEMETRY_CALLS = {}
 _ROCKET_TELEMETRY_SCHEMA = "rocket.qwen38.activation-telemetry.v2"
 
 
+def _rocket_install_linear_load_trace():
+    if os.getenv("ROCKET_QWEN38_LOAD_TRACE") != "1":
+        return
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
+    if getattr(MergedColumnParallelLinear, "_rocket_load_trace", False):
+        return
+    original = MergedColumnParallelLinear.load_weights
+
+    def traced(self, weights):
+        def rows():
+            for name, value in weights:
+                print(
+                    "ROCKET_QWEN38_LINEAR_LOAD\t"
+                    + json.dumps(
+                        {
+                            "prefix": self.prefix,
+                            "name": name,
+                            "shard_id": getattr(value, "shard_id", None),
+                            "shape": list(value.shape),
+                            "dtype": str(value.dtype),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                yield name, value
+
+        return original(self, rows())
+
+    MergedColumnParallelLinear.load_weights = traced
+    MergedColumnParallelLinear._rocket_load_trace = True
+
+
 def _rocket_tensor(value, index=None):
     if index is not None:
         if not isinstance(value, (tuple, list)) or len(value) <= index:
@@ -212,7 +246,11 @@ def _rocket_install_activation_telemetry(model):
 
 '''
 INIT_ANCHOR = "        enable_qwen38next_low_latency_gemm(self, self.model_config.dtype)\n"
-INIT_PATCH = INIT_ANCHOR + "        _rocket_install_activation_telemetry(self.model)\n"
+INIT_PATCH = (
+    INIT_ANCHOR
+    + "        _rocket_install_linear_load_trace()\n"
+    + "        _rocket_install_activation_telemetry(self.model)\n"
+)
 
 
 def replace_once(source, old, new, label):

@@ -33,7 +33,18 @@ class Config:
 
     @staticmethod
     def _quantized_layer_prefix_candidates(prefix: str) -> tuple[str, ...]:
-        return (prefix,)
+        candidates = [prefix]
+
+        if prefix.startswith("language_model.model."):
+            candidates.append(
+                "model.language_model." + prefix[len("language_model.model.") :]
+            )
+        elif prefix.startswith("model.language_model."):
+            candidates.append(
+                "language_model.model." + prefix[len("model.language_model.") :]
+            )
+
+        return tuple(dict.fromkeys(candidates))
 
     def get_quant_method(self, layer, prefix):
         quant_algo = self.algo
@@ -53,16 +64,17 @@ class Config:
         }
         shard_names = fused_projection_shards.get(proj_name)
         if shard_names is not None:
-            parent_dot = prefix.rsplit(".", 1)[0] + "."
-            shard_algos = {
-                self.quantized_layers[parent_dot + name]["quant_algo"].upper()
-                for name in shard_names
-                if parent_dot + name in self.quantized_layers
-            }
-            if len(shard_algos) == 1:
-                return shard_algos.pop()
-            if len(shard_algos) > 1:
-                raise ValueError("Mixed quant_algo within fused layer")
+            for candidate in self._quantized_layer_prefix_candidates(prefix):
+                parent_dot = candidate.rsplit(".", 1)[0] + "."
+                shard_algos = {
+                    self.quantized_layers[parent_dot + name]["quant_algo"].upper()
+                    for name in shard_names
+                    if parent_dot + name in self.quantized_layers
+                }
+                if len(shard_algos) == 1:
+                    return shard_algos.pop()
+                if len(shard_algos) > 1:
+                    raise ValueError("Mixed quant_algo within fused layer")
         return None
 '''
 
@@ -194,6 +206,34 @@ class BlockFp8DispatchTest(unittest.TestCase):
                 config._resolve_quant_algo(
                     "language_model.model.layers.0.linear_attn.in_proj_qkvz"
                 )
+
+    def test_outer_multimodal_model_prefix_does_not_duplicate_model(self):
+        with self.patched_namespace() as namespace:
+            candidates = namespace["Config"]._quantized_layer_prefix_candidates(
+                "model.language_model.model.layers.0.linear_attn.in_proj_qkvz"
+            )
+        self.assertIn(
+            "language_model.model.layers.0.linear_attn.in_proj_qkvz",
+            candidates,
+        )
+        self.assertIn(
+            "model.language_model.layers.0.linear_attn.in_proj_qkvz",
+            candidates,
+        )
+
+    def test_mapper_canonical_model_prefix_resolves_packed_projection(self):
+        with self.patched_namespace() as namespace:
+            config = namespace["Config"]("FP8_PB_WO", 128)
+            config.quantized_layers = {
+                "model.layers.0.linear_attn.in_proj_b": {"quant_algo": "FP8"},
+                "model.layers.0.linear_attn.in_proj_a": {"quant_algo": "FP8"},
+            }
+            self.assertEqual(
+                config._resolve_quant_algo(
+                    "language_model.model.layers.0.linear_attn.in_proj_ba"
+                ),
+                "FP8",
+            )
 
 
 if __name__ == "__main__":

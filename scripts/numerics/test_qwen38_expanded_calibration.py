@@ -78,6 +78,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("getconf PAGESIZE", self.source)
         self.assertIn("patch-vllm-64k-loader.py", self.source)
         self.assertIn("patch-qwen38-activation-telemetry.py", self.source)
+        self.assertIn("ROCKET_QWEN38_LOAD_TRACE=1", self.source)
         for name in (
             "ple_layer_patched.py",
             "modelopt_patched.py",
@@ -205,7 +206,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
 
     def test_modelopt_checksum_matches_dual_spelling_generator(self):
         self.assertIn(
-            "50fac3b1025bb7cb5910c0f19e707f23da41758bd41cb3560b96bd5e25bec406",
+            "89c54b49756e3fe9def912e22c6721e576c03b93d0238cbe061c029d8a6c84e0",
             self.source,
         )
         self.assertNotIn(

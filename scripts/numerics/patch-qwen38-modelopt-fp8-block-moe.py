@@ -83,6 +83,36 @@ FUSED_SHARDS = '''        fused_projection_shards = {
         }
 '''
 
+PREFIX_CANDIDATE_ANCHOR = '''        if prefix.startswith("language_model.model."):
+            candidates.append(
+                "model.language_model." + prefix[len("language_model.model.") :]
+            )
+        elif prefix.startswith("model.language_model."):
+            candidates.append(
+                "language_model.model." + prefix[len("model.language_model.") :]
+            )
+'''
+PREFIX_CANDIDATE_PATCH = '''        if prefix.startswith("model.language_model.model."):
+            suffix = prefix[len("model.language_model.model.") :]
+            candidates.append(
+                "language_model.model."
+                + suffix
+            )
+            candidates.append(
+                "model.language_model."
+                + suffix
+            )
+            candidates.append("model." + suffix)
+        elif prefix.startswith("language_model.model."):
+            suffix = prefix[len("language_model.model.") :]
+            candidates.append("model.language_model." + suffix)
+            candidates.append("model." + suffix)
+        elif prefix.startswith("model.language_model."):
+            candidates.append(
+                "language_model.model." + prefix[len("model.language_model.") :]
+            )
+'''
+
 
 def replace_once(source: str, old: str, new: str, label: str) -> str:
     count = source.count(old)
@@ -98,6 +128,12 @@ def patch(target: Path) -> None:
     source = replace_once(source, HELPER_ANCHOR, HELPER + HELPER_ANCHOR, "helper")
     source = replace_once(
         source, FUSED_SHARDS_ANCHOR, FUSED_SHARDS, "Qwen3.8 fused projections"
+    )
+    source = replace_once(
+        source,
+        PREFIX_CANDIDATE_ANCHOR,
+        PREFIX_CANDIDATE_PATCH,
+        "Qwen3.8 multimodal prefix",
     )
     source = replace_once(source, DISPATCH_ANCHOR, DISPATCH, "dispatch")
     ast.parse(source, filename=str(target))
