@@ -1,0 +1,201 @@
+{
+  "cohort": {
+    "concurrency": "c2_4",
+    "phase": "steady_decode"
+  },
+  "cost_model": {
+    "checkpoint_revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+    "formula": "(step_bytes[depth] + lazy_weight_bytes/residency_rounds when cold) / accepted_tokens",
+    "lazy_weight_bytes": 2698026496,
+    "residency_rounds": 64,
+    "source": "scripts/numerics/qwen38-roofline.py checkpoint-derived c16 uniform-route traffic",
+    "step_bytes": [
+      27014478469.877693,
+      43058601574.859886,
+      55338212408.54245,
+      64872150224.303696
+    ]
+  },
+  "decision": {
+    "depths": [
+      {
+        "accepted_tokens": {
+          "lower": 1.0,
+          "mean": 1.0,
+          "upper": 1.0
+        },
+        "bytes_per_accepted_token": {
+          "lower": 27014478469.877693,
+          "mean": 27014478469.877693,
+          "upper": 27014478469.877693
+        },
+        "depth": 0
+      },
+      {
+        "accepted_tokens": {
+          "lower": 1.7115384441273516,
+          "mean": 1.7216723104975253,
+          "upper": 1.7315844653583115
+        },
+        "bytes_per_accepted_token": {
+          "lower": 24890936076.82671,
+          "mean": 25034240241.921947,
+          "upper": 25182465744.04896
+        },
+        "depth": 1
+      },
+      {
+        "accepted_tokens": {
+          "lower": 2.2231497288738664,
+          "mean": 2.244464704350091,
+          "upper": 2.2655351718926378
+        },
+        "bytes_per_accepted_token": {
+          "lower": 24444718298.62498,
+          "mean": 24674199137.641792,
+          "upper": 24910768875.92061
+        },
+        "depth": 2
+      },
+      {
+        "accepted_tokens": {
+          "lower": 2.5956383496371,
+          "mean": 2.627767647824954,
+          "upper": 2.6597691557715
+        },
+        "bytes_per_accepted_token": {
+          "lower": 24405992808.60315,
+          "mean": 24703214130.07513,
+          "upper": 25008995146.561718
+        },
+        "depth": 3
+      }
+    ],
+    "selected_depth": 1
+  },
+  "observations": {
+    "successes": [
+      5541,
+      4014,
+      2943
+    ],
+    "trials": [
+      7678,
+      7678,
+      7678
+    ]
+  },
+  "otel": {
+    "bounded_labels": {
+      "concurrency": [
+        "c1",
+        "c2_4",
+        "c5_8",
+        "c9_16",
+        "c17_plus"
+      ],
+      "depth": [
+        "k0",
+        "k1",
+        "k2",
+        "k3"
+      ],
+      "phase": [
+        "prefill",
+        "restoring",
+        "early_decode",
+        "steady_decode"
+      ],
+      "reason": [
+        "phase_k0",
+        "remaining_cap",
+        "probe",
+        "policy",
+        "explore",
+        "promote",
+        "demote"
+      ]
+    },
+    "identifiers": "request and session IDs are forbidden on metrics; sampled spans/logs only",
+    "metric": "rocket.scheduler.mtp.decision"
+  },
+  "policy": {
+    "demotion": "two failing 8-round windows",
+    "depths": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "exploration": "one depth deeper every 64 eligible rounds",
+    "forced_k0_phases": [
+      "prefill",
+      "restoring"
+    ],
+    "probe_depths": [
+      1,
+      1,
+      2,
+      1,
+      2,
+      3,
+      2,
+      3,
+      1,
+      1,
+      2,
+      1,
+      2,
+      3,
+      2,
+      3
+    ],
+    "promotion_margin": 0.03,
+    "remaining_token_cap": "depth <= remaining_tokens - 1"
+  },
+  "remaining_proof": "matched live K0, K1, K2, K3 ladder at each concurrency bucket",
+  "schema": "rocket.qwen38.adaptive-mtp-offline.v1",
+  "scope": "offline control proof; no live engine or matched K0-K3 throughput claim",
+  "sources": [
+    {
+      "accepted_tokens": 2384,
+      "drafted_tokens": 4476,
+      "evidence": "/home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/mtp-runtime-evidence.json",
+      "raw_log": "/home/glwillen/calibration/qwen38-all-eligible-nvfp4-live-20260907-01/logs/head-workload.log",
+      "raw_log_sha256": "328f6d99c63b04287cfe83f607b3f0171b8b8eb887ebecce81597e2b52c5abf6",
+      "records": 15
+    },
+    {
+      "accepted_tokens": 2712,
+      "drafted_tokens": 4209,
+      "evidence": "/home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/mtp-runtime-evidence.json",
+      "raw_log": "/home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/logs/head-workload.log",
+      "raw_log_sha256": "df136ece9950918217aad5f746484d75a9567931432522fe970620149c2031bb",
+      "records": 13
+    },
+    {
+      "accepted_tokens": 2581,
+      "drafted_tokens": 4626,
+      "evidence": "/home/glwillen/calibration/qwen38-linear-fp8-live-20260907-08/mtp-runtime-evidence.json",
+      "raw_log": "/home/glwillen/calibration/qwen38-linear-fp8-live-20260907-08/logs/head-workload.log",
+      "raw_log_sha256": "378b30ae14861bd930796ce03eb0e3643bc067248750cc6146ed86599463bf59",
+      "records": 30
+    },
+    {
+      "accepted_tokens": 2458,
+      "drafted_tokens": 4965,
+      "evidence": "/home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/mtp-runtime-evidence.json",
+      "raw_log": "/home/glwillen/calibration/qwen38-linear-nvfp4-live-20260907-04/logs/head-workload.log",
+      "raw_log_sha256": "3c120602a64cc9ee318fc0c51c2b42fde48060a17c6c38dc6e7f9dfe5dbe8c33",
+      "records": 15
+    },
+    {
+      "accepted_tokens": 2363,
+      "drafted_tokens": 4758,
+      "evidence": "/home/glwillen/calibration/qwen38-linear-nvfp4-matched-control-20260907-08/mtp-runtime-evidence.json",
+      "raw_log": "/home/glwillen/calibration/qwen38-linear-nvfp4-matched-control-20260907-08/logs/head-workload.log",
+      "raw_log_sha256": "81b5fe3dc0ff52e3be439a6ba109161455ce73b10a88e93f49600a229cea2477",
+      "records": 14
+    }
+  ]
+}
