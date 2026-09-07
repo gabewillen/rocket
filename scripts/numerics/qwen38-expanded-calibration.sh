@@ -320,6 +320,8 @@ extract_image_file "$CONTAINER_MODEL_DIR/ops/qsa.py" "$RUNTIME_FILES/qsa_ops_pat
 extract_image_file "$CONTAINER_MODEL_DIR/qsa.py" "$RUNTIME_FILES/qsa_nvidia_patched.py.orig"
 extract_image_file "$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py" \
     "$ARTIFACT_DIR/weight_utils_64k.py"
+extract_image_file "$CONTAINER_VLLM_DIR/platforms/interface.py" \
+    "$ARTIFACT_DIR/platform_qsa_patched.py"
 extract_image_file "$CONTAINER_MODEL_DIR/model.py" "$ARTIFACT_DIR/model_router.py"
 
 python3 "$RUNTIME_FILES/patch_ple_layer.py" >/dev/null
@@ -329,6 +331,8 @@ python3 "$SCRIPT_DIR/patch-qwen38-modelopt-fp8-block-moe.py" \
 python3 "$RUNTIME_FILES/patch_qsa_fp8_kv.py" >/dev/null
 python3 "$RUNTIME_FILES/patch_checkpoint_config.py" "$HEAD_SNAPSHOT" "$RUNTIME_FILES" >/dev/null
 python3 "$REPO_ROOT/scripts/runtime/patch-vllm-64k-loader.py" "$ARTIFACT_DIR/weight_utils_64k.py"
+python3 "$REPO_ROOT/scripts/runtime/patch-qwen38-qsa-page-alignment.py" \
+    "$ARTIFACT_DIR/platform_qsa_patched.py"
 weight_utils_64k_sha=$(sha256sum "$ARTIFACT_DIR/weight_utils_64k.py" | cut -d' ' -f1)
 [[ "$weight_utils_64k_sha" == "6cbca7f793403b0d169e0d8a60f100a4c721d3ec008404eab0ddfa0b81389c0e" ]] || \
     fail "64 KiB loader checksum mismatch: $weight_utils_64k_sha"
@@ -409,8 +413,9 @@ verify_sha dd8727422cafbb0257d11a7163442bda46421f6e67c78eb9acd58669cb6eb5f8 "$AR
 docker run --rm \
     -v "$ARTIFACT_DIR/model_telemetry.py:/work/model.py:ro" \
     -v "$ARTIFACT_DIR/model_router.py:/work/model_router.py:ro" \
+    -v "$ARTIFACT_DIR/platform_qsa_patched.py:/work/platform.py:ro" \
     --entrypoint /usr/bin/python3 "$IMAGE_TAG" -m py_compile \
-    /work/model.py /work/model_router.py
+    /work/model.py /work/model_router.py /work/platform.py
 if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
     FP8_CONTAINER_DIR="/rocket/qwen38-linear-fp8"
     docker run --rm \
@@ -500,6 +505,7 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   -v $(printf '%q' "$artifact_dir/ple_layer_patched.py"):$CONTAINER_MODEL_DIR/ple_layer.py:ro \\
   -v $(printf '%q' "$artifact_dir/modelopt_patched.py"):$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro \\
   -v $(printf '%q' "$artifact_dir/weight_utils_64k.py"):$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py:ro \\
+  -v $(printf '%q' "$artifact_dir/platform_qsa_patched.py"):$CONTAINER_VLLM_DIR/platforms/interface.py:ro \\
   -v $(printf '%q' "$artifact_dir/model_telemetry.py"):$CONTAINER_MODEL_DIR/model.py:ro \\
   -v $(printf '%q' "$artifact_dir/qsa_ops_patched.py"):$CONTAINER_MODEL_DIR/ops/qsa.py:ro \\
   -v $(printf '%q' "$artifact_dir/qsa_nvidia_patched.py"):$CONTAINER_MODEL_DIR/qsa.py:ro \\

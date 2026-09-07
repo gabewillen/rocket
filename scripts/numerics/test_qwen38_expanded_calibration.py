@@ -133,6 +133,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("getconf PAGESIZE", self.source)
         self.assertIn("patch-vllm-64k-loader.py", self.source)
         self.assertIn("patch-qwen38-activation-telemetry.py", self.source)
+        self.assertIn("patch-qwen38-qsa-page-alignment.py", self.source)
         self.assertIn("ROCKET_QWEN38_LOAD_TRACE=1", self.source)
         self.assertIn("qwen38-embed-fp8-config.py", self.source)
         self.assertIn("config_fp8_patched.json", self.source)
@@ -141,6 +142,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             "modelopt_patched.py",
             "model_router.py",
             "weight_utils_64k.py",
+            "platform_qsa_patched.py",
             "qsa_ops_patched.py",
             "qsa_nvidia_patched.py",
             "config_patched.json",
@@ -150,6 +152,9 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertLess(
             self.source.index("patch-vllm-64k-loader.py"),
             self.source.index("patch-qwen38-fp8-overlay-loader.py"),
+        )
+        self.assertIn(
+            "$CONTAINER_VLLM_DIR/platforms/interface.py:ro", self.source
         )
 
     def test_precision_overlays_are_opt_in_read_only_and_keep_default_config(self):
