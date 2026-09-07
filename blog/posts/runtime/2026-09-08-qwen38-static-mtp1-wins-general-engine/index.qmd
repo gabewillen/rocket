@@ -1,0 +1,164 @@
+---
+title: "Static MTP1 wins the Qwen3.8 general-engine depth sweep"
+description: "MTP1 leads the matched K1 to K3 sweep at 108.76 aggregate tok/s at c16, while every static depth remains below the Rocket acceptance floor."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, runtime, baseline, hardware]
+verdict: rejected
+rocket: "#engine-status"
+---
+
+**Question.** Can a fixed MTP depth in the pinned Qwen3.8 vLLM path clear the
+greater-than-320 aggregate tok/s and greater-than-20 generated tok/s/stream
+acceptance floors at concurrency 16?
+
+| setup | |
+| --- | --- |
+| nodes | gx10-5e36 head and gx10-2a13 worker, GB10, 6.17.13-rocket64k, 64 KiB pages |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| vLLM image | `vllm/vllm-openai:qwen38-flash-next` at `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| Mia source | [dual-Spark runtime at `c2325b22602b51a5faf55fc2bebccc34f3f80b9f`](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks/tree/c2325b22602b51a5faf55fc2bebccc34f3f80b9f) |
+| Rocket launcher | `scripts/numerics/qwen38-expanded-calibration.sh` at `8a50331de8b75ea0dd48c00c7b9f215b43710246` |
+| serving map | 278 base-model matrices in W4A4 NVFP4, MTP experts in their checkpoint format |
+| runtime | TP2, EP, FP8 KV cache, 262,144-token context, 0.835 GPU memory fraction |
+| workload | one ladder at c1, c2, c4, c8, and c16; 256 requested completion tokens per stream |
+
+K0 is unavailable in this pinned vLLM image. Its speculative configuration
+requires `num_speculative_tokens > 0`, while disabling speculation also removes
+the synchronized MTP state.
+
+## K1
+
+```bash
+scripts/numerics/qwen38-expanded-calibration.sh \
+  --output-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp1-20260907-01 \
+  --mia-source /home/glwillen/Development/Qwen3.8-Flash-Next-Dual-DGX-Sparks \
+  --nvfp4-artifact-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-artifacts/23d2c39e9c2cf36a832cb1750f6542fa46f11f1befe195d80c082051a5a772b4 \
+  --production --mtp-depth 1
+
+jq -r '.[] | [.concurrency,.aggregate_tok_s,.per_stream_tok_s,.mean_ttft_s] | @tsv' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp1-20260907-01/throughput.json
+jq -r '.cases[-1].ranks[] | [.rank,.samples,.clock_mhz.median,.clock_mhz.max,.power_w.median,.power_w.max,.utilization_percent.median,.utilization_percent.max] | @tsv' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp1-20260907-01/hardware.json
+jq -r '.max_pair_span_ms' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp1-20260907-01/hardware.json
+```
+
+```text
+1	47.90907525762913	47.90907525762913	5.8903364459984004
+2	82.07885830279372	41.96230145239433	5.9628688734992465
+4	80.24492705938943	30.519002197589565	5.31348654499925
+8	100.65049962512279	21.834061128765548	9.153299345874984
+16	108.76325356908897	12.462407949132487	16.089976814125066
+0	28	2476	2489	48.68	50.87	96	96
+1	28	2440.5	2470	48.8	51.08	96	96
+667.566075
+```
+
+## K2
+
+```bash
+scripts/numerics/qwen38-expanded-calibration.sh \
+  --output-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp2-20260907-02 \
+  --mia-source /home/glwillen/Development/Qwen3.8-Flash-Next-Dual-DGX-Sparks \
+  --nvfp4-artifact-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-artifacts/23d2c39e9c2cf36a832cb1750f6542fa46f11f1befe195d80c082051a5a772b4 \
+  --production --mtp-depth 2
+
+jq -r '.[] | [.concurrency,.aggregate_tok_s,.per_stream_tok_s,.mean_ttft_s] | @tsv' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp2-20260907-02/throughput.json
+jq -r '.cases[-1].ranks[] | [.rank,.samples,.clock_mhz.median,.clock_mhz.max,.power_w.median,.power_w.max,.utilization_percent.median,.utilization_percent.max] | @tsv' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp2-20260907-02/hardware.json
+jq -r '.max_pair_span_ms' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp2-20260907-02/hardware.json
+```
+
+```text
+1	47.147080314439485	47.147080314439485	6.648361575003946
+2	81.51255509154726	42.11419876516803	5.893480772501789
+4	81.04166199148139	29.66851374160565	5.009835422246397
+8	83.20819068223362	20.630608692480905	12.179732923874326
+16	106.5639709233203	12.359908903638926	16.315298340876325
+0	29	2476	2489	49.62	51.6	96	96
+1	30	2437	2463	49.33	51.14	96	96
+2906.049339
+```
+
+The K2 per-rank medians remain usable. One cross-rank hardware sample pairing
+spans 2.906 s, so the K2 paired-sample timing is weaker than K1 and K3.
+
+## K3
+
+```bash
+scripts/numerics/qwen38-expanded-calibration.sh \
+  --output-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp3-20260907-01 \
+  --mia-source /home/glwillen/Development/Qwen3.8-Flash-Next-Dual-DGX-Sparks \
+  --nvfp4-artifact-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-artifacts/23d2c39e9c2cf36a832cb1750f6542fa46f11f1befe195d80c082051a5a772b4 \
+  --production --mtp-depth 3
+
+jq -r '.[] | [.concurrency,.aggregate_tok_s,.per_stream_tok_s,.mean_ttft_s] | @tsv' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp3-20260907-01/throughput.json
+jq -r '.cases[-1].ranks[] | [.rank,.samples,.clock_mhz.median,.clock_mhz.max,.power_w.median,.power_w.max,.utilization_percent.median,.utilization_percent.max] | @tsv' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp3-20260907-01/hardware.json
+jq -r '.max_pair_span_ms' \
+  /home/glwillen/calibration/qwen38-all-eligible-nvfp4-production-mtp3-20260907-01/hardware.json
+```
+
+```text
+1	42.95291466779239	42.95291466779239	6.002504529998987
+2	79.31657011116243	42.74336714056831	5.884289189503761
+4	73.13424323386768	28.73326222878993	5.3891825552473165
+8	92.43851168258048	19.283540096204987	9.34957075074999
+16	101.81097641510603	11.594667922022985	16.428048782748647
+0	30	2476	2489	46.855	51	96	96
+1	30	2444	2463	48.745	51.39	96	96
+676.406285
+```
+
+The hardware rows above are c16 and contain rank, samples, median and maximum
+SM MHz, median and maximum watts, and median and maximum GPU utilization percent.
+
+| c16 result | K1 | K2 | K3 | acceptance floor |
+| --- | ---: | ---: | ---: | ---: |
+| aggregate throughput | 108.76 tok/s | 106.56 tok/s | 101.81 tok/s | >320 tok/s |
+| per-stream throughput | 12.46 tok/s/stream | 12.36 tok/s/stream | 11.59 tok/s/stream | >20 tok/s/stream |
+| mean TTFT | 16.090 s | 16.315 s | 16.428 s | n/a |
+| aggregate floor fraction | 34.0% | 33.3% | 31.8% | >100% |
+| per-stream floor fraction | 62.3% | 61.8% | 58.0% | >100% |
+
+Each depth has one run. Run-to-run variance was not measured.
+
+**Verdict.** Rejected as a path across the Rocket acceptance floor. K1 wins this matched
+general-engine control, leads K2 by 2.06% and K3 by 6.83% at c16 aggregate,
+and remains below the 132.8 tok/s general-engine pair baseline.
+
+Conventional static MTP3 is value-rejected because its measured ceiling is
+101.81 aggregate tok/s and 11.59 tok/s/stream at c16. Its implementation
+difficulty is no longer the objection.
+
+K1 is a general-engine control only. The remaining work is a Qwen3.8-specific
+static decode engine for this two-GB10 topology, including specialized graph,
+memory, transport, and adaptive speculative execution contracts. The model and
+hardware specificity, plus the implementation difficulty, explain why this path
+is absent from the measured general engine.
+
+| specialized-engine objective | contract |
+| --- | --- |
+| acceptance | exceed 320 aggregate tok/s and 20 tok/s/stream at c16 |
+| optimization | approach the empirically measured whole-decode roofline as closely as possible |
+| reporting | record sustained throughput and its achieved fraction of that whole-decode roofline |
+
+The existing 330.835 tok/s estimate covers weight traffic. The final whole-decode
+ceiling awaits empirical measurement.
+
+**Next.**
+
+- finish end-to-end Qwen3.8 decode in the specialized TP2 engine
+- bind adaptive lazy K1 to K3 acceptance to the specialized scheduler
+- measure the empirical whole-decode roofline
+- clear both c16 acceptance floors, then maximize sustained throughput and report its roofline fraction
+
+**Reopen if.**
+
+- an upstream vLLM release changes Qwen3.8 MTP scheduling or enables a synchronized K0 control
+- NVIDIA publishes a checkpoint revision or ModelOpt ABI change
+- driver, firmware, or GB10 hardware changes move the matched operating range
