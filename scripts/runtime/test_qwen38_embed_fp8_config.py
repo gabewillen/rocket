@@ -11,6 +11,16 @@ SPEC = importlib.util.spec_from_file_location("qwen38_embed_fp8_config", PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
+PATCH_PATH = pathlib.Path(__file__).with_name("patch-qwen38-nvfp4-quant-config.py")
+PATCH_SPEC = importlib.util.spec_from_file_location("qwen38_nvfp4_config_patch", PATCH_PATH)
+PATCH = importlib.util.module_from_spec(PATCH_SPEC)
+assert PATCH_SPEC.loader is not None
+PATCH_SPEC.loader.exec_module(PATCH)
+SNAPSHOT = (
+    pathlib.Path.home()
+    / ".cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots"
+    / "fc694b54fb0174e0913e6adf86691ef85a4ead47"
+)
 
 
 class EmbedConfigTest(unittest.TestCase):
@@ -67,6 +77,9 @@ class EmbedConfigTest(unittest.TestCase):
                 "exclude_modules": [
                     f"model.language_model.layers.{layer}.linear_attn*"
                     for layer in set(range(48)) - set(range(3, 48, 4))
+                ] + [
+                    f"model.language_model.layers.{layer}.mlp.gate"
+                    for layer in range(48)
                 ],
                 "quantized_layers": full_layers,
             }
@@ -75,7 +88,10 @@ class EmbedConfigTest(unittest.TestCase):
         self.assertEqual(len(result["quantization_config"]["quantized_layers"]), 48)
         combined = json.loads(json.dumps(full))
         combined["quantization"]["quantized_layers"].update(linear_layers)
-        combined["quantization"]["exclude_modules"] = []
+        combined["quantization"]["exclude_modules"] = [
+            f"model.language_model.layers.{layer}.mlp.gate"
+            for layer in range(48)
+        ]
         result = MODULE.embed(
             base,
             combined,
@@ -83,6 +99,29 @@ class EmbedConfigTest(unittest.TestCase):
             ("linear_attention", "full_attention"),
         )
         self.assertEqual(len(result["quantization_config"]["quantized_layers"]), 228)
+
+    def test_router_and_ple_policy_is_exact_and_composable(self):
+        base = json.loads((SNAPSHOT / "config.json").read_text())
+        source = json.loads((SNAPSHOT / "hf_quant_config.json").read_text())
+        families = (
+            "linear_attention", "full_attention", "base_routers", "base_ple"
+        )
+        sidecar = PATCH.patched(source, families)
+        result = MODULE.embed(base, sidecar, "NVFP4", families)
+        quant = result["quantization_config"]
+        selected = {
+            name
+            for name, policy in quant["quantized_layers"].items()
+            if policy.get("quant_algo") == "NVFP4"
+            and any(
+                pattern.fullmatch(name)
+                for pattern, _, _ in MODULE.FAMILY_PATTERNS.values()
+            )
+        }
+        self.assertEqual(len(selected), 278)
+        self.assertFalse(
+            any(name.endswith(".mlp.gate") for name in quant["exclude_modules"])
+        )
 
 
 if __name__ == "__main__":

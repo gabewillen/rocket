@@ -47,8 +47,8 @@ def nvfp4_helper() -> str:
         '    r"^model\\.language_model\\.layers\\.(\\d+)\\.linear_attn\\."\n'
         '    r"(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj)\\.weight$"',
         '    r"^model\\.language_model\\.layers\\.(\\d+)\\."\n'
-        '    r"(linear_attn|self_attn)\\."\n'
-        '    r"(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj|q_proj|k_proj|v_proj|o_proj)\\.weight$"',
+        '    r"(linear_attn|self_attn|mlp|ple)\\."\n'
+        '    r"(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj|q_proj|k_proj|v_proj|o_proj|gate|key_proj|value_proj)\\.weight$"',
         1,
         "selected family regex",
     )
@@ -69,7 +69,9 @@ def nvfp4_helper() -> str:
         '    if source.get("revision") != _ROCKET_QWEN38_REVISION:\n'
         '        raise ValueError("Qwen3.8 NVFP4 overlay revision mismatch")\n'
         '    families = source.get("families") if schema == "rocket.qwen38.nvfp4-overlay.v2" else ["linear_attention"]\n'
-        '    if families not in (["full_attention"], ["linear_attention"], ["full_attention", "linear_attention"]):\n'
+        '    valid_families = {"base_ple", "base_routers", "full_attention", "linear_attention"}\n'
+        '    if (not isinstance(families, list) or not families or families != sorted(set(families))\n'
+        '            or set(families) - valid_families):\n'
         '        raise ValueError("Qwen3.8 NVFP4 overlay family selection is invalid")',
         1,
         "family selection",
@@ -78,7 +80,7 @@ def nvfp4_helper() -> str:
         result,
         '    if not isinstance(entries, list) or len(entries) != 180:\n'
         '        raise ValueError("Qwen3.8 NVFP4 overlay requires exactly 180 source tensors")',
-        '    expected_counts = {"linear_attention": 180, "full_attention": 48}\n'
+        '    expected_counts = {"linear_attention": 180, "full_attention": 48, "base_routers": 48, "base_ple": 2}\n'
         '    expected_count = sum(expected_counts[family] for family in families)\n'
         '    if not isinstance(entries, list) or len(entries) != expected_count:\n'
         '        raise ValueError(f"Qwen3.8 NVFP4 overlay requires exactly {expected_count} source tensors")',
@@ -89,7 +91,7 @@ def nvfp4_helper() -> str:
         result,
         '        selected.add(name)\n'
         '        layers.setdefault(int(match.group(1)), set()).add(match.group(2))',
-        '        family = "linear_attention" if match.group(2) == "linear_attn" else "full_attention"\n'
+        '        family = {"linear_attn": "linear_attention", "self_attn": "full_attention", "mlp": "base_routers", "ple": "base_ple"}[match.group(2)]\n'
         '        if family not in families:\n'
         '            raise ValueError(f"Qwen3.8 NVFP4 overlay tensor outside selected families: {name}")\n'
         '        selected.add(name)\n'
@@ -105,6 +107,8 @@ def nvfp4_helper() -> str:
         '    family_contracts = {\n'
         '        "linear_attention": (set(range(48)) - set(range(3, 48, 4)), {"in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"}),\n'
         '        "full_attention": (set(range(3, 48, 4)), {"q_proj", "k_proj", "v_proj", "o_proj"}),\n'
+        '        "base_routers": (set(range(48)), {"gate"}),\n'
+        '        "base_ple": ({1}, {"key_proj", "value_proj"}),\n'
         '    }\n'
         '    for family in families:\n'
         '        expected_layers, projections = family_contracts[family]\n'
@@ -119,13 +123,15 @@ def nvfp4_helper() -> str:
         '    selected_prefixes = {name.removesuffix(".weight") for name in selected}\n'
         '    if any(quantized_layers.get(prefix, {}).get("quant_algo") != "NVFP4" for prefix in selected_prefixes):',
         '    selected_prefixes = {name.removesuffix(".weight") for name in selected}\n'
-        '    attention_policies = {prefix for prefix in quantized_layers if _ROCKET_QWEN38_SELECTED.fullmatch(prefix + ".weight")}\n'
-        '    if attention_policies != selected_prefixes:\n'
-        '        raise ValueError("Qwen3.8 NVFP4 overlay attention policy does not match selected tensors")\n'
+        '    selected_family_policies = {prefix for prefix in quantized_layers if _ROCKET_QWEN38_SELECTED.fullmatch(prefix + ".weight")}\n'
+        '    if selected_family_policies != selected_prefixes:\n'
+        '        raise ValueError("Qwen3.8 NVFP4 overlay family policy does not match selected tensors")\n'
         '    for family, (expected_layers, _) in family_contracts.items():\n'
         '        if family in families:\n'
         '            continue\n'
-        '        module = "linear_attn" if family == "linear_attention" else "self_attn"\n'
+        '        module = {"linear_attention": "linear_attn", "full_attention": "self_attn", "base_routers": "mlp.gate", "base_ple": "ple"}[family]\n'
+        '        if family == "base_ple":\n'
+        '            continue\n'
         '        for layer in expected_layers:\n'
         '            prefix = f"model.language_model.layers.{layer}.{module}"\n'
         '            if not any(fnmatch.fnmatch(prefix, pattern) for pattern in excludes):\n'

@@ -129,6 +129,71 @@ FULL_ATTENTION_REPRO = textwrap.dedent(
     """
 )
 
+ROUTER_PLE_REPRO = textwrap.dedent(
+    """
+    import inspect
+    import json
+    from types import SimpleNamespace
+    import torch
+    import vllm.model_executor.parameter as parameter
+    import vllm.model_executor.layers.linear as linear
+    import vllm.model_executor.layers.quantization.modelopt as modelopt
+    from vllm.config.vllm import set_current_vllm_config
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+    from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+    from vllm.models.qwen3_8_flash_next.nvidia.ple_layer import Qwen3_8FlashNextPLELayer
+
+    parameter.get_tensor_model_parallel_rank = lambda: 0
+    parameter.get_tensor_model_parallel_world_size = lambda: 1
+    linear.get_tensor_model_parallel_rank = lambda: 0
+    linear.get_tensor_model_parallel_world_size = lambda: 1
+    modelopt.init_nvfp4_linear_kernel = lambda **kwargs: SimpleNamespace(input_quant_key=lambda: None)
+    raw = json.load(open('/work/hf_quant_config.json'))
+    quant = raw['quantization']
+    for prefix in (
+        'model.language_model.layers.0.mlp.gate',
+        'model.language_model.layers.1.ple.key_proj',
+        'model.language_model.layers.1.ple.value_proj',
+    ):
+        quant['quantized_layers'][prefix] = {'quant_algo': 'NVFP4'}
+        quant['exclude_modules'] = [item for item in quant['exclude_modules'] if item != prefix]
+    config = modelopt.ModelOptMixedPrecisionConfig.from_config(raw)
+    runtime = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        kernel_config=SimpleNamespace(linear_backend=None),
+        compilation_config=SimpleNamespace(),
+    )
+    contracts = (
+        ('model.language_model.model.layers.0.mlp.gate', 512, 2560),
+        ('model.language_model.model.layers.1.ple.key_proj', 10240, 2560),
+        ('model.language_model.model.layers.1.ple.value_proj', 2560, 2560),
+    )
+    with set_current_vllm_config(runtime):
+        layers = [
+            ReplicatedLinear(k, n, bias=False, quant_config=config, prefix=prefix)
+            for prefix, n, k in contracts
+        ]
+    for layer, (prefix, n, k) in zip(layers, contracts):
+        tensors = [
+            ('weight', torch.empty(n, k // 2, dtype=torch.uint8)),
+            ('weight_scale', torch.ones(n, k // 16, dtype=torch.float8_e4m3fn)),
+            ('weight_scale_2', torch.ones(1, dtype=torch.float32)),
+            ('input_scale', torch.ones(1, dtype=torch.float32)),
+        ]
+        loaded = AutoWeightsLoader(layer).load_weights(tensors)
+        assert type(layer.quant_method).__name__ == 'ModelOptNvFp4LinearMethod', prefix
+        assert loaded == {'weight', 'weight_scale', 'weight_scale_2', 'input_scale'}, (prefix, loaded)
+    ple_source = inspect.getsource(Qwen3_8FlashNextPLELayer.__init__)
+    router_source = inspect.getsource(Qwen3NextSparseMoeBlock.__init__)
+    assert 'self.key_proj = ReplicatedLinear' in ple_source
+    assert 'self.value_proj = ReplicatedLinear' in ple_source
+    assert 'self.gate = ReplicatedLinear' in router_source
+    assert 'quant_config=None' in router_source
+    print('router_ple_nvfp4=ok')
+    """
+)
+
 
 class PackedNvfp4ModuleTest(unittest.TestCase):
     def run_repro(self, source: str):
@@ -153,6 +218,12 @@ class PackedNvfp4ModuleTest(unittest.TestCase):
         result = self.run_repro(FULL_ATTENTION_REPRO)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("full_attention_qkv_nvfp4=ok", result.stdout)
+
+    def test_actual_router_and_ple_linear_types_construct_and_load_nvfp4(self):
+        self.assertTrue(ARTIFACT.is_dir(), f"missing artifact: {ARTIFACT}")
+        result = self.run_repro(ROUTER_PLE_REPRO)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("router_ple_nvfp4=ok", result.stdout)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 import sys
@@ -18,13 +19,29 @@ FULL_SELECTED = re.compile(
     r"^model\.language_model\.layers\.(\d+)\.self_attn\."
     r"(q_proj|k_proj|v_proj|o_proj)$"
 )
+ROUTER_SELECTED = re.compile(
+    r"^model\.language_model\.layers\.(\d+)\.mlp\.gate$"
+)
+PLE_SELECTED = re.compile(
+    r"^model\.language_model\.layers\.(1)\.ple\.(key_proj|value_proj)$"
+)
 FAMILY_PATTERNS = {
     "linear_attention": (SELECTED, 180, "linear_attn"),
     "full_attention": (FULL_SELECTED, 48, "self_attn"),
+    "base_routers": (ROUTER_SELECTED, 48, "mlp"),
+    "base_ple": (PLE_SELECTED, 2, "ple"),
 }
 FAMILY_LAYERS = {
     "linear_attention": set(range(48)) - set(range(3, 48, 4)),
     "full_attention": set(range(3, 48, 4)),
+    "base_routers": set(range(48)),
+    "base_ple": {1},
+}
+REQUIRE_UNSELECTED_EXCLUSION = {"linear_attention", "full_attention", "base_routers"}
+FAMILY_EXCLUSION_MODULE = {
+    "linear_attention": "linear_attn",
+    "full_attention": "self_attn",
+    "base_routers": "mlp.gate",
 }
 
 
@@ -56,21 +73,26 @@ def embed(
             raise ValueError(
                 f"overlay {family} projection coverage is {len(family_selected)}/{expected}"
             )
-        if any(module in value for value in excludes):
-            raise ValueError(f"overlay still excludes {family}")
         selected.update(family_selected)
-    attention_selected = {
+    family_selected = {
         key
         for key in layers
         if any(pattern.fullmatch(key) for pattern, _, _ in FAMILY_PATTERNS.values())
     }
-    if attention_selected != selected:
-        raise ValueError("overlay attention policy does not match selected families")
+    if family_selected != selected:
+        raise ValueError("overlay family policy does not match selected families")
+    if any(
+        any(fnmatch.fnmatch(prefix, pattern) for pattern in excludes)
+        for prefix in selected
+    ):
+        raise ValueError("overlay still excludes a selected family")
     for family in set(FAMILY_PATTERNS) - set(families):
-        _, _, module = FAMILY_PATTERNS[family]
+        if family not in REQUIRE_UNSELECTED_EXCLUSION:
+            continue
+        module = FAMILY_EXCLUSION_MODULE[family]
         for layer in FAMILY_LAYERS[family]:
             prefix = f"model.language_model.layers.{layer}.{module}"
-            if not any(re.fullmatch(re.escape(prefix) + r"\*", value) for value in excludes):
+            if not any(fnmatch.fnmatch(prefix, value) for value in excludes):
                 raise ValueError(f"overlay unselected {family} is not fully excluded")
     if expected_algo not in ("FP8", "NVFP4"):
         raise ValueError(f"unsupported overlay quantization algorithm: {expected_algo}")

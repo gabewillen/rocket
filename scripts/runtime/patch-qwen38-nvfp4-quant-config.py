@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import re
@@ -13,13 +14,18 @@ from pathlib import Path
 
 LINEAR_EXCLUDE = re.compile(r"^model\.language_model\.layers\.(\d+)\.linear_attn\*$")
 FULL_EXCLUDE = re.compile(r"^model\.language_model\.layers\.(\d+)\.self_attn\*$")
+ROUTER_EXCLUDE = re.compile(r"^model\.language_model\.layers\.(\d+)\.mlp\.gate$")
 FAMILY_PROJECTIONS = {
     "linear_attention": ("linear_attn", ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj")),
     "full_attention": ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
+    "base_routers": ("mlp", ("gate",)),
+    "base_ple": ("ple", ("key_proj", "value_proj")),
 }
 FAMILY_EXCLUDES = {
     "linear_attention": (LINEAR_EXCLUDE, set(range(48)) - set(range(3, 48, 4))),
     "full_attention": (FULL_EXCLUDE, set(range(3, 48, 4))),
+    "base_routers": (ROUTER_EXCLUDE, set(range(48))),
+    "base_ple": (None, set()),
 }
 
 
@@ -50,7 +56,8 @@ def patched(config: dict, families=("linear_attention",)) -> dict:
         matched_family = None
         if isinstance(value, str):
             for family in families:
-                match = FAMILY_EXCLUDES[family][0].fullmatch(value)
+                pattern = FAMILY_EXCLUDES[family][0]
+                match = pattern.fullmatch(value) if pattern is not None else None
                 if match:
                     selected[family].append(int(match.group(1)))
                     matched_family = family
@@ -65,11 +72,17 @@ def patched(config: dict, families=("linear_attention",)) -> dict:
                 f"{family} exclude coverage is {len(set(actual))}/{len(expected)}"
             )
         module, projections = FAMILY_PROJECTIONS[family]
-        for layer in sorted(actual):
+        family_layers = actual if actual else ({1} if family == "base_ple" else ())
+        for layer in sorted(family_layers):
             for projection in projections:
                 prefix = f"model.language_model.layers.{layer}.{module}.{projection}"
                 if prefix in layers:
                     raise ValueError(f"quantized layer already exists: {prefix}")
+                if any(
+                    isinstance(pattern, str) and fnmatch.fnmatch(prefix, pattern)
+                    for pattern in kept
+                ):
+                    raise ValueError(f"selected layer remains excluded: {prefix}")
                 layers[prefix] = {"quant_algo": "NVFP4"}
     quant["exclude_modules"] = kept
     return result

@@ -26,11 +26,14 @@ class Nvfp4OverlayLoaderTest(unittest.TestCase):
         self.assertIn('prefix + ".weight_scale": ("F8_E4M3", [n, k // 16])', result)
         self.assertIn('prefix + ".weight_scale_2": ("F32", [1])', result)
         self.assertIn('"linear_attention": 180, "full_attention": 48', result)
+        self.assertIn('"base_routers": 48, "base_ple": 2', result)
         self.assertIn('"full_attention": (set(range(3, 48, 4))', result)
         self.assertIn('"q_proj", "k_proj", "v_proj", "o_proj"', result)
+        self.assertIn('"base_routers": (set(range(48)), {"gate"})', result)
+        self.assertIn('"base_ple": ({1}, {"key_proj", "value_proj"})', result)
         self.assertIn("tensor outside selected families", result)
         self.assertIn("partial {family} family", result)
-        self.assertIn("attention policy does not match selected tensors", result)
+        self.assertIn("family policy does not match selected tensors", result)
         self.assertIn("unselected {family} is not excluded", result)
 
     def test_yields_all_four_tensors_and_preserves_clone(self):

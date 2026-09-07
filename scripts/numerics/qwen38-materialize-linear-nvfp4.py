@@ -28,6 +28,16 @@ FAMILY_SPECS = {
         "layers": set(range(3, 48, 4)),
         "projections": ("q_proj", "k_proj", "v_proj", "o_proj"),
     },
+    "base_routers": {
+        "module": "mlp",
+        "layers": set(range(48)),
+        "projections": ("gate",),
+    },
+    "base_ple": {
+        "module": "ple",
+        "layers": {1},
+        "projections": ("key_proj", "value_proj"),
+    },
 }
 
 
@@ -58,6 +68,10 @@ def input_channel(family: str, layer: int, projection: str) -> str:
     """Map a source projection to its accepted v2 activation-input channel."""
     if family == "linear_attention":
         return FP8.input_channel(layer, projection)
+    if family == "base_routers":
+        return f"layer.{layer}.router.gate.input"
+    if family == "base_ple":
+        return f"layer.{layer}.ple.embedding.output"
     packed = "o_proj" if projection == "o_proj" else "qkv_proj"
     return f"layer.{layer}.full_attn.{packed}.input"
 
@@ -97,6 +111,17 @@ def build_plan(
         ]
         if failures:
             raise MaterializeError("incomplete full-attention trace coverage: " + ", ".join(failures))
+    auxiliary_coverage = {
+        "base_routers": ("router_layers", 48),
+        "base_ple": ("ple_layers", 1),
+    }
+    for family in families:
+        contract = auxiliary_coverage.get(family)
+        if contract is not None and coverage.get(contract[0]) != contract[1]:
+            raise MaterializeError(
+                f"incomplete {family} trace coverage: "
+                f"{contract[0]}={coverage.get(contract[0])!r}/{contract[1]}"
+            )
     tensors = []
     for name, (path, data_start, meta) in headers.items():
         selected = selected_family(name, families)

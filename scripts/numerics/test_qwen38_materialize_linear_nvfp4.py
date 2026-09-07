@@ -32,6 +32,12 @@ class Nvfp4MaterializerTest(unittest.TestCase):
             REAL_SNAPSHOT / "hf_quant_config.json",
             ("linear_attention", "full_attention"),
         )
+        cls.all_eligible_plan = module.build_plan(
+            REAL_SNAPSHOT,
+            REAL_TRACE,
+            REAL_SNAPSHOT / "hf_quant_config.json",
+            ("linear_attention", "full_attention", "base_routers", "base_ple"),
+        )
 
     def test_real_family_and_exact_bytes(self):
         plan = self.plan
@@ -94,6 +100,42 @@ class Nvfp4MaterializerTest(unittest.TestCase):
             and (".linear_attn." in name or ".self_attn." in name)
         ]
         self.assertEqual(len(selected), 228)
+
+    def test_all_eligible_families_are_complete_and_calibrated(self):
+        plan = self.all_eligible_plan
+        self.assertEqual(
+            plan["families"],
+            ("base_ple", "base_routers", "full_attention", "linear_attention"),
+        )
+        self.assertEqual(len(plan["tensors"]), 278)
+        self.assertEqual(sum(x["source_bytes"] for x in plan["tensors"]), 5_556_797_440)
+        self.assertEqual(sum(x["encoded_bytes"] for x in plan["tensors"]), 1_562_851_504)
+        routers = [x for x in plan["tensors"] if x["family"] == "base_routers"]
+        ple = [x for x in plan["tensors"] if x["family"] == "base_ple"]
+        self.assertEqual(len(routers), 48)
+        self.assertEqual({x["layer"] for x in routers}, set(range(48)))
+        self.assertEqual({x["projection"] for x in routers}, {"gate"})
+        self.assertEqual(len(ple), 2)
+        self.assertEqual(
+            {(x["layer"], x["projection"]) for x in ple},
+            {(1, "key_proj"), (1, "value_proj")},
+        )
+        expected_scale = module.FP8.float32(160.0 / module.NVFP4_DENOMINATOR)
+        self.assertEqual({x["input_scale"] for x in ple}, {expected_scale})
+
+    def test_router_family_requires_complete_v2_coverage(self):
+        trace = json.loads(REAL_TRACE.read_text())
+        trace["coverage"]["router_layers"] = 47
+        with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+            path = pathlib.Path(directory) / "trace.json"
+            path.write_text(json.dumps(trace))
+            with self.assertRaisesRegex(module.MaterializeError, "router_layers=47/48"):
+                module.build_plan(
+                    REAL_SNAPSHOT,
+                    path,
+                    REAL_SNAPSHOT / "hf_quant_config.json",
+                    ("base_routers",),
+                )
 
     def test_full_trace_or_family_policy_cannot_be_partial(self):
         trace = json.loads(REAL_TRACE.read_text())
