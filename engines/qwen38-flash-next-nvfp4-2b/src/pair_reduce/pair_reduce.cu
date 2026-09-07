@@ -78,19 +78,22 @@ PairReduce::PairReduce(Transport& transport, OtelStageSink& telemetry)
   if (properties.major != 12 || properties.minor != 1)
     contract_fail("device must be GB10 sm_121");
 
-  cuda_check(cudaHostAlloc(&region_, region_bytes(), cudaHostAllocMapped),
+  cuda_check(cudaHostAlloc(&allocation_, allocation_bytes(),
+                           cudaHostAllocMapped),
              "allocate anonymous pinned region");
-  if (reinterpret_cast<std::uintptr_t>(region_) % kPageBytes != 0) {
-    cudaFreeHost(region_);
-    region_ = nullptr;
-    contract_fail("pinned region is not 65536-byte aligned");
-  }
+  const auto base = reinterpret_cast<std::uintptr_t>(allocation_);
+  const auto aligned = aligned_region_address(base);
+  region_ = reinterpret_cast<void*>(aligned);
   std::memset(region_, 0, region_bytes());
   try {
-    cuda_check(cudaHostGetDevicePointer(&device_region_, region_, 0), "map pinned region");
+    void* device_allocation = nullptr;
+    cuda_check(cudaHostGetDevicePointer(&device_allocation, allocation_, 0),
+               "map pinned allocation");
+    device_region_ = static_cast<std::byte*>(device_allocation) + (aligned - base);
     region_handle_ = transport_.register_region(region_, region_bytes());
   } catch (...) {
-    cudaFreeHost(region_);
+    cudaFreeHost(allocation_);
+    allocation_ = nullptr;
     region_ = nullptr;
     device_region_ = nullptr;
     throw;
@@ -98,9 +101,9 @@ PairReduce::PairReduce(Transport& transport, OtelStageSink& telemetry)
 }
 
 PairReduce::~PairReduce() {
-  if (region_ != nullptr) {
+  if (allocation_ != nullptr) {
     transport_.unregister_region(region_handle_);
-    cudaFreeHost(region_);
+    cudaFreeHost(allocation_);
   }
 }
 

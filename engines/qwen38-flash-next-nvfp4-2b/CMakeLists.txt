@@ -71,10 +71,22 @@ set_target_properties(qwen38_pair_reduce PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-add_library(qwen38_decode_execution STATIC src/decode/execution.cc)
+add_library(qwen38_decode_execution STATIC
+  src/decode/execution.cc
+  src/decode/full_attention_layer.cc
+)
 target_include_directories(qwen38_decode_execution PUBLIC src)
 target_link_libraries(qwen38_decode_execution PUBLIC qwen38_pair_reduce CUDA::cudart)
 target_compile_options(qwen38_decode_execution PRIVATE -Wall -Wextra -Werror)
+
+add_library(qwen38_layer_pair_reduce SHARED src/decode/pair_reduce_c_api.cc)
+target_include_directories(qwen38_layer_pair_reduce PUBLIC src)
+target_link_libraries(qwen38_layer_pair_reduce PRIVATE qwen38_pair_reduce CUDA::cudart)
+target_compile_options(qwen38_layer_pair_reduce PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38_layer_pair_reduce PROPERTIES
+  LINKER_LANGUAGE CUDA
+  CUDA_SEPARABLE_COMPILATION ON
+)
 
 add_library(qwen38_residual_rmsnorm STATIC src/norm/residual_rmsnorm.cu)
 target_include_directories(qwen38_residual_rmsnorm PUBLIC src)
@@ -83,6 +95,17 @@ target_compile_options(qwen38_residual_rmsnorm PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
 )
 set_target_properties(qwen38_residual_rmsnorm PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
+add_library(qwen38_hyperconnection SHARED src/hyperconnection/hyperconnection.cu)
+target_include_directories(qwen38_hyperconnection PUBLIC src)
+target_link_libraries(qwen38_hyperconnection PUBLIC CUDA::cudart CUDA::cublas)
+target_compile_options(qwen38_hyperconnection PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
+)
+set_target_properties(qwen38_hyperconnection PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
   POSITION_INDEPENDENT_CODE ON
 )
@@ -134,6 +157,19 @@ set_target_properties(qwen38-test-decode-execution PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
 )
 add_test(NAME qwen38-decode-pair-reduce-contract COMMAND qwen38-test-decode-execution)
+
+add_executable(qwen38-test-full-attention-layer tests/test_full_attention_layer.cc)
+target_link_libraries(qwen38-test-full-attention-layer PRIVATE qwen38_decode_execution)
+target_compile_options(qwen38-test-full-attention-layer PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-full-attention-layer PROPERTIES LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-full-attention-layer-contract COMMAND qwen38-test-full-attention-layer)
+
+add_executable(qwen38-test-hyperconnection tests/test_hyperconnection.cu)
+target_link_libraries(qwen38-test-hyperconnection PRIVATE qwen38_hyperconnection CUDA::cudart)
+target_compile_options(qwen38-test-hyperconnection PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
+)
+add_test(NAME qwen38-hyperconnection-contract COMMAND qwen38-test-hyperconnection)
 
 add_executable(qwen38-test-residual-rmsnorm tests/test_residual_rmsnorm.cu)
 target_link_libraries(qwen38-test-residual-rmsnorm PRIVATE qwen38_residual_rmsnorm)

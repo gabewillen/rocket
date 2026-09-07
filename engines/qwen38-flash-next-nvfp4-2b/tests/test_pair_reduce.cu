@@ -65,6 +65,8 @@ class FakeTransport final : public pr::Transport {
   int register_region(void* address, std::size_t bytes) override {
     check(address != nullptr && bytes == pr::PairReduce::region_bytes(),
           "registered region contract");
+    check(reinterpret_cast<std::uintptr_t>(address) % pr::kPageBytes == 0,
+          "registered region is not 64 KiB aligned");
     address_ = static_cast<std::byte*>(address);
     operations.push_back("register");
     return 7;
@@ -294,6 +296,19 @@ void test_operation_timeout_bounds() {
   check(!pr::valid_operation_timeout_ms(120'001), "over-ceiling timeout was accepted");
 }
 
+void test_aligned_interior_boundaries() {
+  constexpr std::uintptr_t page = pr::kPageBytes;
+  check(pr::PairReduce::allocation_bytes() ==
+            pr::PairReduce::region_bytes() + page - 1,
+        "aligned allocation extent drift");
+  check(pr::PairReduce::aligned_region_address(page) == page,
+        "aligned base moved");
+  check(pr::PairReduce::aligned_region_address(page + 1) == 2 * page,
+        "first unaligned byte did not advance");
+  check(pr::PairReduce::aligned_region_address(2 * page - 1) == 2 * page,
+        "last unaligned byte did not advance");
+}
+
 }  // namespace
 
 int main() {
@@ -303,6 +318,7 @@ int main() {
     test_topology_and_sequence_drift_fail_closed();
     test_transport_failure_is_typed_and_observed();
     test_operation_timeout_bounds();
+    test_aligned_interior_boundaries();
     std::puts("qwen38 PairReduce: 5 shapes bit-identical; protocol, drift, and timeout contracts passed");
     return 0;
   } catch (const std::exception& error) {

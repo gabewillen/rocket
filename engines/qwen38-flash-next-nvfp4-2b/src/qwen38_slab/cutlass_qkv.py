@@ -298,6 +298,37 @@ class CutlassQkvRuntime:
             1,
         )
 
+    def bind_activations_device(
+        self, source: int, rows: int, stream: ctypes.c_void_p
+    ) -> None:
+        """Copy an HC block input into the stable captured activation buffer."""
+
+        self._require_open()
+        if (
+            isinstance(source, bool) or not isinstance(source, int) or source <= 0
+            or isinstance(rows, bool) or not isinstance(rows, int)
+            or rows not in (1, 2, 4, 8, 16)
+            or not isinstance(stream, ctypes.c_void_p) or not stream.value
+        ):
+            raise DeviceDecodeError("device QKV activation source is invalid")
+        activation = self._device_buffers[-1]
+        total = 16 * PROJECTION_K * 2
+        active = rows * PROJECTION_K * 2
+        self._api.call("cudaMemsetAsync", activation, 0, total, stream)
+        self._api.call(
+            "cudaMemcpyAsync", activation, ctypes.c_void_p(source), active, 3, stream
+        )
+
+    @property
+    def projected_attention_pointer(self) -> int:
+        self._require_open()
+        pointer, elements = ctypes.c_void_p(), ctypes.c_size_t()
+        self._native_call("qwen38_qsa_projected_output", self._qsa_plan,
+                          ctypes.byref(pointer), ctypes.byref(elements))
+        if elements.value != 16 * 2560 or not pointer.value:
+            raise DeviceDecodeError("fixed attention projection pointer drift")
+        return int(pointer.value)
+
     @property
     def qsa_input_buffers(self) -> Mapping[str, tuple[int, int]]:
         """Return stable borrowed buffers for the single CUDA state owner."""

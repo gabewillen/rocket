@@ -371,6 +371,7 @@ class _Cuda13Api:
         self._bind("cudaStreamBeginCapture", [pointer, integer])
         self._bind("cudaStreamEndCapture", [pointer, ctypes.POINTER(pointer)])
         self._bind("cudaMemcpyAsync", [pointer, pointer, size, integer, pointer])
+        self._bind("cudaMemsetAsync", [pointer, integer, size, pointer])
         self._bind("cudaMemcpy", [pointer, pointer, size, integer])
         self._bind(
             "cudaGraphInstantiate", [ctypes.POINTER(pointer), pointer, ulonglong]
@@ -731,6 +732,34 @@ class Cuda13GraphRuntime:
         if self._full_qkv is None or self._staged is not None:
             raise DeviceDecodeError("full QKV activation update is unavailable")
         self._full_qkv.update_activations(activations_bf16)
+
+    def bind_qkv_activation_device(self, source: int, rows: int) -> None:
+        """Stage an HC-produced rank-local block input on the owned stream."""
+
+        self._require_open()
+        if self._full_qkv is None or self._staged is not None:
+            raise DeviceDecodeError("device QKV activation binding is unavailable")
+        self._full_qkv.bind_activations_device(source, rows, self._stream)
+
+    @property
+    def stream_pointer(self) -> int:
+        self._require_open()
+        return int(self._stream.value)
+
+    @property
+    def rank_slab_identity(self) -> tuple[str, int, int]:
+        self._require_open()
+        if self._full_projection is None:
+            raise DeviceDecodeError("full projection slab identity is unavailable")
+        descriptor = self._full_projection.descriptor
+        return descriptor.artifact_key, descriptor.rank, descriptor.layer
+
+    @property
+    def projected_attention_pointer(self) -> int:
+        self._require_open()
+        if self._full_qkv is None or self._active_bank not in (0, 1):
+            raise DeviceDecodeError("no projected attention pointer is published")
+        return self._full_qkv.projected_attention_pointer
 
     @property
     def qsa_input_buffers(self) -> Mapping[str, tuple[int, int]]:

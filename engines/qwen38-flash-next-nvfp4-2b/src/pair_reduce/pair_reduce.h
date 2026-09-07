@@ -81,11 +81,19 @@ class PairReduce final {
 
   static constexpr std::size_t slot_bytes() noexcept { return 2 * kPageBytes; }
   static constexpr std::size_t region_bytes() noexcept { return 2 * slot_bytes(); }
+  static constexpr std::size_t allocation_bytes() noexcept {
+    return region_bytes() + kPageBytes - 1;
+  }
+  static constexpr std::uintptr_t aligned_region_address(
+      std::uintptr_t base) noexcept {
+    return (base + kPageBytes - 1) & ~(kPageBytes - 1);
+  }
   static constexpr std::size_t peer_offset() noexcept { return slot_bytes(); }
 
  private:
   Transport& transport_;
   OtelStageSink& telemetry_;
+  void* allocation_ = nullptr;
   void* region_ = nullptr;
   void* device_region_ = nullptr;
   int region_handle_ = -1;

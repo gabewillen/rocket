@@ -1,0 +1,90 @@
+---
+title: "Layer 3 completes the exact Qwen attention state transition"
+description: "The specialized c16 path completes the exact transition with matching two-rank hashes; three isolated launches ranged from 3.873 to 14.106 ms."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, attention, runtime, kernels, fabric, telemetry]
+verdict: accepted
+rocket: "#kernels"
+---
+
+**Question.** Can one authenticated layer-3 rank-0 slab execute the exact full-attention state transition across TP2?
+
+| setup | |
+| --- | --- |
+| nodes | head (`gx10-5e36`) and peer, one GB10 each |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| Rocket base | `7c5875cd7b5f1c5f49ca1c99e85366e0d9035496` plus this entry's commit |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| rank slab | `a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4` |
+| reference | vLLM `8e685d198`, Apache-2.0, `nvidia/model.py`, `nvidia/ops/hc.py` |
+
+```bash
+python3 scripts/runtime/qwen38-full-attention-layer-smoke.py \
+  --rank 0 --m 16 --bootstrap-host 192.168.100.10 --port 18843 \
+  --timeout-ms 120000 \
+  --rank-slab-artifact /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4 &
+rank0_pid=$!
+ssh glwillen@192.168.100.11 \
+  'cd /home/glwillen/calibration/qwen38-full-attention-layer-live-20260908 && python3 scripts/runtime/qwen38-full-attention-layer-smoke.py --rank 1 --m 16 --bootstrap-host 192.168.100.10 --port 18843 --timeout-ms 120000'
+wait "$rank0_pid"
+```
+
+```json
+{"actual_m":16,"artifact_key":"a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4","attention_graph_nodes":20,"composed_stage_total_ms":3.873094,"graph_batch":16,"hc_cold_composed_effective_gbps":18.141375048347168,"hc_cold_fraction_of_238_gbps_rank_local_roof":0.07622426490902172,"hc_graph_nodes":{"combine_m1":8,"combine_m16":8,"combine_m2":8,"combine_m4":8,"combine_m8":8,"mix_m1":8,"mix_m16":8,"mix_m2":8,"mix_m4":8,"mix_m8":8},"hc_hot_cache_effective_gbps":391.07163259695767,"hc_kernel_ms":{"combine_mix_ms":0.03707840144634247,"mix_ms":0.038961601257324216},"hc_logical_bytes":29737088,"intermediate_hashes":{"attention.projected":"b364748b7a55ec690262e80957be2813abf143ae9b32dda9a8d247b1ed065745","attn_hc.block_input":"1e73ecfe195b475473bc3075d39a4f6b0b78f65b8d81a62d507e110d8af0b145","attn_hc.injection":"663ce462e1a00c39f1c20b0db978142e661cf6622285a413e4a6accbad63265f","mlp_hc.block_input":"9b4e058de274eb42d4727131364e0a67ffb648a7ccd16a102fe4099b128e2181","mlp_hc.injection":"b0cadbf2292c28305e5f84b72203efafc6467933a1f98e380695168cad01be93","mlp_hc.updated_hidden":"eb2258968d3d9c3f8f3d59f59206df988f9f9a7b7d8894ca52b33f441c6b10aa","pair_reduce.output":"fda6cb95529c9e918a1677897a4b26768e2bb359d592058a5e148aac1c7a2398"},"layer":3,"layer_stage_label_cardinality":5,"layer_stage_labels":["activation_bind","attn_hc_mix","mlp_hc_combine_mix","pair_reduce","qsa_attention"],"minimum_layer_effective_gbps":90.4690172766269,"minimum_layer_fraction_of_238_gbps_rank_local_roof":0.38012192133036515,"minimum_layer_logical_bytes":350395008,"otel_spans":12,"pair_reduce_otel":{"failures":0,"metrics":1,"spans":1},"qsa_ms":{"attention_ms":0.283323210477829,"output_projection_ms":0.026715201139450074,"score_ms":1.336723232269287,"select_expand_control_ms":0.45767841339111326,"select_expand_ms":0.2922640085220337,"sparse_attention_control_ms":0.5979167938232421,"sparse_attention_ms":0.2566080093383789,"total_ms":1.9123104512691496},"rank":0,"reference_hashes":"exact_match","result":"qwen38_layer3_full_attention_rank0","stage_ms":{"activation_bind":0.038704,"attn_hc_mix":1.324834,"mlp_hc_combine_mix":0.314352,"pair_reduce":0.127425,"qsa_attention":2.067779}}
+{"m":16,"output_sha256":"fda6cb95529c9e918a1677897a4b26768e2bb359d592058a5e148aac1c7a2398","pair_reduce_otel":{"failures":0,"metrics":1,"spans":1},"rank":1,"result":"qwen38_layer3_full_attention_rank1_zero_peer"}
+```
+
+| stage, fastest launch | latency | unit |
+| --- | ---: | --- |
+| attention HC mix | 1.324834 | ms |
+| activation bind | 0.038704 | ms |
+| QKV, QSA, output projection | 2.067779 | ms |
+| TP2 PairReduce | 0.127425 | ms |
+| MLP HC combine and mix | 0.314352 | ms |
+| summed transition | 3.873094 | ms |
+
+| proof | value | unit |
+| --- | ---: | --- |
+| minimum logical traffic | 350,395,008 | B |
+| rank-local effective bandwidth | 90.469 | GB/s |
+| rank-local 238 GB/s traffic roof | 38.012 | % |
+| three-run transition range | 3.873 to 14.106 | ms |
+| three-run range over mean | 138.99 | % |
+| attention graph | 20 | nodes |
+| each HC graph | 8 | nodes |
+| fixed layer stage labels | 5 | labels |
+
+| isolated launch | transition | minimum traffic rate | rank-local roof |
+| --- | ---: | ---: | ---: |
+| 1 | 4.109077 ms | 85.273 GB/s | 35.829% |
+| 2 | 3.873094 ms | 90.469 GB/s | 38.012% |
+| completion-fence rerun | 14.106405 ms | 24.839 GB/s | 10.437% |
+
+The first live attempt failed before reduction because `cudaHostAlloc` returned a base that was not 64 KiB aligned. PairReduce now overallocates by 65,535 B, registers the aligned interior, maps it by offset from the original allocation, and frees the original base.
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode 99 \
+  engines/qwen38-flash-next-nvfp4-2b/build/qwen38-test-hyperconnection
+compute-sanitizer --tool memcheck --error-exitcode 99 \
+  engines/qwen38-flash-next-nvfp4-2b/build/qwen38-test-pair-reduce
+```
+
+```text
+qwen38_hc buckets=1,2,4,8,16 output_elements=81920 result=match
+========= ERROR SUMMARY: 0 errors
+qwen38 PairReduce: 5 shapes bit-identical; protocol, drift, and timeout contracts passed
+========= ERROR SUMMARY: 0 errors
+```
+
+**Verdict.** Accepted for the exact synthetic layer-3 rank-0 attention transition with a zero rank-1 partial. This is a kernel composition measurement, not full-model throughput.
+
+**Next.**
+
+- Replace the synthetic hidden state and zero peer with consecutive outputs from both authenticated rank slabs.
+- Profile the 1.325 ms cold attention HC mix and the 2.068 ms attention graph before changing either kernel.
+- Bind the pending `updated_hidden`, `next_block_input`, and `next_injection` state to the layer-3 MoE transition.
+
+**Reopen if.**
+
+- A CUDA runtime changes mapped interior pointer or CUDA Graph capture semantics on GB10.
