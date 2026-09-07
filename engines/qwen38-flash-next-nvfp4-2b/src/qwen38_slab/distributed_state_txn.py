@@ -132,7 +132,8 @@ class LocalAuthenticatedState:
     """Local immutable descriptor; payload paths never enter a receipt."""
 
     __slots__ = (
-        "_rank", "_boundary", "_policy_digest", "_policy_state", "_families", "_seal"
+        "_rank", "_boundary", "_commit_sha256", "_policy_digest",
+        "_policy_state", "_families", "_seal"
     )
 
     def __init__(self):
@@ -143,10 +144,14 @@ class LocalAuthenticatedState:
         raise TypeError("local authenticated state is immutable")
 
     @classmethod
-    def _from_verified(cls, rank, boundary, policy_digest, policy_state, families):
+    def _from_verified(
+        cls, rank, boundary, policy_digest, policy_state, families,
+        commit_sha256,
+    ):
         instance = object.__new__(cls)
         object.__setattr__(instance, "_rank", rank)
         object.__setattr__(instance, "_boundary", boundary)
+        object.__setattr__(instance, "_commit_sha256", commit_sha256)
         object.__setattr__(instance, "_policy_digest", policy_digest)
         object.__setattr__(instance, "_policy_state", policy_state)
         object.__setattr__(instance, "_families", MappingProxyType(dict(families)))
@@ -157,6 +162,8 @@ class LocalAuthenticatedState:
     def rank(self): return self._rank
     @property
     def boundary(self): return self._boundary
+    @property
+    def commit_sha256(self): return self._commit_sha256
     @property
     def policy_digest(self): return self._policy_digest
     @property
@@ -426,7 +433,7 @@ class RankStateStore:
             raise StateTransactionError("local whole-rank checksum changed")
         return LocalAuthenticatedState._from_verified(
             self.rank, inspection.boundary, inspection.policy_digest,
-            self._read_policy(inspection), extents,
+            self._read_policy(inspection), extents, inspection.commit_sha256,
         )
 
     def _read_policy(self, inspection):

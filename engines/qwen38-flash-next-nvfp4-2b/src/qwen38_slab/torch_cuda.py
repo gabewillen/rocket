@@ -162,6 +162,8 @@ class TorchCudaRuntime:
         self._stage_views: dict[str, TorchTensor] = {}
         self._stage_backings: dict[str, TorchTensor] = {}
         self._stage_offsets: dict[str, int] = {}
+        self._prepared_boundary: RuntimeBoundary | None = None
+        self._prepared_commit_sha256: str | None = None
 
     @property
     def owner(self) -> TorchStateOwner:
@@ -386,13 +388,15 @@ class TorchCudaRuntime:
         self._stage_backings.clear()
         self._stage_offsets.clear()
 
-    def publish_local(
+    def prepare_local(
         self, staged: Mapping[str, object], boundary: RuntimeBoundary,
-        policy_state: bytes,
+        policy_state: bytes, commit_sha256: str,
     ) -> None:
-        """Publish a complete pointer table and authenticated adaptive policy."""
+        """Transfer a validated pointer table into an inactive owner generation."""
 
         self._require_boundary(boundary)
+        if self._prepared_boundary is not None:
+            raise TorchCudaRuntimeError("inactive CUDA generation already exists")
         if tuple(staged) != STATE_FAMILIES or self._pinned_staging:
             raise TorchCudaRuntimeError("staged pointer table is incomplete or unfenced")
         validated = {}
@@ -403,13 +407,46 @@ class TorchCudaRuntime:
                     f"staged tensor ownership changed for family {family}"
                 )
             validated[family] = self._validated_tensor(tensor, tensor.numel())
-        publish = getattr(self._owner, "publish_state_with_policy", None)
-        if not callable(publish):
-            raise TorchCudaRuntimeError("owner lacks adaptive policy publication")
-        publish(MappingProxyType(validated), policy_state, boundary)
+        prepare = getattr(self._owner, "prepare_state_with_policy", None)
+        if not callable(prepare):
+            raise TorchCudaRuntimeError("owner lacks inactive state preparation")
+        prepare(MappingProxyType(validated), policy_state, boundary, commit_sha256)
         self._stage_views.clear()
         self._stage_backings.clear()
         self._stage_offsets.clear()
+        self._prepared_boundary = boundary
+        self._prepared_commit_sha256 = commit_sha256
+
+    def commit_local(self, boundary: RuntimeBoundary, commit_sha256: str) -> None:
+        """Swap one prepared generation while the two-rank gate stays closed."""
+
+        self._require_prepared(boundary, commit_sha256)
+        self._owner.commit_prepared_state(boundary, commit_sha256)
+
+    def rollback_local(self, boundary: RuntimeBoundary, commit_sha256: str) -> None:
+        """Undo or discard a prepared generation before reopening the gate."""
+
+        self._require_prepared(boundary, commit_sha256)
+        self._owner.rollback_prepared_state(boundary, commit_sha256)
+        if self._gate_boundary is not None:
+            self._owner.open_launch_gate(boundary)
+            self._gate_boundary = None
+        self._prepared_boundary = None
+        self._prepared_commit_sha256 = None
+
+    def finalize_local(self, boundary: RuntimeBoundary, commit_sha256: str) -> None:
+        """Acknowledge the provisional generation without dropping undo state."""
+
+        self._require_prepared(boundary, commit_sha256)
+        self._owner.finalize_prepared_state(boundary, commit_sha256)
+
+    def complete_local(self, boundary: RuntimeBoundary, commit_sha256: str) -> None:
+        """Drop undo state after the two-rank publication commit point."""
+
+        self._require_prepared(boundary, commit_sha256)
+        self._owner._discard_prepared_rollback()
+        self._prepared_boundary = None
+        self._prepared_commit_sha256 = None
 
     def discard(self, staged: tuple[object, ...]) -> None:
         """Release adapter-owned host references; caller releases CUDA tensors."""
@@ -461,6 +498,15 @@ class TorchCudaRuntime:
     def _require_boundary(self, boundary: RuntimeBoundary) -> None:
         if self._gate_boundary is None or self._gate_boundary != boundary:
             raise TorchCudaRuntimeError("Torch launch gate boundary mismatch")
+
+    def _require_prepared(
+        self, boundary: RuntimeBoundary, commit_sha256: str
+    ) -> None:
+        if (
+            self._prepared_boundary != boundary
+            or self._prepared_commit_sha256 != commit_sha256
+        ):
+            raise TorchCudaRuntimeError("inactive CUDA generation does not match")
 
     def _drain_after_copy_failure(self, failure: BaseException) -> None:
         try:

@@ -240,6 +240,37 @@ class TorchCudaTests(unittest.TestCase):
         self.assertEqual(tuple(owner.active_state), STATE_FAMILIES)
         self.assertEqual(owner.upload_and_launch(8).generation, 8)
 
+    def test_inactive_generation_does_not_publish_and_can_rollback(self):
+        decoder = SpecializedDecoder()
+        owner = DecoderStateOwner(rank=0, decoder=decoder, tracer=Tracer())
+        owner.accept_boundary(owner.upload_and_launch(7), self.boundary)
+        owner.hold_launch_gate(self.boundary)
+        runtime = TorchCudaRuntime(
+            owner=owner,
+            compute_streams=self.compute,
+            torch_api=self.torch,
+            device="cuda:0",
+        )
+        runtime.quiesce(self.boundary)
+        staged = {}
+        for family in STATE_FAMILIES:
+            payload = f"inactive:{family}".encode()
+            staged[family] = runtime.allocate_staging(family, len(payload))
+            runtime.copy_host_to_device(staged[family], payload)
+        runtime.finish_transfers()
+        commit = hashlib.sha256(b"durable-two-rank-commit").hexdigest()
+        policy = b'{"schema":"qwen-k0-k7-policy-test"}'
+        runtime.prepare_local(staged, self.boundary, policy, commit)
+        self.assertIsNone(owner.active_state)
+        runtime.commit_local(self.boundary, commit)
+        self.assertEqual(tuple(owner.active_state), STATE_FAMILIES)
+        runtime.rollback_local(self.boundary, commit)
+        self.assertIsNone(owner.active_state)
+        self.assertIsNone(owner.active_policy_state)
+        self.assertEqual(owner.phase, OwnerPhase.CLOSED)
+        owner.release_launch_gate(self.boundary)
+        self.assertEqual(owner.phase, OwnerPhase.OPEN)
+
     def test_padded_plan_uses_eight_backings_for_nine_logical_views(self):
         logical = {
             family: len(self.authenticated.rank_payload(0)[family].accepted)

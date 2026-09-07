@@ -93,6 +93,7 @@ class DistributedStateTests(unittest.TestCase):
             self.assertEqual(tuple(descriptor.families), STATE_FAMILIES)
             self.assertEqual(descriptor.boundary, self.boundary)
             self.assertEqual(descriptor.policy_state, self.policy_state)
+            self.assertEqual(descriptor.commit_sha256, receipts[rank].commit_sha256)
         spans = coordinator.tracer.spans
         self.assertTrue(spans)
         self.assertTrue(all(

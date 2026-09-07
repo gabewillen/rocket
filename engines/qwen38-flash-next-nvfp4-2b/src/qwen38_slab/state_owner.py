@@ -11,7 +11,7 @@ Any failure after those holds faults both owners closed, preventing execution
 through a mixed rank publication.  Cross-rank pointer replacement remains two
 ordered local publications rather than a simultaneous CUDA operation.
 
-OpenTelemetry attributes have finite cardinality: ``phase`` (ten values),
+OpenTelemetry attributes have finite cardinality: ``phase`` (fifteen values),
 ``rank`` (-1, 0, or 1), and ``outcome`` (two values).
 """
 
@@ -21,6 +21,7 @@ import re
 from collections.abc import Mapping
 from contextlib import contextmanager
 from enum import Enum
+from threading import RLock
 from types import MappingProxyType
 from typing import Iterator, Protocol, runtime_checkable
 
@@ -126,6 +127,16 @@ class DecoderStateOwner:
         self._coordinator_hold = False
         self._active_state: Mapping[str, object] | None = None
         self._active_policy_state: bytes | None = None
+        self._active_commit_sha256: str | None = None
+        self._prepared_state: Mapping[str, object] | None = None
+        self._prepared_policy_state: bytes | None = None
+        self._prepared_commit_sha256: str | None = None
+        self._rollback_state: Mapping[str, object] | None = None
+        self._rollback_policy_state: bytes | None = None
+        self._rollback_commit_sha256: str | None = None
+        self._prepared_committed = False
+        self._publication_lock = RLock()
+        self._publication_lock_bound = False
 
     @property
     def rank(self) -> int:
@@ -151,48 +162,64 @@ class DecoderStateOwner:
     def active_policy_state(self) -> bytes | None:
         return self._active_policy_state
 
+    @property
+    def active_commit_sha256(self) -> str | None:
+        return self._active_commit_sha256
+
     def upload_and_launch(self, prepared: PreparedDecode) -> DevicePublication:
         """Launch only while open; success awaits explicit boundary acceptance."""
 
-        with self._observed("launch"):
-            self._require_open()
-            publication = self._decoder.upload_and_launch(prepared)
-            if (
-                not isinstance(publication, DevicePublication)
-                or publication is not self._decoder.publication
-            ):
-                self._fault()
-                raise DecoderStateOwnerError(
-                    "decoder launch returned a non-current publication"
-                )
-            self._accepted_boundary = None
-            return publication
+        with self._publication_lock:
+            with self._observed("launch"):
+                self._require_open()
+                publication = self._decoder.upload_and_launch(prepared)
+                if (
+                    not isinstance(publication, DevicePublication)
+                    or publication is not self._decoder.publication
+                ):
+                    self._fault()
+                    raise DecoderStateOwnerError(
+                        "decoder launch returned a non-current publication"
+                    )
+                self._accepted_boundary = None
+                return publication
 
     def accept_boundary(
         self, publication: DevicePublication, boundary: RuntimeBoundary
     ) -> None:
         """Authenticate the current decoder publication as scheduler-accepted."""
 
-        with self._observed("accept"):
-            self._require_open()
-            _validate_boundary(boundary)
-            if (
-                not isinstance(publication, DevicePublication)
-                or publication is not self._decoder.publication
-                or publication.generation != boundary.generation_epoch
-                or self._decoder.phase is not DevicePhase.IDLE
-            ):
-                raise DecoderStateOwnerError(
-                    "accepted boundary does not describe the current decoder publication"
-                )
-            if (
-                self._accepted_boundary is not None
-                and self._accepted_boundary != boundary
-            ):
-                raise DecoderStateOwnerError(
-                    "current decoder publication already has another boundary"
-                )
-            self._accepted_boundary = boundary
+        with self._publication_lock:
+            with self._observed("accept"):
+                self._require_open()
+                _validate_boundary(boundary)
+                if (
+                    not isinstance(publication, DevicePublication)
+                    or publication is not self._decoder.publication
+                    or publication.generation != boundary.generation_epoch
+                    or self._decoder.phase is not DevicePhase.IDLE
+                ):
+                    raise DecoderStateOwnerError(
+                        "accepted boundary does not describe the current decoder publication"
+                    )
+                if (
+                    self._accepted_boundary is not None
+                    and self._accepted_boundary != boundary
+                ):
+                    raise DecoderStateOwnerError(
+                        "current decoder publication already has another boundary"
+                    )
+                self._accepted_boundary = boundary
+
+    def _bind_publication_lock(self, lock) -> None:
+        """Bind both TP ranks to the coordinator's decoder-admission lock."""
+
+        if not hasattr(lock, "acquire") or not hasattr(lock, "release"):
+            raise DecoderStateOwnerError("publication lock contract is invalid")
+        if self._publication_lock_bound:
+            raise DecoderStateOwnerError("publication lock is already bound")
+        self._publication_lock = lock
+        self._publication_lock_bound = True
 
     def hold_launch_gate(self, boundary: RuntimeBoundary) -> None:
         """Hold the matching rank gate for an entire coordinator restore."""
@@ -244,13 +271,13 @@ class DecoderStateOwner:
                 )
             self._active_state = MappingProxyType(copied)
 
-    def publish_state_with_policy(
+    def prepare_state_with_policy(
         self, staged: Mapping[str, object], policy_state: bytes,
-        boundary: RuntimeBoundary,
+        boundary: RuntimeBoundary, commit_sha256: str,
     ) -> None:
-        """Publish pointers and canonical policy while the same gate is closed."""
+        """Validate one inactive generation without changing live pointers."""
 
-        with self._observed("publish"):
+        with self._observed("prepare_state"):
             if self._phase is OwnerPhase.FAULTED:
                 raise DecoderStateOwnerError("decoder launch gate is faulted")
             if not self._runtime_hold or self._closed_boundary != boundary:
@@ -268,8 +295,72 @@ class DecoderStateOwner:
                 )
             if not isinstance(policy_state, bytes) or not 0 < len(policy_state) <= 65_536:
                 raise DecoderStateOwnerError("canonical adaptive policy state is required")
-            self._active_state = MappingProxyType(copied)
-            self._active_policy_state = policy_state
+            if not isinstance(commit_sha256, str) or not _HEX_256.fullmatch(commit_sha256):
+                raise DecoderStateOwnerError("durable commit digest is required")
+            if self._prepared_state is not None:
+                raise DecoderStateOwnerError("inactive state generation already exists")
+            self._prepared_state = MappingProxyType(copied)
+            self._prepared_policy_state = policy_state
+            self._prepared_commit_sha256 = commit_sha256
+            self._prepared_committed = False
+
+    def commit_prepared_state(
+        self, boundary: RuntimeBoundary, commit_sha256: str
+    ) -> None:
+        """Swap the validated inactive generation while retaining rollback state."""
+
+        with self._observed("commit_state"):
+            self._require_prepared(boundary, commit_sha256)
+            if self._prepared_committed:
+                raise DecoderStateOwnerError("inactive state generation already committed")
+            self._rollback_state = self._active_state
+            self._rollback_policy_state = self._active_policy_state
+            self._rollback_commit_sha256 = self._active_commit_sha256
+            self._active_state = self._prepared_state
+            self._active_policy_state = self._prepared_policy_state
+            self._active_commit_sha256 = self._prepared_commit_sha256
+            self._prepared_committed = True
+
+    def rollback_prepared_state(
+        self, boundary: RuntimeBoundary, commit_sha256: str
+    ) -> None:
+        """Discard or undo one inactive generation before the gate can reopen."""
+
+        with self._observed("rollback_state"):
+            self._require_prepared(boundary, commit_sha256)
+            if self._prepared_committed:
+                self._active_state = self._rollback_state
+                self._active_policy_state = self._rollback_policy_state
+                self._active_commit_sha256 = self._rollback_commit_sha256
+            self._clear_prepared()
+
+    def finalize_prepared_state(
+        self, boundary: RuntimeBoundary, commit_sha256: str
+    ) -> None:
+        """Acknowledge a committed generation while retaining rollback state."""
+
+        with self._observed("finalize_state"):
+            self._require_prepared(boundary, commit_sha256)
+            if not self._prepared_committed:
+                raise DecoderStateOwnerError("inactive state generation is not committed")
+
+    def validate_launch_gate_release(self, boundary: RuntimeBoundary) -> None:
+        """Preflight a coordinator release before the global commit point."""
+
+        with self._observed("validate_release"):
+            self._require_launch_gate_release(boundary)
+
+    def _commit_launch_gate_release(self, boundary: RuntimeBoundary) -> None:
+        """Apply a prevalidated release without a remaining failure branch."""
+
+        self._coordinator_hold = False
+        self._closed_boundary = None
+        self._phase = OwnerPhase.OPEN
+
+    def _discard_prepared_rollback(self) -> None:
+        """Drop undo state after the coordinator's global commit point."""
+
+        self._clear_prepared()
 
     def open_launch_gate(self, boundary: RuntimeBoundary) -> None:
         """Release the runtime hold; a coordinator hold may remain active."""
@@ -288,19 +379,8 @@ class DecoderStateOwner:
         """Release a successful coordinator hold after both ranks restore."""
 
         with self._observed("release"):
-            if self._phase is OwnerPhase.FAULTED:
-                raise DecoderStateOwnerError("decoder launch gate is faulted")
-            if (
-                not self._coordinator_hold
-                or self._runtime_hold
-                or self._closed_boundary != boundary
-            ):
-                raise DecoderStateOwnerError(
-                    "coordinator launch gate boundary does not match"
-                )
-            self._coordinator_hold = False
-            self._closed_boundary = None
-            self._phase = OwnerPhase.OPEN
+            self._require_launch_gate_release(boundary)
+            self._commit_launch_gate_release(boundary)
 
     def fault_closed(self, boundary: RuntimeBoundary) -> None:
         """Permanently reject decoder launches after uncertain rank publication."""
@@ -331,6 +411,40 @@ class DecoderStateOwner:
             raise DecoderStateOwnerError(
                 "decoder accepted boundary does not match the current publication"
             )
+
+    def _require_prepared(
+        self, boundary: RuntimeBoundary, commit_sha256: str
+    ) -> None:
+        if (
+            self._phase is OwnerPhase.FAULTED
+            or self._closed_boundary != boundary
+            or not (self._runtime_hold or self._coordinator_hold)
+            or self._prepared_state is None
+            or self._prepared_policy_state is None
+            or self._prepared_commit_sha256 != commit_sha256
+        ):
+            raise DecoderStateOwnerError("inactive state generation does not match")
+
+    def _require_launch_gate_release(self, boundary: RuntimeBoundary) -> None:
+        if self._phase is OwnerPhase.FAULTED:
+            raise DecoderStateOwnerError("decoder launch gate is faulted")
+        if (
+            not self._coordinator_hold
+            or self._runtime_hold
+            or self._closed_boundary != boundary
+        ):
+            raise DecoderStateOwnerError(
+                "coordinator launch gate boundary does not match"
+            )
+
+    def _clear_prepared(self) -> None:
+        self._prepared_state = None
+        self._prepared_policy_state = None
+        self._prepared_commit_sha256 = None
+        self._rollback_state = None
+        self._rollback_policy_state = None
+        self._rollback_commit_sha256 = None
+        self._prepared_committed = False
 
     def _fault(self) -> None:
         self._runtime_hold = False
