@@ -1,0 +1,114 @@
+---
+title: "The Qwen3.8 state plan counts 2,088,755,200 CUDA bytes per rank-stream"
+description: "The pinned TP2, MTP3, 262144-context allocation plan accounts for 2,022,044,096 logical bytes and 2,088,755,200 CUDA bytes per rank-stream."
+date: 2026-09-07
+author: "agent"
+categories: [research, memory, cache, attention]
+verdict: accepted
+rocket: "#state"
+---
+
+**Question.** What state payload and allocator footprint must each TP rank hold
+for 16 Qwen3.8 streams at the 262144-token context cap?
+
+| setup | |
+| --- | --- |
+| node | `gx10-5e36`, GB10 |
+| kernel | `6.17.13-rocket64k`, 64 KiB pages |
+| Rocket commit | `da33f20e28a932822a12219956cd73787575f488` |
+| checkpoint | [`nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/tree/fc694b54fb0174e0913e6adf86691ef85a4ead47) |
+| checkpoint config SHA-256 | `deef67a61f3311faf051b23dc4192f442c7fee4f9cd2f38cbcbe4da55c763a80` |
+| vLLM image | `vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8` |
+| serving | TP2, c16, MTP3, FP8 E4M3 KV, BF16 convolution, FP32 recurrent state |
+| allocation | requested block 16 tokens, effective block 3200 tokens, 82 pages per sequence |
+| planner | `scripts/memory/qwen38-state-capacity.py` |
+| committed plan | `scripts/memory/qwen38-state-capacity-plan.json`, SHA-256 `ff02fcfd05895dd840cae244319424e014b2c965614671d922a68e3bdf75071e` |
+
+This model-specific ledger joins target and MTP QSA caches with GDN and PLE
+state across four vLLM cache specifications. General KV summaries omit these
+families and the shared aligned GDN allocation.
+
+| pinned vLLM identity | SHA-256 |
+| --- | --- |
+| image digest | `fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8` |
+| image ID | `d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| `kv_cache_interface.py` | `7452e823367960daf73520f80824aee0d5ed8ad2731d0404705695814d3bcff7` |
+| `model.py` | `d900cd6fcacba18f460e00b3f018fbf36fbe6ecc310692b6adb1451f7f53cc17` |
+| `mtp.py` | `7735cee47d0d1e4776bebd30d907e4a62160409ce4ef2d65611559f8d58af431` |
+| `qsa_cache.py` | `e3460b06cd7ed309e47ad5dfd3d4250890539b912385503133bd98a003f73ba8` |
+| `mamba_utils.py` | `e168adae4ac9a951f2566aa5fd84a4615aed97d1fbca3787be9acf9cc192c3eb` |
+| `platform_interface.py` | `7109cdf97649c1b7a3e471fc98df06be2eacb77501df94016a44f1327b01f55d` |
+| `kv_cache_utils.py` | `f6643bad29b7b3cb044482b6736a042afa91a4f43a11f034317a8e8029d3a8a4` |
+| `flash_attn.py` | `6bcd9c496e25abffef257aebb8a5efd332343af3da302560596aa9b2e2815935` |
+
+```bash
+CHECKPOINT=/home/glwillen/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47
+python3 scripts/memory/qwen38-state-capacity.py \
+  --config "$CHECKPOINT/config.json" \
+  --revision fc694b54fb0174e0913e6adf86691ef85a4ead47 \
+  --context 262144 --concurrency 16 --tensor-parallel-size 2 \
+  --block-size 16 --kernel-block-alignment 16 \
+  --kv-cache-dtype fp8_e4m3 --mamba-cache-dtype bfloat16 \
+  --mamba-ssm-cache-dtype float32 --mamba-cache-mode align \
+  --mtp-speculative-tokens 3 --host-page-bytes 65536 \
+  | jq -r '(.families[] | [.id, .logical_bytes_per_stream, .cuda_allocated_bytes_per_stream, .cuda_allocated_bytes_c16, .nvme_padded_bytes_per_stream] | @tsv), ("TOTAL\t\(.totals_per_rank.logical_bytes_per_stream)\t\(.totals_per_rank.cuda_allocated_bytes_per_stream)\t\(.totals_per_rank.cuda_allocated_bytes_c16)\t\(.totals_per_rank.nvme_padded_bytes_c16)")'
+
+python3 -m unittest scripts/memory/test_qwen38_state_capacity.py
+```
+
+```text
+target.full_attention.kv  1610612736  1612185600  25794969600  1610612736
+target.qsa.raw            26880       2457600     39321600     65536
+target.qsa.compressed     201326592   201523200   3224371200   201326592
+target.linear.conv        2211840     117964800   1887436800   2228224
+target.linear.recurrent   56623104    117964800   1887436800   56623104
+target.ple.conv           245760      3276800     52428800     262144
+mtp.full_attention.kv     134217728   134348800   2149580800   134217728
+mtp.qsa.raw               2240        204800      3276800      65536
+mtp.qsa.compressed        16777216    16793600    268697600    16777216
+TOTAL                     2022044096  2088755200  33420083200  32354861056
+
+......
+----------------------------------------------------------------------
+Ran 6 tests in 0.001s
+
+OK
+```
+
+| family | layers | dtype | shape/layer/stream | logical B/stream | CUDA B/stream | counted in CUDA total | 64 KiB NVMe B/stream |
+| --- | ---: | --- | --- | ---: | ---: | --- | ---: |
+| target full-attention KV | 12 | FP8 E4M3 | 262144 x 1 x 512 | 1,610,612,736 | 1,612,185,600 | yes | 1,610,612,736 |
+| target QSA raw ring | 12 | BF16 | 8 x 1 x 140 | 26,880 | 2,457,600 | yes | 65,536 |
+| target QSA compressed | 12 | BF16 | 65536 x 1 x 128 | 201,326,592 | 201,523,200 | yes | 201,326,592 |
+| target linear convolution | 36 | BF16 | 6 x 5120 | 2,211,840 | 117,964,800 | yes | 2,228,224 |
+| target linear recurrent | 36 | FP32 | 24 x 128 x 128 | 56,623,104 | 117,964,800 | shared with convolution | 56,623,104 |
+| target PLE convolution | 1 | BF16 | 12 x 10240 | 245,760 | 3,276,800 | yes | 262,144 |
+| MTP full-attention KV | 1 | FP8 E4M3 | 262144 x 1 x 512 | 134,217,728 | 134,348,800 | yes | 134,217,728 |
+| MTP QSA raw ring | 1 | BF16 | 8 x 1 x 140 | 2,240 | 204,800 | yes | 65,536 |
+| MTP QSA compressed | 1 | BF16 | 65536 x 1 x 128 | 16,777,216 | 16,793,600 | yes | 16,777,216 |
+
+| exact per-rank total | bytes | unit |
+| --- | ---: | --- |
+| logical state per stream | 2,022,044,096 | B/stream |
+| CUDA allocation per stream | 2,088,755,200 | B/stream |
+| CUDA allocation at c16 | 33,420,083,200 | B |
+| 64 KiB NVMe records at c16 | 32,354,861,056 | B |
+
+The recurrent and convolution tensors share one padded GDN Mamba page, so the
+CUDA total counts their 117,964,800-byte allocation once. Byte counts are
+deterministic; run-to-run variance does not apply.
+
+**Verdict.** Accepted as the byte-counted allocation plan at TP2, MTP3, c16,
+and 262144 tokens. The plan covers every pinned target, QSA, GDN, PLE, and MTP
+state family per rank. Model-resident allocation, engine binding, and atomic
+restore parity remain unproven.
+
+**Next.**
+
+- allocate every listed tensor inside one model-resident rank and record CUDA allocator deltas
+- bind every allocation to the serving engine
+- prove atomic evict and restore parity at one shared accepted-token boundary
+
+**Reopen if.**
+
+- NVIDIA publishes a checkpoint revision with different state geometry, or an upstream vLLM release changes QSA, Mamba, PLE, or MTP cache allocation semantics
