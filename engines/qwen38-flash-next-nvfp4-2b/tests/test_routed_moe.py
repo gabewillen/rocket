@@ -24,8 +24,10 @@ from qwen38_slab.routed_moe import (
     compact_owner_pairs,
     shared_intermediate_bounds,
     selector_for,
+    validate_external_mtp_nvfp4,
 )
 from qwen38_slab.contract import PINNED_CONTRACT
+from qwen38_slab.mtp_source import ExternalMtpSource, MTP_NONEXPERT_TENSORS
 
 
 class Tensor:
@@ -83,6 +85,17 @@ def descriptor(rank=0, layer=0):
 
 
 class RoutedMoeGraphTests(unittest.TestCase):
+    def test_external_mtp_candidate_requires_identical_nonexperts(self):
+        hashes = {name: "a" * 64 for name in MTP_NONEXPERT_TENSORS}
+        source = ExternalMtpSource(
+            "b" * 64, PINNED_CONTRACT.revision, 0,
+            "modelopt_nvfp4_group16_cutlass_sm121_sfb", (0, 255),
+            "c" * 64, hashes, "d" * 64,
+        )
+        self.assertIsNone(validate_external_mtp_nvfp4(source))
+        with self.assertRaisesRegex(RoutedMoeGraphError, "source health"):
+            validate_external_mtp_nvfp4(replace(source, nonexpert_differences=("mtp.fc_hidden.weight",)))
+
     def test_production_graph_exists_for_every_immutable_bucket(self):
         self.assertEqual(
             BUCKET_SELECTORS,

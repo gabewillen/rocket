@@ -21,6 +21,7 @@ from types import MappingProxyType
 from typing import Mapping, Protocol
 
 from .contract import MODEL_NVFP4_ABI, PINNED_CONTRACT, SCHEMA, canonical_bytes
+from .mtp_source import ExternalMtpSource
 
 HIDDEN = 2_560
 INTERMEDIATE = 640
@@ -190,6 +191,15 @@ class FlashInferRoutedMoeBackend:
             selector = BUCKET_SELECTORS[m]
             with self._forced_selector(selector):
                 self._wrappers[(m, selector)] = self._new_wrapper(m)
+
+    @classmethod
+    def for_external_mtp(
+        cls, source: ExternalMtpSource, weights: FlashInferMoeWeights, *, torch_api=None
+    ) -> "FlashInferRoutedMoeBackend":
+        """Bind a source-healthy hibrid47-layout candidate to the b12x kernel."""
+
+        validate_external_mtp_nvfp4(source)
+        return cls(weights, torch_api=torch_api)
 
     def _validate_weights(self) -> None:
         w = self._weights
@@ -365,6 +375,19 @@ def shared_intermediate_bounds(rank: int) -> tuple[int, int]:
         raise RoutedMoeGraphError("shared expert rank is outside TP2")
     width = SHARED_INTERMEDIATE // 2
     return rank * width, (rank + 1) * width
+
+
+def validate_external_mtp_nvfp4(source: ExternalMtpSource) -> None:
+    """Fail closed before an optional MTP expert overlay reaches CUDA."""
+
+    if (
+        not isinstance(source, ExternalMtpSource)
+        or source.expert_abi != MODEL_NVFP4_ABI
+        or source.trained_head_distinct
+        or source.nonexpert_differences
+        or len(source.nonexpert_sha256) != 29
+    ):
+        raise RoutedMoeGraphError("external MTP NVFP4 source health changed")
 
 
 def materialize_flashinfer_weights(
