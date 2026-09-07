@@ -41,7 +41,10 @@ def parse_stream(lines):
             record = json.loads(line[marker + len(V2_PREFIX) :])
         except json.JSONDecodeError as error:
             raise ValueError(f"invalid v2 telemetry JSON: {error}") from error
-        if record.get("schema") != "rocket.qwen38.activation-telemetry.v2":
+        if record.get("schema") not in {
+            "rocket.qwen38.activation-telemetry.v2",
+            "rocket.qwen38.activation-telemetry.v3",
+        }:
             raise ValueError(f"unsupported telemetry schema: {record.get('schema')!r}")
         channel = record.get("channel")
         call = record.get("call")

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import importlib.util
-import io
 import json
 import subprocess
 import sys
@@ -45,7 +44,7 @@ class PatchTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             patched = model_py.read_text()
-        self.assertIn('rocket.qwen38.activation-telemetry.v2', patched)
+        self.assertIn('rocket.qwen38.activation-telemetry.v3', patched)
         self.assertIn('ROCKET_QWEN38_LINEAR_LOAD', patched)
         self.assertIn('getattr(value, "shard_id", None)', patched)
         self.assertIn('type(self.quant_method).__name__', patched)
@@ -57,6 +56,68 @@ class PatchTests(unittest.TestCase):
         self.assertNotIn("ROCKET_QWEN38_NVFP4_ROUTER_V1", patched)
         self.assertIn("chunk_gated_delta_rule", patched)
         compile(patched, "model.py", "exec")
+
+    def test_pinned_config_drives_full_top10_router_cohort_without_backend_top_k(self):
+        patch_spec = importlib.util.spec_from_file_location("telemetry_patcher", PATCHER)
+        patcher = importlib.util.module_from_spec(patch_spec)
+        assert patch_spec.loader is not None
+        patch_spec.loader.exec_module(patcher)
+        config_path = Path(
+            "/home/glwillen/.cache/huggingface/hub/"
+            "models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/"
+            "fc694b54fb0174e0913e6adf86691ef85a4ead47/config.json"
+        )
+        harness = r'''
+import json
+import os
+import sys
+import torch
+''' + patcher.HELPER + r'''
+config = json.load(open(sys.argv[1]))["text_config"]
+class Gate:
+    def register_forward_pre_hook(self, _hook): pass
+    def register_forward_hook(self, hook): self.hook = hook
+gate = Gate()
+mlp = type("Mlp", (), {"gate": gate, "experts": object()})()
+layer = type("Layer", (), {
+    "linear_attn": None, "self_attn": None, "ple": None, "mlp": mlp,
+})()
+model = type("Model", (), {
+    "layers": [layer], "config": type("Config", (), config)(),
+})()
+os.environ.update({
+    "ROCKET_NVFP4_CALIBRATE": "1",
+    "ROCKET_ROUTER_COHORT": "contract-c2-k0",
+    "ROCKET_ROUTER_RANK": "0",
+    "ROCKET_ROUTER_SEQUENCES": "2",
+    "ROCKET_ROUTER_VERIFY_WIDTH": "1",
+})
+_rocket_install_activation_telemetry(model)
+gate.hook(None, (), torch.arange(1024).reshape(2, 512))
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            harness_path = Path(directory) / "contract.py"
+            harness_path.write_text(harness)
+            result = subprocess.run(
+                [
+                    "docker", "run", "--rm", "--entrypoint", "python3",
+                    "-v", f"{harness_path}:/test/contract.py:ro",
+                    "-v", f"{config_path}:/test/config.json:ro",
+                    "vllm/vllm-openai:qwen38-flash-next",
+                    "/test/contract.py", "/test/config.json",
+                ],
+                text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout.split("\t", 1)[1])
+        self.assertEqual(payload["schema"], "rocket.qwen38.activation-telemetry.v3")
+        self.assertEqual(payload["route_top_k"], 10)
+        self.assertEqual(payload["selected_expert_count"], 20)
+        self.assertEqual(payload["cohort_call"], 1)
+        self.assertEqual(len(payload["route_rows"]), 2)
+        self.assertEqual([len(row["expert_ids"]) for row in payload["route_rows"]], [10, 10])
+        self.assertEqual(payload["route_rows"][0]["position_kind"], "target")
+        self.assertEqual(payload["cohort"], "contract-c2-k0")
 
     def test_refuses_source_drift(self):
         with tempfile.TemporaryDirectory() as directory:

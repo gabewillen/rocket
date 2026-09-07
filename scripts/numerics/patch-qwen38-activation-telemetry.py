@@ -9,7 +9,7 @@ IMPORT_PATCH = "from itertools import islice\nimport json\nimport os\n\nimport t
 CLASS_ANCHOR = "class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):\n"
 HELPER = r'''_ROCKET_CALIBRATION_MAXIMA = {}
 _ROCKET_TELEMETRY_CALLS = {}
-_ROCKET_TELEMETRY_SCHEMA = "rocket.qwen38.activation-telemetry.v2"
+_ROCKET_TELEMETRY_SCHEMA = "rocket.qwen38.activation-telemetry.v3"
 
 
 def _rocket_install_linear_load_trace():
@@ -98,6 +98,61 @@ def _rocket_summary(value):
     }
 
 
+def _rocket_router_cohort(tensor, top_k):
+    expected_top_k = 10
+    if top_k != expected_top_k:
+        raise RuntimeError(
+            f"Qwen3.8 router top-k contract changed: got {top_k}, "
+            f"expected {expected_top_k}"
+        )
+    rows = int(tensor.shape[0])
+    sequences = int(os.getenv("ROCKET_ROUTER_SEQUENCES", "0"))
+    verify_width = int(os.getenv("ROCKET_ROUTER_VERIFY_WIDTH", "0"))
+    if sequences < 1 or verify_width < 1:
+        raise RuntimeError(
+            "router cohort sequences and verify_width must both be positive"
+        )
+    if sequences * verify_width != rows:
+        return None
+    rank = int(os.getenv("ROCKET_ROUTER_RANK", "-1"))
+    if rank not in (0, 1):
+        raise RuntimeError(f"router cohort rank must be 0 or 1, got {rank}")
+    cohort = os.getenv("ROCKET_ROUTER_COHORT", "")
+    if not cohort:
+        raise RuntimeError("ROCKET_ROUTER_COHORT is required for router telemetry")
+
+    logits = tensor.detach().float()
+    probabilities = torch.softmax(logits, dim=-1)
+    weights, selected = torch.topk(probabilities, top_k, dim=-1)
+    weights = weights / weights.sum(dim=-1, keepdim=True)
+    selected_rows = selected.cpu().tolist()
+    weight_rows = weights.cpu().tolist()
+    route_rows = []
+    for row, (expert_ids, route_weights) in enumerate(
+        zip(selected_rows, weight_rows)
+    ):
+        position = row % verify_width
+        route_rows.append(
+            {
+                "row": row,
+                "sequence": row // verify_width,
+                "position": position,
+                "position_kind": "target" if position == 0 else "speculative",
+                "expert_ids": [int(expert_id) for expert_id in expert_ids],
+                "weights": [float(weight) for weight in route_weights],
+            }
+        )
+    return {
+        "cohort": cohort,
+        "rank": rank,
+        "sequences": sequences,
+        "verify_width": verify_width,
+        "route_top_k": top_k,
+        "route_layout": "sequence_major",
+        "route_rows": route_rows,
+    }
+
+
 def _rocket_emit(name, kind, value, *, output_index=None, top_k=None):
     count = _ROCKET_TELEMETRY_CALLS.get(name, 0) + 1
     _ROCKET_TELEMETRY_CALLS[name] = count
@@ -105,8 +160,10 @@ def _rocket_emit(name, kind, value, *, output_index=None, top_k=None):
         12,
         max(1, int(os.getenv("ROCKET_NVFP4_MAX_EMISSIONS", "4"))),
     )
-    # Emit at calls 1, 2, 4, ... and then stop. Output is bounded per channel.
-    if count & (count - 1) or count.bit_length() > max_emissions:
+    # Non-router channels emit at calls 1, 2, 4, ... and then stop. Router
+    # cohorts instead retain the first bounded set of exact-shape verifier
+    # calls, skipping prefill and draft-only forwards.
+    if top_k is None and (count & (count - 1) or count.bit_length() > max_emissions):
         return
     tensor = _rocket_tensor(value, output_index)
     summary = _rocket_summary(tensor)
@@ -120,9 +177,23 @@ def _rocket_emit(name, kind, value, *, output_index=None, top_k=None):
         **summary,
     }
     if top_k is not None and tensor.ndim > 0 and tensor.shape[-1] > 0:
-        selected = torch.topk(
-            tensor.detach().float(), min(64, top_k, tensor.shape[-1]), dim=-1
-        ).indices.reshape(-1)
+        router_cohort = _rocket_router_cohort(tensor, top_k)
+        if router_cohort is None:
+            return
+        cohort_key = (name, router_cohort["cohort"])
+        cohort_count = _ROCKET_TELEMETRY_CALLS.get(cohort_key, 0) + 1
+        _ROCKET_TELEMETRY_CALLS[cohort_key] = cohort_count
+        router_limit = min(
+            16,
+            max(1, int(os.getenv("ROCKET_ROUTER_MAX_COHORTS", "2"))),
+        )
+        if cohort_count > router_limit:
+            return
+        selected = torch.tensor(
+            [expert_id for row in router_cohort["route_rows"] for expert_id in row["expert_ids"]],
+            dtype=torch.int64,
+            device=tensor.device,
+        )
         expert_counts = torch.bincount(selected, minlength=tensor.shape[-1])
         ranked_counts, ranked_ids = torch.topk(
             expert_counts, min(16, expert_counts.numel())
@@ -139,6 +210,8 @@ def _rocket_emit(name, kind, value, *, output_index=None, top_k=None):
             for selections, expert_id in ranked
         ]
         record["selected_expert_count"] = int(selected.numel())
+        record["cohort_call"] = cohort_count
+        record.update(router_cohort)
     print("ROCKET_NVFP4_TELEMETRY\t" + json.dumps(record, sort_keys=True), flush=True)
 
 
@@ -180,6 +253,11 @@ def _rocket_hook_projection(module, name, kind, *, legacy=False):
 def _rocket_install_activation_telemetry(model):
     if os.getenv("ROCKET_NVFP4_CALIBRATE") != "1":
         return
+    top_k = int(getattr(model.config, "num_experts_per_tok", 0))
+    if top_k != 10:
+        raise RuntimeError(
+            f"Qwen3.8 config num_experts_per_tok changed: got {top_k}, expected 10"
+        )
     for layer_index, layer in enumerate(model.layers):
         prefix = f"layer.{layer_index}"
         attention = getattr(layer, "linear_attn", None)
@@ -238,7 +316,6 @@ def _rocket_install_activation_telemetry(model):
                 gate, f"{prefix}.router.gate", "router_logits"
             )
             # A second post-hook adds bounded top-k expert identities.
-            top_k = int(getattr(getattr(mlp, "experts", None), "top_k", 8))
             gate.register_forward_hook(
                 _rocket_post_hook(
                     f"{prefix}.router.topk", "router_topk", top_k=top_k
