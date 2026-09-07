@@ -5,6 +5,9 @@ import importlib.util
 import json
 import sys
 import tempfile
+import threading
+import time
+import types
 import unittest
 from pathlib import Path
 
@@ -42,8 +45,71 @@ class Steady2x2ContractTest(unittest.TestCase):
         compile(rendered, MODULE.RUNNER_REL, "exec")
         self.assertNotIn('"ignore_eos": True', source)
         self.assertEqual(rendered.count('"ignore_eos": True'), 1)
+        self.assertEqual(rendered.count("w.abort()"), 1)
+        self.assertEqual(rendered.count("join_deadline = time.monotonic() + 30"), 1)
         with self.assertRaisesRegex(MODULE.ContractError, "anchor changed"):
             MODULE.render_runner(rendered)
+
+    def test_runner_overlay_closes_blocked_sse_and_records_all_workers(self):
+        namespace = {"__name__": "rendered_runner", "__file__": MODULE.RUNNER / MODULE.RUNNER_REL}
+        exec(MODULE.render_runner((MODULE.RUNNER / MODULE.RUNNER_REL).read_text()), namespace)
+        worker_type = namespace["Worker"]
+        opened = threading.Event()
+
+        class BlockedResponse:
+            def __init__(self):
+                self.closed = threading.Event()
+
+            def __enter__(self):
+                opened.set()
+                return self
+
+            def __exit__(self, *_):
+                self.close()
+
+            def __iter__(self):
+                self.closed.wait(5)
+                raise OSError("response closed")
+                yield b""  # pragma: no cover
+
+            def close(self):
+                self.closed.set()
+
+        responses = []
+
+        def fake_urlopen(*_, **__):
+            response = BlockedResponse()
+            responses.append(response)
+            return response
+
+        original_urlopen = namespace["urllib"].request.urlopen
+        namespace["urllib"].request.urlopen = fake_urlopen
+        args = types.SimpleNamespace(
+            tag="test", model="model", temperature=0.6, top_p=0.95,
+            max_tokens=32768, thinking="off", url="http://test", token="", timeout=30,
+        )
+        stop = threading.Event()
+        log = []
+        try:
+            workers = [worker_type(i, args, "prompt", stop, log) for i in range(16)]
+            for worker in workers:
+                worker.start()
+            self.assertTrue(opened.wait(1))
+            deadline = time.monotonic() + 1
+            while len(responses) != 16 and time.monotonic() < deadline:
+                time.sleep(0.001)
+            self.assertEqual(len(responses), 16)
+            stop.set()
+            for worker in workers:
+                worker.abort()
+            join_deadline = time.monotonic() + 1
+            for worker in workers:
+                worker.join(max(0.0, join_deadline - time.monotonic()))
+            self.assertFalse(any(worker.is_alive() for worker in workers))
+            self.assertEqual(len(log), 16)
+            self.assertEqual({record["finish"] for record in log}, {"aborted"})
+        finally:
+            namespace["urllib"].request.urlopen = original_urlopen
 
     def test_sources_and_fixture_are_exact(self):
         record = MODULE.validate_sources()

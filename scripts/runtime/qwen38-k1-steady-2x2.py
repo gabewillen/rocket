@@ -139,14 +139,52 @@ def render_launch(source: str, cell: Cell) -> str:
 def render_runner(source: str) -> str:
     """Keep a fixed c16 cohort alive after EOS so three windows remain valid."""
 
-    anchor = 'body = {"model": self.a.model, "temperature": self.a.temperature, "top_p": self.a.top_p,\n'
-    replacement = (
+    request_anchor = 'body = {"model": self.a.model, "temperature": self.a.temperature, "top_p": self.a.top_p,\n'
+    request_replacement = (
         'body = {"model": self.a.model, "temperature": self.a.temperature, '
         '"top_p": self.a.top_p, "ignore_eos": True,\n'
     )
-    if source.count(anchor) != 1 or '"ignore_eos": True' in source:
+    init_anchor = "        self.i, self.a, self.prompt, self.stop, self.log = i, a, prompt, stop, log\n"
+    init_replacement = init_anchor + "        self.response = None\n"
+    response_anchor = "            with urllib.request.urlopen(req, timeout=self.a.timeout) as r:\n"
+    response_replacement = response_anchor + "                self.response = r\n"
+    class_end_anchor = "        self.log.append(rec)\n\n\ndef sample_loop"
+    class_end_replacement = (
+        "        self.log.append(rec)\n\n"
+        "    def abort(self):\n"
+        "        response = self.response\n"
+        "        if response is not None:\n"
+        "            response.close()\n\n\n"
+        "def sample_loop"
+    )
+    join_anchor = (
+        "    stop.set()\n"
+        "    for w in workers:\n"
+        "        w.join(timeout=30)\n"
+    )
+    join_replacement = (
+        "    stop.set()\n"
+        "    for w in workers:\n"
+        "        w.abort()\n"
+        "    join_deadline = time.monotonic() + 30\n"
+        "    for w in workers:\n"
+        "        w.join(timeout=max(0.0, join_deadline - time.monotonic()))\n"
+        "    if any(w.is_alive() for w in workers):\n"
+        "        raise RuntimeError('stream cancellation exceeded 30 seconds')\n"
+    )
+    replacements = (
+        (request_anchor, request_replacement),
+        (init_anchor, init_replacement),
+        (response_anchor, response_replacement),
+        (class_end_anchor, class_end_replacement),
+        (join_anchor, join_replacement),
+    )
+    if '"ignore_eos": True' in source or any(source.count(anchor) != 1 for anchor, _ in replacements):
         raise ContractError("benchmark request anchor changed")
-    return source.replace(anchor, replacement)
+    rendered = source
+    for anchor, replacement in replacements:
+        rendered = rendered.replace(anchor, replacement)
+    return rendered
 
 
 def prepare_cell(root: Path, cell: Cell) -> Path:
