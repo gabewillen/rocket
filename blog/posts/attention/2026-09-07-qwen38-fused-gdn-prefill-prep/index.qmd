@@ -1,0 +1,61 @@
+---
+title: "Fused GDN convolution prep is 1.760x faster at 8192 tokens"
+description: "A GB10-specific Qwen3.8 kernel removes 167.77 MB per layer and cuts the convolution, post-prep, and convolution-state slice from 1663.136 to 944.736 us at 8192 tokens."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, attention, kernels, memory, numerics]
+verdict: accepted
+rocket: "#kernels"
+---
+
+**Question.** Does fusing width-4 causal convolution into normalized Q/K, V, g, beta, and final convolution-state publication reduce the Qwen3.8 GDN prefill slice on GB10?
+
+| setup | |
+| --- | --- |
+| node | gx10-5e36 |
+| GPU | NVIDIA GB10 |
+| kernel | 6.17.13-rocket64k |
+| Rocket commit | 6681af0b2fbca31535e7ea61ecdc80e6a9968348 |
+| vLLM reference | 0.1.dev20073+g8e685d198 |
+| FlashInfer reference | 91bda04c66f7cb851e1ab3b78b9fecea644b9844 |
+| samples | 10 warmup, 50 measured, CUDA graph replay |
+
+```bash
+cmake -S engines/qwen38-flash-next-nvfp4-2b \
+  -B engines/qwen38-flash-next-nvfp4-2b/build \
+  -DROCKET_QWEN38_CUTLASS_DIR=engines/glm5-moe-nvfp4-2b/third_party/cutlass \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build engines/qwen38-flash-next-nvfp4-2b/build \
+  --target qwen38-gdn-prefill-fused-bench -j2
+engines/qwen38-flash-next-nvfp4-2b/build/qwen38-gdn-prefill-fused-bench
+```
+
+```text
+tokens=300 materialized_p50_us=26.976 materialized_p95_us=27.168 fused_p50_us=24.096 fused_p95_us=25.024 materialized_intermediate_bytes=6144000 fused_intermediate_bytes=0 output_max_error=0 state_max_error=0 graph_capture=pass
+tokens=8192 materialized_p50_us=1663.136 materialized_p95_us=1817.856 fused_p50_us=944.736 fused_p95_us=1123.936 materialized_intermediate_bytes=167772160 fused_intermediate_bytes=0 output_max_error=0 state_max_error=0 graph_capture=pass
+```
+
+| tokens | path | p50 | p95 | materialized intermediate | output max error | conv-state max error |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 300 | materialized | 26.976 us | 27.168 us | 6,144,000 B | control | control |
+| 300 | fused | 24.096 us | 25.024 us | 0 B | 0 | 0 |
+| 8192 | materialized | 1663.136 us | 1817.856 us | 167,772,160 B | control | control |
+| 8192 | fused | 944.736 us | 1123.936 us | 0 B | 0 | 0 |
+
+| tokens | p50 speedup | p50 latency reduction |
+| ---: | ---: | ---: |
+| 300 | 1.120x | 10.7% |
+| 8192 | 1.760x | 43.2% |
+
+**Verdict.** Accepted for the convolution, post-convolution preparation, and convolution-state publication slice at c1; this measurement makes no whole-prefill claim.
+
+**Next.**
+
+- Measure input projection, recurrent scan, gated norm, output projection, and transaction publication separately at 300 and 8192 tokens.
+- Compare final FP32 recurrent state and final layer output with the pinned vLLM and FlashInfer path.
+- Measure c1, c2, c4, c8, and c16 after the c1 composition passes parity.
+
+**Reopen if.**
+
+- An upstream vLLM or FlashInfer release fuses causal convolution into post-convolution preparation for this fixed Qwen3.8 shape.
+- A GB10 firmware or compiler release changes the kernel timing distribution.
