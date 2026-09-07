@@ -156,6 +156,17 @@ set_target_properties(qwen38_token_output PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+add_library(qwen38_mtp_executor STATIC src/mtp/native_executor.cu)
+target_include_directories(qwen38_mtp_executor PUBLIC src)
+target_link_libraries(qwen38_mtp_executor PUBLIC CUDA::cudart)
+target_compile_options(qwen38_mtp_executor PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>
+)
+set_target_properties(qwen38_mtp_executor PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
 add_executable(qwen38-pair-reduce-bench bench/pair_reduce_bench.cu)
 target_link_libraries(qwen38-pair-reduce-bench PRIVATE qwen38_pair_reduce ${ROCKET_QWEN38_NVML})
 
@@ -225,3 +236,12 @@ target_compile_options(qwen38-test-token-output PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
 )
 add_test(NAME qwen38-token-output-contract COMMAND qwen38-test-token-output)
+
+add_executable(qwen38-test-native-mtp-executor tests/test_native_mtp_executor.cu)
+target_link_libraries(qwen38-test-native-mtp-executor PRIVATE
+  qwen38_mtp_executor CUDA::cudart)
+target_compile_options(qwen38-test-native-mtp-executor PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
+)
+add_test(NAME qwen38-native-mtp-executor-contract
+  COMMAND qwen38-test-native-mtp-executor)
