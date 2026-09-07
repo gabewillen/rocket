@@ -1,0 +1,193 @@
+---
+title: "Qwen3.8 base full attention passes all 12 quality cases in NVFP4"
+description: "All 48 base full-attention Q/K/V/O matrices pass the matched quality gate in NVFP4, bringing the accepted attention map to 228 matrices and removing 3,856,402,656 bytes per c16 step."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, numerics, attention, memory, telemetry, baseline]
+verdict: accepted
+rocket: "#fuel"
+---
+
+## Question
+
+Can the 48 base full-attention Q/K/V/O matrices serve as NVFP4 on top of the
+accepted 180-matrix linear-attention map?
+
+| setup | value |
+| --- | --- |
+| nodes | head GB10 and worker GB10, 6.17.13-rocket64k, 64 KiB pages |
+| checkpoint | [nvidia/Qwen3.8-Flash-Next-NVFP4 at fc694b54fb0174e0913e6adf86691ef85a4ead47](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/tree/fc694b54fb0174e0913e6adf86691ef85a4ead47) |
+| Rocket commit | `f76ce669a2aec9ad52240eea9499496a1f37dfee` |
+| artifact commit | `4562ec7291de37b6fd7ef6e72a8a16c31a78fe65` |
+| vLLM image | `vllm/vllm-openai:qwen38-flash-next` at `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| runtime source | [MiaAI-Lab Qwen3.8 dual-Spark at c2325b22602b51a5faf55fc2bebccc34f3f80b9f](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks/tree/c2325b22602b51a5faf55fc2bebccc34f3f80b9f) |
+| source weight dtype | BF16 for all 228 selected matrices |
+| serving weight dtype | ModelOpt W4A4 NVFP4 for all 228 selected matrices |
+| unchanged serving families | routed experts in NVFP4; MTP experts in 128x128 block FP8 |
+| combined artifact | `753aae4ab187f7d8862106c1be218a9cfecab4dcbc192c473c43b2035570e5f6` |
+
+Prior absence was a difficulty constraint: this model needs fused Q/K/V shard
+loading, a mixed-precision MTP policy, and matched two-node residency.
+
+## Commands
+
+```bash
+scripts/numerics/qwen38-expanded-calibration.sh \
+  --output-dir /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01 \
+  --nvfp4-artifact-dir /home/glwillen/calibration/qwen38-attention-nvfp4-artifacts/753aae4ab187f7d8862106c1be218a9cfecab4dcbc192c473c43b2035570e5f6 \
+  --launch
+
+scripts/numerics/qwen38-expanded-calibration.sh \
+  --output-dir /home/glwillen/calibration/qwen38-linear-nvfp4-matched-control-20260907-08 \
+  --nvfp4-artifact-dir /home/glwillen/calibration/qwen38-linear-nvfp4-artifacts/64539e4a5a4b533aa143d20e055ae73ebd10b21f05dbd422847a9be30e56c4e5 \
+  --launch
+
+python3 scripts/numerics/qwen38-compare-precision.py \
+  --baseline /home/glwillen/calibration/qwen38-linear-nvfp4-matched-control-20260907-08/combined-activation-summary.json \
+  --candidate /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/combined-activation-summary.json \
+  --baseline-quality /home/glwillen/calibration/qwen38-linear-nvfp4-matched-control-20260907-08/quality.json \
+  --candidate-quality /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/quality.json \
+  --out /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/precision-comparison-matched-linear-nvfp4.json
+```
+
+```text
+channels	494
+answer_tail_equal	10/12
+regressions	none
+```
+
+## Quality and telemetry
+
+```bash
+jq -c '{quality:{answer_tail_equal:.quality.answer_tail_equal,cases:.quality.cases,regressions:.quality.regressions},qkv_input:.groups.full_attention_qkv_projection_input,qkv_output:.groups.full_attention_qkv_projection_output,o_input:.groups.full_attention_output_projection_input,o_output:.groups.full_attention_output,linear_output:.groups.linear_attention_output,recurrent_state:.groups.recurrent_state_output,router_output:.groups.router_logits_output}' \
+  /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/precision-comparison-matched-linear-nvfp4.json
+```
+
+```text
+{"quality":{"answer_tail_equal":10,"cases":12,"regressions":[]},"qkv_input":{"channels":12,"max_histogram_tv":0.05126953125,"max_rms_ratio":1.1900001516295984,"min_rms_ratio":0.8397451762102814},"qkv_output":{"channels":12,"max_histogram_tv":0.2548828125,"max_rms_ratio":2.0546809682730416,"min_rms_ratio":0.9875207773148194},"o_input":{"channels":12,"max_histogram_tv":0.13427734375,"max_rms_ratio":1.3700031130714312,"min_rms_ratio":0.7351696561013337},"o_output":{"channels":12,"max_histogram_tv":0.16357421875,"max_rms_ratio":1.3029820504957936,"min_rms_ratio":0.7965654991378851},"linear_output":{"channels":36,"max_histogram_tv":0.25732421875,"max_rms_ratio":1.5814571121816587,"min_rms_ratio":0.7749723557722784},"recurrent_state":{"channels":36,"max_histogram_tv":0.12451171875,"max_rms_ratio":1.4903364878674388,"min_rms_ratio":0.6201944278860129},"router_output":{"channels":48,"max_histogram_tv":0.013671875,"max_rms_ratio":1.0504964398537429,"min_rms_ratio":0.92829521667935}}
+```
+
+| telemetry family | channels | RMS ratio | max histogram TV |
+| --- | ---: | ---: | ---: |
+| QKV input activation | 12 | 0.8397x to 1.1900x | 0.05126953125 |
+| QKV output | 12 | 0.9875x to 2.05468x | 0.2548828125 |
+| O input activation | 12 | 0.7352x to 1.3700x | 0.13427734375 |
+| O output | 12 | 0.7966x to 1.3030x | 0.16357421875 |
+| existing linear-attention output | 36 | 0.7750x to 1.5815x | 0.25732421875 |
+| existing recurrent state | 36 | 0.6202x to 1.4903x | 0.12451171875 |
+| downstream router logits | 48 | 0.9283x to 1.0505x | 0.013671875 |
+
+| metric | linear only | linear plus full | unit |
+| --- | ---: | ---: | --- |
+| quality gate | 12/12 | 12/12 | cases |
+| candidate answer tails matching control |  | 10/12 | cases |
+| candidate regressions vs control |  | 0 | cases |
+| paired telemetry |  | 494 | channels |
+| model memory per node | 62.88 | 62.46 | GiB |
+| nodes at reported memory | 2/2 | 2/2 | nodes |
+| run-to-run variance | not measured | not measured |  |
+
+## Token divergence
+
+```bash
+python3 scripts/numerics/qwen38-logit-trace.py \
+  --baseline /home/glwillen/calibration/qwen38-linear-nvfp4-matched-control-20260907-08/logit-trace.json \
+  --candidate /home/glwillen/calibration/qwen38-linear-nvfp4-matched-control-20260907-08/logit-trace-repeat.json \
+  --out /home/glwillen/calibration/qwen38-linear-nvfp4-matched-control-20260907-08/logit-repeatability.json
+
+python3 scripts/numerics/qwen38-logit-trace.py \
+  --baseline /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/logit-trace.json \
+  --candidate /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/logit-trace-repeat.json \
+  --out /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/logit-repeatability.json
+
+for report in \
+  /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/logit-matched-{a-a,a-b,b-a,b-b}.json
+do
+  jq -r 'input_filename + "\t" + (.token_parity | tostring)' "$report"
+done
+```
+
+```text
+token_parity	0.174150
+token_parity	0.155546
+/home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/logit-matched-a-a.json	0.081772498857926
+/home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/logit-matched-a-b.json	0.09371980676328502
+/home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/logit-matched-b-a.json	0.0808588396528095
+/home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/logit-matched-b-b.json	0.0951231289232255
+```
+
+| comparison | token-position parity | unit |
+| --- | ---: | --- |
+| linear-only repeat | 0.17415 | fraction |
+| combined repeat | 0.15555 | fraction |
+| four cross-map pairings | 0.08086 to 0.09512 | fraction |
+| interpretation | cascade-sensitive autoregressive divergence | scope |
+| fixed quality gate | 0 | regressions |
+
+## Bytes and MTP
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v "$PWD:/work:ro" \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface:ro" \
+  -v /home/glwillen/calibration:/calibration -w /work \
+  --entrypoint python3 vllm/vllm-openai:qwen38-flash-next \
+  scripts/numerics/qwen38-materialize-linear-nvfp4.py \
+  --checkpoint /root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47 \
+  --trace /calibration/qwen38-expanded-mtp3-20260907-03/combined-activation-summary.json \
+  --source-quant-config /root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47/hf_quant_config.json \
+  --family linear_attention --family full_attention \
+  --output-root /calibration/qwen38-attention-nvfp4-artifacts \
+  | jq '{artifact,source_tensors,source_bytes,estimated_overlay_bytes,bytes_removed_per_c16_step}'
+
+jq -c '{accepted:.totals.accepted_tokens,drafted:.totals.drafted_tokens,mean:.mean_acceptance_length.mean}' \
+  /home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/mtp-runtime-evidence.json
+
+rg -o 'Model loading took [0-9.]+ GiB memory' \
+  /home/glwillen/calibration/qwen38-{linear-nvfp4-matched-control-20260907-08,attention-nvfp4-live-20260907-01}/logs/{head,worker}.log
+```
+
+```text
+{
+  "artifact": "/calibration/qwen38-attention-nvfp4-artifacts/753aae4ab187f7d8862106c1be218a9cfecab4dcbc192c473c43b2035570e5f6",
+  "source_tensors": 228,
+  "source_bytes": 5365432320,
+  "estimated_overlay_bytes": 1509153224,
+  "bytes_removed_per_c16_step": 3856402656
+}
+{"accepted":2712,"drafted":4209,"mean":2.9346153846153844}
+/home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/logs/worker.log:Model loading took 62.46 GiB memory
+/home/glwillen/calibration/qwen38-attention-nvfp4-live-20260907-01/logs/head.log:Model loading took 62.46 GiB memory
+/home/glwillen/calibration/qwen38-linear-nvfp4-matched-control-20260907-08/logs/worker.log:Model loading took 62.88 GiB memory
+/home/glwillen/calibration/qwen38-linear-nvfp4-matched-control-20260907-08/logs/head.log:Model loading took 62.88 GiB memory
+```
+
+| metric | value | unit |
+| --- | ---: | --- |
+| full-attention matrices added | 48 | matrices |
+| total accepted attention map | 228 | matrices |
+| combined safetensors artifact | 1,509,153,224 | bytes |
+| incremental full-attention traffic removed | 859,176,576 | bytes per c16 step |
+| total attention traffic removed | 3,856,402,656 | bytes per c16 step |
+| MTP accepted tokens | 2,712/4,209 | tokens |
+| MTP mean accepted length | 2.9346 | tokens |
+
+## Verdict
+
+Accepted. All 48 base full-attention Q/K/V/O matrices move from BF16 to NVFP4,
+on top of the accepted 180 base linear-attention matrices.
+
+Acceptance covers the lower-byte serving map. The Rocket engine target stays
+above 20 generated tok/s per stream at concurrency 16 and above 320 aggregate
+tok/s.
+
+## Next
+
+- evaluate the remaining 48 base router matrices and layer-2 PLE key/value projections
+- run the healthy-clock production concurrency ladder with the 228-matrix artifact
+- retain family-isolated telemetry for every additional conversion
+
+## Reopen if
+
+- NVIDIA publishes a new checkpoint revision or ModelOpt NVFP4 serialization ABI
+- an upstream evaluation release adds a different full-attention test set
