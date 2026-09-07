@@ -16,7 +16,7 @@ SELECTED = re.compile(
 )
 
 
-def embed(base: dict, sidecar: dict) -> dict:
+def embed(base: dict, sidecar: dict, expected_algo: str = "FP8") -> dict:
     current = base.get("quantization_config")
     overlay = sidecar.get("quantization")
     if not isinstance(current, dict) or current.get("quant_algo") != "MIXED_PRECISION":
@@ -30,8 +30,10 @@ def embed(base: dict, sidecar: dict) -> dict:
     selected = {key for key in layers if SELECTED.fullmatch(key)}
     if len(selected) != 180:
         raise ValueError(f"overlay selected projection coverage is {len(selected)}/180")
-    if any(layers[key].get("quant_algo") != "FP8" for key in selected):
-        raise ValueError("overlay selected projection is not FP8")
+    if expected_algo not in ("FP8", "NVFP4"):
+        raise ValueError(f"unsupported overlay quantization algorithm: {expected_algo}")
+    if any(layers[key].get("quant_algo") != expected_algo for key in selected):
+        raise ValueError(f"overlay selected projection is not {expected_algo}")
     if any("linear_attn" in value for value in excludes):
         raise ValueError("overlay still excludes linear attention")
     method = current.get("quant_method")
@@ -49,11 +51,13 @@ def main() -> int:
     parser.add_argument("base_config", type=Path)
     parser.add_argument("overlay_sidecar", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--quant-algo", choices=("FP8", "NVFP4"), default="FP8")
     args = parser.parse_args()
     try:
         value = embed(
             json.loads(args.base_config.read_text()),
             json.loads(args.overlay_sidecar.read_text()),
+            args.quant_algo,
         )
         args.output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     except (OSError, ValueError, json.JSONDecodeError) as error:

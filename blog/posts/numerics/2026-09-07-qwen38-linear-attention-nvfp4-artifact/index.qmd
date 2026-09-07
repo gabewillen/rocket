@@ -1,0 +1,70 @@
+---
+title: "Qwen3.8 linear-attention NVFP4 removes 2.791 GiB per c16 step"
+description: "All 180 linear-attention projections pack into NVIDIA's block-16 NVFP4 ABI and pass the two-node preflight before quality evaluation."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, numerics, attention, telemetry, tooling]
+verdict: accepted
+rocket: "#fuel"
+---
+
+**Question.** Can the 180 projections accepted in FP8 be packed into the
+installed ModelOpt W4A4 NVFP4 ABI without changing the base checkpoint?
+
+| setup | |
+| --- | --- |
+| nodes | two GB10s, 6.17.13-rocket64k, 64 KiB pages |
+| checkpoint | nvidia/Qwen3.8-Flash-Next-NVFP4 at fc694b54fb0174e0913e6adf86691ef85a4ead47 |
+| commit | 7958fc66b7a9806dd2e717a202ffbf7f1968322b, plus the scripts changed here |
+| calibration | qwen38-expanded-mtp3-20260907-03, schema v2_only |
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v "$PWD:/work:ro" \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface:ro" \
+  -v /home/glwillen/calibration:/calibration -w /work \
+  --entrypoint python3 vllm/vllm-openai:qwen38-flash-next \
+  scripts/numerics/qwen38-materialize-linear-nvfp4.py \
+  --checkpoint /root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47 \
+  --trace /calibration/qwen38-expanded-mtp3-20260907-03/combined-activation-summary.json \
+  --source-quant-config /root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47/hf_quant_config.json \
+  --output-root /calibration/qwen38-linear-nvfp4-artifacts
+```
+
+```
+artifact: 64539e4a5a4b533aa143d20e055ae73ebd10b21f05dbd422847a9be30e56c4e5
+source_tensors: 180
+output_tensors: 720
+source_bytes: 4170055680
+estimated_overlay_bytes: 1172927584
+bytes_removed_per_c16_step: 2997226080
+validated NVFP4 overlay: 180 tensors
+```
+
+| metric | value | unit |
+| --- | ---: | --- |
+| BF16 source | 3.884 | GiB |
+| NVFP4 safetensors artifact | 1.092 | GiB |
+| traffic removed per c16 step | 2.791 | GiB |
+| traffic removed beyond FP8 | 0.849 | GiB |
+| block size | 16 | weights |
+| source ranges hashed | 3.922 | GiB |
+| focused tests | 11/11 | passed |
+| two-node preflight | 180/180 | replacements |
+
+One artifact was materialized. Run-to-run variance does not apply to its byte
+counts.
+
+**Verdict.** Accepted for loading and quality evaluation. The artifact uses
+packed E2M1 weights, E4M3 block scales, FP32 global scales, and activation
+scales from the complete trace. It does not establish model quality.
+
+**Next.**
+
+- run the unchanged telemetry and 12-case quality gate against NVFP4
+- bisect qkv, z, ba, and output projections by layer only if the whole family fails
+- compare accepted-token traffic and the production concurrency ladder to FP8
+
+**Reopen if.**
+
+- NVIDIA changes the checkpoint revision or ModelOpt NVFP4 serialization ABI

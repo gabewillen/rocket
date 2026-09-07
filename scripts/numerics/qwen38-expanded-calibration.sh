@@ -35,6 +35,7 @@ WORKER_HF_VOLUME="vllm-fn-hf"
 OUTPUT_DIR=""
 MIA_SOURCE=""
 FP8_ARTIFACT_DIR=""
+NVFP4_ARTIFACT_DIR=""
 LAUNCH=false
 KEEP_RUNNING=false
 PRODUCTION=false
@@ -56,6 +57,7 @@ Options:
   --keep-running         Leave containers running after a successful calibration
   --mia-source DIR       Existing checkout at the pinned MiaAI-Lab commit
   --fp8-artifact-dir DIR Immutable linear-attention FP8 artifact directory
+  --nvfp4-artifact-dir DIR Immutable linear-attention NVFP4 artifact directory
   --worker USER@HOST     Worker SSH destination (default: glwillen@192.168.100.11)
   --head-ip IP           Head fabric address (default: 192.168.100.10)
   --worker-ip IP         Worker fabric address (default: 192.168.100.11)
@@ -84,6 +86,7 @@ while (($#)); do
         --keep-running) KEEP_RUNNING=true; shift ;;
         --mia-source) MIA_SOURCE=${2:?missing value}; shift 2 ;;
         --fp8-artifact-dir) FP8_ARTIFACT_DIR=${2:?missing value}; shift 2 ;;
+        --nvfp4-artifact-dir) NVFP4_ARTIFACT_DIR=${2:?missing value}; shift 2 ;;
         --worker)
             worker_arg=${2:?missing value}
             [[ "$worker_arg" == *@* ]] || fail "--worker must be USER@HOST"
@@ -120,6 +123,18 @@ if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
         "$FP8_ARTIFACT_DIR/manifest.json") || fail "FP8 artifact manifest is unreadable"
     [[ "$(basename "$FP8_ARTIFACT_DIR")" == "$fp8_artifact_key" ]] || \
         fail "FP8 artifact directory is not keyed by its manifest"
+fi
+if [[ -n "$FP8_ARTIFACT_DIR" && -n "$NVFP4_ARTIFACT_DIR" ]]; then
+    fail "choose at most one linear-attention precision artifact"
+fi
+if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
+    [[ "$NVFP4_ARTIFACT_DIR" == /* ]] || fail "--nvfp4-artifact-dir must be absolute"
+    [[ -d "$NVFP4_ARTIFACT_DIR" ]] || fail "NVFP4 artifact directory missing: $NVFP4_ARTIFACT_DIR"
+    NVFP4_ARTIFACT_DIR=$(cd "$NVFP4_ARTIFACT_DIR" && pwd)
+    nvfp4_artifact_key=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_key"])' \
+        "$NVFP4_ARTIFACT_DIR/manifest.json") || fail "NVFP4 artifact manifest is unreadable"
+    [[ "$(basename "$NVFP4_ARTIFACT_DIR")" == "$nvfp4_artifact_key" ]] || \
+        fail "NVFP4 artifact directory is not keyed by its manifest"
 fi
 if [[ -e "$OUTPUT_DIR" ]] && [[ -n "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     fail "--output-dir must be empty: $OUTPUT_DIR"
@@ -210,6 +225,10 @@ if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
     python3 "$REPO_ROOT/scripts/runtime/patch-qwen38-fp8-overlay-loader.py" \
         "$ARTIFACT_DIR/weight_utils_64k.py"
 fi
+if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
+    python3 "$REPO_ROOT/scripts/runtime/patch-qwen38-nvfp4-overlay-loader.py" \
+        "$ARTIFACT_DIR/weight_utils_64k.py"
+fi
 python3 "$SCRIPT_DIR/patch-qwen38-activation-telemetry.py" "$ARTIFACT_DIR/model_telemetry.py"
 
 for file in ple_layer_patched.py modelopt_patched.py qsa_ops_patched.py \
@@ -223,6 +242,12 @@ if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
         "$FP8_ARTIFACT_DIR/hf_quant_config.json" \
         "$ARTIFACT_DIR/config_fp8_patched.json"
 fi
+if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
+    python3 "$REPO_ROOT/scripts/runtime/qwen38-embed-fp8-config.py" \
+        "$ARTIFACT_DIR/config_patched.json" \
+        "$NVFP4_ARTIFACT_DIR/hf_quant_config.json" \
+        "$ARTIFACT_DIR/config_nvfp4_patched.json" --quant-algo NVFP4
+fi
 
 verify_sha() {
     local expected=$1 file=$2 actual
@@ -232,8 +257,20 @@ verify_sha() {
 }
 verify_sha fae9fd5242748e8cdb314445a25ad628a0ce335cf26f794623f8679497a65186 "$ARTIFACT_DIR/ple_layer_patched.py"
 verify_sha 89c54b49756e3fe9def912e22c6721e576c03b93d0238cbe061c029d8a6c84e0 "$ARTIFACT_DIR/modelopt_patched.py"
-if [[ -z "$FP8_ARTIFACT_DIR" ]]; then
+if [[ -z "$FP8_ARTIFACT_DIR" && -z "$NVFP4_ARTIFACT_DIR" ]]; then
     verify_sha 6cbca7f793403b0d169e0d8a60f100a4c721d3ec008404eab0ddfa0b81389c0e "$ARTIFACT_DIR/weight_utils_64k.py"
+fi
+if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
+    NVFP4_CONTAINER_DIR="/rocket/qwen38-linear-nvfp4"
+    docker run --rm \
+        -v "$HF_CACHE:/root/.cache/huggingface:ro" \
+        -v "$NVFP4_ARTIFACT_DIR:$NVFP4_CONTAINER_DIR:ro" \
+        -v "$NVFP4_ARTIFACT_DIR/hf_quant_config.json:/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/hf_quant_config.json:ro" \
+        -v "$ARTIFACT_DIR/weight_utils_64k.py:$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py:ro" \
+        -e "ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=$NVFP4_CONTAINER_DIR/manifest.json" \
+        -e "ROCKET_QWEN38_NVFP4_QUANT_CONFIG=$NVFP4_CONTAINER_DIR/hf_quant_config.json" \
+        --entrypoint /usr/bin/python3 "$IMAGE_TAG" -c \
+        "import glob; from vllm.model_executor.model_loader.weight_utils import _rocket_qwen38_nvfp4_overlay_preflight as check; files=glob.glob('/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/*.safetensors'); result=check(sorted(files), 'lazy'); assert len(result['selected']) == 180; print('validated NVFP4 overlay: 180 tensors')"
 fi
 verify_sha 0669d6334f58a624c89c15f3e46c90f28e59b0b913507101dec1c5765e3c3b12 "$ARTIFACT_DIR/qsa_ops_patched.py"
 verify_sha ee5de40742ad48a6064ea24b99a285ff69c47d57bbb170f57c4eef71567a1df3 "$ARTIFACT_DIR/qsa_nvidia_patched.py"
@@ -287,8 +324,8 @@ ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p '$REMOTE_OUTPUT/artifacts' '$REMOTE
 scp -q "$ARTIFACT_DIR"/* "$SSH_TARGET:$REMOTE_OUTPUT/artifacts/"
 
 write_launch_script() {
-    local destination=$1 node_rank=$2 node_ip=$3 iface=$4 hca=$5 cache_mount=$6 artifact_dir=$7 mode=$8 cache_access=$9 fp8_host_dir=${10}
-    local fp8_options="" quant_config_source="$artifact_dir/hf_quant_config_patched.json" config_source="$artifact_dir/config_patched.json"
+    local destination=$1 node_rank=$2 node_ip=$3 iface=$4 hca=$5 cache_mount=$6 artifact_dir=$7 mode=$8 cache_access=$9 fp8_host_dir=${10} nvfp4_host_dir=${11}
+    local fp8_options="" nvfp4_options="" quant_config_source="$artifact_dir/hf_quant_config_patched.json" config_source="$artifact_dir/config_patched.json"
     if [[ -n "$fp8_host_dir" ]]; then
         quant_config_source="$fp8_host_dir/hf_quant_config.json"
         config_source="$artifact_dir/config_fp8_patched.json"
@@ -296,6 +333,14 @@ write_launch_script() {
   -v $(printf '%q' "$fp8_host_dir"):/rocket/qwen38-linear-fp8:ro \\
   -e ROCKET_QWEN38_FP8_OVERLAY_MANIFEST=/rocket/qwen38-linear-fp8/manifest.json \\
   -e ROCKET_QWEN38_FP8_QUANT_CONFIG=/rocket/qwen38-linear-fp8/hf_quant_config.json \\"
+    fi
+    if [[ -n "$nvfp4_host_dir" ]]; then
+        quant_config_source="$nvfp4_host_dir/hf_quant_config.json"
+        config_source="$artifact_dir/config_nvfp4_patched.json"
+        nvfp4_options="
+  -v $(printf '%q' "$nvfp4_host_dir"):/rocket/qwen38-linear-nvfp4:ro \\
+  -e ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=/rocket/qwen38-linear-nvfp4/manifest.json \\
+  -e ROCKET_QWEN38_NVFP4_QUANT_CONFIG=/rocket/qwen38-linear-nvfp4/hf_quant_config.json \\"
     fi
     cat > "$destination" <<EOF
 #!/usr/bin/env bash
@@ -313,7 +358,7 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   -e VLLM_HOST_IP=$(printf '%q' "$node_ip") -e HF_HOME=/root/.cache/huggingface \\
   -e ROCKET_NVFP4_CALIBRATE=1 -e ROCKET_NVFP4_SAMPLE_ELEMENTS=2048 \\
   -e ROCKET_QWEN38_LOAD_TRACE=1 \\
-  -e ROCKET_NVFP4_MAX_EMISSIONS=12 \\$fp8_options
+  -e ROCKET_NVFP4_MAX_EMISSIONS=12 \\$fp8_options$nvfp4_options
   -v $(printf '%q' "$artifact_dir/ple_layer_patched.py"):$CONTAINER_MODEL_DIR/ple_layer.py:ro \\
   -v $(printf '%q' "$artifact_dir/modelopt_patched.py"):$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro \\
   -v $(printf '%q' "$artifact_dir/weight_utils_64k.py"):$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py:ro \\
@@ -349,10 +394,18 @@ if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
         "$FP8_ARTIFACT_DIR/linear-attention-fp8.safetensors" \
         "$SSH_TARGET:$REMOTE_FP8_ARTIFACT/"
 fi
+REMOTE_NVFP4_ARTIFACT=""
+if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
+    REMOTE_NVFP4_ARTIFACT="$REMOTE_OUTPUT/nvfp4-artifact"
+    ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p '$REMOTE_NVFP4_ARTIFACT'"
+    scp -q "$NVFP4_ARTIFACT_DIR/manifest.json" "$NVFP4_ARTIFACT_DIR/hf_quant_config.json" \
+        "$NVFP4_ARTIFACT_DIR/linear-attention-nvfp4.safetensors" \
+        "$SSH_TARGET:$REMOTE_NVFP4_ARTIFACT/"
+fi
 write_launch_script "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE" \
-    "$WORKER_HCA" "$WORKER_HF_VOLUME" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT"
+    "$WORKER_HCA" "$WORKER_HF_VOLUME" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT" "$REMOTE_NVFP4_ARTIFACT"
 write_launch_script "$OUTPUT_DIR/launch-head.sh" 0 "$HEAD_IP" "$HEAD_IFACE" \
-    "$HEAD_HCA" "$HF_CACHE" "$ARTIFACT_DIR" "--host 0.0.0.0 --port $API_PORT" "rw" "$FP8_ARTIFACT_DIR"
+    "$HEAD_HCA" "$HF_CACHE" "$ARTIFACT_DIR" "--host 0.0.0.0 --port $API_PORT" "rw" "$FP8_ARTIFACT_DIR" "$NVFP4_ARTIFACT_DIR"
 if [[ "$PRODUCTION" == true ]]; then
     for launch_script in "$OUTPUT_DIR/launch-head.sh" "$OUTPUT_DIR/launch-worker.sh"; do
         sed -i \
