@@ -1,0 +1,103 @@
+---
+title: "The Qwen controller publishes one authenticated TP2 boundary"
+description: "A two-node Rocket restore rejected an injected rank-1 copy fault, then published matching 32,354,861,056-byte rank states and generation 8."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, cache, runtime]
+verdict: accepted
+rocket: "#state"
+---
+
+**Question.** Can the Rocket controller restore two owner-local rank records and
+open decoder admission only after both ranks authenticate one accepted-token
+boundary?
+
+| setup | |
+| --- | --- |
+| nodes | gx10-5e36 rank 0, gx10-2a13 rank 1 |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| CUDA/Python image | `vllm/vllm-openai:qwen38-flash-next`, `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| controller | Rocket `0ea4f63e823119609f6cd3cf4ec020a08a335eaa` |
+| worker cleanup | Rocket `43023413f2a0fe68db5b0a1072f0c41596e202ea` |
+| plan | `scripts/memory/qwen38-state-capacity-plan.json`, SHA-256 `a344b8bbae333c201665a224c0ed8399c199e6e290564fec7c733e27c33bb4a9` |
+| durable owners | `/var/lib/rocket/qwen38-state/rank0`, `/var/lib/rocket/qwen38-state/rank1` |
+
+The image supplied CUDA, PyTorch, and Python. No `vllm serve` process ran.
+
+```bash
+PYTHONPATH=engines/qwen38-flash-next-nvfp4-2b/src \
+python3 scripts/runtime/qwen38-distributed-nvme-crash.py \
+  --crash-case after_index_rank1 \
+  --repo /home/glwillen/Development/rocket \
+  --remote glwillen@192.168.100.11 \
+  --container-prefix qwen38-controller-fixture
+```
+
+```json
+{"event": "sigkill", "policy_digest": "d7525b86303a828155991122e0bcbc467655f23a811f14229156185789eb4ad9", "rank_timings": [[["prepare", 43.538911], ["commit", 0.003296], ["index", 0.003332]], [["prepare", 37.462861], ["commit", 0.001813], ["index", 0.005399]]], "transition": "after_index_rank1", "workers": [{"event": "ready", "free_bytes": 55208046592, "ok": true, "rank": 0, "reclaimable_bytes": 0, "record_bytes": 32354861056}, {"event": "ready", "free_bytes": 45744660480, "ok": true, "rank": 1, "reclaimable_bytes": 0, "record_bytes": 32354861056}]}
+```
+
+The wrapper reported exit 1 through the PTY. The single JSON line was written
+immediately before the inner coordinator called `os.kill(..., SIGKILL)`. This
+run does not report the wrapper as exit 137.
+
+The worker checkout on rank 1 was a clean detached checkout at `4302341` under
+`/home/glwillen/Development/rocket-controller-proof`. The existing sparse
+deployment directory was unchanged.
+
+```bash
+R0='docker run --rm --gpus all --name qwen38-controller-red-r0 --entrypoint python3 -i -v /home/glwillen/Development/rocket:/rocket:ro -v /var/lib/rocket/qwen38-state/rank0:/state -e PYTHONPATH=/rocket/engines/qwen38-flash-next-nvfp4-2b/src vllm/vllm-openai:qwen38-flash-next /rocket/scripts/runtime/qwen38-controller-state-proof.py worker --rank 0 --store /state --plan /rocket/scripts/memory/qwen38-state-capacity-plan.json --session physical --device cuda:0'
+R1='ssh -o BatchMode=yes glwillen@192.168.100.11 docker run --rm --gpus all --name qwen38-controller-red-r1 --entrypoint python3 -i -v /home/glwillen/Development/rocket-controller-proof:/rocket:ro -v /var/lib/rocket/qwen38-state/rank1:/state -e PYTHONPATH=/rocket/engines/qwen38-flash-next-nvfp4-2b/src vllm/vllm-openai:qwen38-flash-next /rocket/scripts/runtime/qwen38-controller-state-proof.py worker --rank 1 --store /state --plan /rocket/scripts/memory/qwen38-state-capacity-plan.json --session physical --device cuda:0 --fail-after-copy-family target_gdn_conv'
+PYTHONPATH=engines/qwen38-flash-next-nvfp4-2b/src \
+python3 scripts/runtime/qwen38-controller-state-proof.py controller \
+  --rank0-command "$R0" --rank1-command "$R1" \
+  --plan scripts/memory/qwen38-state-capacity-plan.json \
+  --session physical --timeout 300 --expect-failure
+```
+
+```json
+{"expected_failure":true,"result":"qwen38-controller-state-proof","worker_status":[{"active_commit_sha256":null,"active_family_count":0,"phase":"faulted","rank":0},{"active_commit_sha256":null,"active_family_count":0,"phase":"faulted","rank":1}]}
+```
+
+```bash
+R0='docker run --rm --gpus all --name qwen38-controller-control-r0 --entrypoint python3 -i -v /home/glwillen/Development/rocket:/rocket:ro -v /var/lib/rocket/qwen38-state/rank0:/state -e PYTHONPATH=/rocket/engines/qwen38-flash-next-nvfp4-2b/src vllm/vllm-openai:qwen38-flash-next /rocket/scripts/runtime/qwen38-controller-state-proof.py worker --rank 0 --store /state --plan /rocket/scripts/memory/qwen38-state-capacity-plan.json --session physical --device cuda:0'
+R1='ssh -o BatchMode=yes glwillen@192.168.100.11 docker run --rm --gpus all --name qwen38-controller-control-r1 --entrypoint python3 -i -v /home/glwillen/Development/rocket-controller-proof:/rocket:ro -v /var/lib/rocket/qwen38-state/rank1:/state -e PYTHONPATH=/rocket/engines/qwen38-flash-next-nvfp4-2b/src vllm/vllm-openai:qwen38-flash-next /rocket/scripts/runtime/qwen38-controller-state-proof.py worker --rank 1 --store /state --plan /rocket/scripts/memory/qwen38-state-capacity-plan.json --session physical --device cuda:0'
+PYTHONPATH=engines/qwen38-flash-next-nvfp4-2b/src \
+python3 scripts/runtime/qwen38-controller-state-proof.py controller \
+  --rank0-command "$R0" --rank1-command "$R1" \
+  --plan scripts/memory/qwen38-state-capacity-plan.json \
+  --session physical --timeout 300
+```
+
+```json
+{"commit_sha256":"e559e39edebad8efb614299888d5e6087909cccf24cf607b6befb8144686395a","continuation_launches":[{"generation":8},{"generation":8}],"generation_epoch":7,"policy_digest":"d7525b86303a828155991122e0bcbc467655f23a811f14229156185789eb4ad9","result":"qwen38-controller-state-proof","token_count":262144,"token_hash":"82cb97c60b5854be8a3c6ec5aa4d64093805f218508965cd3e1abed771b161ab"}
+```
+
+| proof | rank 0 | rank 1 |
+| --- | ---: | ---: |
+| durable payload | 32,354,861,056 B | 32,354,861,056 B |
+| durable state families | 9 | 9 |
+| prepare | 43.538911 s | 37.462861 s |
+| injected-copy result | faulted, 0 active families | faulted, 0 active families |
+| control launch | generation 8 | generation 8 |
+| policy state | 568 B, digest `d7525b86...` | 568 B, digest `d7525b86...` |
+| cleanup | container absent, GPU PID table empty | container absent, GPU PID table empty |
+
+The first `0ea4f63` red produced the same faulted worker state, then its worker
+teardown timed out after 30 seconds. Commit `4302341` added bounded EOF,
+SIGTERM, and SIGKILL cleanup. The repeated red and the control both exited 0
+and left no controller container or CUDA process. The durable records remain as
+proof input.
+
+**Verdict.** Accepted for authenticated two-rank CUDA state publication and
+controller-gated generation launch at one 262,144-token boundary.
+
+**Next.**
+
+- compare model logits and the next generated token before and after restore
+- bind this controller to the complete specialized decoder scheduler
+
+**Reopen if.**
+
+- a CUDA, PyTorch, GB10 firmware, or filesystem release changes stream fencing
+  or O_DIRECT durability behavior
