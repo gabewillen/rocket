@@ -1,0 +1,77 @@
+---
+title: "Native Qwen QSA score leaves too little of the 451 token/s budget"
+description: "The authenticated BLOCK_N16 layer takes 3.332 ms at full context, leaving 24.28 ms of the K1 step budget for the other 36 layers and runtime."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, attention, kernels, cache, numerics, telemetry]
+verdict: rejected
+rocket: "#kernels"
+supersedes: posts/attention/2026-09-07-qwen38-layer3-full-attention-transition
+---
+
+**Question.** Does the first real authenticated full-attention implementation leave enough K1 step time to exceed 451 aggregate token/s at c16?
+
+| setup | |
+| --- | --- |
+| node | `gx10-5e36`, one GB10 |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| Rocket code | `3df3bc4b38eedd63dacd73d60ed9c82e83770d32` |
+| planner fix | `40a444df9d579a85813cf45e3b1dc6ea3b741752` |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| rank slab | `a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4` |
+| reference | vLLM `8e685d198`, Apache-2.0; FlashInfer `91bda04c`, Apache-2.0 |
+
+```bash
+cmake -S engines/qwen38-flash-next-nvfp4-2b \
+  -B build-qwen38-attention -DROCKET_QWEN38_CUDA=ON
+cmake --build build-qwen38-attention -j2
+build-qwen38-attention/qwen38-full-attention-native-smoke \
+  /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank0-target.slab \
+  /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank1-target.slab \
+  0 262144
+```
+
+```text
+rows=16 generation=2 mean_ms=3.33246 min_ms=3.23911 max_ms=3.70111
+phase_ms qkv=0.087808 preprocess=0.098304 format=0.012416 fork=0.012128 score=2.02138 select=0.268288 attention=0.706688 gate_o=0.046752
+output_fnv64=2578894206285321241 state_fnv64=2686608471708731264 reset_replay=exact
+```
+
+| BLOCK_N16 measurement | value | unit |
+| --- | ---: | --- |
+| layer mean | 3.33246 | ms |
+| layer range, five launches | 3.23911 to 3.70111 | ms |
+| compressed-score phase | 2.02138 | ms |
+| score share of layer mean | 60.657 | % |
+| compressed-state traffic | 268,435,456 | B/layer |
+| score effective read rate | 132.798 | GB/s |
+| score share of 238 GB/s cold-read probe | 55.797 | % |
+| 12-layer projection | 39.98952 | ms/step |
+| share of 64.27 ms K1 clear-win budget | 62.221 | % |
+
+The 8-warp BLOCK_N128 control preserved both hashes and raised score time to 8.10022 ms and layer time to 9.07182 ms. It was rejected and is absent from the selected source.
+
+| state contract | value |
+| --- | ---: |
+| full-attention layers | 3, 7, ..., 47 |
+| main state | 2,147,483,648 B/layer |
+| raw state | 35,840 B/layer |
+| compressed state | 268,435,456 B/layer |
+| stage plus accepted-prefix publish | 28.099 us mean |
+| reset replay | bit exact |
+| output hash replay | bit exact |
+
+The current slab stores the replicated index projection as two authenticated 320-row halves. Each rank reconstructs the BF16 `[640,2560]` matrix once. There is no hot-path exchange. Planner rule ordering caused this split; `40a444d` fixes future artifacts without relabeling the measured slab.
+
+**Verdict.** Rejected for the >451 aggregate token/s target. The 3.332 ms K0 layer baseline consumes 62.221% of the K1 step budget across 12 layers. This run proves one-node rank-0 and rank-1 slab authentication, real QSA state traffic, accepted-prefix publication, and reset replay. It does not prove physical-peer execution, CUDA Graph replay, verifier widths above one, pinned full-intermediate parity, or full-model throughput.
+
+**Next.**
+
+- Replace the score grid with persistent gathered 16-key tiles and tensorized QK.
+- Tensorize sparse QK/PV around one shared 12-by-16 probability tile.
+- Prove physical rank-1 execution and pinned intermediate parity.
+- Capture K1, K4, and K7 verifier widths with rejected speculative rows kept private.
+
+**Reopen if.**
+
+- A newer SM121 compiler or CUTLASS attention primitive changes the full-context score ceiling.
