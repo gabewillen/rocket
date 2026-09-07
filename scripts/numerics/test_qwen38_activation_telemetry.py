@@ -54,9 +54,7 @@ class PatchTests(unittest.TestCase):
         self.assertIn('getattr(layer, "self_attn", None)', patched)
         self.assertIn('getattr(layer, "ple", None)', patched)
         self.assertIn('getattr(mlp, "gate", None)', patched)
-        self.assertIn("from vllm.model_executor.layers.linear import ReplicatedLinear", patched)
-        self.assertIn("self.experts.gate = self.gate", patched)
-        self.assertIn('router_algo == "NVFP4"', patched)
+        self.assertNotIn("ROCKET_QWEN38_NVFP4_ROUTER_V1", patched)
         self.assertIn("chunk_gated_delta_rule", patched)
         compile(patched, "model.py", "exec")
 
@@ -72,33 +70,6 @@ class PatchTests(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("source drift", result.stderr)
-
-    def test_patches_actual_pinned_nvidia_model_source(self):
-        image_source = subprocess.run(
-            [
-                "docker", "run", "--rm", "--entrypoint", "cat",
-                "vllm/vllm-openai:qwen38-flash-next",
-                "/usr/local/lib/python3.12/dist-packages/vllm/models/"
-                "qwen3_8_flash_next/nvidia/model.py",
-            ],
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout
-        with tempfile.TemporaryDirectory() as directory:
-            model_py = Path(directory) / "model.py"
-            model_py.write_text(image_source)
-            subprocess.run(
-                [sys.executable, str(PATCHER), str(model_py)],
-                text=True,
-                capture_output=True,
-                check=True,
-            )
-            patched = model_py.read_text()
-        compile(patched, "model.py", "exec")
-        self.assertIn('router_prefix = f"{prefix}.gate"', patched)
-        self.assertIn("self.experts.gate = self.gate", patched)
-
 
 class ReducerTests(unittest.TestCase):
     def legacy_lines(self, layers=2):

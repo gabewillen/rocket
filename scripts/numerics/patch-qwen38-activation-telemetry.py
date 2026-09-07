@@ -6,11 +6,6 @@ from pathlib import Path
 
 IMPORT_ANCHOR = "from itertools import islice\n\nimport torch\n"
 IMPORT_PATCH = "from itertools import islice\nimport json\nimport os\n\nimport torch\n"
-LINEAR_IMPORT_ANCHOR = "from vllm.model_executor.layers.logits_processor import LogitsProcessor\n"
-LINEAR_IMPORT_PATCH = (
-    "from vllm.model_executor.layers.linear import ReplicatedLinear\n"
-    + LINEAR_IMPORT_ANCHOR
-)
 CLASS_ANCHOR = "class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):\n"
 HELPER = r'''_ROCKET_CALIBRATION_MAXIMA = {}
 _ROCKET_TELEMETRY_CALLS = {}
@@ -258,38 +253,6 @@ INIT_PATCH = (
     + "        _rocket_install_linear_load_trace()\n"
     + "        _rocket_install_activation_telemetry(self.model)\n"
 )
-ROUTER_ANCHOR = "        super().__init__(vllm_config=vllm_config, prefix=prefix)\n"
-ROUTER_PATCH = ROUTER_ANCHOR + '''        quant_config = vllm_config.quant_config
-        router_prefix = f"{prefix}.gate"
-        router_algo = (
-            quant_config._resolve_quant_algo(router_prefix)
-            if quant_config is not None
-            and hasattr(quant_config, "_resolve_quant_algo")
-            else None
-        )
-        if router_algo == "NVFP4":
-            if not hasattr(self.experts, "gate") or getattr(
-                self.experts, "_fse_fuse_gate", False
-            ):
-                raise ValueError(
-                    f"Qwen3.8 router {router_prefix} cannot replace the MoE gate"
-                )
-            config = vllm_config.model_config.hf_text_config
-            self.gate = ReplicatedLinear(
-                config.hidden_size,
-                config.num_experts,
-                bias=False,
-                quant_config=quant_config,
-                prefix=router_prefix,
-            )
-            self.experts.gate = self.gate
-        elif router_algo is not None:
-            raise ValueError(
-                f"Qwen3.8 router {router_prefix} has unsupported policy {router_algo}"
-            )
-'''
-
-
 def replace_once(source, old, new, label):
     if source.count(old) != 1:
         raise SystemExit(f"vLLM source drift: expected one {label} anchor")
@@ -304,11 +267,7 @@ def main():
     if "ROCKET_NVFP4_TELEMETRY" in source:
         raise SystemExit("already patched")
     source = replace_once(source, IMPORT_ANCHOR, IMPORT_PATCH, "import")
-    source = replace_once(
-        source, LINEAR_IMPORT_ANCHOR, LINEAR_IMPORT_PATCH, "linear import"
-    )
     source = replace_once(source, CLASS_ANCHOR, HELPER + CLASS_ANCHOR, "class")
-    source = replace_once(source, ROUTER_ANCHOR, ROUTER_PATCH, "router construction")
     source = replace_once(source, INIT_ANCHOR, INIT_PATCH, "initialization")
     args.model_py.write_text(source)
 

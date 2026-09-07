@@ -159,6 +159,10 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("prefix='mtp.layers.48.mlp.experts'", self.source)
         self.assertIn("('FP8_BLOCK_SCALES', 'FP8_PB_WO')", self.source)
         self.assertIn("block.weight_block_size == [128, 128]", self.source)
+        self.assertIn("ROCKET_QWEN38_NVFP4_ROUTER_V1", self.source)
+        self.assertIn("model.language_model.model.layers.0.mlp.gate", self.source)
+        self.assertIn("model.language_model.model.layers.1.ple.key_proj", self.source)
+        self.assertIn("validated worker NVFP4 semantics", self.source)
         self.assertLess(self.source.index(semantic), self.source.index(launch))
 
     def test_worker_transfers_are_checksummed_and_nvfp4_is_preflighted(self):
@@ -181,7 +185,14 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             "rocket.qwen38.nvfp4-overlay.v2",
         ):
             self.assertIn(schema, self.source)
-        self.assertIn('contracts = {"linear_attention": 180, "full_attention": 48}', self.source)
+        for contract in (
+            '"base_ple": 2',
+            '"base_routers": 48',
+            '"full_attention": 48',
+            '"linear_attention": 180',
+        ):
+            self.assertIn(contract, self.source)
+        self.assertIn("families != sorted(set(families))", self.source)
         self.assertIn('NVFP4_OVERLAY_FILE=$(read_nvfp4_manifest file)', self.source)
         self.assertIn('NVFP4_EXPECTED_COUNT=$(read_nvfp4_manifest count)', self.source)
         self.assertIn('mapfile -t NVFP4_FAMILIES', self.source)
@@ -189,6 +200,14 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn('"${nvfp4_family_args[@]}"', self.source)
         self.assertIn('sha256sum manifest.json hf_quant_config.json "$NVFP4_OVERLAY_FILE"', self.source)
         self.assertIn('"$NVFP4_ARTIFACT_DIR/$NVFP4_OVERLAY_FILE"', self.source)
+
+    def test_router_reconstruction_is_selected_by_manifest_only(self):
+        condition = 'if [[ "$NVFP4_HAS_BASE_ROUTERS" == true ]]'
+        patcher = "patch-qwen38-nvfp4-router.py"
+        self.assertIn(condition, self.source)
+        self.assertIn('if [[ "$family" == base_routers ]]', self.source)
+        self.assertEqual(self.source.count(patcher), 1)
+        self.assertLess(self.source.index(condition), self.source.index(patcher))
 
     def test_generated_launch_scripts_are_single_commands(self):
         function = self.source[

@@ -39,6 +39,8 @@ NVFP4_ARTIFACT_DIR=""
 NVFP4_OVERLAY_FILE=""
 NVFP4_EXPECTED_COUNT=""
 NVFP4_FAMILIES=()
+NVFP4_FAMILIES_CSV=""
+NVFP4_HAS_BASE_ROUTERS=false
 LAUNCH=false
 KEEP_RUNNING=false
 PRODUCTION=false
@@ -63,7 +65,7 @@ Options:
   --keep-running         Leave containers running after a successful calibration
   --mia-source DIR       Existing checkout at the pinned MiaAI-Lab commit
   --fp8-artifact-dir DIR Immutable linear-attention FP8 artifact directory
-  --nvfp4-artifact-dir DIR Immutable linear-attention NVFP4 artifact directory
+  --nvfp4-artifact-dir DIR Immutable manifest-driven NVFP4 artifact directory
   --worker USER@HOST     Worker SSH destination (default: glwillen@192.168.100.11)
   --head-ip IP           Head fabric address (default: 192.168.100.10)
   --worker-ip IP         Worker fabric address (default: 192.168.100.11)
@@ -181,8 +183,15 @@ elif schema == "rocket.qwen38.nvfp4-overlay.v2":
     families = source.get("families")
 else:
     raise SystemExit("NVFP4 manifest schema mismatch")
-contracts = {"linear_attention": 180, "full_attention": 48}
-if families not in (["full_attention"], ["linear_attention"], ["full_attention", "linear_attention"]):
+contracts = {
+    "base_ple": 2,
+    "base_routers": 48,
+    "full_attention": 48,
+    "linear_attention": 180,
+}
+if not isinstance(families, list) or not families:
+    raise SystemExit("NVFP4 manifest family selection is invalid")
+if families != sorted(set(families)) or any(family not in contracts for family in families):
     raise SystemExit("NVFP4 manifest family selection is invalid")
 expected = sum(contracts[family] for family in families)
 if not isinstance(source.get("tensors"), list) or len(source["tensors"]) != expected:
@@ -205,6 +214,12 @@ PY
     NVFP4_EXPECTED_COUNT=$(read_nvfp4_manifest count) || fail "NVFP4 artifact manifest is invalid"
     mapfile -t NVFP4_FAMILIES < <(read_nvfp4_manifest families)
     [[ ${#NVFP4_FAMILIES[@]} -gt 0 ]] || fail "NVFP4 artifact has no selected families"
+    NVFP4_FAMILIES_CSV=$(IFS=,; printf '%s' "${NVFP4_FAMILIES[*]}")
+    for family in "${NVFP4_FAMILIES[@]}"; do
+        if [[ "$family" == base_routers ]]; then
+            NVFP4_HAS_BASE_ROUTERS=true
+        fi
+    done
     [[ -f "$NVFP4_ARTIFACT_DIR/$NVFP4_OVERLAY_FILE" ]] || \
         fail "NVFP4 overlay payload missing: $NVFP4_OVERLAY_FILE"
 fi
@@ -314,6 +329,10 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         "$ARTIFACT_DIR/weight_utils_64k.py"
 fi
 python3 "$SCRIPT_DIR/patch-qwen38-activation-telemetry.py" "$ARTIFACT_DIR/model_telemetry.py"
+if [[ "$NVFP4_HAS_BASE_ROUTERS" == true ]]; then
+    python3 "$REPO_ROOT/scripts/runtime/patch-qwen38-nvfp4-router.py" \
+        "$ARTIFACT_DIR/model_telemetry.py"
+fi
 
 for file in ple_layer_patched.py modelopt_patched.py qsa_ops_patched.py \
     qsa_nvidia_patched.py config_patched.json hf_quant_config_patched.json; do
@@ -363,8 +382,10 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
     docker run --rm \
         -v "$ARTIFACT_DIR/modelopt_patched.py:$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro" \
         -v "$NVFP4_ARTIFACT_DIR/hf_quant_config.json:/work/hf_quant_config.json:ro" \
+        -v "$ARTIFACT_DIR/model_telemetry.py:/work/model.py:ro" \
+        -e "ROCKET_NVFP4_FAMILIES=$NVFP4_FAMILIES_CSV" \
         --entrypoint /usr/bin/python3 "$IMAGE_TAG" -c \
-        "import json; from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig; config=ModelOptMixedPrecisionConfig.from_config(json.load(open('/work/hf_quant_config.json'))); prefix='mtp.layers.48.mlp.experts'; algo=config._resolve_quant_algo(prefix); block=config._fp8_block_scales_config(prefix); assert algo in ('FP8_BLOCK_SCALES', 'FP8_PB_WO'), algo; assert block.weight_block_size == [128, 128], block.weight_block_size; print(f'validated MTP dispatch: {algo} {block.weight_block_size}')"
+        "import json,os,pathlib; from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig; config=ModelOptMixedPrecisionConfig.from_config(json.load(open('/work/hf_quant_config.json'))); families=set(os.environ['ROCKET_NVFP4_FAMILIES'].split(',')); prefix='mtp.layers.48.mlp.experts'; algo=config._resolve_quant_algo(prefix); block=config._fp8_block_scales_config(prefix); assert algo in ('FP8_BLOCK_SCALES', 'FP8_PB_WO'), algo; assert block.weight_block_size == [128, 128], block.weight_block_size; checks={'base_routers':'model.language_model.model.layers.0.mlp.gate','base_ple':'model.language_model.model.layers.1.ple.key_proj'}; [(_ for _ in ()).throw(AssertionError((family, config._resolve_quant_algo(target)))) for family,target in checks.items() if family in families and config._resolve_quant_algo(target) != 'NVFP4']; marker='ROCKET_QWEN38_NVFP4_ROUTER_V1' in pathlib.Path('/work/model.py').read_text(); assert marker == ('base_routers' in families), marker; print(f'validated NVFP4 semantics: {sorted(families)}; MTP {algo} {block.weight_block_size}')"
 fi
 verify_sha 0669d6334f58a624c89c15f3e46c90f28e59b0b913507101dec1c5765e3c3b12 "$ARTIFACT_DIR/qsa_ops_patched.py"
 verify_sha ee5de40742ad48a6064ea24b99a285ff69c47d57bbb170f57c4eef71567a1df3 "$ARTIFACT_DIR/qsa_nvidia_patched.py"
@@ -526,6 +547,14 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         -e ROCKET_QWEN38_NVFP4_QUANT_CONFIG=/rocket/qwen38-linear-nvfp4/hf_quant_config.json \
         --entrypoint /usr/bin/python3 '$IMAGE_TAG' -c \
         \"import glob; from vllm.model_executor.model_loader.weight_utils import _rocket_qwen38_nvfp4_overlay_preflight as check; files=glob.glob('/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/*.safetensors'); result=check(sorted(files), 'lazy'); assert len(result['selected']) == $NVFP4_EXPECTED_COUNT; print('validated worker NVFP4 overlay: $NVFP4_EXPECTED_COUNT tensors')\""
+    ssh -o BatchMode=yes "$SSH_TARGET" \
+        "docker run --rm \
+        -v '$REMOTE_OUTPUT/artifacts/modelopt_patched.py:$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro' \
+        -v '$REMOTE_NVFP4_ARTIFACT/hf_quant_config.json:/work/hf_quant_config.json:ro' \
+        -v '$REMOTE_OUTPUT/artifacts/model_telemetry.py:/work/model.py:ro' \
+        -e ROCKET_NVFP4_FAMILIES='$NVFP4_FAMILIES_CSV' \
+        --entrypoint /usr/bin/python3 '$IMAGE_TAG' -c \
+        \"import json,os,pathlib; from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig; config=ModelOptMixedPrecisionConfig.from_config(json.load(open('/work/hf_quant_config.json'))); families=set(os.environ['ROCKET_NVFP4_FAMILIES'].split(',')); checks={'base_routers':'model.language_model.model.layers.0.mlp.gate','base_ple':'model.language_model.model.layers.1.ple.value_proj'}; [(_ for _ in ()).throw(AssertionError((family, config._resolve_quant_algo(target)))) for family,target in checks.items() if family in families and config._resolve_quant_algo(target) != 'NVFP4']; marker='ROCKET_QWEN38_NVFP4_ROUTER_V1' in pathlib.Path('/work/model.py').read_text(); assert marker == ('base_routers' in families), marker; print(f'validated worker NVFP4 semantics: {sorted(families)}')\""
 fi
 write_launch_script "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE" \
     "$WORKER_HCA" "$WORKER_HF_VOLUME" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT" "$REMOTE_NVFP4_ARTIFACT"
