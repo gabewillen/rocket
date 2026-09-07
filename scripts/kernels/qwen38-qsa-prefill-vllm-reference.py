@@ -56,9 +56,13 @@ def make_indices(
                 first_row, first_row + count, dtype=torch.int32, device="cuda"
             )
             position = context_tokens - query_tokens + local
+            if pattern == "causal-zero":
+                position = local
             first = torch.maximum(position - (TOPK - 1), torch.zeros_like(position))
             if pattern == "disjoint":
                 first = torch.where((local & 1) != 0, 4096, 0)
+            elif pattern == "identical":
+                first = torch.zeros_like(position)
             logical = first[:, None] + slots[None, :]
             logical = torch.where(
                 (logical <= position[:, None]) & (logical < context_tokens),
@@ -96,7 +100,9 @@ def main() -> None:
     parser.add_argument("sequences", type=int, choices=(1, 2, 4, 8, 16))
     parser.add_argument("query_tokens", type=int, choices=(300, 8192))
     parser.add_argument(
-        "--pattern", choices=("overlap", "disjoint"), default="overlap"
+        "--pattern",
+        choices=("overlap", "disjoint", "identical", "causal-zero"),
+        default="overlap",
     )
     parser.add_argument("--native-output", type=Path)
     parser.add_argument("--output", type=Path)

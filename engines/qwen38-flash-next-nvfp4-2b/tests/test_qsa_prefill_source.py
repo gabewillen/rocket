@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src/attention/qsa_prefill.cu"
 HEADER = ROOT / "src/attention/qsa_prefill.h"
+CUTE = ROOT / "src/attention/qsa_prefill_cute.py"
 
 
 class QsaPrefillSourceContractTest(unittest.TestCase):
@@ -14,6 +15,7 @@ class QsaPrefillSourceContractTest(unittest.TestCase):
     def setUpClass(cls):
         cls.source = SOURCE.read_text()
         cls.header = HEADER.read_text()
+        cls.cute = CUTE.read_text()
 
     def test_pins_reference_provenance_and_qwen_geometry(self):
         self.assertIn("FlashInfer 91bda04c", self.source)
@@ -73,6 +75,30 @@ class QsaPrefillSourceContractTest(unittest.TestCase):
             self.source,
             r"(?s)while \(true\).*?__syncthreads\(\);\n    if \(s\.mask\[0\] == 0\) break;",
         )
+
+    def test_cute_hard_cut_preserves_provenance_and_fixed_schedule(self):
+        self.assertIn("Copyright (c) 2026 by FlashInfer team", self.cute)
+        self.assertIn("91bda04c66f7cb851e1ab3b78b9fecea644b9844", self.cute)
+        self.assertIn("cfdee49ee968868dee7ce1a0b4e2b62a", self.cute)
+        self.assertIn("class Qwen38QsaPrefillSm121", self.cute)
+        for value in ("256,", "64,", "16,", "128,"):
+            self.assertIn(value, self.cute)
+        self.assertIn("_load_qwen_gathered_kv", self.cute)
+        self.assertIn("(topk, tokens_per_tile) != (2051, 4)", self.cute)
+        self.assertIn(
+            "while (m != sentinel) and (u < self._max_union)", self.cute
+        )
+        self.assertNotIn("if m == sentinel:\n                break", self.cute)
+        self.assertIn("mUnionMasks[work_idx, u, token_slot]", self.cute)
+        self.assertIn("bit == 0 or k_pos < 0", self.cute)
+        self.assertIn("cO = cute.make_identity_tensor", self.cute)
+        self.assertIn("d_pos = tOcO_mn[0, c][1]", self.cute)
+        runner = (
+            ROOT.parents[1] / "scripts/kernels/qwen38-qsa-prefill-cute.py"
+        ).read_text()
+        self.assertIn("union_tokens = torch.where(valid, union_tokens, -1)", runner)
+        self.assertIn("union_masks = torch.where(valid, union_masks, 0)", runner)
+        self.assertLess(runner.index("difference ="), runner.index("kernel_samples ="))
 
 
 if __name__ == "__main__":
