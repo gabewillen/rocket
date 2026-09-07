@@ -1,0 +1,61 @@
+---
+title: "Display-power renegotiation does not lift the head's 728 MHz cap"
+description: "Under the same two-node Qwen3.8 inference load, the head remains capped at 728 MHz while the peer reaches 2489 MHz, so the display-power hypothesis is rejected."
+date: 2026-09-08
+author: "agent"
+categories: [incident, hardware, baseline]
+verdict: rejected
+rocket: "#boosters"
+supersedes: posts/hardware/2026-09-08-display-power-held-head-clock-low
+---
+
+**Question.** Did disconnecting the powered display and renegotiating PDU input
+remove the head's 728 MHz inference ceiling?
+
+| setup | |
+| --- | --- |
+| nodes | gx10-5e36 (head), gx10-2a13 / 192.168.100.11 (peer), GB10 |
+| kernel | 6.17.13-rocket64k, 64 KiB pages, both nodes |
+| checkpoint | nvidia/Qwen3.8-Flash-Next-NVFP4 at fc694b54fb0174e0913e6adf86691ef85a4ead47 |
+| runtime commit | 6ba463e1485c57e9c990583f21fc7b353860eeb9 |
+| run | qwen38-linear-fp8-production-20260907-09 |
+
+```bash
+scripts/numerics/qwen38-expanded-calibration.sh \
+  --output-dir /home/glwillen/calibration/qwen38-linear-fp8-production-20260907-09 \
+  --fp8-artifact-dir /home/glwillen/calibration/qwen38-linear-fp8-artifacts/dbefeae04f00118080ce821909786b0c84941b3ac39f1854941a2d2bf4cd516d \
+  --production --keep-running --startup-timeout-seconds 3600
+```
+
+| active-load metric | head | peer |
+| --- | ---: | ---: |
+| samples | 154 | 165 |
+| median SM clock | 721 MHz | 2457 MHz |
+| maximum SM clock | 728 MHz | 2489 MHz |
+| median power | 10.61 W | 36.45 W |
+| maximum power | 13.02 W | 42.34 W |
+| maximum utilization | 96% | 96% |
+
+| concurrency | aggregate tok/s | per-stream tok/s | mean TTFT |
+| ---: | ---: | ---: | ---: |
+| 1 | 30.54 | 30.54 | 13.68 s |
+| 2 | 46.20 | 23.56 | 10.84 s |
+| 4 | 48.51 | 19.81 | 9.84 s |
+| 8 | 62.43 | 13.97 | 15.31 s |
+| 16 | 65.81 | 7.81 | 27.21 s |
+
+**Verdict.** Rejected. Idle clocks matched after the display was disconnected,
+but active inference reproduced the exact 728 MHz head ceiling. The throughput
+table records the failed-power-state run and is excluded from the healthy-node
+engine baseline.
+
+**Next.**
+
+- reboot the head with the display power disconnected
+- run the existing single-node static-fire clock test before another model load
+- rerun the production FP8 ladder only after the head exceeds 728 MHz
+
+**Reopen if.**
+
+- PDU firmware or GB10 firmware changes input-power negotiation behavior
+- the powered-display hardware or power topology changes
