@@ -13,6 +13,10 @@ SPEC = importlib.util.spec_from_file_location("router_cohort_reduce", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
+LIVE_SPEC = importlib.util.spec_from_file_location("router_cohort_live", LIVE)
+LIVE_MODULE = importlib.util.module_from_spec(LIVE_SPEC)
+assert LIVE_SPEC.loader is not None
+LIVE_SPEC.loader.exec_module(LIVE_MODULE)
 
 
 class ReducerTests(unittest.TestCase):
@@ -29,6 +33,13 @@ class ReducerTests(unittest.TestCase):
         self.assertIn('"--concurrency", type=int, required=True', source)
         self.assertNotIn("for concurrency in CONCURRENCY", source)
         self.assertIn("args.concurrency * args.divergence_tokens > 8192", source)
+
+    def test_decode_exceeds_base_plus_three_fully_accepted_k4_steps(self):
+        self.assertEqual(LIVE_MODULE.VERIFY_WIDTH, 5)
+        self.assertEqual(LIVE_MODULE.CAPTURE_CALLS, 4)
+        self.assertEqual(LIVE_MODULE.EARLY_TERMINAL_TOKENS, 1 + 3 * 5)
+        self.assertEqual(LIVE_MODULE.EARLY_TERMINAL_TOKENS, 16)
+        self.assertEqual(LIVE_MODULE.MIN_DECODE, 17)
 
     def test_exact_target_and_speculative_rank_unions(self):
         with tempfile.TemporaryDirectory() as directory:

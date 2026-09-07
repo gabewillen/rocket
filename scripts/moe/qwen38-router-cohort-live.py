@@ -19,6 +19,10 @@ ROUTER_METADATA = (
     "ROCKET_ROUTER_COHORT",
     "ROCKET_ROUTER_SEQUENCES",
 )
+VERIFY_WIDTH = 5
+CAPTURE_CALLS = 4
+EARLY_TERMINAL_TOKENS = 1 + (CAPTURE_CALLS - 1) * VERIFY_WIDTH
+MIN_DECODE = EARLY_TERMINAL_TOKENS + 1
 
 
 def main() -> None:
@@ -26,12 +30,14 @@ def main() -> None:
     parser.add_argument(
         "--concurrency", type=int, required=True, choices=SUPPORTED_CONCURRENCY
     )
-    parser.add_argument("--decode", type=int, default=16)
+    parser.add_argument("--decode", type=int, default=MIN_DECODE)
     parser.add_argument("--prefix-tokens", type=int, default=8192)
     parser.add_argument("--divergence-tokens", type=int, default=128)
     args = parser.parse_args()
-    if args.decode < 8:
-        parser.error("--decode must be at least 8 to reach steady K4 verification")
+    if args.decode < MIN_DECODE:
+        parser.error(
+            f"--decode must be at least {MIN_DECODE} to guarantee four K4 calls"
+        )
     if args.prefix_tokens < 1024 or args.prefix_tokens > 8192:
         parser.error("--prefix-tokens must be between 1024 and 8192")
     if args.divergence_tokens < 50 or args.divergence_tokens > 200:
@@ -92,8 +98,8 @@ def main() -> None:
     os.environ.update(
         {
             "ROCKET_ROUTER_RANK": str(rank),
-            "ROCKET_ROUTER_VERIFY_WIDTH": "5",
-            "ROCKET_ROUTER_MAX_COHORTS": "4",
+            "ROCKET_ROUTER_VERIFY_WIDTH": str(VERIFY_WIDTH),
+            "ROCKET_ROUTER_MAX_COHORTS": str(CAPTURE_CALLS),
             "ROCKET_ROUTER_COHORT": cohort,
             "ROCKET_ROUTER_SEQUENCES": str(concurrency),
         }
@@ -126,7 +132,7 @@ def main() -> None:
                     "model": MODEL,
                     "revision": REVISION,
                     "concurrency": concurrency,
-                    "verify_width": 5,
+                    "verify_width": VERIFY_WIDTH,
                     "top_k": 10,
                     "decode": args.decode,
                     "root_prefix_tokens": args.prefix_tokens,
