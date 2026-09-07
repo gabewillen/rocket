@@ -37,6 +37,7 @@ MIA_SOURCE=""
 FP8_ARTIFACT_DIR=""
 LAUNCH=false
 KEEP_RUNNING=false
+PRODUCTION=false
 STARTUP_TIMEOUT_SECONDS=3600
 
 usage() {
@@ -51,6 +52,7 @@ Required:
 
 Options:
   --launch               Launch both nodes, run the corpus, reduce telemetry
+  --production           Launch without telemetry/eager mode and benchmark throughput
   --keep-running         Leave containers running after a successful calibration
   --mia-source DIR       Existing checkout at the pinned MiaAI-Lab commit
   --fp8-artifact-dir DIR Immutable linear-attention FP8 artifact directory
@@ -78,6 +80,7 @@ while (($#)); do
     case "$1" in
         --output-dir) OUTPUT_DIR=${2:?missing value}; shift 2 ;;
         --launch) LAUNCH=true; shift ;;
+        --production) PRODUCTION=true; LAUNCH=true; shift ;;
         --keep-running) KEEP_RUNNING=true; shift ;;
         --mia-source) MIA_SOURCE=${2:?missing value}; shift 2 ;;
         --fp8-artifact-dir) FP8_ARTIFACT_DIR=${2:?missing value}; shift 2 ;;
@@ -350,6 +353,18 @@ write_launch_script "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE
     "$WORKER_HCA" "$WORKER_HF_VOLUME" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT"
 write_launch_script "$OUTPUT_DIR/launch-head.sh" 0 "$HEAD_IP" "$HEAD_IFACE" \
     "$HEAD_HCA" "$HF_CACHE" "$ARTIFACT_DIR" "--host 0.0.0.0 --port $API_PORT" "rw" "$FP8_ARTIFACT_DIR"
+if [[ "$PRODUCTION" == true ]]; then
+    for launch_script in "$OUTPUT_DIR/launch-head.sh" "$OUTPUT_DIR/launch-worker.sh"; do
+        sed -i \
+            -e '/ROCKET_NVFP4_CALIBRATE=/d' \
+            -e '/ROCKET_NVFP4_SAMPLE_ELEMENTS=/d' \
+            -e '/ROCKET_NVFP4_MAX_EMISSIONS=/d' \
+            -e '/ROCKET_QWEN38_LOAD_TRACE=/d' \
+            -e '/model_telemetry.py:.*\/model.py:ro/d' \
+            -e 's/--enforce-eager //' \
+            "$launch_script"
+    done
+fi
 scp -q "$OUTPUT_DIR/launch-worker.sh" "$SSH_TARGET:$REMOTE_OUTPUT/launch-worker.sh"
 
 head_log_pid=""
@@ -389,6 +404,15 @@ until curl -fsS "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; do
         fail "worker container exited during startup"
     sleep 10
 done
+
+if [[ "$PRODUCTION" == true ]]; then
+    python3 "$REPO_ROOT/scripts/baseline/openai-forked-prefix.py" \
+        --endpoint "http://127.0.0.1:$API_PORT" --concurrency 1,2,4,8,16 \
+        --decode 256 --json > "$OUTPUT_DIR/throughput.json"
+    cat "$OUTPUT_DIR/throughput.json"
+    printf 'Production benchmark complete: %s\n' "$OUTPUT_DIR"
+    exit 0
+fi
 
 # Move past the health-check second before opening the workload-only log window.
 # This prevents a final startup/profiling record with the same timestamp second

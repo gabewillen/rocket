@@ -33,6 +33,16 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("--startup-timeout-seconds", help_result.stdout)
         self.assertIn("default: 3600", help_result.stdout)
         self.assertIn("--fp8-artifact-dir", help_result.stdout)
+        self.assertIn("--production", help_result.stdout)
+
+    def test_production_mode_cuts_instrumentation_and_runs_ladder(self):
+        self.assertIn('if [[ "$PRODUCTION" == true ]]', self.source)
+        self.assertIn("/ROCKET_NVFP4_CALIBRATE=/d", self.source)
+        self.assertIn("/model_telemetry.py:.*\\/model.py:ro/d", self.source)
+        self.assertIn("s/--enforce-eager //", self.source)
+        self.assertIn("openai-forked-prefix.py", self.source)
+        self.assertIn("--concurrency 1,2,4,8,16", self.source)
+        self.assertIn('$OUTPUT_DIR/throughput.json', self.source)
 
     def test_startup_timeout_requires_positive_integer(self):
         for invalid in ("0", "-1", "1.5", "nope"):
