@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Owned CUDA-graph runtime for the pinned one-layer Qwen3.8 MTP block.
+"""Matched CUDA-graph reference oracle for the pinned Qwen3.8 MTP block.
 
 Cold construction receives the already weight-loaded pinned vLLM MTP module,
 fixed arena tensors, and the active attention metadata context. It captures the
-entire K-step proposal chain once. The hot path performs one graph replay and
-does not invoke Python model callbacks or loop over draft positions.
+entire K-step proposal chain once. This module is excluded from the production
+custom runtime because the captured kernels and dispatch remain vLLM-owned.
+Its hidden snapshots also omit QSA cache state. It exists only to compare
+Rocket-native FP8 and NVFP4 results against an independent measured engine.
 """
 
 from __future__ import annotations
@@ -76,8 +78,8 @@ class _Captured:
     pending: bool = False
 
 
-class MtpGraphRuntime:
-    """Single-writer owner of immutable resident and lazy MTP graphs."""
+class MtpReferenceOracle:
+    """Single-writer matched oracle, never a production serving adapter."""
 
     def __init__(self, source: NativeMtpSource, module: object, *, torch_api=None):
         if torch_api is None:

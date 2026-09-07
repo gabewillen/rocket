@@ -8,7 +8,14 @@ from qwen38_slab.mtp_graph_runtime import MtpGraphKey, MtpGraphRuntimeError, Res
 from pathlib import Path
 
 
-class MtpGraphRuntimeContractTests(unittest.TestCase):
+class MtpReferenceOracleContractTests(unittest.TestCase):
+    def test_source_excludes_oracle_from_production(self):
+        source = (
+            Path(__file__).parents[1] / "src" / "qwen38_slab" / "mtp_graph_runtime.py"
+        ).read_text()
+        self.assertIn("excluded from the production", source)
+        self.assertIn("class MtpReferenceOracle", source)
+
     def test_hot_draft_is_one_graph_replay_without_step_loop(self):
         source = (
             Path(__file__).parents[1] / "src" / "qwen38_slab" / "mtp_graph_runtime.py"
