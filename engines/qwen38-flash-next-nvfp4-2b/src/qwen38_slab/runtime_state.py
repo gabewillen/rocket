@@ -40,7 +40,7 @@ from .state_txn import (
     OtelTracer,
 )
 
-MAX_FAMILY_BYTES = 16 * 1024**3
+MAX_FAMILY_BYTES = 24 * 1024**3
 MAX_RANK_BYTES = 64 * 1024**3
 _HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
 

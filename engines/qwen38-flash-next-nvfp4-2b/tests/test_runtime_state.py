@@ -10,6 +10,7 @@ from qwen38_slab.runtime_state import (
     CudaQuiesceError,
     CudaStateBinding,
     DeviceState,
+    MAX_FAMILY_BYTES,
     QuiesceReceipt,
     RuntimeBoundary,
     RuntimeStateError,
@@ -143,6 +144,20 @@ class RuntimeStateTests(unittest.TestCase):
             list(STATE_FAMILIES),
         )
         self.assertEqual(self.binding.phase, BindingPhase.IDLE)
+
+    def test_largest_measured_c16_family_reaches_adapter_copy_boundary(self):
+        sources = dict(self.sources)
+        first = STATE_FAMILIES[0]
+        sources[first] = DeviceState(
+            family=first,
+            handle="measured-c16-device",
+            accepted_bytes=24 * 1024**3,
+            allocated_bytes=24 * 1024**3,
+        )
+        self.assertEqual(MAX_FAMILY_BYTES, sources[first].accepted_bytes)
+        with self.assertRaisesRegex(RuntimeStateError, "invalid extent"):
+            self.binding.capture(self.boundary, sources)
+        self.assertEqual(self.runtime.events[0], ("quiesce", 11))
 
     def test_restore_stages_all_families_and_publishes_once_after_transfer_fence(self):
         self.binding.restore(self.authenticated, generation_epoch=12)

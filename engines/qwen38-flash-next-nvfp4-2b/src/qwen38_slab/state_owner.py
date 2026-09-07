@@ -22,7 +22,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from enum import Enum
 from types import MappingProxyType
-from typing import Iterator, Protocol
+from typing import Iterator, Protocol, runtime_checkable
 
 from .decode import PreparedDecode
 from .device_decode import DevicePhase, DevicePublication
@@ -76,6 +76,21 @@ class RankRuntimeBinding(Protocol):
     def restore(
         self, authenticated: AuthenticatedState, generation_epoch: int
     ) -> None: ...
+
+
+@runtime_checkable
+class CoordinatedStateOwner(Protocol):
+    """Rank owner surface, including a synchronous physical-node proxy."""
+
+    @property
+    def rank(self) -> int: ...
+
+    @property
+    def accepted_boundary(self) -> RuntimeBoundary | None: ...
+
+    def hold_launch_gate(self, boundary: RuntimeBoundary) -> None: ...
+    def release_launch_gate(self, boundary: RuntimeBoundary) -> None: ...
+    def fault_closed(self, boundary: RuntimeBoundary) -> None: ...
 
 
 class DecoderStateOwner:
@@ -310,14 +325,14 @@ class TwoRankRestoreCoordinator:
 
     def __init__(
         self,
-        owners: tuple[DecoderStateOwner, DecoderStateOwner],
+        owners: tuple[CoordinatedStateOwner, CoordinatedStateOwner],
         bindings: tuple[RankRuntimeBinding, RankRuntimeBinding],
         tracer: OtelTracer,
     ):
         if (
             not isinstance(owners, tuple)
             or len(owners) != 2
-            or any(not isinstance(owner, DecoderStateOwner) for owner in owners)
+            or any(not isinstance(owner, CoordinatedStateOwner) for owner in owners)
             or tuple(getattr(owner, "rank", None) for owner in owners) != (0, 1)
             or not isinstance(bindings, tuple)
             or len(bindings) != 2
@@ -437,6 +452,7 @@ def _validate_boundary(boundary: RuntimeBoundary) -> None:
 
 
 __all__ = [
+    "CoordinatedStateOwner",
     "CoordinatorPhase",
     "DecoderStateOwner",
     "DecoderStateOwnerError",

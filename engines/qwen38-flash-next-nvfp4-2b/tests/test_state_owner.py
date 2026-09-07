@@ -61,6 +61,29 @@ class RuntimeBinding:
         self.owner.open_launch_gate(boundary)
 
 
+class OwnerProxy:
+    def __init__(self, owner):
+        self.owner = owner
+
+    @property
+    def rank(self): return self.owner.rank
+    @property
+    def accepted_boundary(self): return self.owner.accepted_boundary
+    def hold_launch_gate(self, boundary): self.owner.hold_launch_gate(boundary)
+    def release_launch_gate(self, boundary): self.owner.release_launch_gate(boundary)
+    def fault_closed(self, boundary): self.owner.fault_closed(boundary)
+
+
+class ProxyBinding:
+    def __init__(self, rank, owner, events):
+        self.rank = rank
+        self.state_owner = owner
+        self.events = events
+
+    def restore(self, authenticated, generation_epoch):
+        self.events.append((self.rank, authenticated.boundary, generation_epoch))
+
+
 class StateOwnerTests(unittest.TestCase):
     def setUp(self):
         self.digest = hashlib.sha256(b"accepted-41").hexdigest()
@@ -167,6 +190,22 @@ class StateOwnerTests(unittest.TestCase):
                 ),
                 Tracer(),
             )
+
+    def test_coordinator_accepts_strict_physical_owner_proxy_contract(self):
+        concrete = (self._owner(0)[0], self._owner(1)[0])
+        proxies = (OwnerProxy(concrete[0]), OwnerProxy(concrete[1]))
+        events = []
+        coordinator = TwoRankRestoreCoordinator(
+            proxies,
+            (
+                ProxyBinding(0, proxies[0], events),
+                ProxyBinding(1, proxies[1], events),
+            ),
+            Tracer(),
+        )
+        coordinator.restore(self.authenticated, generation_epoch=7)
+        self.assertEqual([event[0] for event in events], [0, 1])
+        self.assertTrue(all(owner.phase.value == "open" for owner in concrete))
 
     def test_owner_and_coordinator_otel_dimensions_are_bounded(self):
         owner0, _decoder0, tracer0 = self._owner(0)
