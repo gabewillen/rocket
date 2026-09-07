@@ -456,7 +456,7 @@ class Cuda13GraphRuntime:
         self._graph_nodes = (
             TARGET_GRAPH_NODES
             + 2 * int(projection is not None)
-            + 12 * int(full_projection is not None)
+            + 18 * int(full_projection is not None)
         )
         self._active_bank = -1
         self._active_graph_batch: int | None = None
@@ -706,6 +706,22 @@ class Cuda13GraphRuntime:
             raise DeviceDecodeError("no CUDA QSA indexer result has been published")
         return struct.unpack("<32816i", self._full_qkv.qsa_output_bytes())
 
+    def read_qsa_attention(self) -> bytes:
+        """Copy active rank-local BF16 sparse-attention output."""
+
+        self._require_open()
+        if self._active_bank not in (0, 1) or self._full_qkv is None:
+            raise DeviceDecodeError("no CUDA QSA attention result has been published")
+        return self._full_qkv.attention_output_bytes()
+
+    def read_qsa_projected_output(self) -> bytes:
+        """Copy active rank-local BF16 attention output projection."""
+
+        self._require_open()
+        if self._active_bank not in (0, 1) or self._full_qkv is None:
+            raise DeviceDecodeError("no CUDA attention projection has been published")
+        return self._full_qkv.projected_attention_bytes()
+
     def update_qkv_activations(self, activations_bf16: bytes) -> None:
         """Refresh the stable full-width input before a metadata transaction."""
 
@@ -875,6 +891,10 @@ class Cuda13GraphRuntime:
                 self._device[bank]["seq_lens"],
                 self._device[bank]["token_to_req"],
                 self._stream,
+            )
+            self._full_qkv.capture_qsa_attention(
+                self._device[bank]["logical_positions"],
+                self._device[bank]["token_to_req"], self._stream,
             )
         self._api.call("cudaStreamEndCapture", self._stream, ctypes.byref(graph))
         self._graphs[(bank, graph_batch)] = graph

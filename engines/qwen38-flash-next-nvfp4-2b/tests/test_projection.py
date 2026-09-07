@@ -10,11 +10,15 @@ from qwen38_slab.projection import (
     PROJECTION_K,
     PROJECTION_OUTPUTS,
     PROJECTION_SCHEMA,
+    OUTPUT_PROJECTION_K,
+    OUTPUT_PROJECTION_N,
+    OUTPUT_ACTIVATION_GLOBAL_SCALE,
     ProjectionError,
     load_full_projection_payload,
     load_projection_payload,
     load_rank0_layer3_projection,
     reference_projection,
+    reference_output_projection,
 )
 
 REAL_SLAB = Path(
@@ -33,7 +37,7 @@ class ProjectionContractTests(unittest.TestCase):
         descriptor = load_rank0_layer3_projection(REAL_SLAB)
         self.assertEqual(descriptor.schema, PROJECTION_SCHEMA)
         self.assertEqual((descriptor.rank, descriptor.layer), (0, 3))
-        self.assertEqual(len(descriptor.components), 9)
+        self.assertEqual(len(descriptor.components), 12)
         with self.assertRaises(FrozenInstanceError):
             descriptor.rank = 1
         payload = load_projection_payload(descriptor)
@@ -50,6 +54,13 @@ class ProjectionContractTests(unittest.TestCase):
             tuple(rows * PROJECTION_K // 16 for rows in PROJECTION_FAMILY_ROWS),
         )
         self.assertEqual(full.global_scales, payload.global_scales)
+        self.assertEqual(len(full.output_weight), OUTPUT_PROJECTION_N * OUTPUT_PROJECTION_K // 2)
+        self.assertEqual(len(full.output_scale), OUTPUT_PROJECTION_N * OUTPUT_PROJECTION_K // 16)
+        self.assertEqual(OUTPUT_ACTIVATION_GLOBAL_SCALE, 1.0 / 256.0)
+        self.assertEqual(
+            reference_output_projection(full, bytes(16 * OUTPUT_PROJECTION_K * 2)),
+            (0.0,) * 64,
+        )
         self.assertEqual(reference_projection(payload, 0), (0.0,) * (16 * PROJECTION_OUTPUTS))
         with self.assertRaisesRegex(ProjectionError, "descriptor"):
             load_projection_payload(replace(descriptor, schema="drift"))

@@ -40,7 +40,9 @@ int qwen38_qsa_expand_topk(const std::int32_t* block_indices,
 // owns stable query, paged compressed-key, score, selection, and output
 // buffers. Input pointers are borrowed so the future pre-indexer can refresh
 // their contents without changing captured graph arguments.
-int qwen38_qsa_indexer_create(int device, void** plan);
+int qwen38_qsa_indexer_create(const std::uint8_t* output_weight,
+                              const std::uint8_t* output_scale,
+                              float output_global, int device, void** plan);
 int qwen38_qsa_indexer_launch(void* plan,
                              const std::int64_t* logical_positions,
                              const std::int32_t* sequence_lengths,
@@ -64,5 +66,21 @@ int qwen38_qsa_indexer_inputs(void* plan, void** query_bf16,
 int qwen38_qsa_indexer_output(void* plan, void** token_indices,
                              std::size_t* elements);
 int qwen38_qsa_indexer_destroy(void* plan);
+
+// Fixed rank-local QSA sparse attention: 12 query heads, one KV head,
+// head-dim 256, 32 FP32-LSE splits, and arbitrary logical token ids.
+int qwen38_qsa_attention_launch(void* plan, const void* qkv_output_bf16,
+                               const std::int64_t* logical_positions,
+                               const std::int32_t* token_to_request,
+                               cudaStream_t stream);
+int qwen38_qsa_sparse_attention(void* plan, const void* qkv_output_bf16,
+                               const std::int64_t* logical_positions,
+                               const std::int32_t* token_to_request,
+                               cudaStream_t stream);
+int qwen38_qsa_output_project(void* plan, cudaStream_t stream);
+int qwen38_qsa_attention_output(void* plan, void** output_bf16,
+                               std::size_t* elements);
+int qwen38_qsa_projected_output(void* plan, void** output_bf16,
+                               std::size_t* elements);
 
 }

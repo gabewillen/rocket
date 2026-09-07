@@ -15,6 +15,8 @@ from .projection import (
     PROJECTION_FAMILY_ROWS,
     PROJECTION_K,
     PROJECTION_SCHEMA,
+    OUTPUT_PROJECTION_K,
+    OUTPUT_PROJECTION_N,
 )
 
 DEFAULT_CUTLASS_QKV = Path(__file__).resolve().parents[2] / "build/libqwen38_cutlass_qkv.so"
@@ -56,6 +58,10 @@ class CutlassQkvRuntime:
                 for value in payload.global_scales
             )
             or len(payload.activations_bf16) != 16 * PROJECTION_K * 2
+            or len(payload.output_weight) != OUTPUT_PROJECTION_N * OUTPUT_PROJECTION_K // 2
+            or len(payload.output_scale) != OUTPUT_PROJECTION_N * OUTPUT_PROJECTION_K // 16
+            or not math.isfinite(payload.output_global_scale)
+            or payload.output_global_scale <= 0.0
         ):
             raise DeviceDecodeError("full QKV payload extent is invalid")
         try:
@@ -85,6 +91,13 @@ class CutlassQkvRuntime:
                 self._api.call("cudaMemcpy", pointer, ctypes.c_char_p(blob), len(blob), 1)
                 self._device_buffers.append(pointer)
                 pointers.append(pointer)
+            output_pointers = []
+            for blob in (payload.output_weight, payload.output_scale):
+                pointer = ctypes.c_void_p()
+                self._api.call("cudaMalloc", ctypes.byref(pointer), len(blob))
+                self._api.call("cudaMemcpy", pointer, ctypes.c_char_p(blob), len(blob), 1)
+                self._device_buffers.append(pointer)
+                output_pointers.append(pointer)
             activation = ctypes.c_void_p()
             self._api.call("cudaMalloc", ctypes.byref(activation), len(payload.activations_bf16))
             self._api.call(
@@ -106,7 +119,11 @@ class CutlassQkvRuntime:
             )
             if self._output_elements.value != 16 * FULL_OUTPUTS:
                 raise DeviceDecodeError("fixed CUTLASS QKV output extent drift")
-            self._native_call("qwen38_qsa_indexer_create", device, ctypes.byref(self._qsa_plan))
+            self._native_call(
+                "qwen38_qsa_indexer_create", output_pointers[0], output_pointers[1],
+                ctypes.c_float(payload.output_global_scale), device,
+                ctypes.byref(self._qsa_plan),
+            )
             query, keys, table = self._qsa_inputs
             query_bytes, key_bytes, table_bytes = self._qsa_input_bytes
             self._native_call(
@@ -202,6 +219,25 @@ class CutlassQkvRuntime:
             sequence_lengths, token_to_request, stream,
         )
 
+    def capture_qsa_attention(
+        self,
+        logical_positions: ctypes.c_void_p,
+        token_to_request: ctypes.c_void_p,
+        stream: ctypes.c_void_p,
+    ) -> None:
+        """Append fixed K/V update and FP32-LSE sparse attention nodes."""
+
+        self._require_open()
+        if any(
+            not isinstance(pointer, ctypes.c_void_p) or not pointer.value
+            for pointer in (logical_positions, token_to_request, stream)
+        ):
+            raise DeviceDecodeError("fixed QSA attention pointer ABI is invalid")
+        self._native_call(
+            "qwen38_qsa_attention_launch", self._qsa_plan, self._output,
+            logical_positions, token_to_request, stream,
+        )
+
     def qsa_output_bytes(self) -> bytes:
         """Copy the fixed 16 by 2,051 selected logical token ids."""
 
@@ -214,6 +250,34 @@ class CutlassQkvRuntime:
         if elements.value != 16 * 2051:
             raise DeviceDecodeError("fixed QSA output extent drift")
         output = ctypes.create_string_buffer(elements.value * 4)
+        self._api.call("cudaMemcpy", ctypes.addressof(output), pointer, len(output), 2)
+        return output.raw
+
+    def attention_output_bytes(self) -> bytes:
+        """Copy fixed rank-local 16 by 12 by 256 BF16 attention output."""
+
+        self._require_open()
+        pointer, elements = ctypes.c_void_p(), ctypes.c_size_t()
+        self._native_call(
+            "qwen38_qsa_attention_output", self._qsa_plan,
+            ctypes.byref(pointer), ctypes.byref(elements),
+        )
+        if elements.value != 16 * 12 * 256:
+            raise DeviceDecodeError("fixed QSA attention output extent drift")
+        output = ctypes.create_string_buffer(elements.value * 2)
+        self._api.call("cudaMemcpy", ctypes.addressof(output), pointer, len(output), 2)
+        return output.raw
+
+    def projected_attention_bytes(self) -> bytes:
+        """Copy fixed rank-local 16 by 2,560 BF16 projected output."""
+
+        self._require_open()
+        pointer, elements = ctypes.c_void_p(), ctypes.c_size_t()
+        self._native_call("qwen38_qsa_projected_output", self._qsa_plan,
+                          ctypes.byref(pointer), ctypes.byref(elements))
+        if elements.value != 16 * 2560:
+            raise DeviceDecodeError("fixed attention projection extent drift")
+        output = ctypes.create_string_buffer(elements.value * 2)
         self._api.call("cudaMemcpy", ctypes.addressof(output), pointer, len(output), 2)
         return output.raw
 
@@ -363,8 +427,36 @@ class CutlassQkvRuntime:
                 self._api.call("cudaEventDestroy", start)
         score = measured("qwen38_qsa_indexer_score")
         select = measured("qwen38_qsa_indexer_select_expand")
+        def measured_attention(name: str, args: tuple[object, ...]) -> float:
+            start, end = ctypes.c_void_p(), ctypes.c_void_p()
+            self._api.call("cudaEventCreate", ctypes.byref(start))
+            self._api.call("cudaEventCreate", ctypes.byref(end))
+            try:
+                for _ in range(3): self._native_call(name, *args, self._stream)
+                self._api.call("cudaStreamSynchronize", self._stream)
+                self._api.call("cudaEventRecord", start, self._stream)
+                for _ in range(iterations): self._native_call(name, *args, self._stream)
+                self._api.call("cudaEventRecord", end, self._stream)
+                self._api.call("cudaEventSynchronize", end)
+                elapsed = ctypes.c_float()
+                self._api.call("cudaEventElapsedTime", ctypes.byref(elapsed), start, end)
+                return elapsed.value / iterations
+            finally:
+                self._api.call("cudaEventDestroy", end)
+                self._api.call("cudaEventDestroy", start)
+        sparse_attention = measured_attention(
+            "qwen38_qsa_sparse_attention",
+            (self._qsa_plan, self._output, logical_positions, token_to_request),
+        )
+        output_projection = measured_attention(
+            "qwen38_qsa_output_project", (self._qsa_plan,)
+        )
+        attention = sparse_attention + output_projection
         return MappingProxyType({"score_ms": score, "select_expand_ms": select,
-                                 "total_ms": score + select})
+                                 "sparse_attention_ms": sparse_attention,
+                                 "output_projection_ms": output_projection,
+                                 "attention_ms": attention,
+                                 "total_ms": score + select + attention})
 
     def close(self) -> None:
         if self._closed: return
@@ -394,6 +486,9 @@ class CutlassQkvRuntime:
             "qwen38_qsa_indexer_score", "qwen38_qsa_indexer_select_expand",
             "qwen38_qsa_indexer_inputs", "qwen38_qsa_indexer_output",
             "qwen38_qsa_indexer_destroy",
+            "qwen38_qsa_attention_launch", "qwen38_qsa_sparse_attention",
+            "qwen38_qsa_output_project", "qwen38_qsa_attention_output",
+            "qwen38_qsa_projected_output",
         ):
             getattr(self._native, name).restype = ctypes.c_int
 

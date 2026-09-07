@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import sys
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from qwen38_slab.projection import (  # noqa: E402
     load_projection_payload,
     load_rank0_layer3_projection,
     reference_cutlass_projection,
+    reference_output_projection,
 )
 
 
@@ -117,6 +119,9 @@ def run(
         timing = dict(runtime.benchmark_projection())
         qsa_timing = dict(runtime.benchmark_qsa_indexer())
         first_qsa = runtime.read_qsa_token_indices()
+        first_attention = runtime.read_qsa_attention()
+        first_projected = runtime.read_qsa_projected_output()
+        output_reference = reference_output_projection(full_projection, first_attention)
         first_pointers = dict(runtime.active_device_pointers)
 
         negated = bytearray(full_projection.activations_bf16)
@@ -153,6 +158,16 @@ def run(
         third_qkv = runtime.read_qkv_projection()
         third_qsa = runtime.read_qsa_token_indices()
         third_pointers = dict(runtime.active_device_pointers)
+        third_attention = runtime.read_qsa_attention()
+        third_projected = runtime.read_qsa_projected_output()
+        fourth = executor.prepare(
+            [StreamStep(slot, 64 + slot, Depth.K0) for slot in range(5)]
+        )
+        fourth_publication = binding.upload_and_launch(fourth)
+        fourth_qkv = runtime.read_qkv_projection()
+        fourth_attention = runtime.read_qsa_attention()
+        fourth_projected = runtime.read_qsa_projected_output()
+        fourth_pointers = dict(runtime.active_device_pointers)
 
     if not first_verified or not second_verified or not third_verified:
         raise RuntimeError("CUDA graph metadata copyback mismatch")
@@ -163,6 +178,7 @@ def run(
     if (
         set(first_pointers.values()) & set(second_pointers.values())
         or set(second_pointers.values()) & set(third_pointers.values())
+        or set(third_pointers.values()) & set(fourth_pointers.values())
     ):
         raise RuntimeError("CUDA metadata publications did not alternate banks")
     if third_target_rows != second_target_rows:
@@ -178,6 +194,44 @@ def run(
         262_136, 262_137, 262_138, 262_139,
     ):
         raise RuntimeError("CUDA QSA paged score/top-k order did not match reference")
+    if third_qkv != fourth_qkv or third_attention != fourth_attention or third_projected != fourth_projected:
+        raise RuntimeError(
+            "CUDA sparse attention/output projection repeat was not bit-exact: "
+            f"qkv={third_qkv == fourth_qkv}, "
+            f"attention={third_attention == fourth_attention}, "
+            f"projection={third_projected == fourth_projected}"
+        )
+    if not any(first_attention) or not any(first_projected):
+        attention_max = max(
+            abs(struct.unpack("<f", struct.pack("<I", int.from_bytes(
+                first_attention[index : index + 2], "little") << 16))[0])
+            for index in range(0, len(first_attention), 2)
+        )
+        raise RuntimeError(
+            "CUDA sparse attention/output projection produced no live output: "
+            f"attention={any(first_attention)}, projection={any(first_projected)}"
+            f", scalar_projection={any(output_reference)}, "
+            f"scalar_max={max(map(abs, output_reference))}, "
+            f"attention_max={attention_max}"
+        )
+    projected_values = [
+        int.from_bytes(first_projected[index : index + 2], "little")
+        for index in range(0, len(first_projected), 2)
+    ]
+    projected_floats = [
+        struct.unpack("<f", struct.pack("<I", bits << 16))[0]
+        for bits in projected_values
+    ]
+    selected_projected = tuple(
+        projected_floats[batch * 2560 + output]
+        for batch in range(16) for output in range(4)
+    )
+    output_projection_max_abs_error = max(
+        abs(actual - expected)
+        for actual, expected in zip(selected_projected, output_reference)
+    )
+    if output_projection_max_abs_error > 3e-3:
+        raise RuntimeError("CUDA attention output projection exceeded scalar reference error")
     if any(value != -1 for value in second_qsa[5 * 2051 :]):
         raise RuntimeError("CUDA QSA invalid rows did not retain -1 semantics")
     full_outputs = sum(PROJECTION_FAMILY_ROWS)
@@ -198,11 +252,30 @@ def run(
     rank_local_traffic_roof = 238.0
     qsa_score_bytes = 16 * 65536 * (128 * 2 + 4)
     qsa_score_gbps = qsa_score_bytes / (qsa_timing["score_ms"] * 1.0e6)
+    sparse_attention_bytes = 16 * 2051 * 256 * 2 * 2
+    sparse_attention_flops = 16 * 12 * 2051 * 256 * 4
+    sparse_attention_gbps = sparse_attention_bytes / (
+        qsa_timing["sparse_attention_ms"] * 1.0e6
+    )
+    sparse_attention_tflops = sparse_attention_flops / (
+        qsa_timing["sparse_attention_ms"] * 1.0e9
+    )
+    output_projection_bytes = (
+        2560 * 3072 // 2 + 2560 * 3072 // 16
+        + 16 * 3072 * 2 + 16 * 2560 * 2
+    )
+    output_projection_flops = 2 * 16 * 2560 * 3072
+    output_projection_gbps = output_projection_bytes / (
+        qsa_timing["output_projection_ms"] * 1.0e6
+    )
+    output_projection_tflops = output_projection_flops / (
+        qsa_timing["output_projection_ms"] * 1.0e9
+    )
     base_step_ms = 1000.0 * 16 / 330.835
     full_attention_requants = 24
     final_map_requants = 278
     return {
-        "schema": "rocket.qwen38-k0-cuda-smoke.v3",
+        "schema": "rocket.qwen38-k0-cuda-smoke.v4",
         "device": device,
         "cuda_runtime": str(cudart),
         "cuda_driver": str(driver),
@@ -245,12 +318,26 @@ def run(
             "score_ms": qsa_timing["score_ms"],
             "select_expand_ms": qsa_timing["select_expand_ms"],
             "total_ms": qsa_timing["total_ms"],
+            "sparse_attention_ms": qsa_timing["sparse_attention_ms"],
+            "sparse_attention_physical_gbps": sparse_attention_gbps,
+            "sparse_attention_tflops": sparse_attention_tflops,
+            "sparse_attention_fraction_of_238_gbps_rank_local_roof": (
+                sparse_attention_gbps / rank_local_traffic_roof
+            ),
+            "output_projection_ms": qsa_timing["output_projection_ms"],
+            "output_projection_physical_gbps": output_projection_gbps,
+            "output_projection_tflops": output_projection_tflops,
+            "output_projection_fraction_of_238_gbps_rank_local_roof": (
+                output_projection_gbps / rank_local_traffic_roof
+            ),
+            "sparse_attention_output_projection_ms": qsa_timing["attention_ms"],
             "score_physical_gbps": qsa_score_gbps,
             "score_fraction_of_238_gbps_rank_local_roof": qsa_score_gbps
             / rank_local_traffic_roof,
             "deterministic_repeat": "bit_exact",
             "invalid_rows": "minus_one",
             "reference": "vllm@8e685d198 models/qwen3_8_flash_next/nvidia/ops/qsa.py",
+            "output_projection_max_abs_error": output_projection_max_abs_error,
         },
         "metadata_fields": len(BUFFER_LAYOUT),
         "metadata_bytes": sum(length for _name, length in BUFFER_LAYOUT),
@@ -273,6 +360,13 @@ def run(
                 "generation": third_publication.generation,
                 "graph_batch": third_publication.graph_batch,
                 "bank": third_publication.bank,
+                "copyback": "match",
+                "target_prologue": "match",
+            },
+            {
+                "generation": fourth_publication.generation,
+                "graph_batch": fourth_publication.graph_batch,
+                "bank": fourth_publication.bank,
                 "copyback": "match",
                 "target_prologue": "match",
             },

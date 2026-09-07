@@ -17,7 +17,10 @@ PROJECTION_ROWS_PER_FAMILY = 4
 PROJECTION_FAMILIES = ("q_proj", "k_proj", "v_proj")
 PROJECTION_FAMILY_ROWS = (6144, 256, 256)
 PROJECTION_OUTPUTS = len(PROJECTION_FAMILIES) * PROJECTION_ROWS_PER_FAMILY
-PROJECTION_SCHEMA = "qwen3.8-flash-next:tp2:rank0:layer3:qkv-w4a4:v1"
+PROJECTION_SCHEMA = "qwen3.8-flash-next:tp2:rank0:layer3:qkv-o-w4a4:v2"
+OUTPUT_PROJECTION_K = 3072
+OUTPUT_PROJECTION_N = 2560
+OUTPUT_ACTIVATION_GLOBAL_SCALE = 1.0 / 256.0
 
 
 class ProjectionError(RuntimeError):
@@ -70,6 +73,9 @@ class FullQkvProjectionPayload:
     swizzled_scales: tuple[bytes, bytes, bytes]
     global_scales: tuple[float, float, float]
     activations_bf16: bytes
+    output_weight: bytes
+    output_scale: bytes
+    output_global_scale: float
 
 
 def load_rank0_layer3_projection(artifact: Path) -> RankSlabProjection:
@@ -149,6 +155,26 @@ def load_rank0_layer3_projection(artifact: Path) -> RankSlabProjection:
             components.append(
                 ProjectionComponent(name, offset, length, shape, dtype, layout)
             )
+    prefix = "model.language_model.layers.3.self_attn.o_proj"
+    for suffix, shape, dtype, layout, expected_length in (
+        ("weight", (OUTPUT_PROJECTION_N, OUTPUT_PROJECTION_K // 2), "U8",
+         "packed_e2m1_row_major", OUTPUT_PROJECTION_N * OUTPUT_PROJECTION_K // 2),
+        ("weight_scale", (OUTPUT_PROJECTION_N * OUTPUT_PROJECTION_K // 16,),
+         "F8_E4M3", "cutlass_sm121_sfb", OUTPUT_PROJECTION_N * OUTPUT_PROJECTION_K // 16),
+        ("weight_scale_2", (1,), "F32", "scalar", 4),
+    ):
+        name = f"{prefix}.{suffix}"
+        entry = by_name.get(name)
+        if (
+            not isinstance(entry, dict) or entry.get("abi") != MODEL_NVFP4_ABI
+            or tuple(entry.get("shape", ())) != shape or entry.get("dtype") != dtype
+            or entry.get("layout") != layout or entry.get("length_bytes") != expected_length
+        ):
+            raise ProjectionError(f"rank slab projection contract drift: {name}")
+        offset, length = entry.get("offset_bytes"), entry.get("length_bytes")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0 or offset % 256:
+            raise ProjectionError(f"rank slab projection extent is invalid: {name}")
+        components.append(ProjectionComponent(name, offset, length, shape, dtype, layout))
     slab_path = artifact / str(slab.get("file", ""))
     slab_bytes = slab.get("bytes")
     try:
@@ -276,6 +302,12 @@ def load_full_projection_payload(
             weights.append(weight_blob)
             scales.append(scale_blob)
             globals_.append(struct.unpack("<f", raw_global)[0])
+        output_prefix = "model.language_model.layers.3.self_attn.o_proj"
+        output_weight = os.pread(fd, by_name[f"{output_prefix}.weight"].length,
+                                 by_name[f"{output_prefix}.weight"].offset)
+        output_scale = os.pread(fd, by_name[f"{output_prefix}.weight_scale"].length,
+                                by_name[f"{output_prefix}.weight_scale"].offset)
+        raw_output_global = os.pread(fd, 4, by_name[f"{output_prefix}.weight_scale_2"].offset)
     finally:
         os.close(fd)
     activation = bytearray()
@@ -284,12 +316,17 @@ def load_full_projection_payload(
             value = ((column + row * 3) % 17 - 8) / 16.0
             bits = struct.unpack("<I", struct.pack("<f", value))[0]
             activation.extend(struct.pack("<H", bits >> 16))
+    if len(output_weight) != OUTPUT_PROJECTION_N * OUTPUT_PROJECTION_K // 2 or len(output_scale) != OUTPUT_PROJECTION_N * OUTPUT_PROJECTION_K // 16 or len(raw_output_global) != 4:
+        raise ProjectionError("short output projection read")
     return FullQkvProjectionPayload(
         descriptor,
         tuple(weights),
         tuple(scales),
         tuple(globals_),
         bytes(activation),
+        output_weight,
+        output_scale,
+        struct.unpack("<f", raw_output_global)[0],
     )
 
 
@@ -404,6 +441,52 @@ def reference_cutlass_projection(
             result[batch * PROJECTION_OUTPUTS + output] = (
                 total * payload.global_scales[output // PROJECTION_ROWS_PER_FAMILY]
             )
+    return tuple(result)
+
+
+def reference_output_projection(
+    payload: FullQkvProjectionPayload, attention_bf16: bytes, output_rows: int = 4
+) -> tuple[float, ...]:
+    """Scalar oracle for selected rows of the fixed rank-local output GEMM."""
+
+    if (
+        not isinstance(payload, FullQkvProjectionPayload)
+        or not isinstance(attention_bf16, bytes)
+        or len(attention_bf16) != 16 * OUTPUT_PROJECTION_K * 2
+        or isinstance(output_rows, bool)
+        or not 1 <= output_rows <= 4
+    ):
+        raise ProjectionError("output projection reference inputs are invalid")
+    result = []
+    activation_global = OUTPUT_ACTIVATION_GLOBAL_SCALE
+    for batch in range(16):
+        quantized, activation_scales = [], []
+        for group in range(OUTPUT_PROJECTION_K // 16):
+            values = []
+            for offset in range(16):
+                index = batch * OUTPUT_PROJECTION_K + group * 16 + offset
+                bf16 = struct.unpack_from("<H", attention_bf16, index * 2)[0]
+                values.append(struct.unpack("<f", struct.pack("<I", bf16 << 16))[0])
+            scale_bits = _float_to_e4m3(
+                max(abs(value) for value in values) / (6.0 * activation_global)
+            )
+            scale = _e4m3(scale_bits)
+            activation_scales.append(scale)
+            for value in values:
+                normalized = value / (scale * activation_global) if scale else 0.0
+                code = min(range(16), key=lambda item: abs(normalized - _e2m1(item)))
+                quantized.append(_e2m1(code))
+        for output in range(output_rows):
+            total = 0.0
+            packed_base = output * OUTPUT_PROJECTION_K // 2
+            for column in range(OUTPUT_PROJECTION_K):
+                pair = payload.output_weight[packed_base + column // 2]
+                weight = _e2m1(pair >> 4 if column & 1 else pair & 15)
+                sf = payload.output_scale[
+                    _sfb_offset(output, column // 16, OUTPUT_PROJECTION_K)
+                ]
+                total += quantized[column] * activation_scales[column // 16] * weight * _e4m3(sf)
+            result.append(total * activation_global * payload.output_global_scale)
     return tuple(result)
 
 
