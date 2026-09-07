@@ -27,6 +27,8 @@ Stage B adds one fixed `PairReduce` for TP2 hidden partials. Each rank owns a
 four-page anonymous pinned region, publishes a versioned BF16 wire message with
 an unsignaled RC write followed by a signaled sequence doorbell, validates the
 peer header, then accumulates rank 0 followed by rank 1 into FP32 `[M, 2560]`.
+Each rank publishes a second sequence doorbell after accumulation and waits for
+the peer acknowledgment before reusing the single receive slot.
 Only M 1, 2, 4, 8, and 16 is accepted. The embedder must supply an OpenTelemetry
 sink. Metric labels are limited to rank, M bucket, dtype, and outcome. Trace and
 request IDs are confined to spans and logs.

@@ -172,6 +172,9 @@ void PairReduce::reduce(const __nv_bfloat16* input, float* output, int m,
         rank0, rank1, output, elements);
     cuda_check(cudaGetLastError(), "launch deterministic accumulation");
     cuda_check(cudaStreamSynchronize(stream), "complete deterministic accumulation");
+    transport_.acknowledge_consumed(sequence);
+    transport_.wait_peer_consumed(sequence);
+    transport_.flush_signaled();
   } catch (const PairReduceContractError&) {
     outcome = Outcome::kContractError;
     emit();

@@ -21,6 +21,8 @@ class Transport {
   virtual void signal_sequence(std::uint64_t sequence) = 0;
   virtual void wait_peer(std::uint64_t sequence) = 0;
   virtual void flush_signaled() = 0;
+  virtual void acknowledge_consumed(std::uint64_t sequence) = 0;
+  virtual void wait_peer_consumed(std::uint64_t sequence) = 0;
 };
 
 }  // namespace rocket::qwen38::pair_reduce

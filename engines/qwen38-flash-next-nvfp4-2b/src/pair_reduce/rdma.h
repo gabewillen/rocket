@@ -54,6 +54,8 @@ class RdmaTransport final : public Transport {
   void signal_sequence(std::uint64_t sequence) override;
   void wait_peer(std::uint64_t sequence) override;
   void flush_signaled() override;
+  void acknowledge_consumed(std::uint64_t sequence) override;
+  void wait_peer_consumed(std::uint64_t sequence) override;
 
  private:
   struct Impl;

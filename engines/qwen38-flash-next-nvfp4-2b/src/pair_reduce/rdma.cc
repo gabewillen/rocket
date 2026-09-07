@@ -23,6 +23,8 @@ namespace {
 using Clock = std::chrono::steady_clock;
 constexpr int kRails = 2;
 constexpr std::size_t kDoorStride = 64;
+constexpr std::size_t kReadyOffset = 0;
+constexpr std::size_t kConsumedOffset = sizeof(std::uint64_t);
 constexpr std::uint32_t kBootstrapSchema = 2;
 constexpr std::array<std::string_view, kRails> kDevices{"rocep1s0f1", "roceP2p1s0f1"};
 
@@ -186,9 +188,9 @@ struct RdmaTransport::Impl {
     if (socket >= 0) ::close(socket);
   }
 
-  volatile std::uint64_t* door_word(int rail) noexcept {
+  volatile std::uint64_t* door_word(int rail, std::size_t offset) noexcept {
     return reinterpret_cast<volatile std::uint64_t*>(
-        door + static_cast<std::size_t>(rail) * kDoorStride);
+        door + static_cast<std::size_t>(rail) * kDoorStride + offset);
   }
 
   RdmaConfig config;
@@ -436,7 +438,7 @@ void RdmaTransport::signal_sequence(std::uint64_t sequence) {
     write.opcode = IBV_WR_RDMA_WRITE;
     write.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
     write.wr.rdma.remote_addr = rail.peer_door_address +
-                                static_cast<std::size_t>(index) * kDoorStride;
+                                static_cast<std::size_t>(index) * kDoorStride + kReadyOffset;
     write.wr.rdma.rkey = rail.peer_door_rkey;
     ibv_send_wr* bad = nullptr;
     if (ibv_post_send(rail.queue_pair, &write, &bad) != 0)
@@ -448,12 +450,54 @@ void RdmaTransport::signal_sequence(std::uint64_t sequence) {
 void RdmaTransport::wait_peer(std::uint64_t sequence) {
   const auto start = Clock::now();
   for (int index = 0; index < kRails; ++index) {
-    volatile std::uint64_t* word = impl_->door_word(index);
+    volatile std::uint64_t* word = impl_->door_word(index, kReadyOffset);
     std::uint64_t spins = 0;
     while (*word < sequence) {
       if ((++spins & 0x3ffu) == 0 &&
           elapsed_ms(start) > impl_->config.operation_timeout_ms)
         fail("peer doorbell timed out");
+#if defined(__aarch64__)
+      asm volatile("yield" ::: "memory");
+#endif
+    }
+  }
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+}
+
+void RdmaTransport::acknowledge_consumed(std::uint64_t sequence) {
+  if (sequence == 0 || sequence != impl_->sequence) fail("consumed sequence drift");
+  for (int index = 0; index < kRails; ++index) {
+    auto& rail = impl_->rails[static_cast<std::size_t>(index)];
+    rail.sequence_source = sequence;
+    ibv_sge scatter{};
+    scatter.addr = reinterpret_cast<std::uint64_t>(&rail.sequence_source);
+    scatter.length = sizeof(sequence);
+    ibv_send_wr write{};
+    write.wr_id = sequence;
+    write.sg_list = &scatter;
+    write.num_sge = 1;
+    write.opcode = IBV_WR_RDMA_WRITE;
+    write.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+    write.wr.rdma.remote_addr = rail.peer_door_address +
+                                static_cast<std::size_t>(index) * kDoorStride +
+                                kConsumedOffset;
+    write.wr.rdma.rkey = rail.peer_door_rkey;
+    ibv_send_wr* bad = nullptr;
+    if (ibv_post_send(rail.queue_pair, &write, &bad) != 0)
+      fail("consumed doorbell post failed on " + rail.name);
+    ++rail.outstanding;
+  }
+}
+
+void RdmaTransport::wait_peer_consumed(std::uint64_t sequence) {
+  const auto start = Clock::now();
+  for (int index = 0; index < kRails; ++index) {
+    volatile std::uint64_t* word = impl_->door_word(index, kConsumedOffset);
+    std::uint64_t spins = 0;
+    while (*word < sequence) {
+      if ((++spins & 0x3ffu) == 0 &&
+          elapsed_ms(start) > impl_->config.operation_timeout_ms)
+        fail("peer consumption acknowledgment timed out");
 #if defined(__aarch64__)
       asm volatile("yield" ::: "memory");
 #endif

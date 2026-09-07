@@ -99,6 +99,13 @@ class FakeTransport final : public pr::Transport {
   }
   void wait_peer(std::uint64_t) override { operations.push_back("wait_peer"); }
   void flush_signaled() override { operations.push_back("flush_signaled"); }
+  void acknowledge_consumed(std::uint64_t sequence) override {
+    check(sequence != 0, "consumed sequence is nonzero");
+    operations.push_back("acknowledge_consumed");
+  }
+  void wait_peer_consumed(std::uint64_t) override {
+    operations.push_back("wait_peer_consumed");
+  }
 
   int rank_;
   int world_size_ = 2;
@@ -165,7 +172,8 @@ void test_all_shapes_are_bit_identical() {
     }
     const std::vector<std::string> expected_order{
         "register", "next_sequence", "unsignaled_payload", "signaled_doorbell",
-        "wait_peer", "flush_signaled", "unregister"};
+        "wait_peer", "flush_signaled", "acknowledge_consumed", "wait_peer_consumed",
+        "flush_signaled", "unregister"};
     check(transport0.operations == expected_order && transport1.operations == expected_order,
           "payload/doorbell protocol order drift");
     check(otel0.spans.size() == 1 && otel0.metrics.size() == 1 &&
