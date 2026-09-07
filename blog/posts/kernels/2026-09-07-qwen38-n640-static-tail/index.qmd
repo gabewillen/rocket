@@ -1,0 +1,78 @@
+---
+title: "Exact-N640 retained tail wins only at Qwen c4"
+description: "A guarded FlashInfer retained2 tail cuts c4 MoE latency by 1.84%, ties within variance at c8, and loses by 1.83% at c16."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, kernels, numerics, telemetry]
+verdict: accepted
+rocket: "#kernels"
+supersedes: posts/kernels/2026-09-07-qwen38-exact-n640-moe
+---
+
+**Question.** Does an exact-N640 final group improve FlashInfer's retained2 static MoE at Qwen c4, c8, or c16?
+
+| setup | |
+| --- | --- |
+| node | head (`gx10-5e36`) |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| GPU / CUDA | NVIDIA GB10, `sm_121` / 13.0.88 |
+| Rocket base | `a29adf1c5972db60cc99b89e88bd520bb21d3df5` plus this entry's commit |
+| FlashInfer | [`91bda04c66f7cb851e1ab3b78b9fecea644b9844`](https://github.com/flashinfer-ai/flashinfer/commit/91bda04c66f7cb851e1ab3b78b9fecea644b9844), Apache-2.0 |
+| shape | H2560, N640, E512, top-k 10 |
+
+```bash
+python3 -m unittest \
+  scripts.kernels.test_qwen38_flashinfer_b12x_moe \
+  scripts.kernels.test_qwen38_flashinfer_n640_tail
+python3 scripts/kernels/qwen38_flashinfer_n640_tail.py \
+  --source /home/glwillen/Development/inference-references/flashinfer \
+  --output /home/glwillen/.cache/rocket-qwen38-b12x/n640-tail-workspace-91bda04c
+docker run --rm --name rocket-qwen38-n640-tail-retry --gpus all \
+  --entrypoint python3 -v "$PWD:/rocket:ro" \
+  -v /home/glwillen/Development/inference-references/flashinfer:/reference:ro \
+  -v /home/glwillen/.cache/rocket-qwen38-b12x/n640-tail-workspace-91bda04c:/flashinfer:ro \
+  -v /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4:/artifact:ro \
+  -v /home/glwillen/.cache/rocket-qwen38-b12x:/root/.cache/flashinfer \
+  -e PYTHONPATH=/flashinfer vllm/vllm-openai:qwen38-flash-next \
+  /rocket/scripts/kernels/qwen38-flashinfer-b12x-moe.py \
+  --flashinfer-repo /reference --manifest /artifact/manifest.json \
+  --tokens 4 8 16 --backends static static_tail dynamic \
+  --warmup 3 --iterations 20
+```
+
+| M | untouched dynamic | exact static tail | delta versus dynamic | selection | unit |
+| ---: | ---: | ---: | ---: | --- | --- |
+| 4 | 0.551954 ± 0.002538 | 0.541822 ± 0.010416 | +1.835 | static tail | ms / % |
+| 8 | 1.056781 ± 0.022126 | 1.064760 ± 0.015063 | -0.755 | dynamic, within variance | ms / % |
+| 16 | 2.064312 ± 0.005478 | 2.101990 ± 0.017631 | -1.825 | dynamic | ms / % |
+
+| M | padded static traffic | exact-tail traffic | traffic removed | parity max abs | replay max abs | unit |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 4 | 132,752,320 | 110,633,920 | 16.667 | 0 | 0 | B / % |
+| 8 | 265,504,640 | 221,267,840 | 16.667 | 0 | 0 | B / % |
+| 16 | 531,009,280 | 442,535,680 | 16.667 | 0 | 0 | B / % |
+
+| M | post init | post histogram | post prefix | post producer | post publish | max-wait sum ceiling | dynamic latency fraction | unit |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 4 | 1,312 | 1,536 | 25,504 | 7,040 | 2,112 | 37,504 | 6.795 | ns / % |
+| 8 | 1,312 | 1,568 | 25,280 | 8,672 | 1,856 | 38,688 | 3.661 | ns / % |
+| 16 | 1,344 | 1,248 | 25,888 | 7,424 | 2,016 | 37,920 | 1.837 | ns / % |
+
+| contract check | result |
+| --- | --- |
+| first overlay run | rejected before launch: preallocated workspace N768 versus requested N640 |
+| workspace correction | N640 opt-in allocates and validates three retained groups; default N768 path unchanged |
+| retained slices | `[2, 2, 1]`, guarded in FC1 compute, FC2 compute, FC1 DMA, and FC2 DMA |
+| dynamic telemetry | fixed `[5,256,2]` int64 clock plane |
+| barrier interpretation | each cell is a per-phase maximum; the sum is an upper ceiling, not additive kernel stall |
+
+**Verdict.** Select exact-N640 static tail at c4. Keep exact-N640 dynamic at c8 and c16. The proof covers generated ModelOpt-layout output parity and graph replay. It does not cover checkpoint logits or the rank-local EP2 launch.
+
+**Next.**
+
+- Bind the selected c4 path to authenticated owner-local E256 slab views.
+- Measure checkpoint logit and two-rank token continuation parity.
+
+**Reopen if.**
+
+- A FlashInfer, CUDA, or GB10 firmware release changes the measured crossover.

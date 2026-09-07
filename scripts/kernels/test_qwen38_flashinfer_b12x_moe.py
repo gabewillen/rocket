@@ -16,6 +16,20 @@ SPEC.loader.exec_module(BENCH)
 
 
 class B12xReferenceContractTest(unittest.TestCase):
+    def test_dynamic_barrier_telemetry_is_bounded(self):
+        self.assertEqual(
+            BENCH.DYNAMIC_BARRIER_PHASES,
+            (
+                "post_init",
+                "post_histogram",
+                "post_prefix",
+                "post_producer",
+                "post_publish",
+            ),
+        )
+        self.assertNotIn("static_tail", BENCH.BACKENDS)
+        self.assertIn("static_tail", BENCH.DIAGNOSTIC_BACKENDS)
+
     def test_geometry_and_modelopt_bytes_are_exact(self):
         self.assertEqual(
             (BENCH.HIDDEN, BENCH.INTERMEDIATE, BENCH.EXPERTS, BENCH.TOP_K),
@@ -34,6 +48,18 @@ class B12xReferenceContractTest(unittest.TestCase):
             {m: BENCH.natural_backend(m) for m in BENCH.BUCKETS},
             {1: "micro", 2: "micro", 4: "micro", 8: "static", 16: "static"},
         )
+
+    def test_measured_n640_dispatch_selects_tail_only_at_c4(self):
+        self.assertEqual(
+            {m: BENCH.selected_n640_backend(m) for m in (4, 8, 16)},
+            {4: "static_tail", 8: "dynamic", 16: "dynamic"},
+        )
+        for tokens in (1, 2, 3, True, 4.0):
+            with self.assertRaisesRegex(ValueError, "overlay bucket"):
+                BENCH.selected_n640_backend(tokens)
+        tail_n, tail_bytes = BENCH.kernel_touched_bytes(4, "static_tail")
+        self.assertEqual(tail_n, 640)
+        self.assertEqual(tail_bytes, BENCH.touched_bytes(4))
 
     def test_forced_backend_contract_fails_closed(self):
         for tokens in BENCH.BUCKETS:

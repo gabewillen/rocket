@@ -31,10 +31,18 @@ EXPERTS = 512
 TOP_K = 10
 BUCKETS = (1, 2, 4, 8, 16)
 BACKENDS = ("direct_micro", "micro", "static", "dynamic")
+DIAGNOSTIC_BACKENDS = BACKENDS + ("static_tail",)
 DIRECT_MICRO_MAX_INTERMEDIATE = 512
 MICRO_MAX_TOKENS = 8
 MICRO_MULTI_TOPK_CUTOVER_PAIRS = 40
 MEASURED_GB10_READ_GBPS = 241.3
+DYNAMIC_BARRIER_PHASES = (
+    "post_init",
+    "post_histogram",
+    "post_prefix",
+    "post_producer",
+    "post_publish",
+)
 REFERENCE_SHA256 = {
     "LICENSE": "cb67c224f503e0a063908950b12f89a7280c6e527dcffac972aa114e4bf3c5de",
     "benchmarks/bench_b12x_mxfp4_moe.py": "82ea42d2bb83d405d84b7a8433bbe240dd8e70ccf3165502fe3bf8ab27dbb54a",
@@ -57,10 +65,22 @@ def natural_backend(tokens: int) -> str:
     return "static"
 
 
+def selected_n640_backend(tokens: int) -> str:
+    """Return the measured exact-N640 choice for the c4-c16 overlay domain."""
+
+    if isinstance(tokens, bool) or not isinstance(tokens, int):
+        raise ValueError("tokens must be a measured N640 overlay bucket")
+    selected = {4: "static_tail", 8: "dynamic", 16: "dynamic"}
+    try:
+        return selected[tokens]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("tokens must be a measured N640 overlay bucket") from exc
+
+
 def backend_eligibility(backend: str, tokens: int) -> tuple[bool, str]:
     """Fail closed on forced backends outside the pinned kernel's domain."""
 
-    if backend not in BACKENDS or tokens not in BUCKETS:
+    if backend not in DIAGNOSTIC_BACKENDS or tokens not in BUCKETS:
         raise ValueError("unknown backend or token bucket")
     if backend == "direct_micro":
         return False, (
@@ -318,7 +338,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         {"tokens": tokens, "backend": backend, "status": "rejected", "reason": reason}
                     )
                     continue
-                moe_dispatch._FORCED_BACKEND = backend
+                if backend == "static_tail":
+                    if not hasattr(moe_dispatch, "_EXACT_N640_RETAINED_TAIL"):
+                        raise RuntimeError("exact-N640 source overlay is not active")
+                    moe_dispatch._EXACT_N640_RETAINED_TAIL = True
+                    moe_dispatch._FORCED_BACKEND = "static"
+                else:
+                    if hasattr(moe_dispatch, "_EXACT_N640_RETAINED_TAIL"):
+                        moe_dispatch._EXACT_N640_RETAINED_TAIL = False
+                    moe_dispatch._FORCED_BACKEND = backend
                 print(
                     f"compile/run tokens={tokens} backend={backend}",
                     file=sys.stderr,
@@ -394,6 +422,21 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                             "roofline_fraction": roofline_ms / latency_ms,
                         }
                     )
+                    if backend == "dynamic" and hasattr(
+                        wrapper._dynamic_workspace, "barrier_phase_clock"
+                    ):
+                        trace = wrapper._dynamic_workspace.barrier_phase_clock
+                        elapsed = trace[:, :, 1] - trace[:, :, 0]
+                        valid = trace[:, :, 1] > trace[:, :, 0]
+                        case = cases[-1]
+                        case["barrier_phase_max_ns"] = {
+                            name: (
+                                int(elapsed[phase][valid[phase]].max().item())
+                                if bool(valid[phase].any().item())
+                                else None
+                            )
+                            for phase, name in enumerate(DYNAMIC_BARRIER_PHASES)
+                        }
                     print(
                         f"measured tokens={tokens} backend={backend} "
                         f"latency_ms={latency_ms:.6f}",
@@ -431,6 +474,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                         }
     finally:
         moe_dispatch._FORCED_BACKEND = None
+        if hasattr(moe_dispatch, "_EXACT_N640_RETAINED_TAIL"):
+            moe_dispatch._EXACT_N640_RETAINED_TAIL = False
+    failed_tail = [
+        case
+        for case in cases
+        if case.get("backend") == "static_tail" and case.get("status") != "measured"
+    ]
+    if "static_tail" in args.backends and failed_tail:
+        raise RuntimeError("requested exact-N640 static tail did not complete")
     if not all(any(c["tokens"] == m and c["status"] == "measured" for c in cases) for m in args.tokens):
         raise RuntimeError("at least one Qwen bucket has no measured backend")
     return {
@@ -450,6 +502,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "slab_layout": slab_layout,
         "storage_bytes": modelopt_storage_bytes(),
         "natural_dispatch": {str(m): natural_backend(m) for m in args.tokens},
+        "selected_n640_dispatch": {
+            str(m): selected_n640_backend(m) for m in args.tokens if m >= 4
+        },
         "resident_layout_gap": (
             "reference expects contiguous [E,projection-row,packed-K]; Rocket slabs are "
             "owner-local E=256 with individually addressed projection extents"
@@ -463,7 +518,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--flashinfer-repo", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--tokens", nargs="+", type=int, choices=BUCKETS, default=list(BUCKETS))
-    parser.add_argument("--backends", nargs="+", choices=BACKENDS, default=list(BACKENDS))
+    parser.add_argument(
+        "--backends", nargs="+", choices=DIAGNOSTIC_BACKENDS, default=list(BACKENDS)
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=20)
     args = parser.parse_args(argv)
