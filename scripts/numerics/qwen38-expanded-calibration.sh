@@ -152,6 +152,18 @@ command -v ssh >/dev/null || fail "ssh is required"
 command -v scp >/dev/null || fail "scp is required"
 command -v sha256sum >/dev/null || fail "sha256sum is required"
 
+check_port_available() {
+    local host=$1 port=$2
+    python3 - "$host" "$port" <<'PY'
+import socket
+import sys
+
+host, raw_port = sys.argv[1:]
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind((host, int(raw_port)))
+PY
+}
+
 actual_image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG" 2>/dev/null || true)
 [[ "$actual_image_id" == "$IMAGE_ID" ]] || fail \
     "head image mismatch: expected $IMAGE_ID, got ${actual_image_id:-missing}"
@@ -271,6 +283,11 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         -e "ROCKET_QWEN38_NVFP4_QUANT_CONFIG=$NVFP4_CONTAINER_DIR/hf_quant_config.json" \
         --entrypoint /usr/bin/python3 "$IMAGE_TAG" -c \
         "import glob; from vllm.model_executor.model_loader.weight_utils import _rocket_qwen38_nvfp4_overlay_preflight as check; files=glob.glob('/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/*.safetensors'); result=check(sorted(files), 'lazy'); assert len(result['selected']) == 180; print('validated NVFP4 overlay: 180 tensors')"
+    docker run --rm \
+        -v "$ARTIFACT_DIR/modelopt_patched.py:$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro" \
+        -v "$NVFP4_ARTIFACT_DIR/hf_quant_config.json:/work/hf_quant_config.json:ro" \
+        --entrypoint /usr/bin/python3 "$IMAGE_TAG" -c \
+        "import json; from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig; config=ModelOptMixedPrecisionConfig.from_config(json.load(open('/work/hf_quant_config.json'))); prefix='mtp.layers.48.mlp.experts'; algo=config._resolve_quant_algo(prefix); block=config._fp8_block_scales_config(prefix); assert algo in ('FP8_BLOCK_SCALES', 'FP8_PB_WO'), algo; assert block.weight_block_size == [128, 128], block.weight_block_size; print(f'validated MTP dispatch: {algo} {block.weight_block_size}')"
 fi
 verify_sha 0669d6334f58a624c89c15f3e46c90f28e59b0b913507101dec1c5765e3c3b12 "$ARTIFACT_DIR/qsa_ops_patched.py"
 verify_sha ee5de40742ad48a6064ea24b99a285ff69c47d57bbb170f57c4eef71567a1df3 "$ARTIFACT_DIR/qsa_nvidia_patched.py"
@@ -318,10 +335,16 @@ docker container inspect "$HEAD_CONTAINER" >/dev/null 2>&1 && fail "head contain
 ssh -o BatchMode=yes "$SSH_TARGET" \
     "docker container inspect '$WORKER_CONTAINER' >/dev/null 2>&1" && \
     fail "worker container already exists: $WORKER_CONTAINER"
+check_port_available "$HEAD_IP" "$MASTER_PORT" || \
+    fail "head master port is unavailable: $HEAD_IP:$MASTER_PORT"
+check_port_available "0.0.0.0" "$API_PORT" || \
+    fail "head API port is unavailable: 0.0.0.0:$API_PORT"
 
 REMOTE_OUTPUT="$OUTPUT_DIR"
 ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p '$REMOTE_OUTPUT/artifacts' '$REMOTE_OUTPUT/logs'"
 scp -q "$ARTIFACT_DIR"/* "$SSH_TARGET:$REMOTE_OUTPUT/artifacts/"
+ssh -o BatchMode=yes "$SSH_TARGET" \
+    "cd '$REMOTE_OUTPUT/artifacts' && sha256sum --check SHA256SUMS"
 
 write_launch_script() {
     local destination=$1 node_rank=$2 node_ip=$3 iface=$4 hca=$5 cache_mount=$6 artifact_dir=$7 mode=$8 cache_access=$9 fp8_host_dir=${10} nvfp4_host_dir=${11}
@@ -390,17 +413,42 @@ REMOTE_FP8_ARTIFACT=""
 if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
     REMOTE_FP8_ARTIFACT="$REMOTE_OUTPUT/fp8-artifact"
     ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p '$REMOTE_FP8_ARTIFACT'"
+    (
+        cd "$FP8_ARTIFACT_DIR"
+        sha256sum manifest.json hf_quant_config.json linear-attention-fp8.safetensors \
+            > "$WORK_DIR/fp8-artifact-SHA256SUMS"
+    )
     scp -q "$FP8_ARTIFACT_DIR/manifest.json" "$FP8_ARTIFACT_DIR/hf_quant_config.json" \
         "$FP8_ARTIFACT_DIR/linear-attention-fp8.safetensors" \
+        "$WORK_DIR/fp8-artifact-SHA256SUMS" \
         "$SSH_TARGET:$REMOTE_FP8_ARTIFACT/"
+    ssh -o BatchMode=yes "$SSH_TARGET" \
+        "cd '$REMOTE_FP8_ARTIFACT' && sha256sum --check fp8-artifact-SHA256SUMS"
 fi
 REMOTE_NVFP4_ARTIFACT=""
 if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
     REMOTE_NVFP4_ARTIFACT="$REMOTE_OUTPUT/nvfp4-artifact"
     ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p '$REMOTE_NVFP4_ARTIFACT'"
+    (
+        cd "$NVFP4_ARTIFACT_DIR"
+        sha256sum manifest.json hf_quant_config.json linear-attention-nvfp4.safetensors \
+            > "$WORK_DIR/nvfp4-artifact-SHA256SUMS"
+    )
     scp -q "$NVFP4_ARTIFACT_DIR/manifest.json" "$NVFP4_ARTIFACT_DIR/hf_quant_config.json" \
         "$NVFP4_ARTIFACT_DIR/linear-attention-nvfp4.safetensors" \
+        "$WORK_DIR/nvfp4-artifact-SHA256SUMS" \
         "$SSH_TARGET:$REMOTE_NVFP4_ARTIFACT/"
+    ssh -o BatchMode=yes "$SSH_TARGET" \
+        "cd '$REMOTE_NVFP4_ARTIFACT' && sha256sum --check nvfp4-artifact-SHA256SUMS"
+    ssh -o BatchMode=yes "$SSH_TARGET" \
+        "docker run --rm \
+        -v '$WORKER_HF_VOLUME:/root/.cache/huggingface:ro' \
+        -v '$REMOTE_NVFP4_ARTIFACT:/rocket/qwen38-linear-nvfp4:ro' \
+        -v '$REMOTE_OUTPUT/artifacts/weight_utils_64k.py:$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py:ro' \
+        -e ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=/rocket/qwen38-linear-nvfp4/manifest.json \
+        -e ROCKET_QWEN38_NVFP4_QUANT_CONFIG=/rocket/qwen38-linear-nvfp4/hf_quant_config.json \
+        --entrypoint /usr/bin/python3 '$IMAGE_TAG' -c \
+        \"import glob; from vllm.model_executor.model_loader.weight_utils import _rocket_qwen38_nvfp4_overlay_preflight as check; files=glob.glob('/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/*.safetensors'); result=check(sorted(files), 'lazy'); assert len(result['selected']) == 180; print('validated worker NVFP4 overlay: 180 tensors')\""
 fi
 write_launch_script "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE" \
     "$WORKER_HCA" "$WORKER_HF_VOLUME" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT" "$REMOTE_NVFP4_ARTIFACT"

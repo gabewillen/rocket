@@ -2,6 +2,7 @@
 """Focused contract tests for the two-node expanded-calibration launcher."""
 
 import pathlib
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -63,6 +64,38 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("positive integer", result.stderr)
 
+    def test_port_preflight_rejects_an_occupied_port(self):
+        function = self.source[
+            self.source.index("check_port_available() {"):
+            self.source.index("\nactual_image_id=")
+        ]
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            occupied = subprocess.run(
+                ["bash", "-c", function + f"\ncheck_port_available 127.0.0.1 {port}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        available = subprocess.run(
+            ["bash", "-c", function + f"\ncheck_port_available 127.0.0.1 {port}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(occupied.returncode, 0)
+        self.assertEqual(available.returncode, 0, available.stderr)
+
+    def test_launch_checks_both_head_ports_before_remote_transfer(self):
+        master = 'check_port_available "$HEAD_IP" "$MASTER_PORT"'
+        api = 'check_port_available "0.0.0.0" "$API_PORT"'
+        transfer = 'scp -q "$ARTIFACT_DIR"/*'
+        self.assertIn(master, self.source)
+        self.assertIn(api, self.source)
+        self.assertLess(self.source.index(master), self.source.index(transfer))
+        self.assertLess(self.source.index(api), self.source.index(transfer))
+
     def test_timeout_budget_is_recorded_and_used_in_failure(self):
         self.assertIn(
             '"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS', self.source
@@ -115,11 +148,34 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn('quant_config_source="$fp8_host_dir/hf_quant_config.json"', self.source)
         self.assertIn("assert len(result['selected']) == 180", self.source)
         self.assertIn('if [[ -z "$FP8_ARTIFACT_DIR" && -z "$NVFP4_ARTIFACT_DIR" ]]', self.source)
-        self.assertEqual(self.source.count("linear-attention-fp8.safetensors"), 1)
+        self.assertEqual(self.source.count("linear-attention-fp8.safetensors"), 2)
         self.assertIn('basename "$FP8_ARTIFACT_DIR"', self.source)
         self.assertNotIn('\n$fp8_options\n', self.source)
 
-    def test_generated_launch_scripts_default_and_fp8_are_single_commands(self):
+    def test_nvfp4_dispatch_is_semantically_checked_before_launch(self):
+        semantic = "config._resolve_quant_algo(prefix)"
+        launch = 'ssh -o BatchMode=yes "$SSH_TARGET" "bash \'$REMOTE_OUTPUT/launch-worker.sh\'"'
+        self.assertIn("ModelOptMixedPrecisionConfig.from_config", self.source)
+        self.assertIn("prefix='mtp.layers.48.mlp.experts'", self.source)
+        self.assertIn("('FP8_BLOCK_SCALES', 'FP8_PB_WO')", self.source)
+        self.assertIn("block.weight_block_size == [128, 128]", self.source)
+        self.assertLess(self.source.index(semantic), self.source.index(launch))
+
+    def test_worker_transfers_are_checksummed_and_nvfp4_is_preflighted(self):
+        launch = 'ssh -o BatchMode=yes "$SSH_TARGET" "bash \'$REMOTE_OUTPUT/launch-worker.sh\'"'
+        launch_offset = self.source.index(launch)
+        for checksum in (
+            "sha256sum --check SHA256SUMS",
+            "sha256sum --check fp8-artifact-SHA256SUMS",
+            "sha256sum --check nvfp4-artifact-SHA256SUMS",
+        ):
+            self.assertIn(checksum, self.source)
+            self.assertLess(self.source.index(checksum), launch_offset)
+        worker_preflight = "validated worker NVFP4 overlay: 180 tensors"
+        self.assertIn(worker_preflight, self.source)
+        self.assertLess(self.source.index(worker_preflight), launch_offset)
+
+    def test_generated_launch_scripts_are_single_commands(self):
         function = self.source[
             self.source.index("write_launch_script() {"):
             self.source.index('\nREMOTE_FP8_ARTIFACT=""')
@@ -128,6 +184,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             root = pathlib.Path(directory)
             default_script = root / "default.sh"
             fp8_script = root / "fp8.sh"
+            nvfp4_script = root / "nvfp4.sh"
             harness = root / "generate.sh"
             harness.write_text(
                 "set -euo pipefail\n"
@@ -138,9 +195,10 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
                 + function
                 + f'\nwrite_launch_script {default_script} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" ""\n'
                 + f'write_launch_script {fp8_script} 1 10.0.0.2 eth1 hca /cache /generated --headless ro /durable/fp8 ""\n'
+                + f'write_launch_script {nvfp4_script} 1 10.0.0.2 eth1 hca /cache /generated --headless ro "" /durable/nvfp4\n'
             )
             subprocess.run(["bash", str(harness)], check=True)
-            for generated in (default_script, fp8_script):
+            for generated in (default_script, fp8_script, nvfp4_script):
                 parsed = subprocess.run(
                     ["bash", "-n", str(generated)], capture_output=True, text=True
                 )
@@ -166,6 +224,18 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             self.assertIn(
                 "/durable/fp8/hf_quant_config.json:/root/.cache/huggingface/hub/model-cache/snapshots/revision/hf_quant_config.json:ro",
                 fp8,
+            )
+            nvfp4 = nvfp4_script.read_text()
+            self.assertIn(
+                "-v /durable/nvfp4:/rocket/qwen38-linear-nvfp4:ro", nvfp4
+            )
+            self.assertIn(
+                "-e ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=/rocket/qwen38-linear-nvfp4/manifest.json",
+                nvfp4,
+            )
+            self.assertIn(
+                "/generated/config_nvfp4_patched.json:/root/.cache/huggingface/hub/model-cache/snapshots/revision/config.json:ro",
+                nvfp4,
             )
 
     def test_real_artifact_passes_accepted_runtime_preflight(self):
