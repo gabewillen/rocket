@@ -426,6 +426,7 @@ class CutlassQkvRuntime:
                 self._api.call("cudaEventDestroy", end)
                 self._api.call("cudaEventDestroy", start)
         score = measured("qwen38_qsa_indexer_score")
+        select_control = measured("qwen38_qsa_indexer_select_expand_control")
         select = measured("qwen38_qsa_indexer_select_expand")
         def measured_attention(name: str, args: tuple[object, ...]) -> float:
             start, end = ctypes.c_void_p(), ctypes.c_void_p()
@@ -457,6 +458,7 @@ class CutlassQkvRuntime:
         )
         attention = sparse_attention + output_projection
         return MappingProxyType({"score_ms": score, "select_expand_ms": select,
+                                 "select_expand_control_ms": select_control,
                                  "sparse_attention_ms": sparse_attention,
                                  "sparse_attention_control_ms": scalar_control,
                                  "output_projection_ms": output_projection,
@@ -489,6 +491,7 @@ class CutlassQkvRuntime:
             "qwen38_qsa_expand_topk",
             "qwen38_qsa_indexer_create", "qwen38_qsa_indexer_launch",
             "qwen38_qsa_indexer_score", "qwen38_qsa_indexer_select_expand",
+            "qwen38_qsa_indexer_select_expand_control",
             "qwen38_qsa_indexer_inputs", "qwen38_qsa_indexer_output",
             "qwen38_qsa_indexer_destroy",
             "qwen38_qsa_attention_launch", "qwen38_qsa_sparse_attention",

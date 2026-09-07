@@ -58,6 +58,10 @@ int qwen38_qsa_indexer_select_expand(void* plan,
                                     const std::int32_t* sequence_lengths,
                                     const std::int32_t* token_to_request,
                                     cudaStream_t stream);
+int qwen38_qsa_indexer_select_expand_control(
+    void* plan, const std::int64_t* logical_positions,
+    const std::int32_t* sequence_lengths,
+    const std::int32_t* token_to_request, cudaStream_t stream);
 int qwen38_qsa_indexer_inputs(void* plan, void** query_bf16,
                              std::size_t* query_bytes, void** key_cache_bf16,
                              std::size_t* key_cache_bytes,

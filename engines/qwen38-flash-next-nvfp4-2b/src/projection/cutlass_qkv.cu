@@ -57,9 +57,9 @@ constexpr float kOutputActivationGlobal = 1.0f / 256.0f;
 // include/flashinfer/topk.cuh and TensorRT-LLM
 // c426264bc4d01930fad01426b81800e96fe19c2b
 // cpp/tensorrt_llm/kernels/indexerTopK.cu both use exact radix filtering.
-// This first executable slice reuses CUDA 13 CUB's captured segmented radix
-// sort as the upstream correctness control. Its full-sort traffic is profiled
-// separately so replacing it with the audited fixed K=512 filter is measurable.
+// The fixed K=512 selector below specializes the audited histogram/filter
+// structure to one c16 score row per CTA. CUDA 13 CUB's captured segmented
+// radix sort remains callable only as the exact-ID and latency control.
 // Sparse attention follows vLLM 8e685d198
 // models/qwen3_8_flash_next/nvidia/ops/qsa.py:
 // _qsa_sparse_paged_gqa_splitk_kernel and _qsa_merge_splitk_kernel. It keeps
@@ -312,6 +312,148 @@ __global__ void extract_qsa_topk(const float* sorted_logits,
                 isfinite(sorted_logits[static_cast<std::size_t>(row) * kQsaColumns + rank])
             ? sorted_indices[static_cast<std::size_t>(row) * kQsaColumns + rank]
             : -1;
+}
+
+// Fixed-K=512 form of FlashInfer's deterministic radix filtering and
+// TensorRT-LLM's staged histogram selection. One CTA owns one fixed 65,536
+// score row. Four byte histograms isolate the exact FP32 threshold, contiguous
+// per-thread scans choose the lowest indices at threshold, and a 512-item
+// bitonic network restores the stable (score descending, index ascending)
+// order required by the untouched CUB control.
+__global__ void select_qsa_topk_radix512(
+    const float* __restrict__ logits,
+    const std::int32_t* __restrict__ visible_blocks,
+    std::int32_t* __restrict__ selected) {
+  using Scan = cub::BlockScan<int, 512>;
+  // A private 256-bin table per warp removes the all-row contention that a
+  // single shared histogram would create for the narrow FP32 exponent bins.
+  __shared__ std::uint32_t warp_histogram[16][256];
+  __shared__ typename Scan::TempStorage scan_storage;
+  __shared__ std::uint32_t prefix, mask, threshold_key;
+  __shared__ int remaining;
+  __shared__ unsigned long long ordered[512];
+  const int tid = threadIdx.x;
+  const int row = blockIdx.x;
+  constexpr int items_per_thread = kQsaColumns / 512;
+  const int begin = tid * items_per_thread;
+  const int end = begin + items_per_thread;
+  if (tid == 0) {
+    prefix = 0;
+    mask = 0;
+    remaining = min(visible_blocks[row], kBlockTopk);
+  }
+  __syncthreads();
+  if (remaining == 0) {
+    selected[row * kBlockTopk + tid] = -1;
+    return;
+  }
+
+#pragma unroll
+  for (int pass = 0; pass < 4; ++pass) {
+    for (int index = tid; index < 16 * 256; index += 512)
+      warp_histogram[index / 256][index % 256] = 0;
+    __syncthreads();
+    const int shift = 24 - pass * 8;
+    for (int index = begin; index < end; ++index) {
+      const float value = logits[static_cast<std::size_t>(row) * kQsaColumns + index];
+      const std::uint32_t bits = __float_as_uint(value);
+      const std::uint32_t key =
+          bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+      if (isfinite(value) && (key & mask) == prefix)
+        atomicAdd(&warp_histogram[tid / 32][(key >> shift) & 0xffu], 1u);
+    }
+    __syncthreads();
+    if (tid < 256) {
+      std::uint32_t count = 0;
+#pragma unroll
+      for (int warp = 0; warp < 16; ++warp)
+        count += warp_histogram[warp][tid];
+      warp_histogram[0][tid] = count;
+    }
+    __syncthreads();
+    if (tid == 0) {
+      int higher = 0;
+      int bin = 255;
+      for (; bin >= 0; --bin) {
+        const int count = static_cast<int>(warp_histogram[0][bin]);
+        if (higher + count >= remaining) break;
+        higher += count;
+      }
+      remaining -= higher;
+      prefix |= static_cast<std::uint32_t>(bin) << shift;
+      mask |= 0xffu << shift;
+    }
+    __syncthreads();
+  }
+  if (tid == 0) threshold_key = prefix;
+  __syncthreads();
+
+  int equal_count = 0;
+  for (int index = begin; index < end; ++index) {
+    const float value = logits[static_cast<std::size_t>(row) * kQsaColumns + index];
+    const std::uint32_t bits = __float_as_uint(value);
+    const std::uint32_t key = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+    equal_count += isfinite(value) && key == threshold_key;
+  }
+  int equal_prefix = 0;
+  Scan(scan_storage).ExclusiveSum(equal_count, equal_prefix);
+  __syncthreads();
+  int local_equal = 0, selected_count = 0;
+  for (int index = begin; index < end; ++index) {
+    const float value = logits[static_cast<std::size_t>(row) * kQsaColumns + index];
+    const std::uint32_t bits = __float_as_uint(value);
+    const std::uint32_t key = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+    const bool equal = isfinite(value) && key == threshold_key;
+    const bool take = isfinite(value) &&
+                      (key > threshold_key ||
+                       (equal && equal_prefix + local_equal < remaining));
+    selected_count += take;
+    local_equal += equal;
+  }
+  int selected_prefix = 0;
+  Scan(scan_storage).ExclusiveSum(selected_count, selected_prefix);
+  __syncthreads();
+  ordered[tid] = ~0ull;
+  __syncthreads();
+  int local_selected = 0;
+  local_equal = 0;
+  for (int index = begin; index < end; ++index) {
+    const float value = logits[static_cast<std::size_t>(row) * kQsaColumns + index];
+    const std::uint32_t bits = __float_as_uint(value);
+    const std::uint32_t key = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+    const bool equal = isfinite(value) && key == threshold_key;
+    const bool take = isfinite(value) &&
+                      (key > threshold_key ||
+                       (equal && equal_prefix + local_equal < remaining));
+    if (take) {
+      ordered[selected_prefix + local_selected] =
+          (static_cast<unsigned long long>(~key) << 32) |
+          static_cast<std::uint32_t>(index);
+      ++local_selected;
+    }
+    local_equal += equal;
+  }
+  __syncthreads();
+
+  for (int width = 2; width <= kBlockTopk; width <<= 1) {
+    for (int stride = width >> 1; stride; stride >>= 1) {
+      const int peer = tid ^ stride;
+      if (peer > tid) {
+        const unsigned long long left = ordered[tid];
+        const unsigned long long right = ordered[peer];
+        const bool ascending = (tid & width) == 0;
+        if ((left > right) == ascending) {
+          ordered[tid] = right;
+          ordered[peer] = left;
+        }
+      }
+      __syncthreads();
+    }
+  }
+  const unsigned long long item = ordered[tid];
+  selected[row * kBlockTopk + tid] =
+      item == ~0ull ? -1
+                    : static_cast<std::int32_t>(static_cast<std::uint32_t>(item));
 }
 
 __global__ void initialize_attention_cache(__nv_bfloat16* keys,
@@ -962,6 +1104,22 @@ extern "C" int qwen38_qsa_indexer_score(
 }
 
 extern "C" int qwen38_qsa_indexer_select_expand(
+    void* opaque, const std::int64_t* logical_positions,
+    const std::int32_t* sequence_lengths,
+    const std::int32_t* token_to_request, cudaStream_t stream) {
+  if (!opaque || !logical_positions || !sequence_lengths || !token_to_request)
+    return 1;
+  auto* plan = static_cast<QsaPlan*>(opaque);
+  select_qsa_topk_radix512<<<kM, 512, 0, stream>>>(
+      plan->logits, plan->visible, plan->selected);
+  if (!cuda_ok(cudaGetLastError(), "fixed QSA radix-512 selection")) return 1;
+  expand_qsa_topk<<<dim3(kM, (kExpandedWidth + 255) / 256), 256, 0, stream>>>(
+      plan->selected, logical_positions, sequence_lengths, token_to_request,
+      plan->output, kM);
+  return cuda_ok(cudaGetLastError(), "expand radix-selected QSA blocks") ? 0 : 1;
+}
+
+extern "C" int qwen38_qsa_indexer_select_expand_control(
     void* opaque, const std::int64_t* logical_positions,
     const std::int32_t* sequence_lengths,
     const std::int32_t* token_to_request, cudaStream_t stream) {

@@ -146,6 +146,22 @@ int main() {
                                   cudaMemcpyDeviceToHost), "copy attention replay");
   }
   ok = ok && first == second && attention_first == attention_second;
+  std::vector<std::int32_t> cub_selected(first.size()), radix_selected(first.size());
+  if (ok) ok = qwen38_qsa_indexer_select_expand_control(
+                   plan, d_positions, d_lengths, d_requests, stream) == 0 &&
+               cuda_ok(cudaStreamSynchronize(stream), "sync CUB selection control") &&
+               cuda_ok(cudaMemcpy(cub_selected.data(), d_index_output,
+                                  cub_selected.size() * 4,
+                                  cudaMemcpyDeviceToHost),
+                       "copy CUB selection control") &&
+               qwen38_qsa_indexer_select_expand(
+                   plan, d_positions, d_lengths, d_requests, stream) == 0 &&
+               cuda_ok(cudaStreamSynchronize(stream), "sync radix selection") &&
+               cuda_ok(cudaMemcpy(radix_selected.data(), d_index_output,
+                                  radix_selected.size() * 4,
+                                  cudaMemcpyDeviceToHost),
+                       "copy radix selection") &&
+               cub_selected == radix_selected && radix_selected == first;
   for (int rank = 0; ok && rank < kBlockTopk; ++rank) {
     const int block = kColumns - 1 - rank;
     for (int offset = 0; offset < 4; ++offset)
@@ -208,38 +224,52 @@ int main() {
                                   cudaMemcpyDeviceToHost), "copy projected output");
   for (const auto value : projected) ok = ok && __bfloat162float(value) == 0.0f;
 
+  auto launch = [&](int operation) {
+    if (operation == 0)
+      return qwen38_qsa_indexer_score(
+          plan, d_positions, d_lengths, d_requests, stream);
+    if (operation == 1)
+      return qwen38_qsa_indexer_select_expand(
+          plan, d_positions, d_lengths, d_requests, stream);
+    if (operation == 2)
+      return qwen38_qsa_attention_launch(
+          plan, d_qkv, d_positions, d_requests, stream);
+    if (operation == 3)
+      return qwen38_qsa_sparse_attention(
+          plan, d_qkv, d_positions, d_requests, stream);
+    if (operation == 4)
+      return qwen38_qsa_sparse_attention_control(
+          plan, d_qkv, d_positions, d_requests, stream);
+    return qwen38_qsa_indexer_select_expand_control(
+        plan, d_positions, d_lengths, d_requests, stream);
+  };
   auto elapsed = [&](int operation) {
     cudaEvent_t start = nullptr, end = nullptr;
     cudaEventCreate(&start); cudaEventCreate(&end);
-    for (int warm = 0; warm < 3; ++warm)
-      (operation == 0 ? qwen38_qsa_indexer_score(plan, d_positions, d_lengths, d_requests, stream)
-       : operation == 1 ? qwen38_qsa_indexer_select_expand(plan, d_positions, d_lengths, d_requests, stream)
-       : operation == 2 ? qwen38_qsa_attention_launch(plan, d_qkv, d_positions, d_requests, stream)
-       : operation == 3 ? qwen38_qsa_sparse_attention(plan, d_qkv, d_positions, d_requests, stream)
-                        : qwen38_qsa_sparse_attention_control(plan, d_qkv, d_positions, d_requests, stream));
+    for (int warm = 0; warm < 3; ++warm) launch(operation);
     cudaStreamSynchronize(stream); cudaEventRecord(start, stream);
     constexpr int iterations = 20;
-    for (int iteration = 0; iteration < iterations; ++iteration)
-      (operation == 0 ? qwen38_qsa_indexer_score(plan, d_positions, d_lengths, d_requests, stream)
-       : operation == 1 ? qwen38_qsa_indexer_select_expand(plan, d_positions, d_lengths, d_requests, stream)
-       : operation == 2 ? qwen38_qsa_attention_launch(plan, d_qkv, d_positions, d_requests, stream)
-       : operation == 3 ? qwen38_qsa_sparse_attention(plan, d_qkv, d_positions, d_requests, stream)
-                        : qwen38_qsa_sparse_attention_control(plan, d_qkv, d_positions, d_requests, stream));
+    for (int iteration = 0; iteration < iterations; ++iteration) launch(operation);
     cudaEventRecord(end, stream); cudaEventSynchronize(end);
     float ms = 0; cudaEventElapsedTime(&ms, start, end);
     cudaEventDestroy(end); cudaEventDestroy(start); return ms / iterations;
   };
   const float score_ms = elapsed(0), select_ms = elapsed(1), attention_ms = elapsed(2);
   const float tiled_ms = elapsed(3), control_ms = elapsed(4);
+  const float select_control_ms = elapsed(5);
   const double physical_gb =
       (15.0 * kColumns * (128.0 * 2.0 + 4.0)) / 1.0e9;
   const double bandwidth = physical_gb / (score_ms / 1000.0);
   std::printf("qsa_indexer rows=16 columns=65536 score_ms=%.6f "
               "score_gbps=%.3f local_roof_pct=%.3f select_expand_ms=%.6f "
+              "select_control_ms=%.6f select_speedup=%.3f select_exact=%s "
               "attention_output_ms=%.6f tiled_ms=%.6f control_ms=%.6f "
               "speedup=%.3f control_max_error=%.7f repeat=%s result=%s\n",
               score_ms, bandwidth,
-              bandwidth / 238.0 * 100.0, select_ms, attention_ms, tiled_ms,
+              bandwidth / 238.0 * 100.0, select_ms, select_control_ms,
+              select_control_ms / select_ms,
+              cub_selected == radix_selected ? "yes" : "no",
+              attention_ms, tiled_ms,
               control_ms, control_ms / tiled_ms, control_max_error,
               first == second ? "bit-exact" : "mismatch", ok ? "match" : "failure");
   if (index_exec) cudaGraphExecDestroy(index_exec);

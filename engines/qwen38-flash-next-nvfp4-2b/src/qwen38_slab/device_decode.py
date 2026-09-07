@@ -14,9 +14,9 @@ Each graph then runs the Qwen3.8 TP2 K0 target prologue, which consumes all
 seven metadata fields and writes deterministic row descriptors. With an
 authenticated full rank-slab payload, the same graph requantizes a stable live
 c16 activation buffer and executes the production layer-3 Q/K/V widths through
-one fixed SM121 W4A4 projection. The twelve-output scalar kernel remains an
-explicit oracle path. Indexer scoring/top-k, sparse paged attention, and
-sampling remain excluded.
+one fixed SM121 W4A4 projection, fixed QSA scoring/radix-512 selection, sparse
+paged attention, and output projection. The CUB full-sort selector and scalar
+attention kernel remain explicit oracle paths. Sampling remains excluded.
 
 OpenTelemetry span attributes are ``phase`` (six values), ``depth`` (k0),
 ``graph_batch`` (1, 2, 4, 8, or 16), and ``outcome`` (success or failure).
@@ -456,7 +456,9 @@ class Cuda13GraphRuntime:
         self._graph_nodes = (
             TARGET_GRAPH_NODES
             + 2 * int(projection is not None)
-            + 18 * int(full_projection is not None)
+            # Fixed radix-512 is one kernel node; the CUB control's seven-node
+            # segmented sort is excluded from the production capture.
+            + 12 * int(full_projection is not None)
         )
         self._active_bank = -1
         self._active_graph_batch: int | None = None
