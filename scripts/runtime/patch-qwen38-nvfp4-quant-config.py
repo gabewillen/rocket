@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create the mixed-precision ModelOpt policy for Qwen linear-attention NVFP4."""
+"""Create a complete mixed-precision ModelOpt policy for Qwen attention NVFP4."""
 
 from __future__ import annotations
 
@@ -12,10 +12,29 @@ from pathlib import Path
 
 
 LINEAR_EXCLUDE = re.compile(r"^model\.language_model\.layers\.(\d+)\.linear_attn\*$")
-PROJECTIONS = ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj")
+FULL_EXCLUDE = re.compile(r"^model\.language_model\.layers\.(\d+)\.self_attn\*$")
+FAMILY_PROJECTIONS = {
+    "linear_attention": ("linear_attn", ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj")),
+    "full_attention": ("self_attn", ("q_proj", "k_proj", "v_proj", "o_proj")),
+}
+FAMILY_EXCLUDES = {
+    "linear_attention": (LINEAR_EXCLUDE, set(range(48)) - set(range(3, 48, 4))),
+    "full_attention": (FULL_EXCLUDE, set(range(3, 48, 4))),
+}
 
 
-def patched(config: dict) -> dict:
+def normalize_families(families) -> tuple[str, ...]:
+    """Return the canonical non-empty family selection or raise ValueError."""
+    selected = tuple(sorted(set(families)))
+    unknown = set(selected) - set(FAMILY_PROJECTIONS)
+    if not selected or unknown:
+        raise ValueError(f"invalid NVFP4 families: {sorted(unknown) if unknown else selected}")
+    return selected
+
+
+def patched(config: dict, families=("linear_attention",)) -> dict:
+    """Copy and extend a pinned config; input is borrowed and never mutated."""
+    families = normalize_families(families)
     result = json.loads(json.dumps(config))
     quant = result.get("quantization")
     if not isinstance(quant, dict) or quant.get("quant_algo") != "MIXED_PRECISION":
@@ -25,21 +44,33 @@ def patched(config: dict) -> dict:
     excludes, layers = quant.get("exclude_modules"), quant.get("quantized_layers")
     if not isinstance(excludes, list) or not isinstance(layers, dict):
         raise ValueError("pinned config lacks excludes or quantized_layers")
-    selected, kept = [], []
+    selected = {family: [] for family in families}
+    kept = []
     for value in excludes:
-        match = LINEAR_EXCLUDE.fullmatch(value) if isinstance(value, str) else None
-        if match:
-            selected.append(int(match.group(1)))
-        else:
+        matched_family = None
+        if isinstance(value, str):
+            for family in families:
+                match = FAMILY_EXCLUDES[family][0].fullmatch(value)
+                if match:
+                    selected[family].append(int(match.group(1)))
+                    matched_family = family
+                    break
+        if matched_family is None:
             kept.append(value)
-    if len(selected) != 36 or len(set(selected)) != 36:
-        raise ValueError(f"linear-attention exclude coverage is {len(set(selected))}/36")
-    for layer in sorted(selected):
-        for projection in PROJECTIONS:
-            prefix = f"model.language_model.layers.{layer}.linear_attn.{projection}"
-            if prefix in layers:
-                raise ValueError(f"quantized layer already exists: {prefix}")
-            layers[prefix] = {"quant_algo": "NVFP4"}
+    for family in families:
+        actual = selected[family]
+        expected = FAMILY_EXCLUDES[family][1]
+        if len(actual) != len(expected) or set(actual) != expected:
+            raise ValueError(
+                f"{family} exclude coverage is {len(set(actual))}/{len(expected)}"
+            )
+        module, projections = FAMILY_PROJECTIONS[family]
+        for layer in sorted(actual):
+            for projection in projections:
+                prefix = f"model.language_model.layers.{layer}.{module}.{projection}"
+                if prefix in layers:
+                    raise ValueError(f"quantized layer already exists: {prefix}")
+                layers[prefix] = {"quant_algo": "NVFP4"}
     quant["exclude_modules"] = kept
     return result
 
@@ -52,9 +83,18 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--family",
+        action="append",
+        choices=tuple(FAMILY_PROJECTIONS),
+        default=None,
+        help="attention family to enable; repeat to create a combined policy",
+    )
     args = parser.parse_args()
     try:
-        encoded = canonical_bytes(patched(json.loads(args.source.read_text())))
+        encoded = canonical_bytes(
+            patched(json.loads(args.source.read_text()), args.family or ("linear_attention",))
+        )
         with args.output.open("xb") as stream:
             stream.write(encoded)
     except (OSError, ValueError, json.JSONDecodeError) as error:

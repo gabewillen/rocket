@@ -40,6 +40,50 @@ class EmbedConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "0/180"):
             MODULE.embed(base, sidecar)
 
+    def test_full_attention_and_combined_policies_are_independently_selectable(self):
+        base = {
+            "quantization_config": {
+                "quant_algo": "MIXED_PRECISION",
+                "quant_method": "modelopt",
+            }
+        }
+        full_layers = {
+            f"model.language_model.layers.{layer}.self_attn.{projection}": {
+                "quant_algo": "NVFP4"
+            }
+            for layer in range(3, 48, 4)
+            for projection in ("q_proj", "k_proj", "v_proj", "o_proj")
+        }
+        linear_layers = {
+            f"model.language_model.layers.{layer}.linear_attn.{projection}": {
+                "quant_algo": "NVFP4"
+            }
+            for layer in set(range(48)) - set(range(3, 48, 4))
+            for projection in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj")
+        }
+        full = {
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "exclude_modules": [
+                    f"model.language_model.layers.{layer}.linear_attn*"
+                    for layer in set(range(48)) - set(range(3, 48, 4))
+                ],
+                "quantized_layers": full_layers,
+            }
+        }
+        result = MODULE.embed(base, full, "NVFP4", ("full_attention",))
+        self.assertEqual(len(result["quantization_config"]["quantized_layers"]), 48)
+        combined = json.loads(json.dumps(full))
+        combined["quantization"]["quantized_layers"].update(linear_layers)
+        combined["quantization"]["exclude_modules"] = []
+        result = MODULE.embed(
+            base,
+            combined,
+            "NVFP4",
+            ("linear_attention", "full_attention"),
+        )
+        self.assertEqual(len(result["quantization_config"]["quantized_layers"]), 228)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,18 @@ class Nvfp4MaterializerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.plan = module.build_plan(REAL_SNAPSHOT, REAL_TRACE, REAL_SNAPSHOT / "hf_quant_config.json")
+        cls.full_plan = module.build_plan(
+            REAL_SNAPSHOT,
+            REAL_TRACE,
+            REAL_SNAPSHOT / "hf_quant_config.json",
+            ("full_attention",),
+        )
+        cls.combined_plan = module.build_plan(
+            REAL_SNAPSHOT,
+            REAL_TRACE,
+            REAL_SNAPSHOT / "hf_quant_config.json",
+            ("linear_attention", "full_attention"),
+        )
 
     def test_real_family_and_exact_bytes(self):
         plan = self.plan
@@ -51,12 +63,78 @@ class Nvfp4MaterializerTest(unittest.TestCase):
         final = max(meta["data_offsets"][1] for meta in header.values())
         self.assertEqual(final, sum(x["encoded_bytes"] for x in self.plan["tensors"]))
 
+    def test_full_attention_family_is_exact_and_mtp_is_isolated(self):
+        plan = self.full_plan
+        self.assertEqual(plan["families"], ("full_attention",))
+        self.assertEqual(len(plan["tensors"]), 48)
+        self.assertEqual(sum(x["source_bytes"] for x in plan["tensors"]), 1_195_376_640)
+        self.assertEqual(sum(x["encoded_bytes"] for x in plan["tensors"]), 336_200_064)
+        self.assertEqual({x["layer"] for x in plan["tensors"]}, set(range(3, 48, 4)))
+        self.assertFalse(any(x["name"].startswith("mtp.") for x in plan["tensors"]))
+        self.assertTrue(all(x["family"] == "full_attention" for x in plan["tensors"]))
+        for layer in range(3, 48, 4):
+            scales = {
+                item["input_scale"]
+                for item in plan["tensors"]
+                if item["layer"] == layer and item["projection"] != "o_proj"
+            }
+            self.assertEqual(len(scales), 1)
+
+    def test_combined_map_preserves_both_complete_families(self):
+        plan = self.combined_plan
+        self.assertEqual(plan["families"], ("full_attention", "linear_attention"))
+        self.assertEqual(len(plan["tensors"]), 228)
+        self.assertEqual(sum(x["source_bytes"] for x in plan["tensors"]), 5_365_432_320)
+        self.assertEqual(sum(x["encoded_bytes"] for x in plan["tensors"]), 1_509_029_664)
+        algorithms = plan["quant_config"]["quantization"]["quantized_layers"]
+        selected = [
+            name
+            for name, value in algorithms.items()
+            if value.get("quant_algo") == "NVFP4"
+            and (".linear_attn." in name or ".self_attn." in name)
+        ]
+        self.assertEqual(len(selected), 228)
+
+    def test_full_trace_or_family_policy_cannot_be_partial(self):
+        trace = json.loads(REAL_TRACE.read_text())
+        trace["coverage"]["full_attention_layers"] = 11
+        with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+            path = pathlib.Path(directory) / "trace.json"
+            path.write_text(json.dumps(trace))
+            with self.assertRaisesRegex(module.MaterializeError, "full-attention trace coverage"):
+                module.build_plan(
+                    REAL_SNAPSHOT,
+                    path,
+                    REAL_SNAPSHOT / "hf_quant_config.json",
+                    ("full_attention",),
+                )
+
+    def test_quant_config_full_family_is_complete_and_isolated(self):
+        source = json.loads((REAL_SNAPSHOT / "hf_quant_config.json").read_text())
+        result = module.CONFIG.patched(source, ("full_attention",))
+        quant = result["quantization"]
+        selected = {
+            name
+            for name, policy in quant["quantized_layers"].items()
+            if ".self_attn." in name and policy.get("quant_algo") == "NVFP4"
+        }
+        self.assertEqual(len(selected), 48)
+        self.assertTrue(any("linear_attn" in item for item in quant["exclude_modules"]))
+        partial = json.loads(json.dumps(source))
+        partial["quantization"]["exclude_modules"].remove(
+            "model.language_model.layers.3.self_attn*"
+        )
+        with self.assertRaisesRegex(ValueError, "11/12"):
+            module.CONFIG.patched(partial, ("full_attention",))
+
     def test_interrupted_output_fails_closed(self):
         with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
             root = pathlib.Path(directory)
             (root / f".{module.REVISION}.linear-nvfp4.building").mkdir()
             with self.assertRaisesRegex(module.MaterializeError, "interrupted output"):
-                module.materialize({"tensors": []}, root)
+                module.materialize(
+                    {"families": ("linear_attention",), "tensors": []}, root
+                )
 
 
 if __name__ == "__main__":

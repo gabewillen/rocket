@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Materialize the selected Qwen linear-attention family as ModelOpt NVFP4."""
+"""Materialize complete Qwen attention families as immutable ModelOpt NVFP4."""
 
 from __future__ import annotations
 
@@ -8,13 +8,27 @@ import hashlib
 import importlib.util
 import json
 import math
+import re
 import struct
 import sys
 from pathlib import Path
 
 
-MANIFEST_SCHEMA = "rocket.qwen38.linear-nvfp4-overlay.v1"
+LINEAR_MANIFEST_SCHEMA = "rocket.qwen38.linear-nvfp4-overlay.v1"
+MANIFEST_SCHEMA = "rocket.qwen38.nvfp4-overlay.v2"
 NVFP4_DENOMINATOR = 6.0 * 448.0
+FAMILY_SPECS = {
+    "linear_attention": {
+        "module": "linear_attn",
+        "layers": set(range(48)) - set(range(3, 48, 4)),
+        "projections": ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"),
+    },
+    "full_attention": {
+        "module": "self_attn",
+        "layers": set(range(3, 48, 4)),
+        "projections": ("q_proj", "k_proj", "v_proj", "o_proj"),
+    },
+}
 
 
 class MaterializeError(ValueError):
@@ -40,21 +54,135 @@ def canonical_hash(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def build_plan(checkpoint: Path, trace_path: Path, source_quant_config: Path) -> dict:
-    plan = FP8.build_plan(checkpoint, trace_path, source_quant_config)
-    config = CONFIG.patched(json.loads(source_quant_config.read_text()))
-    config_bytes = CONFIG.canonical_bytes(config)
-    for item in plan["tensors"]:
-        n, k = item["shape"]
+def input_channel(family: str, layer: int, projection: str) -> str:
+    """Map a source projection to its accepted v2 activation-input channel."""
+    if family == "linear_attention":
+        return FP8.input_channel(layer, projection)
+    packed = "o_proj" if projection == "o_proj" else "qkv_proj"
+    return f"layer.{layer}.full_attn.{packed}.input"
+
+
+def selected_family(name: str, families: tuple[str, ...]):
+    for family in families:
+        spec = FAMILY_SPECS[family]
+        prefix = r"^model\.language_model\.layers\.(\d+)\." + spec["module"] + r"\."
+        projections = "|".join(spec["projections"])
+        match = re.fullmatch(prefix + rf"({projections})\.weight$", name)
+        if match:
+            return family, int(match.group(1)), match.group(2)
+    return None
+
+
+def build_plan(
+    checkpoint: Path,
+    trace_path: Path,
+    source_quant_config: Path,
+    families=("linear_attention",),
+) -> dict:
+    """Build a bounded, read-only plan; all family invariants hold on return."""
+    families = CONFIG.normalize_families(families)
+    shards, headers, bytes_hashed = FP8.read_checkpoint(checkpoint)
+    trace, trace_hash = FP8.validate_trace(trace_path)
+    coverage = trace["coverage"]
+    if "full_attention" in families:
+        expected = {
+            "full_attention_layers": 12,
+            "full_qkv_projection_layers": 12,
+            "full_output_projection_layers": 12,
+        }
+        failures = [
+            f"{key}={coverage.get(key)!r}/{value}"
+            for key, value in expected.items()
+            if coverage.get(key) != value
+        ]
+        if failures:
+            raise MaterializeError("incomplete full-attention trace coverage: " + ", ".join(failures))
+    tensors = []
+    for name, (path, data_start, meta) in headers.items():
+        selected = selected_family(name, families)
+        if selected is None:
+            continue
+        family, layer, projection = selected
+        dtype, shape, offsets = meta.get("dtype"), meta.get("shape"), meta.get("data_offsets")
+        if dtype != "BF16" or not isinstance(shape, list) or len(shape) != 2:
+            raise MaterializeError(f"selected tensor dtype/shape drift: {name}")
+        if not all(isinstance(value, int) and value > 0 for value in shape):
+            raise MaterializeError(f"selected tensor shape drift: {name}")
+        if not isinstance(offsets, list) or len(offsets) != 2:
+            raise MaterializeError(f"selected tensor offsets missing: {name}")
+        size = offsets[1] - offsets[0]
+        if size != math.prod(shape) * 2:
+            raise MaterializeError(f"selected tensor byte/shape drift: {name}")
+        channel = input_channel(family, layer, projection)
+        record = trace["telemetry"].get(channel)
+        activation_amax = record.get("absmax") if isinstance(record, dict) else None
+        if (
+            not isinstance(activation_amax, (int, float))
+            or not math.isfinite(activation_amax)
+            or activation_amax < 0
+        ):
+            raise MaterializeError(f"missing or invalid calibrated activation: {channel}")
+        absolute = data_start + offsets[0]
+        n, k = shape
         if k % 16:
-            raise MaterializeError(f"selected tensor K is not divisible by 16: {item['name']}")
-        item["input_scale"] = FP8.float32(item["input_scale"] / 6.0)
-        item["encoded_bytes"] = n * (k // 2 + k // 16) + 8
-    plan["quant_config"] = config
-    plan["quant_config_bytes"] = config_bytes
-    plan["quant_config_sha256"] = hashlib.sha256(config_bytes).hexdigest()
-    plan["payload_bytes"] = sum(item["encoded_bytes"] for item in plan["tensors"])
-    return plan
+            raise MaterializeError(f"selected tensor K is not divisible by 16: {name}")
+        source_hash = FP8.range_sha256(path, absolute, size)
+        bytes_hashed += size
+        tensors.append(
+            {
+                "name": name,
+                "family": family,
+                "layer": layer,
+                "projection": projection,
+                "shape": shape,
+                "source_bytes": size,
+                "source_path": str(path),
+                "source_offset": absolute,
+                "sha256": source_hash,
+                "input_scale": FP8.float32(activation_amax / NVFP4_DENOMINATOR),
+                "encoded_bytes": n * (k // 2 + k // 16) + 8,
+            }
+        )
+    family_order = {family: index for index, family in enumerate(families)}
+    tensors.sort(
+        key=lambda item: (
+            family_order[item["family"]],
+            item["layer"],
+            FAMILY_SPECS[item["family"]]["projections"].index(item["projection"]),
+        )
+    )
+    for family in families:
+        spec = FAMILY_SPECS[family]
+        selected = [item for item in tensors if item["family"] == family]
+        by_layer = {}
+        for item in selected:
+            by_layer.setdefault(item["layer"], set()).add(item["projection"])
+        expected_count = len(spec["layers"]) * len(spec["projections"])
+        if (
+            set(by_layer) != spec["layers"]
+            or len(selected) != expected_count
+            or any(value != set(spec["projections"]) for value in by_layer.values())
+        ):
+            raise MaterializeError(
+                f"{family} coverage is {len(by_layer)}/{len(spec['layers'])} layers, "
+                f"{len(selected)}/{expected_count} matrices"
+            )
+    config = CONFIG.patched(json.loads(source_quant_config.read_text()), families)
+    config_bytes = CONFIG.canonical_bytes(config)
+    bytes_hashed += trace_path.stat().st_size + len(config_bytes)
+    return {
+        "checkpoint": str(checkpoint.absolute()),
+        "revision": REVISION,
+        "families": families,
+        "trace_sha256": trace_hash,
+        "shards": shards,
+        "tensors": tensors,
+        "quant_config": config,
+        "quant_config_bytes": config_bytes,
+        "quant_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "payload_bytes": sum(item["encoded_bytes"] for item in tensors),
+        "bytes_hashed": bytes_hashed,
+    }
 
 
 def output_entries(item: dict):
@@ -76,8 +204,9 @@ def safetensors_header(items: list[dict]) -> bytes:
                 raise MaterializeError(f"duplicate output tensor: {name}")
             header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + size]}
             offset += size
-    if len(header) != 720:
-        raise MaterializeError(f"overlay tensor count is {len(header)}/720")
+    expected = 4 * len(items)
+    if not items or len(header) != expected:
+        raise MaterializeError(f"overlay tensor count is {len(header)}/{expected}")
     raw = json.dumps(header, sort_keys=True, separators=(",", ":")).encode()
     return raw + b" " * ((-len(raw)) % 8)
 
@@ -140,12 +269,15 @@ def estimated_overlay_bytes(items: list[dict]) -> int:
 
 def materialize(plan: dict, output_root: Path) -> Path:
     output_root.mkdir(parents=True, exist_ok=True)
-    staging = output_root / f".{REVISION}.linear-nvfp4.building"
+    families = tuple(plan["families"])
+    slug = "linear-nvfp4" if families == ("linear_attention",) else "-".join(families) + "-nvfp4"
+    staging = output_root / f".{REVISION}.{slug}.building"
     if staging.exists():
         raise MaterializeError(f"refusing interrupted output: {staging}")
     staging.mkdir()
     try:
-        overlay_path = staging / "linear-attention-nvfp4.safetensors"
+        overlay_name = "linear-attention-nvfp4.safetensors" if families == ("linear_attention",) else "attention-nvfp4.safetensors"
+        overlay_path = staging / overlay_name
         write_overlay(overlay_path, plan["tensors"])
         overlay_hash = FP8.sha256_file(overlay_path)
         config_path = staging / "hf_quant_config.json"
@@ -157,10 +289,14 @@ def materialize(plan: dict, output_root: Path) -> Path:
             "shards": plan["shards"],
             "tensors": [{"name": x["name"], "shape": x["shape"], "sha256": x["sha256"]} for x in plan["tensors"]],
         }
+        schema = LINEAR_MANIFEST_SCHEMA
+        if families != ("linear_attention",):
+            schema = MANIFEST_SCHEMA
+            source["families"] = list(families)
         overlay = {"file": overlay_path.name, "sha256": overlay_hash}
         quant = {"file": config_path.name, "sha256": plan["quant_config_sha256"]}
         key = canonical_hash({"source": source, "overlay": overlay, "quant_config": quant})
-        manifest = {"schema": MANIFEST_SCHEMA, "artifact_key": key, "source": source, "overlay": overlay, "quant_config": quant}
+        manifest = {"schema": schema, "artifact_key": key, "source": source, "overlay": overlay, "quant_config": quant}
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         destination = output_root / key
         if destination.exists():
@@ -178,13 +314,26 @@ def main() -> int:
     parser.add_argument("--source-quant-config", required=True, type=Path)
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument(
+        "--family",
+        action="append",
+        choices=tuple(FAMILY_SPECS),
+        default=None,
+        help="attention family to materialize; repeat for a combined immutable overlay",
+    )
     args = parser.parse_args()
     try:
         if args.plan_only == (args.output_root is not None):
             raise MaterializeError("choose exactly one of --plan-only or --output-root")
-        plan = build_plan(args.checkpoint, args.trace, args.source_quant_config)
+        plan = build_plan(
+            args.checkpoint,
+            args.trace,
+            args.source_quant_config,
+            args.family or ("linear_attention",),
+        )
         summary = {
             "revision": REVISION,
+            "families": list(plan["families"]),
             "source_tensors": len(plan["tensors"]),
             "output_tensors": 4 * len(plan["tensors"]),
             "source_bytes": sum(x["source_bytes"] for x in plan["tensors"]),

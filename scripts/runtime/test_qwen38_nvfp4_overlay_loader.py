@@ -16,16 +16,22 @@ BASE_SPEC.loader.exec_module(fixture)
 
 
 class Nvfp4OverlayLoaderTest(unittest.TestCase):
-    def test_exact_nvfp4_abi_and_full_family_preflight(self):
+    def test_exact_nvfp4_abi_and_selected_family_preflight(self):
         result = patcher.patched(fixture.SOURCE)
         self.assertIn(patcher.MARKER, result)
         self.assertIn('"rocket.qwen38.linear-nvfp4-overlay.v1"', result)
+        self.assertIn('"rocket.qwen38.nvfp4-overlay.v2"', result)
         self.assertIn('get("quant_algo") != "NVFP4"', result)
         self.assertIn('name: ("U8", [n, k // 2])', result)
         self.assertIn('prefix + ".weight_scale": ("F8_E4M3", [n, k // 16])', result)
         self.assertIn('prefix + ".weight_scale_2": ("F32", [1])', result)
-        self.assertIn('len(entries) != 180', result)
-        self.assertIn('len(layers) != 36', result)
+        self.assertIn('"linear_attention": 180, "full_attention": 48', result)
+        self.assertIn('"full_attention": (set(range(3, 48, 4))', result)
+        self.assertIn('"q_proj", "k_proj", "v_proj", "o_proj"', result)
+        self.assertIn("tensor outside selected families", result)
+        self.assertIn("partial {family} family", result)
+        self.assertIn("attention policy does not match selected tensors", result)
+        self.assertIn("unselected {family} is not excluded", result)
 
     def test_yields_all_four_tensors_and_preserves_clone(self):
         result = patcher.patched(fixture.SOURCE)
