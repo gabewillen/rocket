@@ -52,6 +52,13 @@ cudaGraphExec_t empty_graph() {
 }  // namespace
 
 int main() {
+  static_assert(rocket::qwen38::mtp::allowed_graph_key({1, 16}));
+  static_assert(rocket::qwen38::mtp::allowed_graph_key({2, 16}));
+  static_assert(rocket::qwen38::mtp::allowed_graph_key({3, 16}));
+  static_assert(rocket::qwen38::mtp::allowed_graph_key({4, 16}));
+  static_assert(!rocket::qwen38::mtp::allowed_graph_key({5, 16}));
+  static_assert(!rocket::qwen38::mtp::allowed_graph_key({6, 8}));
+  static_assert(rocket::qwen38::mtp::allowed_graph_key({7, 4}));
   constexpr int kDepth = 2;
   constexpr int kSequences = 2;
   constexpr std::size_t kStateBytes = 4;
@@ -64,7 +71,8 @@ int main() {
       {0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 0, 1, 2, 3, 3, 3},
       {7, 7, 8, 8, 9, 9, 10, 10, 7, 8, 9, 10, 10, 10, 10, 10},
   }};
-  std::array<std::int32_t, kSequences * kDepth> tokens{17, 18, 19, 20};
+  std::array<std::int32_t, kSequences * (kDepth + 1)> tokens{
+      11, 12, 17, 19, 18, 20};
   std::array<std::array<std::byte, kSequences * kStateBytes>, kDepth>
       snapshots{};
   snapshots[0].fill(std::byte{0x11});
@@ -93,7 +101,7 @@ int main() {
   assert(cudaMemcpy(token_device, tokens.data(), sizeof(tokens),
                     cudaMemcpyHostToDevice) == cudaSuccess);
   assert(cudaMalloc(&active_device, active.size()) == cudaSuccess);
-  graph.proposal_tokens = token_device;
+  graph.verification_tokens = token_device;
   graph.active_causal_state = active_device;
   graph.state_bytes_per_sequence = kStateBytes;
 
@@ -107,7 +115,11 @@ int main() {
                        rocket::qwen38::mtp::kNativeRankSlabBytes, digest},
         graph, sink, stream);
     const auto result = executor.draft(1);
-    assert(result.tokens[0][0] == 17 && result.tokens[1][1] == 20);
+    assert(result.verification_tokens == token_device);
+    assert(result.depth == kDepth && result.sequences == kSequences);
+    // This is the one terminal fence owned by the target verifier.
+    assert(cudaStreamSynchronize(stream) == cudaSuccess);
+    executor.export_telemetry_after_fence(1);
     assert(sink.experts.size() == kDepth);
     assert(sink.experts[0].unique_local_experts == 4);
     assert(sink.experts[1].unique_local_experts == 4);
@@ -122,7 +134,13 @@ int main() {
                 << " resident_expert_bytes=" << usage.resident_expert_bytes
                 << '\n';
     const std::array<std::int32_t, kSequences> accepted{1, 3};
-    executor.publish(1, accepted.data());
+    std::int32_t* accepted_device = nullptr;
+    assert(cudaMalloc(&accepted_device, sizeof(accepted)) == cudaSuccess);
+    assert(cudaMemcpy(accepted_device, accepted.data(), sizeof(accepted),
+                      cudaMemcpyHostToDevice) == cudaSuccess);
+    executor.publish(1, accepted_device);
+    // Publication is asynchronous and ordered before the next engine step.
+    assert(cudaStreamSynchronize(stream) == cudaSuccess);
     assert(cudaMemcpy(active.data(), active_device, active.size(),
                       cudaMemcpyDeviceToHost) == cudaSuccess);
     for (std::size_t index = 0; index < kStateBytes; ++index)
@@ -131,6 +149,7 @@ int main() {
       assert(active[index] == std::byte{0x22});
     std::cout << "accepted_widths=1,3 published_snapshots=0,1 exact=1\n";
     assert(executor.phase() == rocket::qwen38::mtp::ExecutorPhase::kReady);
+    assert(cudaFree(accepted_device) == cudaSuccess);
   }
 
   for (int step = 0; step < kDepth; ++step) {

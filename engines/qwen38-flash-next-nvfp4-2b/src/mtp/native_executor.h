@@ -92,16 +92,16 @@ struct BoundGraph {
       phase_graphs{};
   // Actual post-router expert IDs, laid out [sequences, top_k], per step.
   std::array<const std::int32_t*, kMaxDepth> router_expert_ids{};
-  // Captured sample output, laid out [sequences, depth].
-  const std::int32_t* proposal_tokens = nullptr;
+  // Captured target+proposal output, position-major [depth + 1, sequences].
+  const std::int32_t* verification_tokens = nullptr;
   // Private causal snapshots, one [sequences, state_bytes] array per step.
   std::array<const std::byte*, kMaxDepth> causal_snapshots{};
   std::byte* active_causal_state = nullptr;
   std::size_t state_bytes_per_sequence = 0;
 };
 
-struct DraftResult {
-  std::array<std::array<std::int32_t, kMaxDepth>, kMaxSequences> tokens{};
+struct DeviceDraftView {
+  const std::int32_t* verification_tokens = nullptr;
   int depth = 0;
   int sequences = 0;
   std::uint64_t generation = 0;
@@ -124,9 +124,12 @@ class NativeExecutor final {
   NativeExecutor(const NativeExecutor&) = delete;
   NativeExecutor& operator=(const NativeExecutor&) = delete;
 
-  DraftResult draft(std::uint64_t generation);
+  DeviceDraftView draft(std::uint64_t generation);
   void publish(std::uint64_t generation,
-               const std::int32_t* accepted_widths_host);
+               const std::int32_t* accepted_widths_device);
+  // Invoke only after DecoderVerifier's terminal fence. This method performs
+  // no CUDA synchronization and launches no device work.
+  void export_telemetry_after_fence(std::uint64_t generation);
   void discard(std::uint64_t generation) noexcept;
 
   [[nodiscard]] ExecutorPhase phase() const noexcept { return phase_; }
@@ -137,12 +140,12 @@ class NativeExecutor final {
   BoundGraph graph_;
   TelemetrySink& telemetry_;
   cudaStream_t stream_;
-  std::array<cudaEvent_t, static_cast<int>(Phase::kCount) + 1> events_{};
+  std::array<std::array<cudaEvent_t, static_cast<int>(Phase::kCount) + 1>,
+             kMaxDepth>
+      events_{};
   std::uint32_t* expert_masks_device_ = nullptr;
-  std::int32_t* accepted_widths_device_ = nullptr;
   const std::byte** snapshots_device_ = nullptr;
   std::array<std::array<std::uint32_t, 8>, kMaxDepth> expert_masks_host_{};
-  std::array<std::int32_t, kMaxSequences> accepted_widths_{};
   ExecutorPhase phase_ = ExecutorPhase::kReady;
   std::uint64_t active_generation_ = 0;
   std::uint64_t pending_generation_ = 0;
