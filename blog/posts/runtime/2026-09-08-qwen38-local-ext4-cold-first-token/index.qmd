@@ -1,0 +1,65 @@
+---
+title: "Local EXT4 puts Qwen3.8 first token at 468.83 seconds"
+description: "Two cold K1 runs from matched local EXT4 checkpoints averaged 468.83 seconds from service exec to the first visible token."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, runtime, memory, hardware, baseline]
+verdict: accepted
+rocket: "#engine-status"
+---
+
+**Question.** What is the pinned vLLM total cold boundary when both nodes read the checkpoint from local EXT4?
+
+| setup | value |
+| --- | --- |
+| nodes | gx10-5e36 and gx10-2a13, GB10, 64 KiB pages |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| image | `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| launcher | Rocket `52bcadd67`, Mia `c2325b22602b51a5faf55fc2bebccc34f3f80b9f` |
+| storage | EXT4 on both nodes, 11 shards, manifest `105d7276c7d665164e6e419f20b9d15d5f667bcb9830ca81d84e0302476f5222` |
+
+```bash
+python3 scripts/runtime/qwen38-vllm-cold-first-token.py \
+  --prepared-dir /home/glwillen/calibration/qwen38-vllm-cold-k1-local-ext4-production-prepared-20260907-03 \
+  --output-dir /home/glwillen/calibration/qwen38-vllm-cold-k1-first-token-local-ext4-20260907-03 \
+  --runs 2 --required-worker-cache-kind host_ext4
+```
+
+| population | runs | exec to ready mean | ready to token mean | total mean | total sample SD | total CV |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| local EXT4 | 2 | 467.740152 s | 1.092748 s | 468.832900 s | 2.074099 s | 0.4424% |
+| production NFS | 2 | 388.333120 s | 1.116338 s | 389.449459 s | 12.875240 s | 3.3060% |
+
+| local run | total | max SM clock rank 0/1 | max power rank 0/1 | max utilization rank 0/1 | max pair span |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 470.299509 s | 2496/2489 MHz | 91.89/40.13 W | 96/96% | 709.768960 ms |
+| 2 | 467.366291 s | 2496/2489 MHz | 91.35/40.58 W | 96/96% | 619.290806 ms |
+
+The NFS control dropped client page caches only. Server cache state was outside the control boundary, so the NFS and local populations are not pooled.
+
+```bash
+PYTHONPATH=engines/qwen38-flash-next-nvfp4-2b/src \
+python3 scripts/runtime/qwen38-cuda-slab-load.py \
+  --repo /home/glwillen/Development/rocket \
+  --artifact /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4 \
+  --remote glwillen@192.168.100.11
+```
+
+```text
+aggregate wall: 17.862785416 s
+rank 0 load-to-publish: 13.559461941 s
+rank 1 load-to-publish: 12.850416106 s
+```
+
+The specialized loader result at Rocket `ddc04cb` covers slab load-to-publish. It excludes service launch, engine initialization, and first-token generation, so it is not a total-cold comparison.
+
+**Verdict.** Accepted as the local-storage vLLM total-cold baseline. Each run ended on the first non-empty `content` token, `1`.
+
+**Next.**
+
+- measure specialized exec-to-first-token after end-to-end decode exists
+- keep storage provenance in every cold result
+
+**Reopen if.**
+
+- an upstream image, checkpoint revision, kernel, firmware, or storage device changes
