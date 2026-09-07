@@ -359,3 +359,14 @@ target_compile_options(qwen38-test-gdn-prefill-width4 PRIVATE
   -Wall -Wextra -Werror)
 add_test(NAME qwen38-gdn-prefill-width4-cpu-contract
   COMMAND qwen38-test-gdn-prefill-width4)
+
+add_executable(qwen38-test-gdn-prefill-projection-contract
+  tests/test_gdn_prefill_projection_contract.cc)
+target_include_directories(qwen38-test-gdn-prefill-projection-contract PRIVATE
+  src)
+target_link_libraries(qwen38-test-gdn-prefill-projection-contract PRIVATE
+  CUDA::cudart)
+target_compile_options(qwen38-test-gdn-prefill-projection-contract PRIVATE
+  -Wall -Wextra -Werror)
+add_test(NAME qwen38-gdn-prefill-projection-cpu-contract
+  COMMAND qwen38-test-gdn-prefill-projection-contract)

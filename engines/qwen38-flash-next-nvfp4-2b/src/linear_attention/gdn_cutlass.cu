@@ -8,6 +8,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cmath>
 #include <memory>
 #include <stdexcept>
@@ -121,11 +122,6 @@ __device__ __forceinline__ std::uint8_t float_to_e2m1(float value) {
   return static_cast<std::uint8_t>(sign | best);
 }
 
-__device__ __forceinline__ std::size_t sf_offset(int row, int sf) {
-  return static_cast<std::size_t>(sf / 4) * 512 +
-         static_cast<std::size_t>((row % 32) * 16 + (row / 32) * 4 + sf % 4);
-}
-
 template <int K>
 __global__ void quantize_fixed(std::uint8_t* packed, std::uint8_t* scales,
                                const __nv_bfloat16* input,
@@ -144,7 +140,7 @@ __global__ void quantize_fixed(std::uint8_t* packed, std::uint8_t* scales,
             ? __nv_cvt_float_to_fp8(amax / (6.0F * activation_global),
                                     __NV_SATFINITE, __NV_E4M3)
             : 0;
-    scales[sf_offset(row, block)] = scale;
+    scales[prefill_sfa_offset(row, block, K / 16)] = scale;
     const float combined = e4m3_to_float(scale) * activation_global;
 #pragma unroll
     for (int item = 0; item < 8; ++item) {
@@ -165,7 +161,8 @@ __global__ void fuse_ba_scales(const std::uint8_t* b,
   if (row >= kBaN || sf >= kInputK / 16) return;
   const int source_row = row < kBN ? row : row - kBN;
   const auto* source = row < kBN ? b : a;
-  fused[sf_offset(row, sf)] = source[sf_offset(source_row, sf)];
+  fused[prefill_sfa_offset(row, sf, kInputK / 16)] =
+      source[prefill_sfa_offset(source_row, sf, kInputK / 16)];
 }
 
 __global__ void scale_projection(__nv_bfloat16* output, int n,
@@ -480,6 +477,238 @@ void CutlassGdnGraph::launch_verifier(
 
 const __nv_bfloat16* CutlassGdnGraph::verifier_output() const noexcept {
   return impl_ ? impl_->verify_projected : nullptr;
+}
+
+namespace {
+
+struct PrefillProjectionBucket {
+  explicit PrefillProjectionBucket(int selected_tokens) : tokens(selected_tokens) {}
+  ~PrefillProjectionBucket() {
+    cudaFree(projected);
+    cudaFree(output_sfa);
+    cudaFree(output_packed);
+    cudaFree(ba);
+    cudaFree(qkvz);
+    cudaFree(input_sfa);
+    cudaFree(input_packed);
+  }
+
+  int tokens;
+  std::uint8_t* input_packed = nullptr;
+  std::uint8_t* input_sfa = nullptr;
+  std::uint8_t* output_packed = nullptr;
+  std::uint8_t* output_sfa = nullptr;
+  __nv_bfloat16* qkvz = nullptr;
+  __nv_bfloat16* ba = nullptr;
+  __nv_bfloat16* projected = nullptr;
+  FixedGemm qkvz_gemm;
+  FixedGemm ba_gemm;
+  FixedGemm output_gemm;
+};
+
+}  // namespace
+
+struct CutlassGdnPrefillProjection::Impl {
+  Impl(int selected_device, GdnWeights selected_weights)
+      : device(selected_device), globals(selected_weights) {}
+  ~Impl() {
+    cudaSetDevice(device);
+    cudaFree(output_scale);
+    cudaFree(output_weight);
+    cudaFree(ba_scale);
+    cudaFree(ba_weight);
+    cudaFree(qkvz_scale);
+    cudaFree(qkvz_weight);
+  }
+
+  PrefillProjectionBucket* bucket(int tokens) const noexcept {
+    if (!allowed_prefill_tokens(tokens)) return nullptr;
+    for (const auto& candidate : buckets) {
+      if (candidate && candidate->tokens == tokens) return candidate.get();
+    }
+    return nullptr;
+  }
+
+  int device;
+  GdnWeights globals;
+  std::uint8_t* qkvz_weight = nullptr;
+  std::uint8_t* qkvz_scale = nullptr;
+  std::uint8_t* ba_weight = nullptr;
+  std::uint8_t* ba_scale = nullptr;
+  std::uint8_t* output_weight = nullptr;
+  std::uint8_t* output_scale = nullptr;
+  std::array<std::unique_ptr<PrefillProjectionBucket>, 2> buckets;
+};
+
+CutlassGdnPrefillProjection::CutlassGdnPrefillProjection(int device,
+                                                         GdnWeights weights)
+    : impl_(new Impl(device, weights)) {
+  const Nvfp4Matrix matrices[] = {weights.qkv, weights.z, weights.b,
+                                  weights.a, weights.output};
+  if (device < 0) {
+    delete impl_;
+    impl_ = nullptr;
+    throw std::invalid_argument("prefill projection device is invalid");
+  }
+  for (const auto& matrix : matrices) {
+    if (!matrix.weight || !matrix.scale || !std::isfinite(matrix.global_scale) ||
+        matrix.global_scale <= 0.0F) {
+      delete impl_;
+      impl_ = nullptr;
+      throw std::invalid_argument(
+          "authenticated prefill projection matrix is invalid");
+    }
+  }
+  try {
+    cuda_check(cudaSetDevice(device), "set prefill projection device");
+    cuda_check(cudaMalloc(&impl_->qkvz_weight,
+                          static_cast<std::size_t>(kQkvzN) * kInputK / 2),
+               "malloc prefill QKVZ weight");
+    cuda_check(cudaMalloc(&impl_->qkvz_scale,
+                          static_cast<std::size_t>(kQkvzN) * kInputK / 16),
+               "malloc prefill QKVZ scale");
+    cuda_check(cudaMalloc(&impl_->ba_weight,
+                          static_cast<std::size_t>(kBaN) * kInputK / 2),
+               "malloc prefill BA weight");
+    cuda_check(cudaMalloc(&impl_->ba_scale, kBaSfbBytes),
+               "malloc prefill BA scale");
+    cuda_check(cudaMalloc(&impl_->output_weight,
+                          static_cast<std::size_t>(kOutputN) * kOutputK / 2),
+               "malloc prefill output weight");
+    cuda_check(cudaMalloc(&impl_->output_scale,
+                          static_cast<std::size_t>(kOutputN) * kOutputK / 16),
+               "malloc prefill output scale");
+
+    const std::size_t qkv_weight_bytes =
+        static_cast<std::size_t>(kQkvN) * kInputK / 2;
+    const std::size_t qkv_scale_bytes =
+        static_cast<std::size_t>(kQkvN) * kInputK / 16;
+    copy(impl_->qkvz_weight, weights.qkv.weight, qkv_weight_bytes,
+         "copy prefill QKV weight");
+    copy(impl_->qkvz_weight + qkv_weight_bytes, weights.z.weight,
+         static_cast<std::size_t>(kZN) * kInputK / 2,
+         "copy prefill Z weight");
+    copy(impl_->qkvz_scale, weights.qkv.scale, qkv_scale_bytes,
+         "copy prefill QKV scale");
+    copy(impl_->qkvz_scale + qkv_scale_bytes, weights.z.scale,
+         static_cast<std::size_t>(kZN) * kInputK / 16,
+         "copy prefill Z scale");
+    const std::size_t ba_weight_bytes =
+        static_cast<std::size_t>(kBN) * kInputK / 2;
+    copy(impl_->ba_weight, weights.b.weight, ba_weight_bytes,
+         "copy prefill B weight");
+    copy(impl_->ba_weight + ba_weight_bytes, weights.a.weight, ba_weight_bytes,
+         "copy prefill A weight");
+    fuse_ba_scales<<<dim3((kInputK / 16 + 255) / 256, kBaN), 256>>>(
+        weights.b.scale, weights.a.scale, impl_->ba_scale);
+    copy(impl_->output_weight, weights.output.weight,
+         static_cast<std::size_t>(kOutputN) * kOutputK / 2,
+         "copy prefill output weight");
+    copy(impl_->output_scale, weights.output.scale,
+         static_cast<std::size_t>(kOutputN) * kOutputK / 16,
+         "copy prefill output scale");
+
+    constexpr std::array<int, 2> token_buckets{300, 8'192};
+    for (std::size_t index = 0; index < token_buckets.size(); ++index) {
+      const int tokens = token_buckets[index];
+      auto bucket = std::make_unique<PrefillProjectionBucket>(tokens);
+      cuda_check(cudaMalloc(&bucket->input_packed,
+                            static_cast<std::size_t>(tokens) * kInputK / 2),
+                 "malloc prefill input A");
+      cuda_check(cudaMalloc(&bucket->input_sfa,
+                            prefill_sfa_bytes(tokens, kInputK)),
+                 "malloc prefill input SFA");
+      cuda_check(cudaMalloc(&bucket->output_packed,
+                            static_cast<std::size_t>(tokens) * kOutputK / 2),
+                 "malloc prefill output A");
+      cuda_check(cudaMalloc(&bucket->output_sfa,
+                            prefill_sfa_bytes(tokens, kOutputK)),
+                 "malloc prefill output SFA");
+      cuda_check(cudaMalloc(&bucket->qkvz,
+                            static_cast<std::size_t>(tokens) * kQkvzN * 2),
+                 "malloc prefill QKVZ output");
+      cuda_check(cudaMalloc(&bucket->ba,
+                            static_cast<std::size_t>(tokens) * kBaN * 2),
+                 "malloc prefill BA output");
+      cuda_check(cudaMalloc(&bucket->projected,
+                            static_cast<std::size_t>(tokens) * kOutputN * 2),
+                 "malloc prefill projected output");
+      bucket->qkvz_gemm.init(tokens, kQkvzN, kInputK, bucket->input_packed,
+                             bucket->input_sfa, impl_->qkvz_weight,
+                             impl_->qkvz_scale, bucket->qkvz);
+      bucket->ba_gemm.init(tokens, kBaN, kInputK, bucket->input_packed,
+                           bucket->input_sfa, impl_->ba_weight,
+                           impl_->ba_scale, bucket->ba);
+      bucket->output_gemm.init(tokens, kOutputN, kOutputK,
+                               bucket->output_packed, bucket->output_sfa,
+                               impl_->output_weight, impl_->output_scale,
+                               bucket->projected);
+      impl_->buckets[index] = std::move(bucket);
+    }
+    cuda_check(cudaDeviceSynchronize(),
+               "synchronize prefill projection construction");
+  } catch (...) {
+    delete impl_;
+    impl_ = nullptr;
+    throw;
+  }
+}
+
+CutlassGdnPrefillProjection::~CutlassGdnPrefillProjection() { delete impl_; }
+
+void CutlassGdnPrefillProjection::launch_input(const __nv_bfloat16* hidden,
+                                               int tokens,
+                                               cudaStream_t stream) {
+  auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  if (!bucket || !hidden || !stream)
+    throw std::invalid_argument("prefill input projection contract changed");
+  quantize_fixed<kInputK><<<tokens, 256, 0, stream>>>(
+      bucket->input_packed, bucket->input_sfa, hidden, 1.0F);
+  if (bucket->qkvz_gemm.gemm.run(stream) != cutlass::Status::kSuccess ||
+      bucket->ba_gemm.gemm.run(stream) != cutlass::Status::kSuccess)
+    throw std::runtime_error("prefill input projection failed");
+  scale_projection<<<dim3((kQkvzN + 255) / 256, tokens), 256, 0, stream>>>(
+      bucket->qkvz, kQkvzN, kQkvN, impl_->globals.qkv.global_scale,
+      impl_->globals.z.global_scale);
+  scale_projection<<<dim3((kBaN + 255) / 256, tokens), 256, 0, stream>>>(
+      bucket->ba, kBaN, kBN, impl_->globals.b.global_scale,
+      impl_->globals.a.global_scale);
+  cuda_check(cudaPeekAtLastError(), "launch prefill input projection");
+}
+
+void CutlassGdnPrefillProjection::launch_output(
+    const __nv_bfloat16* normalized, int tokens, cudaStream_t stream) {
+  auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  if (!bucket || !normalized || !stream)
+    throw std::invalid_argument("prefill output projection contract changed");
+  quantize_fixed<kOutputK><<<tokens, 256, 0, stream>>>(
+      bucket->output_packed, bucket->output_sfa, normalized,
+      kOutputActivationGlobal);
+  if (bucket->output_gemm.gemm.run(stream) != cutlass::Status::kSuccess)
+    throw std::runtime_error("prefill output projection failed");
+  scale_projection<<<dim3((kOutputN + 255) / 256, tokens), 256, 0, stream>>>(
+      bucket->projected, kOutputN, kOutputN,
+      impl_->globals.output.global_scale * kOutputActivationGlobal,
+      impl_->globals.output.global_scale * kOutputActivationGlobal);
+  cuda_check(cudaPeekAtLastError(), "launch prefill output projection");
+}
+
+const __nv_bfloat16* CutlassGdnPrefillProjection::qkvz(
+    int tokens) const noexcept {
+  const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  return bucket ? bucket->qkvz : nullptr;
+}
+
+const __nv_bfloat16* CutlassGdnPrefillProjection::ba(
+    int tokens) const noexcept {
+  const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  return bucket ? bucket->ba : nullptr;
+}
+
+const __nv_bfloat16* CutlassGdnPrefillProjection::output(
+    int tokens) const noexcept {
+  const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  return bucket ? bucket->projected : nullptr;
 }
 
 }  // namespace rocket::qwen38::linear_attention

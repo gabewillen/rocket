@@ -30,6 +30,36 @@ struct GdnWeights {
   const __nv_bfloat16* norm;
 };
 
+[[nodiscard]] constexpr bool allowed_prefill_tokens(int tokens) noexcept {
+  return tokens == 300 || tokens == 8'192;
+}
+
+[[nodiscard]] constexpr std::size_t prefill_sfa_bytes(int tokens,
+                                                       int width) noexcept {
+  return allowed_prefill_tokens(tokens) && width > 0 && width % 16 == 0
+             ? static_cast<std::size_t>(((tokens + 127) / 128) * 128) *
+                   (width / 16)
+             : 0;
+}
+
+inline constexpr int kPrefillInputQuantizationsPerLaunch = 1;
+
+#if defined(__CUDACC__)
+#define ROCKET_QWEN38_GDN_HOST_DEVICE __host__ __device__
+#else
+#define ROCKET_QWEN38_GDN_HOST_DEVICE
+#endif
+ROCKET_QWEN38_GDN_HOST_DEVICE constexpr std::size_t prefill_sfa_offset(
+    int row, int scale_column, int scale_columns) noexcept {
+  const int row_tile = row / 128;
+  const int tile_row = row % 128;
+  return static_cast<std::size_t>(row_tile) * 128 * scale_columns +
+         static_cast<std::size_t>(scale_column / 4) * 512 +
+         static_cast<std::size_t>((tile_row % 32) * 16 +
+                                  (tile_row / 32) * 4 + scale_column % 4);
+}
+#undef ROCKET_QWEN38_GDN_HOST_DEVICE
+
 // Exact layer-0 rank-0 graph adapter. Construction copies authenticated weight
 // extents into graph-owned immutable storage before capture. No allocations or
 // pointer changes occur in launch().
@@ -67,6 +97,34 @@ class CutlassGdnGraph final : public decode::LinearAttentionGraph {
       int sequences, int verify_width, cudaStream_t stream);
   const __nv_bfloat16* verifier_output() const noexcept;
   const __nv_bfloat16* projected_output() const noexcept override;
+
+ private:
+  struct Impl;
+  Impl* impl_;
+};
+
+// Prefill-only projection owner for the workload anchors. Input quantization
+// is shared by QKVZ and BA, unlike the two independent general-engine linear
+// calls. The plan owns immutable copies of authenticated projection slabs and
+// fixed arenas for both graph shapes.
+class CutlassGdnPrefillProjection final {
+ public:
+  CutlassGdnPrefillProjection(int device, GdnWeights weights);
+  ~CutlassGdnPrefillProjection();
+  CutlassGdnPrefillProjection(const CutlassGdnPrefillProjection&) = delete;
+  CutlassGdnPrefillProjection& operator=(
+      const CutlassGdnPrefillProjection&) = delete;
+
+  void launch_input(const __nv_bfloat16* hidden, int tokens,
+                    cudaStream_t stream);
+  void launch_output(const __nv_bfloat16* normalized, int tokens,
+                     cudaStream_t stream);
+  [[nodiscard]] const __nv_bfloat16* qkvz(int tokens) const noexcept;
+  [[nodiscard]] const __nv_bfloat16* ba(int tokens) const noexcept;
+  [[nodiscard]] const __nv_bfloat16* output(int tokens) const noexcept;
+  [[nodiscard]] static constexpr int input_quantizations_per_launch() noexcept {
+    return kPrefillInputQuantizationsPerLaunch;
+  }
 
  private:
   struct Impl;

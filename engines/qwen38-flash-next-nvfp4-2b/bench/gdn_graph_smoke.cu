@@ -103,6 +103,15 @@ __global__ void initialize_rows(__nv_bfloat16* input, int rows) {
   }
 }
 
+__global__ void initialize_elements(__nv_bfloat16* input,
+                                    std::size_t elements) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    input[index] = __float2bfloat16(
+        static_cast<float>((index * 17 % 61) - 30) / 64.0F);
+  }
+}
+
 struct Telemetry final : rocket::qwen38::pair_reduce::OtelStageSink {
   std::uint64_t spans = 0, metrics = 0;
   void emit_span_and_log(
@@ -122,10 +131,97 @@ std::uint64_t hash(const void* data, std::size_t bytes) {
   return value;
 }
 
+std::uint64_t device_hash(const void* data, std::size_t bytes) {
+  std::vector<std::uint8_t> host(bytes);
+  check(cudaMemcpy(host.data(), data, bytes, cudaMemcpyDeviceToHost),
+        "copy projection hash input");
+  return hash(host.data(), host.size());
+}
+
+template <typename Launch>
+std::pair<float, float> capture_measure(cudaStream_t stream, Launch launch) {
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t executable = nullptr;
+  check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+        "begin prefill projection capture");
+  launch();
+  check(cudaStreamEndCapture(stream, &graph), "end prefill projection capture");
+  check(cudaGraphInstantiate(&executable, graph, 0),
+        "instantiate prefill projection graph");
+  for (int iteration = 0; iteration < 10; ++iteration)
+    check(cudaGraphLaunch(executable, stream), "warm prefill projection");
+  check(cudaStreamSynchronize(stream), "synchronize prefill projection warmup");
+  cudaEvent_t begin = nullptr, end = nullptr;
+  check(cudaEventCreate(&begin), "create prefill begin event");
+  check(cudaEventCreate(&end), "create prefill end event");
+  std::vector<float> samples;
+  for (int iteration = 0; iteration < 50; ++iteration) {
+    check(cudaEventRecord(begin, stream), "record prefill begin");
+    check(cudaGraphLaunch(executable, stream), "replay prefill projection");
+    check(cudaEventRecord(end, stream), "record prefill end");
+    check(cudaEventSynchronize(end), "synchronize prefill end");
+    float milliseconds = 0.0F;
+    check(cudaEventElapsedTime(&milliseconds, begin, end),
+          "time prefill projection");
+    samples.push_back(milliseconds * 1000.0F);
+  }
+  std::sort(samples.begin(), samples.end());
+  cudaEventDestroy(end);
+  cudaEventDestroy(begin);
+  cudaGraphExecDestroy(executable);
+  cudaGraphDestroy(graph);
+  return {samples[24], samples[47]};
+}
+
+void run_prefill_projection(int device,
+                            rocket::qwen38::linear_attention::GdnWeights weights) {
+  using rocket::qwen38::linear_attention::CutlassGdnPrefillProjection;
+  CutlassGdnPrefillProjection projection(device, weights);
+  DeviceBlob hidden(8'192ULL * kHidden * 2);
+  DeviceBlob normalized(8'192ULL * kHeads * kDim * 2);
+  constexpr std::size_t hidden_elements = 8'192ULL * kHidden;
+  constexpr std::size_t normalized_elements = 8'192ULL * kHeads * kDim;
+  initialize_elements<<<(hidden_elements + 255) / 256, 256>>>(
+      static_cast<__nv_bfloat16*>(hidden.pointer), hidden_elements);
+  initialize_elements<<<(normalized_elements + 255) / 256, 256>>>(
+      static_cast<__nv_bfloat16*>(normalized.pointer), normalized_elements);
+  check(cudaDeviceSynchronize(), "initialize prefill projection inputs");
+  cudaStream_t stream = nullptr;
+  check(cudaStreamCreate(&stream), "create prefill projection stream");
+  for (const int tokens : std::array<int, 2>{300, 8'192}) {
+    const auto input = capture_measure(stream, [&] {
+      projection.launch_input(static_cast<__nv_bfloat16*>(hidden.pointer),
+                              tokens, stream);
+    });
+    const auto output = capture_measure(stream, [&] {
+      projection.launch_output(
+          static_cast<__nv_bfloat16*>(normalized.pointer), tokens, stream);
+    });
+    const auto input_hash =
+        device_hash(projection.qkvz(tokens),
+                    static_cast<std::size_t>(tokens) * 8'192 * 2);
+    const auto output_hash =
+        device_hash(projection.output(tokens),
+                    static_cast<std::size_t>(tokens) * kOut * 2);
+    std::cout << "prefill_tokens=" << tokens
+              << " shared_input_quantizations=1 input_p50_us=" << input.first
+              << " input_p95_us=" << input.second
+              << " output_p50_us=" << output.first
+              << " output_p95_us=" << output.second
+              << " qkvz_hash=" << input_hash << " output_hash=" << output_hash
+              << " graph_capture=pass\n";
+  }
+  cudaStreamDestroy(stream);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) try {
-  if (argc != 3) throw std::invalid_argument("usage: qwen38-gdn-graph-smoke SLAB DEVICE");
+  if (argc != 3 && argc != 4)
+    throw std::invalid_argument(
+        "usage: qwen38-gdn-graph-smoke SLAB DEVICE [--prefill-projection]");
+  if (argc == 4 && std::string(argv[3]) != "--prefill-projection")
+    throw std::invalid_argument("unknown GDN graph smoke mode");
   const int device = std::stoi(argv[2]);
   check(cudaSetDevice(device), "cudaSetDevice");
   const int fd = open(argv[1], O_RDONLY | O_CLOEXEC);
@@ -150,6 +246,26 @@ int main(int argc, char** argv) try {
   const float bg = load_scalar(fd, kBGlobal), ag = load_scalar(fd, kAGlobal);
   const float og = load_scalar(fd, kOGlobal);
   close(fd);
+
+  const rocket::qwen38::linear_attention::GdnWeights weights{
+      {static_cast<std::uint8_t*>(qw.pointer),
+       static_cast<std::uint8_t*>(qs.pointer), qg},
+      {static_cast<std::uint8_t*>(zw.pointer),
+       static_cast<std::uint8_t*>(zs.pointer), zg},
+      {static_cast<std::uint8_t*>(bw.pointer),
+       static_cast<std::uint8_t*>(bs.pointer), bg},
+      {static_cast<std::uint8_t*>(aw.pointer),
+       static_cast<std::uint8_t*>(as.pointer), ag},
+      {static_cast<std::uint8_t*>(ow.pointer),
+       static_cast<std::uint8_t*>(os.pointer), og},
+      static_cast<__nv_bfloat16*>(conv.pointer),
+      static_cast<__nv_bfloat16*>(alog.pointer),
+      static_cast<__nv_bfloat16*>(dt.pointer),
+      static_cast<__nv_bfloat16*>(norm.pointer)};
+  if (argc == 4) {
+    run_prefill_projection(device, weights);
+    return 0;
+  }
 
   void* graph = nullptr;
   if (qwen38_gdn_graph_create(
