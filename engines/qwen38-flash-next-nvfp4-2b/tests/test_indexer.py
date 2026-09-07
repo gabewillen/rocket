@@ -9,6 +9,7 @@ from qwen38_slab.indexer import (
     QsaIndexerContract,
     QsaIndexerError,
     reference_expand_qsa_topk,
+    reference_select_qsa_blocks,
 )
 
 
@@ -32,6 +33,16 @@ class QsaIndexerContractTests(unittest.TestCase):
         self.assertEqual(output, (-1,) * QSA_EXPANDED_WIDTH)
         with self.assertRaisesRegex(QsaIndexerError, "input ABI"):
             reference_expand_qsa_topk(((0,),), (0,), (1,), (0,))
+
+    def test_score_select_is_relu_scaled_stable_and_minus_one_padded(self):
+        zero = (0.0,) * 128
+        positive = (1.0,) + (0.0,) * 127
+        negative = (-2.0,) + (0.0,) * 127
+        query = ((positive, positive, negative, zero),)
+        keys = ((1.0,) + zero[1:], (2.0,) + zero[1:], (2.0,) + zero[1:])
+        selected = reference_select_qsa_blocks(query, keys, (3,))[0]
+        self.assertEqual(selected[:3], (1, 2, 0))
+        self.assertEqual(selected[3:], (-1,) * (QSA_BLOCK_TOPK - 3))
 
 
 if __name__ == "__main__":

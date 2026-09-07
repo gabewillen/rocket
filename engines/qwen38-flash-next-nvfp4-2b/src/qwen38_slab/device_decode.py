@@ -456,7 +456,7 @@ class Cuda13GraphRuntime:
         self._graph_nodes = (
             TARGET_GRAPH_NODES
             + 2 * int(projection is not None)
-            + 3 * int(full_projection is not None)
+            + 12 * int(full_projection is not None)
         )
         self._active_bank = -1
         self._active_graph_batch: int | None = None
@@ -698,6 +698,14 @@ class Cuda13GraphRuntime:
         )
         return struct.unpack(f"<{MAX_STREAMS * PROJECTION_OUTPUTS}f", output.raw)
 
+    def read_qsa_token_indices(self) -> tuple[int, ...]:
+        """Copy the active fixed QSA score/top-k/causal-expansion result."""
+
+        self._require_open()
+        if self._active_bank not in (0, 1) or self._full_qkv is None:
+            raise DeviceDecodeError("no CUDA QSA indexer result has been published")
+        return struct.unpack("<32816i", self._full_qkv.qsa_output_bytes())
+
     def update_qkv_activations(self, activations_bf16: bytes) -> None:
         """Refresh the stable full-width input before a metadata transaction."""
 
@@ -705,6 +713,15 @@ class Cuda13GraphRuntime:
         if self._full_qkv is None or self._staged is not None:
             raise DeviceDecodeError("full QKV activation update is unavailable")
         self._full_qkv.update_activations(activations_bf16)
+
+    @property
+    def qsa_input_buffers(self) -> Mapping[str, tuple[int, int]]:
+        """Borrow stable QSA buffers only while the decoder owner is quiesced."""
+
+        self._require_open()
+        if self._full_qkv is None or self._staged is not None:
+            raise DeviceDecodeError("QSA input buffers are unavailable")
+        return self._full_qkv.qsa_input_buffers
 
     @property
     def target_schema(self) -> str:
@@ -783,6 +800,18 @@ class Cuda13GraphRuntime:
         )
         return MappingProxyType({"graph_ms": graph_ms, "requant_ms": requant_ms})
 
+    def benchmark_qsa_indexer(self, iterations: int = 40) -> Mapping[str, float]:
+        """Profile score versus stable exact selection on the active bank."""
+
+        self._require_open()
+        if self._active_bank not in (0, 1) or self._full_qkv is None:
+            raise DeviceDecodeError("QSA benchmark preconditions are not met")
+        bank = self._device[self._active_bank]
+        return self._full_qkv.benchmark_qsa(
+            bank["logical_positions"], bank["seq_lens"],
+            bank["token_to_req"], iterations,
+        )
+
     def close(self) -> None:
         """Synchronize and release all owned CUDA resources exactly once."""
 
@@ -841,6 +870,12 @@ class Cuda13GraphRuntime:
             )
         if self._full_qkv is not None:
             self._full_qkv.capture_launch(self._stream)
+            self._full_qkv.capture_qsa_indexer(
+                self._device[bank]["logical_positions"],
+                self._device[bank]["seq_lens"],
+                self._device[bank]["token_to_req"],
+                self._stream,
+            )
         self._api.call("cudaStreamEndCapture", self._stream, ctypes.byref(graph))
         self._graphs[(bank, graph_batch)] = graph
         nodes = ctypes.c_size_t()

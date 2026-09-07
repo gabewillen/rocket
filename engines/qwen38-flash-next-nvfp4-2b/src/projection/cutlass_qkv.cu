@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cub/device/device_segmented_radix_sort.cuh>
 
 #include <cmath>
 #include <cstdio>
@@ -35,6 +36,22 @@ constexpr int kBlockTopk = 512;
 constexpr int kCompressRatio = 4;
 constexpr int kTokenTopk = 2048;
 constexpr int kExpandedWidth = kTokenTopk + kCompressRatio - 1;
+constexpr int kQsaHeads = 4;
+constexpr int kQsaDim = 128;
+constexpr int kQsaPageSize = 64;
+constexpr int kQsaColumns = 262144 / kCompressRatio;
+constexpr int kQsaPages = kQsaColumns / kQsaPageSize;
+
+// Reference audit (all Apache-2.0): vLLM 8e685d198
+// models/qwen3_8_flash_next/nvidia/ops/qsa.py supplies the paged score,
+// sqrt(128), causal visibility, and SM120 persistent-top-k contract.
+// FlashInfer 91bda04c66f7cb851e1ab3b78b9fecea644b9844
+// include/flashinfer/topk.cuh and TensorRT-LLM
+// c426264bc4d01930fad01426b81800e96fe19c2b
+// cpp/tensorrt_llm/kernels/indexerTopK.cu both use exact radix filtering.
+// This first executable slice reuses CUDA 13 CUB's captured segmented radix
+// sort as the upstream correctness control. Its full-sort traffic is profiled
+// separately so replacing it with the audited fixed K=512 filter is measurable.
 
 thread_local std::string last_error;
 
@@ -177,6 +194,100 @@ __global__ void expand_qsa_topk(const std::int32_t* block_indices,
   token_indices[row * kExpandedWidth + column] = token;
 }
 
+__global__ void initialize_qsa_inputs(__nv_bfloat16* query,
+                                      __nv_bfloat16* keys,
+                                      std::int32_t* page_table,
+                                      std::int32_t* indices,
+                                      std::int32_t* offsets) {
+  const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                            threadIdx.x;
+  const std::size_t query_elements = kM * kQsaHeads * kQsaDim;
+  const std::size_t key_elements =
+      static_cast<std::size_t>(kQsaColumns) * kQsaDim;
+  if (index < query_elements) {
+    const int dim = index % kQsaDim;
+    query[index] = __float2bfloat16(
+        dim == 0 ? 4096.0f : (dim == 1 ? 64.0f : (dim == 2 ? 1.0f : 0.0f)));
+  }
+  if (index < key_elements) {
+    const int physical_page = index / (kQsaPageSize * kQsaDim);
+    const int within_page = (index / kQsaDim) % kQsaPageSize;
+    const int dim = index % kQsaDim;
+    const int logical_page = kQsaPages - 1 - physical_page;
+    keys[index] = __float2bfloat16(
+        dim == 0 ? static_cast<float>(logical_page / 64)
+                 : (dim == 1 ? static_cast<float>(logical_page % 64)
+                             : (dim == 2 ? static_cast<float>(within_page) : 0.0f)));
+  }
+  if (index < static_cast<std::size_t>(kM * kQsaPages)) {
+    page_table[index] = kQsaPages - 1 - static_cast<int>(index % kQsaPages);
+  }
+  if (index < static_cast<std::size_t>(kM * kQsaColumns))
+    indices[index] = static_cast<int>(index % kQsaColumns);
+  if (index <= kM) offsets[index] = static_cast<int>(index) * kQsaColumns;
+}
+
+__global__ void score_qsa_c16(const __nv_bfloat16* __restrict__ query,
+                              const __nv_bfloat16* __restrict__ keys,
+                              const std::int32_t* __restrict__ page_table,
+                              const std::int64_t* logical_positions,
+                              const std::int32_t* sequence_lengths,
+                              const std::int32_t* token_to_request,
+                              float* __restrict__ logits,
+                              std::int32_t* __restrict__ visible_blocks) {
+  const int column = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y;
+  if (column >= kQsaColumns) return;
+  const int request = token_to_request[row];
+  int visible = 0;
+  if (request >= 0 && request < kM) {
+    const std::int64_t query_end = logical_positions[row] + 1;
+    visible = min(static_cast<int>(query_end / kCompressRatio),
+                  sequence_lengths[request] / kCompressRatio);
+    visible = max(0, min(visible, kQsaColumns));
+  }
+  if (column == 0) visible_blocks[row] = visible;
+  float score = -INFINITY;
+  if (column < visible) {
+    const int physical_page = page_table[row * kQsaPages + column / kQsaPageSize];
+    if (physical_page >= 0 && physical_page < kQsaPages) {
+      const __nv_bfloat16* key =
+          keys + (static_cast<std::size_t>(physical_page) * kQsaPageSize +
+                  column % kQsaPageSize) * kQsaDim;
+      float head_scores[kQsaHeads] = {};
+#pragma unroll
+      for (int dim = 0; dim < kQsaDim; ++dim) {
+        const float key_value = __bfloat162float(key[dim]);
+#pragma unroll
+        for (int head = 0; head < kQsaHeads; ++head)
+          head_scores[head] = fmaf(
+              __bfloat162float(query[(row * kQsaHeads + head) * kQsaDim + dim]),
+              key_value, head_scores[head]);
+      }
+      score = 0.0f;
+#pragma unroll
+      for (int head = 0; head < kQsaHeads; ++head)
+        score += fmaxf(head_scores[head], 0.0f);
+      score *= 0.08838834764831845f;  // 1 / sqrt(128)
+    }
+  }
+  logits[static_cast<std::size_t>(row) * kQsaColumns + column] = score;
+}
+
+__global__ void extract_qsa_topk(const float* sorted_logits,
+                                 const std::int32_t* sorted_indices,
+                                 const std::int32_t* visible_blocks,
+                                 std::int32_t* selected) {
+  const int rank = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y;
+  if (rank < kBlockTopk)
+    selected[row * kBlockTopk + rank] =
+        rank < visible_blocks[row] &&
+                isfinite(sorted_logits[static_cast<std::size_t>(row) * kQsaColumns + rank])
+            ? sorted_indices[static_cast<std::size_t>(row) * kQsaColumns + rank]
+            : -1;
+}
+
 __global__ void scale_qkv_families(__nv_bfloat16* output, float q_scale,
                                    float k_scale, float v_scale) {
   const int column = blockIdx.x * blockDim.x + threadIdx.x;
@@ -229,6 +340,24 @@ struct QkvPlan {
     cudaFree(fused_weight);
     cudaFree(sfa);
     cudaFree(packed);
+  }
+};
+
+struct QsaPlan {
+  __nv_bfloat16* query = nullptr;
+  __nv_bfloat16* keys = nullptr;
+  std::int32_t* page_table = nullptr;
+  float *logits = nullptr, *sorted_logits = nullptr;
+  std::int32_t *indices = nullptr, *sorted_indices = nullptr;
+  std::int32_t *offsets = nullptr, *visible = nullptr, *selected = nullptr,
+               *output = nullptr;
+  void* sort_workspace = nullptr;
+  std::size_t sort_workspace_bytes = 0;
+  ~QsaPlan() {
+    cudaFree(sort_workspace); cudaFree(output); cudaFree(selected); cudaFree(visible);
+    cudaFree(offsets); cudaFree(sorted_indices); cudaFree(indices);
+    cudaFree(sorted_logits); cudaFree(logits); cudaFree(page_table);
+    cudaFree(keys); cudaFree(query);
   }
 };
 
@@ -357,4 +486,118 @@ extern "C" int qwen38_qsa_expand_topk(
       block_indices, logical_positions, sequence_lengths, token_to_request,
       token_indices, rows);
   return cuda_ok(cudaGetLastError(), "expand_qsa_topk") ? 0 : 1;
+}
+
+extern "C" int qwen38_qsa_indexer_create(int device, void** result) {
+  last_error.clear();
+  if (!result || device < 0) { last_error = "invalid fixed QSA plan arguments"; return 1; }
+  *result = nullptr;
+  auto plan = std::make_unique<QsaPlan>();
+  const std::size_t entries = static_cast<std::size_t>(kM) * kQsaColumns;
+  const std::size_t query_bytes = static_cast<std::size_t>(kM) * kQsaHeads * kQsaDim * 2;
+  const std::size_t key_bytes = static_cast<std::size_t>(kQsaColumns) * kQsaDim * 2;
+  const std::size_t table_bytes = static_cast<std::size_t>(kM) * kQsaPages * 4;
+  if (!cuda_ok(cudaSetDevice(device), "cudaSetDevice") ||
+      !cuda_ok(cudaMalloc(&plan->query, query_bytes), "cudaMalloc QSA query") ||
+      !cuda_ok(cudaMalloc(&plan->keys, key_bytes), "cudaMalloc QSA keys") ||
+      !cuda_ok(cudaMalloc(&plan->page_table, table_bytes), "cudaMalloc QSA page table") ||
+      !cuda_ok(cudaMalloc(&plan->logits, entries * 4), "cudaMalloc QSA logits") ||
+      !cuda_ok(cudaMalloc(&plan->sorted_logits, entries * 4), "cudaMalloc sorted QSA logits") ||
+      !cuda_ok(cudaMalloc(&plan->indices, entries * 4), "cudaMalloc QSA indices") ||
+      !cuda_ok(cudaMalloc(&plan->sorted_indices, entries * 4), "cudaMalloc sorted QSA indices") ||
+      !cuda_ok(cudaMalloc(&plan->offsets, (kM + 1) * 4), "cudaMalloc QSA offsets") ||
+      !cuda_ok(cudaMalloc(&plan->visible, kM * 4), "cudaMalloc QSA visible") ||
+      !cuda_ok(cudaMalloc(&plan->selected, kM * kBlockTopk * 4), "cudaMalloc QSA selected") ||
+      !cuda_ok(cudaMalloc(&plan->output, kM * kExpandedWidth * 4), "cudaMalloc QSA output"))
+    return 1;
+  const cudaError_t size_status = cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      nullptr, plan->sort_workspace_bytes, plan->logits, plan->sorted_logits,
+      plan->indices, plan->sorted_indices, entries, kM, plan->offsets,
+      plan->offsets + 1);
+  if (!cuda_ok(size_status, "size QSA segmented sort") ||
+      !cuda_ok(cudaMalloc(&plan->sort_workspace, plan->sort_workspace_bytes),
+               "cudaMalloc QSA sort workspace"))
+    return 1;
+  const std::size_t init_elements =
+      max(max(query_bytes / 2, key_bytes / 2), max(entries, table_bytes / 4));
+  initialize_qsa_inputs<<<(init_elements + 255) / 256, 256>>>(
+      plan->query, plan->keys, plan->page_table, plan->indices, plan->offsets);
+  if (!cuda_ok(cudaGetLastError(), "initialize QSA inputs") ||
+      !cuda_ok(cudaDeviceSynchronize(), "synchronize QSA initialization"))
+    return 1;
+  *result = plan.release();
+  return 0;
+}
+
+extern "C" int qwen38_qsa_indexer_launch(
+    void* opaque, const std::int64_t* logical_positions,
+    const std::int32_t* sequence_lengths,
+    const std::int32_t* token_to_request, cudaStream_t stream) {
+  last_error.clear();
+  if (!opaque || !logical_positions || !sequence_lengths || !token_to_request) {
+    last_error = "null fixed QSA launch argument"; return 1;
+  }
+  if (qwen38_qsa_indexer_score(opaque, logical_positions, sequence_lengths,
+                               token_to_request, stream) != 0) return 1;
+  return qwen38_qsa_indexer_select_expand(
+      opaque, logical_positions, sequence_lengths, token_to_request, stream);
+}
+
+extern "C" int qwen38_qsa_indexer_score(
+    void* opaque, const std::int64_t* logical_positions,
+    const std::int32_t* sequence_lengths,
+    const std::int32_t* token_to_request, cudaStream_t stream) {
+  if (!opaque || !logical_positions || !sequence_lengths || !token_to_request)
+    return 1;
+  auto* plan = static_cast<QsaPlan*>(opaque);
+  score_qsa_c16<<<dim3((kQsaColumns + 255) / 256, kM), 256, 0, stream>>>(
+      plan->query, plan->keys, plan->page_table, logical_positions,
+      sequence_lengths, token_to_request, plan->logits, plan->visible);
+  return cuda_ok(cudaGetLastError(), "score_qsa_c16") ? 0 : 1;
+}
+
+extern "C" int qwen38_qsa_indexer_select_expand(
+    void* opaque, const std::int64_t* logical_positions,
+    const std::int32_t* sequence_lengths,
+    const std::int32_t* token_to_request, cudaStream_t stream) {
+  if (!opaque || !logical_positions || !sequence_lengths || !token_to_request)
+    return 1;
+  auto* plan = static_cast<QsaPlan*>(opaque);
+  const cudaError_t sort_status = cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      plan->sort_workspace, plan->sort_workspace_bytes, plan->logits,
+      plan->sorted_logits, plan->indices, plan->sorted_indices,
+      static_cast<std::size_t>(kM) * kQsaColumns, kM, plan->offsets,
+      plan->offsets + 1, 0, 32, stream);
+  if (!cuda_ok(sort_status, "sort QSA scores")) return 1;
+  extract_qsa_topk<<<dim3((kBlockTopk + 255) / 256, kM), 256, 0, stream>>>(
+      plan->sorted_logits, plan->sorted_indices, plan->visible, plan->selected);
+  if (!cuda_ok(cudaGetLastError(), "extract QSA top-k")) return 1;
+  expand_qsa_topk<<<dim3(kM, (kExpandedWidth + 255) / 256), 256, 0, stream>>>(
+      plan->selected, logical_positions, sequence_lengths, token_to_request,
+      plan->output, kM);
+  return cuda_ok(cudaGetLastError(), "expand selected QSA blocks") ? 0 : 1;
+}
+
+extern "C" int qwen38_qsa_indexer_inputs(
+    void* opaque, void** query, std::size_t* query_bytes, void** keys,
+    std::size_t* key_bytes, void** page_table, std::size_t* page_table_bytes) {
+  if (!opaque || !query || !query_bytes || !keys || !key_bytes || !page_table ||
+      !page_table_bytes) return 1;
+  auto* plan = static_cast<QsaPlan*>(opaque);
+  *query = plan->query; *query_bytes = static_cast<std::size_t>(kM) * kQsaHeads * kQsaDim * 2;
+  *keys = plan->keys; *key_bytes = static_cast<std::size_t>(kQsaColumns) * kQsaDim * 2;
+  *page_table = plan->page_table; *page_table_bytes = static_cast<std::size_t>(kM) * kQsaPages * 4;
+  return 0;
+}
+
+extern "C" int qwen38_qsa_indexer_output(void* opaque, void** output,
+                                            std::size_t* elements) {
+  if (!opaque || !output || !elements) return 1;
+  *output = static_cast<QsaPlan*>(opaque)->output;
+  *elements = static_cast<std::size_t>(kM) * kExpandedWidth;
+  return 0;
+}
+
+extern "C" int qwen38_qsa_indexer_destroy(void* opaque) {
+  delete static_cast<QsaPlan*>(opaque); return 0;
 }

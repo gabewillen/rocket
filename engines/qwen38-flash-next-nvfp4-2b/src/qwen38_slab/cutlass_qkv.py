@@ -66,6 +66,9 @@ class CutlassQkvRuntime:
         self._api = _Cuda13Api(cudart)
         self._stream = ctypes.c_void_p()
         self._plan = ctypes.c_void_p()
+        self._qsa_plan = ctypes.c_void_p()
+        self._qsa_inputs = (ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p())
+        self._qsa_input_bytes = (ctypes.c_size_t(), ctypes.c_size_t(), ctypes.c_size_t())
         self._graph = ctypes.c_void_p()
         self._exec = ctypes.c_void_p()
         self._device_buffers: list[ctypes.c_void_p] = []
@@ -103,6 +106,15 @@ class CutlassQkvRuntime:
             )
             if self._output_elements.value != 16 * FULL_OUTPUTS:
                 raise DeviceDecodeError("fixed CUTLASS QKV output extent drift")
+            self._native_call("qwen38_qsa_indexer_create", device, ctypes.byref(self._qsa_plan))
+            query, keys, table = self._qsa_inputs
+            query_bytes, key_bytes, table_bytes = self._qsa_input_bytes
+            self._native_call(
+                "qwen38_qsa_indexer_inputs", self._qsa_plan,
+                ctypes.byref(query), ctypes.byref(query_bytes),
+                ctypes.byref(keys), ctypes.byref(key_bytes),
+                ctypes.byref(table), ctypes.byref(table_bytes),
+            )
             self._api.call("cudaStreamBeginCapture", self._stream, 1)
             self._native_call("qwen38_cutlass_qkv_launch", self._plan, activation, self._stream)
             self._api.call("cudaStreamEndCapture", self._stream, ctypes.byref(self._graph))
@@ -170,6 +182,41 @@ class CutlassQkvRuntime:
             stream,
         )
 
+    def capture_qsa_indexer(
+        self,
+        logical_positions: ctypes.c_void_p,
+        sequence_lengths: ctypes.c_void_p,
+        token_to_request: ctypes.c_void_p,
+        stream: ctypes.c_void_p,
+    ) -> None:
+        """Append fixed paged score, stable top-k, and causal expansion."""
+
+        self._require_open()
+        if any(
+            not isinstance(pointer, ctypes.c_void_p) or not pointer.value
+            for pointer in (logical_positions, sequence_lengths, token_to_request, stream)
+        ):
+            raise DeviceDecodeError("fixed QSA indexer pointer ABI is invalid")
+        self._native_call(
+            "qwen38_qsa_indexer_launch", self._qsa_plan, logical_positions,
+            sequence_lengths, token_to_request, stream,
+        )
+
+    def qsa_output_bytes(self) -> bytes:
+        """Copy the fixed 16 by 2,051 selected logical token ids."""
+
+        self._require_open()
+        pointer, elements = ctypes.c_void_p(), ctypes.c_size_t()
+        self._native_call(
+            "qwen38_qsa_indexer_output", self._qsa_plan,
+            ctypes.byref(pointer), ctypes.byref(elements),
+        )
+        if elements.value != 16 * 2051:
+            raise DeviceDecodeError("fixed QSA output extent drift")
+        output = ctypes.create_string_buffer(elements.value * 4)
+        self._api.call("cudaMemcpy", ctypes.addressof(output), pointer, len(output), 2)
+        return output.raw
+
     def update_activations(self, activations_bf16: bytes) -> None:
         """Replace the stable c16 input contents without changing graph pointers."""
 
@@ -185,6 +232,22 @@ class CutlassQkvRuntime:
             ctypes.c_char_p(activations_bf16),
             len(activations_bf16),
             1,
+        )
+
+    @property
+    def qsa_input_buffers(self) -> Mapping[str, tuple[int, int]]:
+        """Return stable borrowed buffers for the single CUDA state owner."""
+
+        self._require_open()
+        return MappingProxyType(
+            {
+                name: (int(pointer.value), int(size.value))
+                for name, pointer, size in zip(
+                    ("query_bf16", "compressed_keys_bf16", "page_table_i32"),
+                    self._qsa_inputs,
+                    self._qsa_input_bytes,
+                )
+            }
         )
 
     def finish(self) -> None:
@@ -265,6 +328,44 @@ class CutlassQkvRuntime:
             {"requant_ms": quant_ms, "projection_ms": projection_ms, "graph_ms": graph_ms}
         )
 
+    def benchmark_qsa(
+        self,
+        logical_positions: ctypes.c_void_p,
+        sequence_lengths: ctypes.c_void_p,
+        token_to_request: ctypes.c_void_p,
+        iterations: int = 40,
+    ) -> Mapping[str, float]:
+        """Measure fixed max-context score and exact selection independently."""
+
+        self._require_open()
+        if not 5 <= iterations <= 1000:
+            raise DeviceDecodeError("QSA benchmark iterations must be in 5..1000")
+        def measured(name: str) -> float:
+            start, end = ctypes.c_void_p(), ctypes.c_void_p()
+            self._api.call("cudaEventCreate", ctypes.byref(start))
+            self._api.call("cudaEventCreate", ctypes.byref(end))
+            try:
+                for _ in range(3):
+                    self._native_call(name, self._qsa_plan, logical_positions,
+                                      sequence_lengths, token_to_request, self._stream)
+                self._api.call("cudaStreamSynchronize", self._stream)
+                self._api.call("cudaEventRecord", start, self._stream)
+                for _ in range(iterations):
+                    self._native_call(name, self._qsa_plan, logical_positions,
+                                      sequence_lengths, token_to_request, self._stream)
+                self._api.call("cudaEventRecord", end, self._stream)
+                self._api.call("cudaEventSynchronize", end)
+                elapsed = ctypes.c_float()
+                self._api.call("cudaEventElapsedTime", ctypes.byref(elapsed), start, end)
+                return elapsed.value / iterations
+            finally:
+                self._api.call("cudaEventDestroy", end)
+                self._api.call("cudaEventDestroy", start)
+        score = measured("qwen38_qsa_indexer_score")
+        select = measured("qwen38_qsa_indexer_select_expand")
+        return MappingProxyType({"score_ms": score, "select_expand_ms": select,
+                                 "total_ms": score + select})
+
     def close(self) -> None:
         if self._closed: return
         errors = self._close_noexcept()
@@ -289,6 +390,10 @@ class CutlassQkvRuntime:
             "qwen38_cutlass_qkv_quantize", "qwen38_cutlass_qkv_project",
             "qwen38_cutlass_qkv_output", "qwen38_cutlass_qkv_destroy",
             "qwen38_qsa_expand_topk",
+            "qwen38_qsa_indexer_create", "qwen38_qsa_indexer_launch",
+            "qwen38_qsa_indexer_score", "qwen38_qsa_indexer_select_expand",
+            "qwen38_qsa_indexer_inputs", "qwen38_qsa_indexer_output",
+            "qwen38_qsa_indexer_destroy",
         ):
             getattr(self._native, name).restype = ctypes.c_int
 
@@ -303,6 +408,9 @@ class CutlassQkvRuntime:
                 except Exception as exc: errors.append(str(exc))
         if self._plan.value:
             try: self._native_call("qwen38_cutlass_qkv_destroy", self._plan)
+            except Exception as exc: errors.append(str(exc))
+        if self._qsa_plan.value:
+            try: self._native_call("qwen38_qsa_indexer_destroy", self._qsa_plan)
             except Exception as exc: errors.append(str(exc))
         for pointer in reversed(self._device_buffers):
             try: self._api.call("cudaFree", pointer)

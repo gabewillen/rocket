@@ -36,4 +36,33 @@ int qwen38_qsa_expand_topk(const std::int32_t* block_indices,
                            std::int32_t* token_indices, int rows,
                            cudaStream_t stream);
 
+// Fixed Qwen QSA indexer for c16 at the 262,144-token serving cap. The plan
+// owns stable query, paged compressed-key, score, selection, and output
+// buffers. Input pointers are borrowed so the future pre-indexer can refresh
+// their contents without changing captured graph arguments.
+int qwen38_qsa_indexer_create(int device, void** plan);
+int qwen38_qsa_indexer_launch(void* plan,
+                             const std::int64_t* logical_positions,
+                             const std::int32_t* sequence_lengths,
+                             const std::int32_t* token_to_request,
+                             cudaStream_t stream);
+int qwen38_qsa_indexer_score(void* plan,
+                            const std::int64_t* logical_positions,
+                            const std::int32_t* sequence_lengths,
+                            const std::int32_t* token_to_request,
+                            cudaStream_t stream);
+int qwen38_qsa_indexer_select_expand(void* plan,
+                                    const std::int64_t* logical_positions,
+                                    const std::int32_t* sequence_lengths,
+                                    const std::int32_t* token_to_request,
+                                    cudaStream_t stream);
+int qwen38_qsa_indexer_inputs(void* plan, void** query_bf16,
+                             std::size_t* query_bytes, void** key_cache_bf16,
+                             std::size_t* key_cache_bytes,
+                             void** page_table_i32,
+                             std::size_t* page_table_bytes);
+int qwen38_qsa_indexer_output(void* plan, void** token_indices,
+                             std::size_t* elements);
+int qwen38_qsa_indexer_destroy(void* plan);
+
 }

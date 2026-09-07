@@ -115,6 +115,8 @@ def run(
             for actual, expected in zip(first_qkv, reference_qkv)
         )
         timing = dict(runtime.benchmark_projection())
+        qsa_timing = dict(runtime.benchmark_qsa_indexer())
+        first_qsa = runtime.read_qsa_token_indices()
         first_pointers = dict(runtime.active_device_pointers)
 
         negated = bytearray(full_projection.activations_bf16)
@@ -134,6 +136,7 @@ def run(
         )
         second_target_rows = runtime.read_target_rows()
         runtime_qkv_second = runtime.read_qkv_projection()
+        second_qsa = runtime.read_qsa_token_indices()
         second_pointers = dict(runtime.active_device_pointers)
 
         runtime.update_qkv_activations(full_projection.activations_bf16)
@@ -148,6 +151,7 @@ def run(
         third_target_rows = runtime.read_target_rows()
         third_target_verified = third_target_rows == expected_target_rows(third)
         third_qkv = runtime.read_qkv_projection()
+        third_qsa = runtime.read_qsa_token_indices()
         third_pointers = dict(runtime.active_device_pointers)
 
     if not first_verified or not second_verified or not third_verified:
@@ -167,6 +171,15 @@ def run(
         raise RuntimeError("CUDA Q/K/V projection exceeded scalar reference error")
     if runtime_qkv_second == first_qkv or third_qkv != first_qkv:
         raise RuntimeError("CUDA Q/K/V live activation replay contract failed")
+    if second_qsa != third_qsa:
+        raise RuntimeError("CUDA QSA score/select/expansion repeat was not bit-exact")
+    if first_qsa[:8] != (
+        262_140, 262_141, 262_142, 262_143,
+        262_136, 262_137, 262_138, 262_139,
+    ):
+        raise RuntimeError("CUDA QSA paged score/top-k order did not match reference")
+    if any(value != -1 for value in second_qsa[5 * 2051 :]):
+        raise RuntimeError("CUDA QSA invalid rows did not retain -1 semantics")
     full_outputs = sum(PROJECTION_FAMILY_ROWS)
     projection_flops = 16 * full_outputs * PROJECTION_K * 2
     projection_bytes = full_outputs * (PROJECTION_K // 2 + PROJECTION_K // 16)
@@ -183,11 +196,13 @@ def run(
     graph_tflops = projection_flops / (timing["projection_ms"] * 1.0e9)
     requant_gbps = requant_bytes / (timing["requant_ms"] * 1.0e6)
     rank_local_traffic_roof = 238.0
+    qsa_score_bytes = 16 * 65536 * (128 * 2 + 4)
+    qsa_score_gbps = qsa_score_bytes / (qsa_timing["score_ms"] * 1.0e6)
     base_step_ms = 1000.0 * 16 / 330.835
     full_attention_requants = 24
     final_map_requants = 278
     return {
-        "schema": "rocket.qwen38-k0-cuda-smoke.v2",
+        "schema": "rocket.qwen38-k0-cuda-smoke.v3",
         "device": device,
         "cuda_runtime": str(cudart),
         "cuda_driver": str(driver),
@@ -224,6 +239,18 @@ def run(
             / ((base_step_ms + final_map_requants * timing["requant_ms"]) / 1000),
             "traffic_only_k0_early_ceiling_tok_s": 330.835,
             "two_rank_aggregate_traffic_roof_gbps": 476.0,
+        },
+        "qsa_indexer": {
+            "shape": [16, 65536, 4, 128],
+            "score_ms": qsa_timing["score_ms"],
+            "select_expand_ms": qsa_timing["select_expand_ms"],
+            "total_ms": qsa_timing["total_ms"],
+            "score_physical_gbps": qsa_score_gbps,
+            "score_fraction_of_238_gbps_rank_local_roof": qsa_score_gbps
+            / rank_local_traffic_roof,
+            "deterministic_repeat": "bit_exact",
+            "invalid_rows": "minus_one",
+            "reference": "vllm@8e685d198 models/qwen3_8_flash_next/nvidia/ops/qsa.py",
         },
         "metadata_fields": len(BUFFER_LAYOUT),
         "metadata_bytes": sum(length for _name, length in BUFFER_LAYOUT),
