@@ -30,6 +30,9 @@ RECIPE = Path(
 )
 RUNNER_COMMIT = "5bc4c2b6f483f3a8f422ca8a8d8aac58c1a7c061"
 RECIPE_COMMIT = "c7f69055e9ca572d0c562708a2cd68ea9a1af42b"
+OPENAI_PYTHON_COMMIT = "753ab5c1a81cd85e8bf0aef4c04c51a2e8dae6cd"
+OPENAI_PYTHON_VERSION = "3.3.1"
+OPENAI_ASYNC_EXAMPLE_SHA256 = "50468f6737372e9dc3d6f46e74225605d20e02f80200efff317517cba0ea0f28"
 IMAGE = "vllm/vllm-openai:qwen38-flash-next"
 IMAGE_ID = "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a"
 MODEL_REVISION = "fc694b54fb0174e0913e6adf86691ef85a4ead47"
@@ -140,65 +143,131 @@ def render_runner(source: str) -> str:
     """Keep a fixed c16 cohort alive after EOS so three windows remain valid."""
 
     import_anchor = "import argparse, json, os, re, sys, threading, time, urllib.request\n"
-    import_replacement = "import argparse, json, os, re, socket, sys, threading, time, urllib.request\n"
-    request_anchor = 'body = {"model": self.a.model, "temperature": self.a.temperature, "top_p": self.a.top_p,\n'
-    request_replacement = (
-        'body = {"model": self.a.model, "temperature": self.a.temperature, '
-        '"top_p": self.a.top_p, "ignore_eos": True,\n'
+    import_replacement = (
+        "import argparse, asyncio, json, os, re, sys, threading, time, urllib.request\n"
+        "import openai\n"
+        "from openai import AsyncOpenAI\n"
+        "if openai.__version__ != '3.3.1':\n"
+        "    raise RuntimeError(f'openai 3.3.1 required, found {openai.__version__}')\n"
     )
-    init_anchor = "        self.i, self.a, self.prompt, self.stop, self.log = i, a, prompt, stop, log\n"
-    init_replacement = init_anchor + "        self.response = None\n        self.socket = None\n"
-    response_anchor = "            with urllib.request.urlopen(req, timeout=self.a.timeout) as r:\n"
-    response_replacement = (
-        response_anchor
-        + "                self.response = r\n"
-        + "                self.socket = r.fp.raw._sock\n"
+    worker_start = "class Worker(threading.Thread):\n"
+    worker_end = "\n\ndef sample_loop"
+    worker_replacement = '''async def stream_one(i, a, prompt, stop, log, client):
+    """One official-SDK stream with cancellation-safe stream ownership."""
+    nonce = f"{a.tag}-s{i}-{int(time.time()*1000)}"
+    t0 = time.time()
+    rec = {"stream": i, "t0": t0, "ok": True, "completion_tokens": 0, "prompt_tokens": 0,
+           "finish": None, "reasoning_chars": 0, "answer_chars": 0, "chunks": 0}
+    stream = None
+    try:
+        stream = await client.chat.completions.create(
+            model=a.model,
+            temperature=a.temperature,
+            top_p=a.top_p,
+            max_tokens=a.max_tokens,
+            messages=[{"role": "user", "content": f"{prompt}\\n\\n(request id {nonce}, answer fully)"}],
+            stream=True,
+            stream_options={"include_usage": True},
+            extra_body={
+                "ignore_eos": True,
+                "chat_template_kwargs": {"enable_thinking": a.thinking == "on"},
+            },
+        )
+        async for event in stream:
+            if stop.is_set():
+                rec["finish"] = "aborted"
+                break
+            usage = getattr(event, "usage", None)
+            if usage is not None:
+                rec["completion_tokens"] = getattr(usage, "completion_tokens", rec["completion_tokens"])
+                rec["prompt_tokens"] = getattr(usage, "prompt_tokens", rec["prompt_tokens"])
+            for choice in getattr(event, "choices", ()) or ():
+                delta = getattr(choice, "delta", None)
+                rec["chunks"] += 1
+                rec["reasoning_chars"] += len(getattr(delta, "reasoning_content", None) or "")
+                rec["answer_chars"] += len(getattr(delta, "content", None) or "")
+                if getattr(choice, "finish_reason", None):
+                    rec["finish"] = choice.finish_reason
+    except asyncio.CancelledError:
+        rec["finish"] = "aborted"
+        raise
+    except Exception as exc:
+        if stop.is_set():
+            rec["finish"] = "aborted"
+        else:
+            rec.update(ok=False, error=str(exc)[:200])
+    finally:
+        if stream is not None:
+            await stream.close()
+        rec["t1"] = time.time()
+        log.append(rec)
+
+
+async def run_stream_cohort(a, prompt, c, t_start, deadline, samples):
+    """Run sampling beside c streams and bound teardown of every SDK task."""
+    client = AsyncOpenAI(
+        base_url=a.url,
+        api_key=a.token or "rocket-benchmark-dummy",
+        timeout=a.timeout,
+        max_retries=0,
     )
-    class_end_anchor = "        self.log.append(rec)\n\n\ndef sample_loop"
-    class_end_replacement = (
-        "        if self.stop.is_set() and rec['finish'] is None:\n"
-        "            rec['finish'] = 'aborted'\n"
-        "        self.log.append(rec)\n\n"
-        "    def abort(self):\n"
-        "        sock = self.socket\n"
-        "        response = self.response\n"
-        "        if sock is not None:\n"
-        "            try:\n"
-        "                sock.shutdown(socket.SHUT_RDWR)\n"
-        "            except OSError:\n"
-        "                pass\n"
-        "        if response is not None:\n"
-        "            response.close()\n\n\n"
-        "def sample_loop"
+    stop = asyncio.Event()
+    log = []
+    tasks = [
+        asyncio.create_task(stream_one(i, a, prompt, stop, log, client))
+        for i in range(c)
+    ]
+    try:
+        await asyncio.to_thread(sample_loop, a, t_start, deadline, samples)
+    finally:
+        stop.set()
+        for task in tasks:
+            task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), timeout=30
+            )
+        finally:
+            await client.close()
+    if len(log) != c or any(not task.done() for task in tasks):
+        raise RuntimeError("SDK stream cleanup did not account for every task")
+    return log
+
+
+def sample_loop'''
+    cohort_start = (
+        "    t_start = time.time(); deadline = t_start + (a.warmup + a.seconds if a.seconds > 0 else 10**9)"
     )
-    join_anchor = (
-        "    stop.set()\n"
-        "    for w in workers:\n"
-        "        w.join(timeout=30)\n"
+    cohort_end = "    for _ in range(60):\n"
+    cohort_replacement = (
+        "    t_start = time.time(); deadline = t_start + (a.warmup + a.seconds if a.seconds > 0 else 10**9)"
+        "   # cap = warmup + measured\n"
+        "    samples = []\n"
+        "    log = asyncio.run(run_stream_cohort(a, prompt, c, t_start, deadline, samples))\n"
+        "    print(\"· window over — SDK streams closed\", flush=True)\n"
+        "    for _ in range(60):\n"
     )
-    join_replacement = (
-        "    stop.set()\n"
-        "    for w in workers:\n"
-        "        w.abort()\n"
-        "    join_deadline = time.monotonic() + 30\n"
-        "    for w in workers:\n"
-        "        w.join(timeout=max(0.0, join_deadline - time.monotonic()))\n"
-        "    if any(w.is_alive() for w in workers):\n"
-        "        raise RuntimeError('stream cancellation exceeded 30 seconds')\n"
-    )
-    replacements = (
-        (import_anchor, import_replacement),
-        (request_anchor, request_replacement),
-        (init_anchor, init_replacement),
-        (response_anchor, response_replacement),
-        (class_end_anchor, class_end_replacement),
-        (join_anchor, join_replacement),
-    )
-    if '"ignore_eos": True' in source or any(source.count(anchor) != 1 for anchor, _ in replacements):
+    if (
+        '"ignore_eos": True' in source
+        or source.count(import_anchor) != 1
+        or source.count(worker_start) != 1
+        or source.count(worker_end) != 1
+        or source.count(cohort_start) != 1
+        or source.count(cohort_end) != 1
+    ):
         raise ContractError("benchmark request anchor changed")
-    rendered = source
-    for anchor, replacement in replacements:
-        rendered = rendered.replace(anchor, replacement)
+    rendered = source.replace(import_anchor, import_replacement)
+    rendered = rendered.replace(
+        "The served model is DETECTED from GET /v1/models (--model only to override). Stdlib only. Run it ON the",
+        "The served model is DETECTED from GET /v1/models (--model only to override). "
+        "Streaming uses openai-python. Run it ON the",
+    ).replace("Worker/sample_loop read a.c", "stream cohort/sample_loop read a.c")
+    start = rendered.index(worker_start)
+    end = rendered.index(worker_end, start)
+    rendered = rendered[:start] + worker_replacement + rendered[end + len(worker_end):]
+    start = rendered.index(cohort_start)
+    end = rendered.index(cohort_end, start)
+    rendered = rendered[:start] + cohort_replacement + rendered[end + len(cohort_end):]
     return rendered
 
 
@@ -230,10 +299,17 @@ def prepare_cell(root: Path, cell: Cell) -> Path:
                 "mtp_depth": 1,
                 "runner_commit": RUNNER_COMMIT,
                 "recipe_commit": RECIPE_COMMIT,
+                "openai_python_commit": OPENAI_PYTHON_COMMIT,
+                "openai_python_version": OPENAI_PYTHON_VERSION,
+                "openai_async_example_sha256": OPENAI_ASYNC_EXAMPLE_SHA256,
                 "prompt_sha256": RUNNER_SHA256["bench/pasture-text.txt"],
                 "windows": 3,
                 "window_seconds": 10,
                 "otel_cardinality": {"cell": 4, "rank": 2, "hca": 2},
+                "otel_scope": (
+                    "benchmark-only external client; runtime/service telemetry "
+                    "boundary unchanged"
+                ),
             },
             indent=2,
             sort_keys=True,
