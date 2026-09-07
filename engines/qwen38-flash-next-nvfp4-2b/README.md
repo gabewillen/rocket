@@ -23,6 +23,21 @@ The production plan is pinned at 545,726,297 bytes and SHA-256
 `8035c520827bece63756138c820593cad91b68ac3388424d7482c184f19b49d6`.
 Its deterministic identity replaces a generic JSON allocation ceiling.
 
+Stage B adds one fixed `PairReduce` for TP2 hidden partials. Each rank owns a
+four-page anonymous pinned region, publishes a versioned BF16 wire message with
+an unsignaled RC write followed by a signaled sequence doorbell, validates the
+peer header, then accumulates rank 0 followed by rank 1 into FP32 `[M, 2560]`.
+Only M 1, 2, 4, 8, and 16 is accepted. The embedder must supply an OpenTelemetry
+sink. Metric labels are limited to rank, M bucket, dtype, and outcome. Trace and
+request IDs are confined to spans and logs.
+
+```bash
+cmake -S engines/qwen38-flash-next-nvfp4-2b \
+  -B engines/qwen38-flash-next-nvfp4-2b/build -DCMAKE_BUILD_TYPE=Release
+cmake --build engines/qwen38-flash-next-nvfp4-2b/build -j
+ctest --test-dir engines/qwen38-flash-next-nvfp4-2b/build --output-on-failure
+```
+
 ```bash
 PYTHONPATH=engines/qwen38-flash-next-nvfp4-2b/src python3 -m qwen38_slab.materialize \
   --plan /path/to/qwen38-rank-slab-plan.json \
