@@ -24,6 +24,32 @@ find_library(ROCKET_QWEN38_IBVERBS ibverbs REQUIRED)
 find_library(ROCKET_QWEN38_NVML nvidia-ml REQUIRED)
 find_package(CUDAToolkit 13.0 REQUIRED)
 
+# CUTLASS 4.8 is pinned by the measured GLM engine. Reuse that checkout for
+# the Qwen-only c16 Q/K/V path, while keeping its sm_121a code out of the
+# ordinary CUDA targets.
+set(ROCKET_QWEN38_CUTLASS_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../glm5-moe-nvfp4-2b/third_party/cutlass"
+  CACHE PATH "Pinned CUTLASS checkout")
+if(NOT EXISTS "${ROCKET_QWEN38_CUTLASS_DIR}/include/cutlass/cutlass.h")
+  message(FATAL_ERROR "CUTLASS 4.8 checkout missing at ${ROCKET_QWEN38_CUTLASS_DIR}")
+endif()
+
+add_library(qwen38_cutlass_qkv SHARED src/projection/cutlass_qkv.cu)
+target_include_directories(qwen38_cutlass_qkv PRIVATE
+  src
+  "${ROCKET_QWEN38_CUTLASS_DIR}/include"
+  "${ROCKET_QWEN38_CUTLASS_DIR}/tools/util/include"
+)
+target_compile_options(qwen38_cutlass_qkv PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>
+)
+set_target_properties(qwen38_cutlass_qkv PROPERTIES
+  CUDA_ARCHITECTURES "121a"
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+target_link_libraries(qwen38_cutlass_qkv PRIVATE CUDA::cudart)
+
 add_library(qwen38_pair_reduce STATIC
   src/pair_reduce/pair_reduce.cu
   src/pair_reduce/rdma.cc

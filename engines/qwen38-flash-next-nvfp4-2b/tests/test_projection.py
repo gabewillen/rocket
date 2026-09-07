@@ -6,10 +6,12 @@ from pathlib import Path
 
 from qwen38_slab.device_decode import Cuda13GraphRuntime, DeviceDecodeError
 from qwen38_slab.projection import (
+    PROJECTION_FAMILY_ROWS,
     PROJECTION_K,
     PROJECTION_OUTPUTS,
     PROJECTION_SCHEMA,
     ProjectionError,
+    load_full_projection_payload,
     load_projection_payload,
     load_rank0_layer3_projection,
     reference_projection,
@@ -35,9 +37,19 @@ class ProjectionContractTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             descriptor.rank = 1
         payload = load_projection_payload(descriptor)
+        full = load_full_projection_payload(descriptor)
         self.assertEqual(len(payload.packed_weights), PROJECTION_OUTPUTS * PROJECTION_K // 2)
         self.assertEqual(len(payload.linear_scales), PROJECTION_OUTPUTS * PROJECTION_K // 16)
         self.assertEqual(len(payload.activations_bf16), 16 * PROJECTION_K * 2)
+        self.assertEqual(
+            tuple(map(len, full.packed_weights)),
+            tuple(rows * PROJECTION_K // 2 for rows in PROJECTION_FAMILY_ROWS),
+        )
+        self.assertEqual(
+            tuple(map(len, full.swizzled_scales)),
+            tuple(rows * PROJECTION_K // 16 for rows in PROJECTION_FAMILY_ROWS),
+        )
+        self.assertEqual(full.global_scales, payload.global_scales)
         self.assertEqual(reference_projection(payload, 0), (0.0,) * (16 * PROJECTION_OUTPUTS))
         with self.assertRaisesRegex(ProjectionError, "descriptor"):
             load_projection_payload(replace(descriptor, schema="drift"))

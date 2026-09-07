@@ -169,7 +169,7 @@ def run(
     graph_gbps = projection_bytes / (timing["graph_ms"] * 1.0e6)
     graph_tflops = projection_flops / (timing["graph_ms"] * 1.0e9)
     requant_gbps = requant_bytes / (timing["requant_ms"] * 1.0e6)
-    traffic_ceiling = 476.0
+    rank_local_traffic_roof = 238.0
     base_step_ms = 1000.0 * 16 / 330.835
     full_attention_requants = 24
     final_map_requants = 278
@@ -195,7 +195,8 @@ def run(
             "graph_ms": timing["graph_ms"],
             "effective_gbps": graph_gbps,
             "tflops": graph_tflops,
-            "fraction_of_476_gbps_early_ceiling": graph_gbps / traffic_ceiling,
+            "fraction_of_238_gbps_rank_local_roof": graph_gbps
+            / rank_local_traffic_roof,
         },
         "activation_requant": {
             "c16_k2560_ms": timing["requant_ms"],
@@ -206,6 +207,7 @@ def run(
             "k0_equal_shape_278_call_ceiling_tok_s": 16
             / ((base_step_ms + final_map_requants * timing["requant_ms"]) / 1000),
             "traffic_only_k0_early_ceiling_tok_s": 330.835,
+            "two_rank_aggregate_traffic_roof_gbps": 476.0,
         },
         "metadata_fields": len(BUFFER_LAYOUT),
         "metadata_bytes": sum(length for _name, length in BUFFER_LAYOUT),

@@ -15,6 +15,7 @@ PROJECTION_LAYER = 3
 PROJECTION_K = 2560
 PROJECTION_ROWS_PER_FAMILY = 4
 PROJECTION_FAMILIES = ("q_proj", "k_proj", "v_proj")
+PROJECTION_FAMILY_ROWS = (6144, 256, 256)
 PROJECTION_OUTPUTS = len(PROJECTION_FAMILIES) * PROJECTION_ROWS_PER_FAMILY
 PROJECTION_SCHEMA = "qwen3.8-flash-next:tp2:rank0:layer3:qkv-w4a4:v1"
 
@@ -56,6 +57,17 @@ class QkvProjectionPayload:
     descriptor: RankSlabProjection
     packed_weights: bytes
     linear_scales: bytes
+    global_scales: tuple[float, float, float]
+    activations_bf16: bytes
+
+
+@dataclass(frozen=True)
+class FullQkvProjectionPayload:
+    """Owned production-width Q/K/V tensors in the authenticated slab ABI."""
+
+    descriptor: RankSlabProjection
+    packed_weights: tuple[bytes, bytes, bytes]
+    swizzled_scales: tuple[bytes, bytes, bytes]
     global_scales: tuple[float, float, float]
     activations_bf16: bytes
 
@@ -230,6 +242,57 @@ def load_projection_payload(descriptor: RankSlabProjection) -> QkvProjectionPayl
     )
 
 
+def load_full_projection_payload(
+    descriptor: RankSlabProjection,
+) -> FullQkvProjectionPayload:
+    """Read full production widths without changing packed weight or SFB layout."""
+
+    if not isinstance(descriptor, RankSlabProjection) or descriptor.schema != PROJECTION_SCHEMA:
+        raise ProjectionError("projection descriptor is invalid")
+    by_name = {component.name: component for component in descriptor.components}
+    weights: list[bytes] = []
+    scales: list[bytes] = []
+    globals_: list[float] = []
+    fd = os.open(descriptor.slab_path, os.O_RDONLY)
+    try:
+        if (
+            os.fstat(fd).st_size != descriptor.slab_bytes
+            or _sha256_fd_range(fd, descriptor.chunk_offset, descriptor.chunk_length)
+            != descriptor.chunk_sha256
+        ):
+            raise ProjectionError("rank slab changed after descriptor authentication")
+        for family in PROJECTION_FAMILIES:
+            prefix = f"model.language_model.layers.3.self_attn.{family}"
+            weight = by_name[f"{prefix}.weight"]
+            scale = by_name[f"{prefix}.weight_scale"]
+            global_scale = by_name[f"{prefix}.weight_scale_2"]
+            weight_blob = os.pread(fd, weight.length, weight.offset)
+            scale_blob = os.pread(fd, scale.length, scale.offset)
+            raw_global = os.pread(fd, 4, global_scale.offset)
+            if len(weight_blob) != weight.length or len(scale_blob) != scale.length:
+                raise ProjectionError("short full projection read")
+            if len(raw_global) != 4:
+                raise ProjectionError("short global projection scale read")
+            weights.append(weight_blob)
+            scales.append(scale_blob)
+            globals_.append(struct.unpack("<f", raw_global)[0])
+    finally:
+        os.close(fd)
+    activation = bytearray()
+    for row in range(16):
+        for column in range(PROJECTION_K):
+            value = ((column + row * 3) % 17 - 8) / 16.0
+            bits = struct.unpack("<I", struct.pack("<f", value))[0]
+            activation.extend(struct.pack("<H", bits >> 16))
+    return FullQkvProjectionPayload(
+        descriptor,
+        tuple(weights),
+        tuple(scales),
+        tuple(globals_),
+        bytes(activation),
+    )
+
+
 def reference_projection(
     payload: QkvProjectionPayload, active_rows: int
 ) -> tuple[float, ...]:
@@ -265,6 +328,65 @@ def reference_projection(
             for value in values:
                 normalized = value / scale if scale else 0.0
                 code = min(range(16), key=lambda item: abs(normalized - _e2m1(item)))
+                quantized.append(_e2m1(code))
+        for output in range(PROJECTION_OUTPUTS):
+            total = 0.0
+            packed_base = output * packed_stride
+            scale_base = output * scale_stride
+            for column in range(PROJECTION_K):
+                pair = payload.packed_weights[packed_base + column // 2]
+                nibble = pair >> 4 if column & 1 else pair & 15
+                total += (
+                    quantized[column]
+                    * activation_scales[column // 16]
+                    * _e2m1(nibble)
+                    * _e4m3(payload.linear_scales[scale_base + column // 16])
+                )
+            result[batch * PROJECTION_OUTPUTS + output] = (
+                total * payload.global_scales[output // PROJECTION_ROWS_PER_FAMILY]
+            )
+    return tuple(result)
+
+
+def reference_cutlass_projection(
+    payload: QkvProjectionPayload, active_rows: int
+) -> tuple[float, ...]:
+    """Scalar oracle with the E4M3 activation scales consumed by CUTLASS."""
+
+    if (
+        not isinstance(payload, QkvProjectionPayload)
+        or isinstance(active_rows, bool)
+        or not isinstance(active_rows, int)
+        or not 0 <= active_rows <= 16
+    ):
+        raise ProjectionError("reference projection inputs are invalid")
+    result = [0.0] * (16 * PROJECTION_OUTPUTS)
+    packed_stride = PROJECTION_K // 2
+    scale_stride = PROJECTION_K // 16
+    for batch in range(active_rows):
+        activation_base = batch * PROJECTION_K * 2
+        quantized = []
+        activation_scales = []
+        for group in range(PROJECTION_K // 16):
+            values = []
+            for offset in range(16):
+                column = group * 16 + offset
+                bf16 = struct.unpack(
+                    "<H",
+                    payload.activations_bf16[
+                        activation_base + 2 * column : activation_base + 2 * column + 2
+                    ],
+                )[0]
+                values.append(struct.unpack("<f", struct.pack("<I", bf16 << 16))[0])
+            scale_code = _float_to_e4m3(max(abs(value) for value in values) / 6.0)
+            scale = _e4m3(scale_code)
+            activation_scales.append(scale)
+            for value in values:
+                normalized = value / scale if scale else 0.0
+                code = min(
+                    range(16),
+                    key=lambda item: (abs(normalized - _e2m1(item)), item & 1),
+                )
                 quantized.append(_e2m1(code))
         for output in range(PROJECTION_OUTPUTS):
             total = 0.0
@@ -328,3 +450,14 @@ def _e4m3(value: int) -> float:
     if exponent == 0:
         return sign * mantissa * (2.0**-9)
     return sign * (1.0 + mantissa / 8.0) * (2.0 ** (exponent - 7))
+
+
+def _float_to_e4m3(value: float) -> int:
+    sign = 0x80 if value < 0.0 else 0
+    magnitude = abs(value)
+    if magnitude >= 464.0:
+        return sign | 0x7E
+    return sign | min(
+        range(0x7F),
+        key=lambda bits: (abs(magnitude - _e4m3(bits)), bits & 1),
+    )
