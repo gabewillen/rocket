@@ -112,12 +112,37 @@ def variance_summary(runs: list[dict[str, object]]) -> dict[str, object]:
     return output
 
 
-def validate_production_prepared(prepared: Path) -> dict[str, object]:
+def validate_production_prepared(
+    prepared: Path, required_worker_cache_kind: str | None = None
+) -> dict[str, object]:
     """Reject calibration/eager launch scripts before any cold timer starts."""
 
     run_record = json.loads(prepared.joinpath("run.json").read_text())
     if run_record.get("mtp_depth") != 1:
         raise ValueError("cold c16 control requires the measured K1 ceiling")
+    if required_worker_cache_kind is not None:
+        actual = run_record.get("worker_cache_kind")
+        if actual != required_worker_cache_kind:
+            raise ValueError(
+                "prepared worker cache kind mismatch: "
+                f"expected {required_worker_cache_kind}, got {actual or 'missing'}"
+            )
+        if required_worker_cache_kind == "host_ext4" and not run_record.get(
+            "checkpoint_manifest_sha256"
+        ):
+            raise ValueError("local ext4 preparation lacks checkpoint manifest proof")
+        if required_worker_cache_kind == "host_ext4":
+            if (
+                run_record.get("head_cache_filesystem") != "ext4"
+                or run_record.get("worker_cache_filesystem") != "ext4"
+            ):
+                raise ValueError("local cache preparation requires ext4 on both nodes")
+            if run_record.get("checkpoint_safetensor_shards") != 11:
+                raise ValueError("local cache preparation requires 11 checkpoint shards")
+            if not run_record.get("head_snapshot_path") or not run_record.get(
+                "worker_snapshot_path"
+            ):
+                raise ValueError("local cache preparation lacks exact snapshot paths")
     for name in ("launch-head.sh", "launch-worker.sh"):
         source = prepared.joinpath(name).read_text()
         forbidden = (
@@ -373,6 +398,9 @@ def main() -> int:
     parser.add_argument("--endpoint", default="http://127.0.0.1:8888")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=int, default=3600)
+    parser.add_argument(
+        "--required-worker-cache-kind", choices=("docker_volume", "host_ext4")
+    )
     args = parser.parse_args()
     if args.runs < 2:
         parser.error("--runs must be at least 2 to report variance")
@@ -384,7 +412,9 @@ def main() -> int:
         if not args.prepared_dir.joinpath(name).is_file():
             parser.error(f"prepared directory is missing {name}")
     try:
-        prepared_run = validate_production_prepared(args.prepared_dir)
+        prepared_run = validate_production_prepared(
+            args.prepared_dir, args.required_worker_cache_kind
+        )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     if args.output_dir.exists():

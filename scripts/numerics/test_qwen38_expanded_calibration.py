@@ -35,6 +35,30 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("default: 3600", help_result.stdout)
         self.assertIn("--fp8-artifact-dir", help_result.stdout)
         self.assertIn("--production", help_result.stdout)
+        self.assertIn("--worker-hf-cache", help_result.stdout)
+
+    def test_worker_host_cache_is_ext4_and_manifest_matched_fail_closed(self):
+        self.assertIn('[[ "$WORKER_HF_CACHE" == /* ]]', self.source)
+        self.assertIn('WORKER_CACHE_KIND="host_ext4"', self.source)
+        self.assertIn('"$WORKER_CACHE_FILESYSTEM" == ext4', self.source)
+        self.assertIn("head_safetensor_count", self.source)
+        self.assertIn("worker_safetensor_count", self.source)
+        self.assertIn('"$worker_manifest" == "$head_manifest"', self.source)
+        self.assertIn('"worker_cache_kind":"$WORKER_CACHE_KIND"', self.source)
+        self.assertIn('"head_cache_filesystem":"$HEAD_CACHE_FILESYSTEM"', self.source)
+        self.assertIn('"worker_cache_filesystem":"$WORKER_CACHE_FILESYSTEM"', self.source)
+        self.assertIn('"head_snapshot_path":"$HEAD_SNAPSHOT"', self.source)
+        self.assertIn('"worker_snapshot_path":"$WORKER_SNAPSHOT"', self.source)
+        self.assertIn(
+            '"checkpoint_manifest_sha256":"$CHECKPOINT_MANIFEST_SHA256"',
+            self.source,
+        )
+        self.assertIn(
+            '"checkpoint_safetensor_shards":$CHECKPOINT_SHARD_COUNT', self.source
+        )
+        self.assertIn(
+            '"$WORKER_HCA" "$WORKER_CACHE_MOUNT"', self.source
+        )
 
     def test_production_mode_cuts_instrumentation_and_runs_ladder(self):
         self.assertIn('if [[ "$PRODUCTION" == true ]]', self.source)

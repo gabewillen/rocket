@@ -32,6 +32,14 @@ HEAD_CONTAINER="rocket-qwen38-calibration-head"
 WORKER_CONTAINER="rocket-qwen38-calibration-worker"
 HF_CACHE="${HOME}/.cache/huggingface"
 WORKER_HF_VOLUME="vllm-fn-hf"
+WORKER_HF_CACHE=""
+WORKER_CACHE_KIND="docker_volume"
+WORKER_CACHE_MOUNT="$WORKER_HF_VOLUME"
+CHECKPOINT_MANIFEST_SHA256=""
+CHECKPOINT_SHARD_COUNT=0
+HEAD_CACHE_FILESYSTEM=""
+WORKER_CACHE_FILESYSTEM=""
+WORKER_SNAPSHOT=""
 OUTPUT_DIR=""
 MIA_SOURCE=""
 FP8_ARTIFACT_DIR=""
@@ -77,6 +85,7 @@ Options:
   --worker-hca NAME      Worker RDMA HCA (default: rocep1s0f1)
   --hf-cache DIR         Head Hugging Face cache
   --worker-hf-volume V   Worker read-only HF volume (default: vllm-fn-hf)
+  --worker-hf-cache DIR  Worker host HF cache; require matching ext4 checkpoint
   --startup-timeout-seconds N
                          Health deadline in seconds (default: 3600)
   --gpu-memory-utilization F
@@ -122,6 +131,7 @@ while (($#)); do
         --worker-hca) WORKER_HCA=${2:?missing value}; shift 2 ;;
         --hf-cache) HF_CACHE=${2:?missing value}; shift 2 ;;
         --worker-hf-volume) WORKER_HF_VOLUME=${2:?missing value}; shift 2 ;;
+        --worker-hf-cache) WORKER_HF_CACHE=${2:?missing value}; shift 2 ;;
         --startup-timeout-seconds)
             STARTUP_TIMEOUT_SECONDS=${2:?missing value}
             shift 2
@@ -138,6 +148,11 @@ done
 
 [[ -n "$OUTPUT_DIR" ]] || fail "--output-dir is required"
 [[ "$OUTPUT_DIR" == /* ]] || fail "--output-dir must be absolute"
+if [[ -n "$WORKER_HF_CACHE" ]]; then
+    [[ "$WORKER_HF_CACHE" == /* ]] || fail "--worker-hf-cache must be absolute"
+    WORKER_CACHE_KIND="host_ext4"
+    WORKER_CACHE_MOUNT="$WORKER_HF_CACHE"
+fi
 [[ "$MTP_DEPTH" =~ ^[0-7]$ ]] || fail "--mtp-depth must be one of 0,1,2,3,4,5,6,7"
 # Pinned image d464f3b4 declares SpeculativeConfig.num_speculative_tokens with
 # Pydantic Field(gt=0). Omitting speculative_config also omits the MTP model and
@@ -285,11 +300,35 @@ worker_page_size=$(ssh -o BatchMode=yes "$SSH_TARGET" getconf PAGESIZE)
 
 HEAD_SNAPSHOT="$HF_CACHE/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION"
 [[ -f "$HEAD_SNAPSHOT/config.json" ]] || fail "head checkpoint revision missing: $HEAD_SNAPSHOT"
-ssh -o BatchMode=yes "$SSH_TARGET" "docker volume inspect '$WORKER_HF_VOLUME' >/dev/null" || \
-    fail "worker Hugging Face volume missing: $WORKER_HF_VOLUME"
-ssh -o BatchMode=yes "$SSH_TARGET" \
-    "docker run --rm -v '$WORKER_HF_VOLUME:/cache:ro' --entrypoint /bin/sh '$IMAGE_TAG' -c 'test -f /cache/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/model.safetensors.index.json'" || \
-    fail "worker volume $WORKER_HF_VOLUME does not contain pinned checkpoint metadata"
+HEAD_CACHE_FILESYSTEM=$(findmnt -T "$HEAD_SNAPSHOT" -n -o FSTYPE)
+if [[ "$WORKER_CACHE_KIND" == host_ext4 ]]; then
+    [[ "$HEAD_CACHE_FILESYSTEM" == ext4 ]] || \
+        fail "head checkpoint cache must be ext4 for local-cache control"
+    WORKER_SNAPSHOT="$WORKER_HF_CACHE/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION"
+    printf -v worker_snapshot_q '%q' "$WORKER_SNAPSHOT"
+    WORKER_CACHE_FILESYSTEM=$(ssh -o BatchMode=yes "$SSH_TARGET" \
+        "findmnt -T $worker_snapshot_q -n -o FSTYPE" 2>/dev/null || true)
+    [[ "$WORKER_CACHE_FILESYSTEM" == ext4 ]] || \
+        fail "worker checkpoint cache must exist on ext4, got ${WORKER_CACHE_FILESYSTEM:-missing}"
+    head_safetensor_count=$(find "$HEAD_SNAPSHOT" -maxdepth 1 -name '*.safetensors' | wc -l)
+    worker_safetensor_count=$(ssh -o BatchMode=yes "$SSH_TARGET" \
+        "find $worker_snapshot_q -maxdepth 1 -name '*.safetensors' | wc -l")
+    [[ "$head_safetensor_count" == 11 && "$worker_safetensor_count" == 11 ]] || \
+        fail "pinned checkpoint requires 11 safetensor shards on each node"
+    CHECKPOINT_SHARD_COUNT=11
+    head_manifest=$(find "$HEAD_SNAPSHOT" -maxdepth 1 -type l -printf '%f\t%l\n' | sort | sha256sum | cut -d' ' -f1)
+    worker_manifest=$(ssh -o BatchMode=yes "$SSH_TARGET" \
+        "find $worker_snapshot_q -maxdepth 1 -type l -printf '%f\\t%l\\n' | sort | sha256sum | cut -d' ' -f1")
+    [[ -n "$head_manifest" && "$worker_manifest" == "$head_manifest" ]] || \
+        fail "worker local checkpoint manifest differs from head"
+    CHECKPOINT_MANIFEST_SHA256="$head_manifest"
+else
+    ssh -o BatchMode=yes "$SSH_TARGET" "docker volume inspect '$WORKER_HF_VOLUME' >/dev/null" || \
+        fail "worker Hugging Face volume missing: $WORKER_HF_VOLUME"
+    ssh -o BatchMode=yes "$SSH_TARGET" \
+        "docker run --rm -v '$WORKER_HF_VOLUME:/cache:ro' --entrypoint /bin/sh '$IMAGE_TAG' -c 'test -f /cache/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/model.safetensors.index.json'" || \
+        fail "worker volume $WORKER_HF_VOLUME does not contain pinned checkpoint metadata"
+fi
 
 MIA_WORK="$WORK_DIR/mia"
 if [[ -n "$MIA_SOURCE" ]]; then
@@ -440,7 +479,7 @@ fi
     sha256sum ./* > SHA256SUMS
 )
 cat > "$OUTPUT_DIR/run.json" <<EOF
-{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size,"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS,"gpu_memory_utilization":$GPU_MEMORY_UTILIZATION,"mtp_depth":$MTP_DEPTH}
+{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size,"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS,"gpu_memory_utilization":$GPU_MEMORY_UTILIZATION,"mtp_depth":$MTP_DEPTH,"worker_cache_kind":"$WORKER_CACHE_KIND","head_cache_filesystem":"$HEAD_CACHE_FILESYSTEM","worker_cache_filesystem":"$WORKER_CACHE_FILESYSTEM","head_snapshot_path":"$HEAD_SNAPSHOT","worker_snapshot_path":"$WORKER_SNAPSHOT","checkpoint_manifest_sha256":"$CHECKPOINT_MANIFEST_SHA256","checkpoint_safetensor_shards":$CHECKPOINT_SHARD_COUNT}
 EOF
 
 printf 'Prepared and verified pinned calibration artifacts in %s\n' "$ARTIFACT_DIR"
@@ -570,7 +609,7 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         "cd '$REMOTE_NVFP4_ARTIFACT' && sha256sum --check nvfp4-artifact-SHA256SUMS"
     ssh -o BatchMode=yes "$SSH_TARGET" \
         "docker run --rm \
-        -v '$WORKER_HF_VOLUME:/root/.cache/huggingface:ro' \
+        -v '$WORKER_CACHE_MOUNT:/root/.cache/huggingface:ro' \
         -v '$REMOTE_NVFP4_ARTIFACT:/rocket/qwen38-linear-nvfp4:ro' \
         -v '$REMOTE_OUTPUT/artifacts/weight_utils_64k.py:$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py:ro' \
         -e ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=/rocket/qwen38-linear-nvfp4/manifest.json \
@@ -588,7 +627,7 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         \"import json,os,pathlib; from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig; config=ModelOptMixedPrecisionConfig.from_config(json.load(open('/work/hf_quant_config.json'))); families=set(os.environ['ROCKET_NVFP4_FAMILIES'].split(',')); checks={'base_routers':'model.language_model.model.layers.0.mlp.gate','base_ple':'model.language_model.model.layers.1.ple.value_proj'}; [(_ for _ in ()).throw(AssertionError((family, config._resolve_quant_algo(target)))) for family,target in checks.items() if family in families and config._resolve_quant_algo(target) != 'NVFP4']; telemetry=pathlib.Path('/work/model.py').read_text(); runtime=pathlib.Path('/work/model_router.py').read_text(); selected='base_routers' in families; assert ('ROCKET_QWEN38_NVFP4_ROUTER_V1' in telemetry) == selected; assert ('ROCKET_QWEN38_NVFP4_ROUTER_V1' in runtime) == selected; assert 'ROCKET_NVFP4_TELEMETRY' in telemetry; assert 'ROCKET_NVFP4_TELEMETRY' not in runtime; print(f'validated worker NVFP4 mounted-model semantics: {sorted(families)}')\""
 fi
 write_launch_script "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE" \
-    "$WORKER_HCA" "$WORKER_HF_VOLUME" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT" "$REMOTE_NVFP4_ARTIFACT"
+    "$WORKER_HCA" "$WORKER_CACHE_MOUNT" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT" "$REMOTE_NVFP4_ARTIFACT"
 write_launch_script "$OUTPUT_DIR/launch-head.sh" 0 "$HEAD_IP" "$HEAD_IFACE" \
     "$HEAD_HCA" "$HF_CACHE" "$ARTIFACT_DIR" "--host 0.0.0.0 --port $API_PORT" "rw" "$FP8_ARTIFACT_DIR" "$NVFP4_ARTIFACT_DIR"
 if [[ "$PRODUCTION" == true ]]; then

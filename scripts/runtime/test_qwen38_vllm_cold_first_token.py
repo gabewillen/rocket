@@ -110,6 +110,42 @@ class ColdFirstTokenTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "K1 ceiling"):
                 cold.validate_production_prepared(root)
 
+    def test_local_ext4_control_requires_cache_and_manifest_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("launch-head.sh", "launch-worker.sh"):
+                root.joinpath(name).write_text("docker run image\n")
+            root.joinpath("run.json").write_text(
+                json.dumps({"mtp_depth": 1, "worker_cache_kind": "docker_volume"})
+            )
+            with self.assertRaisesRegex(ValueError, "cache kind mismatch"):
+                cold.validate_production_prepared(root, "host_ext4")
+            root.joinpath("run.json").write_text(
+                json.dumps({"mtp_depth": 1, "worker_cache_kind": "host_ext4"})
+            )
+            with self.assertRaisesRegex(ValueError, "manifest proof"):
+                cold.validate_production_prepared(root, "host_ext4")
+            root.joinpath("run.json").write_text(
+                json.dumps(
+                    {
+                        "mtp_depth": 1,
+                        "worker_cache_kind": "host_ext4",
+                        "checkpoint_manifest_sha256": "a" * 64,
+                        "head_cache_filesystem": "ext4",
+                        "worker_cache_filesystem": "ext4",
+                        "checkpoint_safetensor_shards": 11,
+                        "head_snapshot_path": "/cache/head/revision",
+                        "worker_snapshot_path": "/cache/worker/revision",
+                    }
+                )
+            )
+            self.assertEqual(
+                cold.validate_production_prepared(root, "host_ext4")[
+                    "worker_cache_kind"
+                ],
+                "host_ext4",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
