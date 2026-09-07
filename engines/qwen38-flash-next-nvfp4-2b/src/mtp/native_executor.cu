@@ -64,8 +64,7 @@ NativeExecutor::NativeExecutor(ImmutableSlabs slabs, BoundGraph graph,
       !slabs_.mtp_rank_slab ||
       slabs_.mtp_rank_slab_bytes != kNativeRankSlabBytes ||
       !valid_digest(slabs_.source_contract_digest) ||
-      !graph_.verification_tokens ||
-      !graph_.active_causal_state || graph_.state_bytes_per_sequence == 0)
+      !graph_.verification_tokens || graph_.state_bytes_per_sequence == 0)
     throw NativeExecutorError("native MTP binding contract changed");
   for (int step = 0; step < graph_.key.depth; ++step) {
     if (!graph_.router_expert_ids[step] || !graph_.causal_snapshots[step])
@@ -143,10 +142,14 @@ DeviceDraftView NativeExecutor::draft(std::uint64_t generation) {
   }
 }
 
-void NativeExecutor::publish(std::uint64_t generation,
-                             const std::int32_t* accepted_widths_device) {
+void NativeExecutor::stage_accept(
+    std::uint64_t generation, std::byte* inactive_state,
+    const std::int32_t* accepted_widths_device,
+    decode::DecoderVerifierShape shape, cudaStream_t stream) {
   if (phase_ != ExecutorPhase::kDrafted || generation != pending_generation_ ||
-      !accepted_widths_device)
+      !inactive_state || !accepted_widths_device || stream != stream_ ||
+      shape.sequences != graph_.key.sequences ||
+      shape.verify_width != graph_.key.depth + 1)
     throw NativeExecutorError("accepted-prefix publication contract changed");
   try {
     const std::size_t bytes = static_cast<std::size_t>(graph_.key.sequences) *
@@ -154,33 +157,43 @@ void NativeExecutor::publish(std::uint64_t generation,
     const int blocks = static_cast<int>(std::min<std::size_t>(
         4096, (bytes + 255) / 256));
     publish_accepted_snapshots<<<blocks, 256, 0, stream_>>>(
-        graph_.active_causal_state, snapshots_device_, accepted_widths_device,
+        inactive_state, snapshots_device_, accepted_widths_device,
         graph_.key.sequences, graph_.key.depth,
         graph_.state_bytes_per_sequence);
     check(cudaGetLastError(), "publish accepted MTP snapshot");
-    active_generation_ = generation;
-    pending_generation_ = 0;
-    phase_ = ExecutorPhase::kReady;
   } catch (...) {
     phase_ = ExecutorPhase::kFaulted;
     throw;
   }
 }
 
-void NativeExecutor::export_telemetry_after_fence(std::uint64_t generation) {
-  if (phase_ != ExecutorPhase::kDrafted || generation != pending_generation_)
-    throw NativeExecutorError("telemetry export must precede accepted publication");
-  check(cudaMemcpy(expert_masks_host_.data(), expert_masks_device_,
+void NativeExecutor::commit(std::uint64_t generation) noexcept {
+  if (phase_ == ExecutorPhase::kDrafted && generation == pending_generation_) {
+    active_generation_ = generation;
+    pending_generation_ = 0;
+    phase_ = ExecutorPhase::kReady;
+  } else {
+    phase_ = ExecutorPhase::kFaulted;
+  }
+}
+
+void NativeExecutor::export_telemetry_after_fence(
+    std::uint64_t generation) noexcept {
+  if (phase_ != ExecutorPhase::kReady || generation != active_generation_) return;
+  if (cudaMemcpy(expert_masks_host_.data(), expert_masks_device_,
                    graph_.key.depth * 8 * sizeof(std::uint32_t),
-                   cudaMemcpyDeviceToHost),
-        "copy expert usage after verifier fence");
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+    telemetry_.record_phase({Phase::kInputFusion, Outcome::kCudaError,
+                             graph_.key.depth, graph_.key.sequences, 0});
+    return;
+  }
   std::array<float, kPhaseCount> phase_ms{};
   for (int step = 0; step < graph_.key.depth; ++step)
     for (int phase = 0; phase < kPhaseCount; ++phase) {
       float elapsed = 0.0F;
-      check(cudaEventElapsedTime(&elapsed, events_[step][phase],
-                                 events_[step][phase + 1]),
-            "read MTP phase time after verifier fence");
+      if (cudaEventElapsedTime(&elapsed, events_[step][phase],
+                               events_[step][phase + 1]) != cudaSuccess)
+        return;
       phase_ms[phase] += elapsed;
     }
   for (int phase = 0; phase < kPhaseCount; ++phase)

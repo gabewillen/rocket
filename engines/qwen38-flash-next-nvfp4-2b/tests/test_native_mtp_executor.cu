@@ -82,7 +82,7 @@ int main() {
   std::array<std::int32_t*, kDepth> router_device{};
   std::int32_t* token_device = nullptr;
   std::array<std::byte*, kDepth> snapshot_device{};
-  std::byte* active_device = nullptr;
+  std::byte* inactive_device = nullptr;
   for (int step = 0; step < kDepth; ++step) {
     assert(cudaMalloc(&router_device[step], sizeof(router[step])) == cudaSuccess);
     assert(cudaMemcpy(router_device[step], router[step].data(),
@@ -100,15 +100,19 @@ int main() {
   assert(cudaMalloc(&token_device, sizeof(tokens)) == cudaSuccess);
   assert(cudaMemcpy(token_device, tokens.data(), sizeof(tokens),
                     cudaMemcpyHostToDevice) == cudaSuccess);
-  assert(cudaMalloc(&active_device, active.size()) == cudaSuccess);
+  assert(cudaMalloc(&inactive_device, active.size()) == cudaSuccess);
   graph.verification_tokens = token_device;
-  graph.active_causal_state = active_device;
   graph.state_bytes_per_sequence = kStateBytes;
 
   std::array<std::uint8_t, 32> digest{};
   digest[0] = 1;
   Sink sink;
   {
+    const std::array<std::int32_t, kSequences> accepted{1, 3};
+    std::int32_t* accepted_device = nullptr;
+    assert(cudaMalloc(&accepted_device, sizeof(accepted)) == cudaSuccess);
+    assert(cudaMemcpy(accepted_device, accepted.data(), sizeof(accepted),
+                      cudaMemcpyHostToDevice) == cudaSuccess);
     NativeExecutor executor(
         ImmutableSlabs{reinterpret_cast<void*>(1), 1,
                        reinterpret_cast<void*>(2),
@@ -117,37 +121,24 @@ int main() {
     const auto result = executor.draft(1);
     assert(result.verification_tokens == token_device);
     assert(result.depth == kDepth && result.sequences == kSequences);
+    executor.stage_accept(1, inactive_device, accepted_device,
+                          {kSequences, kDepth + 1}, stream);
     // This is the one terminal fence owned by the target verifier.
     assert(cudaStreamSynchronize(stream) == cudaSuccess);
-    executor.export_telemetry_after_fence(1);
-    assert(sink.experts.size() == kDepth);
-    assert(sink.experts[0].unique_local_experts == 4);
-    assert(sink.experts[1].unique_local_experts == 4);
-    assert(sink.experts[0].resident_expert_bytes ==
-           4 * rocket::qwen38::mtp::kNvidiaFp8BytesPerLocalExpert);
-    for (const auto& phase : sink.phases)
-      std::cout << "phase=" << static_cast<int>(phase.phase)
-                << " duration_ns=" << phase.duration_ns << '\n';
-    for (const auto& usage : sink.experts)
-      std::cout << "draft_step=" << usage.draft_step
-                << " unique_local_experts=" << usage.unique_local_experts
-                << " resident_expert_bytes=" << usage.resident_expert_bytes
-                << '\n';
-    const std::array<std::int32_t, kSequences> accepted{1, 3};
-    std::int32_t* accepted_device = nullptr;
-    assert(cudaMalloc(&accepted_device, sizeof(accepted)) == cudaSuccess);
-    assert(cudaMemcpy(accepted_device, accepted.data(), sizeof(accepted),
-                      cudaMemcpyHostToDevice) == cudaSuccess);
-    executor.publish(1, accepted_device);
-    // Publication is asynchronous and ordered before the next engine step.
-    assert(cudaStreamSynchronize(stream) == cudaSuccess);
-    assert(cudaMemcpy(active.data(), active_device, active.size(),
+    executor.commit(1);
+    assert(cudaMemcpy(active.data(), inactive_device, active.size(),
                       cudaMemcpyDeviceToHost) == cudaSuccess);
     for (std::size_t index = 0; index < kStateBytes; ++index)
       assert(active[index] == std::byte{0x11});
     for (std::size_t index = kStateBytes; index < active.size(); ++index)
       assert(active[index] == std::byte{0x22});
     std::cout << "accepted_widths=1,3 published_snapshots=0,1 exact=1\n";
+    executor.export_telemetry_after_fence(1);
+    assert(sink.experts.size() == kDepth);
+    assert(sink.experts[0].unique_local_experts == 4);
+    assert(sink.experts[1].unique_local_experts == 4);
+    assert(sink.experts[0].resident_expert_bytes ==
+           4 * rocket::qwen38::mtp::kNvidiaFp8BytesPerLocalExpert);
     assert(executor.phase() == rocket::qwen38::mtp::ExecutorPhase::kReady);
     assert(cudaFree(accepted_device) == cudaSuccess);
   }
@@ -159,7 +150,7 @@ int main() {
     assert(cudaFree(snapshot_device[step]) == cudaSuccess);
   }
   assert(cudaFree(token_device) == cudaSuccess);
-  assert(cudaFree(active_device) == cudaSuccess);
+  assert(cudaFree(inactive_device) == cudaSuccess);
   assert(cudaStreamDestroy(stream) == cudaSuccess);
   return 0;
 }

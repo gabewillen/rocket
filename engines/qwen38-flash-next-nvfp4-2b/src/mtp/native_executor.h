@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <string_view>
 
+#include "decode/decoder_verifier.h"
+
 namespace rocket::qwen38::mtp {
 
 inline constexpr int kMaxDepth = 7;
@@ -96,7 +98,6 @@ struct BoundGraph {
   const std::int32_t* verification_tokens = nullptr;
   // Private causal snapshots, one [sequences, state_bytes] array per step.
   std::array<const std::byte*, kMaxDepth> causal_snapshots{};
-  std::byte* active_causal_state = nullptr;
   std::size_t state_bytes_per_sequence = 0;
 };
 
@@ -113,9 +114,9 @@ class NativeExecutorError : public std::runtime_error {
 };
 
 // One logical writer. draft() performs every MTP layer and proposal step in
-// native code. publish() is the only accepted-state mutation and selects the
-// private snapshot corresponding to DecoderVerifier's accepted target width.
-class NativeExecutor final {
+// native code. stage_accept() writes only the shared transaction's inactive
+// state. commit() advances generation after DecoderVerifier publishes it.
+class NativeExecutor final : public decode::AcceptedStateParticipant {
  public:
   NativeExecutor(ImmutableSlabs slabs, BoundGraph graph,
                  TelemetrySink& telemetry, cudaStream_t stream);
@@ -125,12 +126,18 @@ class NativeExecutor final {
   NativeExecutor& operator=(const NativeExecutor&) = delete;
 
   DeviceDraftView draft(std::uint64_t generation);
-  void publish(std::uint64_t generation,
-               const std::int32_t* accepted_widths_device);
+  std::size_t state_bytes_per_sequence() const noexcept override {
+    return graph_.state_bytes_per_sequence;
+  }
+  void stage_accept(std::uint64_t generation, std::byte* inactive_state,
+                    const std::int32_t* accepted_widths_device,
+                    decode::DecoderVerifierShape shape,
+                    cudaStream_t stream) override;
+  void commit(std::uint64_t generation) noexcept override;
   // Invoke only after DecoderVerifier's terminal fence. This method performs
   // no CUDA synchronization and launches no device work.
-  void export_telemetry_after_fence(std::uint64_t generation);
-  void discard(std::uint64_t generation) noexcept;
+  void export_telemetry_after_fence(std::uint64_t generation) noexcept;
+  void discard(std::uint64_t generation) noexcept override;
 
   [[nodiscard]] ExecutorPhase phase() const noexcept { return phase_; }
   [[nodiscard]] GraphKey key() const noexcept { return graph_.key; }

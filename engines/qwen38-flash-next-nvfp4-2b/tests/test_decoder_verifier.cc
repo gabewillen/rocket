@@ -45,6 +45,10 @@ class State final : public decode::DecoderStateTransaction {
             pointer<float>(0x2000 + layer),
             pointer<const std::int32_t>(0x3000 + layer)};
   }
+  std::byte* mtp_state(void* transaction, std::size_t bytes) override {
+    check(transaction == this && bytes == 4, "MTP inactive state ABI drift");
+    return fail_mtp_state ? nullptr : mtp.data();
+  }
   void publish(void* transaction) noexcept override {
     if (transaction == this) {
       active = pending;
@@ -58,6 +62,30 @@ class State final : public decode::DecoderStateTransaction {
   std::uint64_t pending = 0;
   int publications = 0;
   int discards = 0;
+  bool fail_mtp_state = false;
+  std::array<std::byte, 4> mtp{};
+};
+
+class MtpParticipant final : public decode::AcceptedStateParticipant {
+ public:
+  std::size_t state_bytes_per_sequence() const noexcept override { return 4; }
+  void stage_accept(std::uint64_t generation, std::byte* inactive,
+                    const std::int32_t* widths,
+                    decode::DecoderVerifierShape, cudaStream_t) override {
+    check(generation == 8 && inactive && widths, "MTP stage inputs changed");
+    ++stages;
+    if (fail_stage) throw std::runtime_error("injected MTP accept failure");
+  }
+  void commit(std::uint64_t generation) noexcept override {
+    active = generation;
+    ++commits;
+  }
+  void discard(std::uint64_t) noexcept override { ++discards; }
+  std::uint64_t active = 7;
+  int stages = 0;
+  int commits = 0;
+  int discards = 0;
+  bool fail_stage = false;
 };
 
 class Gdn final : public decode::GdnVerifierPort {
@@ -243,6 +271,29 @@ void test_partial_accept_keeps_active_state_unchanged() {
         "accept failure did not occur after ten private layer writes");
 }
 
+void test_mtp_accept_faults_leave_every_generation_unpublished() {
+  for (int fault = 0; fault < 2; ++fault) {
+    Fixture fixture;
+    MtpParticipant mtp;
+    fixture.state.fail_mtp_state = fault == 0;
+    mtp.fail_stage = fault == 1;
+    decode::DecoderVerifier verifier(
+        fixture.ports, fixture.runtime, fixture.state, fixture.telemetry,
+        reinterpret_cast<cudaStream_t>(0xb000), &mtp);
+    std::int32_t token = 1;
+    bool threw = false;
+    try {
+      (void)verifier.step(8, &token, {1, 4}, "trace", "request");
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    check(threw && fixture.state.active == 7 && mtp.active == 7 &&
+              fixture.state.publications == 0 && fixture.state.discards == 1 &&
+              mtp.commits == 0 && mtp.discards == 1,
+          "MTP accept fault exposed target or MTP generation");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -252,6 +303,7 @@ int main() {
           "coarse C ABI accepted null construction state");
     test_success_publishes_after_all_layers_and_accepts();
     test_partial_accept_keeps_active_state_unchanged();
+    test_mtp_accept_faults_leave_every_generation_unpublished();
     std::puts("decoder verifier transaction: 48 layers, 96 reductions, atomic state passed");
     return 0;
   } catch (const std::exception& error) {

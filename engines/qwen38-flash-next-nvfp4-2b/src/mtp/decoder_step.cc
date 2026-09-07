@@ -13,9 +13,8 @@ decode::VerificationOutput DecoderStep::step(std::uint64_t generation,
     decode::VerificationOutput output = verifier_.step(
         generation, draft.verification_tokens,
         {draft.sequences, draft.depth + 1}, trace_id, request_id);
-    // DecoderVerifier::step has completed the sole stream fence here.
+    // DecoderVerifier staged and committed MTP with target/GDN/QSA state.
     drafter_.export_telemetry_after_fence(generation);
-    drafter_.publish(generation, output.accepted_prefixes_device);
     return output;
   } catch (...) {
     drafter_.discard(generation);

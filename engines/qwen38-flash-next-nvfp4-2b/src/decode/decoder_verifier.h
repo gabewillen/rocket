@@ -5,6 +5,7 @@
 #include <cuda_runtime_api.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string_view>
@@ -100,8 +101,21 @@ class DecoderStateTransaction {
   virtual void* begin(std::uint64_t generation,
                       DecoderVerifierShape shape) = 0;
   virtual GdnInactiveState gdn_state(void* transaction, int layer) = 0;
+  virtual std::byte* mtp_state(void*, std::size_t) { return nullptr; }
   virtual void publish(void* transaction) noexcept = 0;
   virtual void discard(void* transaction) noexcept = 0;
+};
+
+class AcceptedStateParticipant {
+ public:
+  virtual ~AcceptedStateParticipant() = default;
+  virtual std::size_t state_bytes_per_sequence() const noexcept = 0;
+  virtual void stage_accept(std::uint64_t generation, std::byte* inactive_state,
+                            const std::int32_t* accepted_widths_device,
+                            DecoderVerifierShape shape,
+                            cudaStream_t stream) = 0;
+  virtual void commit(std::uint64_t generation) noexcept = 0;
+  virtual void discard(std::uint64_t generation) noexcept = 0;
 };
 
 // Native CUDA work surface. Every method is synchronous enqueue onto the bound
@@ -152,7 +166,8 @@ class DecoderVerifier final {
                   DecoderStepRuntime& runtime,
                   DecoderStateTransaction& state,
                   pair_reduce::OtelStageSink& telemetry,
-                  cudaStream_t stream);
+                  cudaStream_t stream,
+                  AcceptedStateParticipant* accepted_state = nullptr);
 
   VerificationOutput step(
       std::uint64_t generation, const std::int32_t* token_ids,
@@ -171,6 +186,7 @@ class DecoderVerifier final {
   DecoderStateTransaction& state_;
   pair_reduce::OtelStageSink& telemetry_;
   cudaStream_t stream_;
+  AcceptedStateParticipant* accepted_state_;
   DecoderVerifierPhase phase_ = DecoderVerifierPhase::kReady;
 };
 

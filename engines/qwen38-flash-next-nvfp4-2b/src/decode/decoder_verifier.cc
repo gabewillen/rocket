@@ -55,9 +55,10 @@ void NativeGdnVerifierPort::reset(std::string_view trace_id,
 DecoderVerifier::DecoderVerifier(
     std::array<GdnVerifierPort*, kDecoderLayers> gdn_by_layer,
     DecoderStepRuntime& runtime, DecoderStateTransaction& state,
-    pair_reduce::OtelStageSink& telemetry, cudaStream_t stream)
+    pair_reduce::OtelStageSink& telemetry, cudaStream_t stream,
+    AcceptedStateParticipant* accepted_state)
     : gdn_(gdn_by_layer), runtime_(runtime), state_(state),
-      telemetry_(telemetry), stream_(stream) {
+      telemetry_(telemetry), stream_(stream), accepted_state_(accepted_state) {
   if (!stream_) throw DecoderVerifierError("decoder verifier requires one stream");
   int gdn_count = 0;
   for (int layer = 0; layer < kDecoderLayers; ++layer) {
@@ -144,6 +145,14 @@ VerificationOutput DecoderVerifier::step(
     }
     runtime_.accept_qsa(inactive, output.accepted_prefixes.data(), shape,
                         stream_);
+    if (accepted_state_) {
+      std::byte* mtp = state_.mtp_state(
+          inactive, accepted_state_->state_bytes_per_sequence());
+      if (!mtp) throw DecoderVerifierError("inactive MTP state is absent");
+      accepted_state_->stage_accept(generation, mtp,
+                                    output.accepted_prefixes_device, shape,
+                                    stream_);
+    }
     runtime_.synchronize(stream_);
     state_.publish(inactive);
     inactive = nullptr;
@@ -151,6 +160,7 @@ VerificationOutput DecoderVerifier::step(
       phase_ = DecoderVerifierPhase::kFaulted;
       throw DecoderVerifierError("state publisher violated atomic commit contract");
     }
+    if (accepted_state_) accepted_state_->commit(generation);
     phase_ = DecoderVerifierPhase::kReady;
     emit("rocket.qwen38.decoder_verifier.step", pair_reduce::Outcome::kOk,
          shape, trace_id, request_id, elapsed_ns(begin));
@@ -162,6 +172,7 @@ VerificationOutput DecoderVerifier::step(
       runtime_.reset_qsa(inactive);
       state_.discard(inactive);
     }
+    if (accepted_state_) accepted_state_->discard(generation);
     phase_ = DecoderVerifierPhase::kFaulted;
     emit("rocket.qwen38.decoder_verifier.step",
          pair_reduce::Outcome::kCudaError, shape, trace_id, request_id,

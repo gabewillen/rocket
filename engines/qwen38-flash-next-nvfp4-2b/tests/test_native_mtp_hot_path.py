@@ -24,13 +24,13 @@ def body(signature: str, next_signature: str) -> str:
 
 class NativeMtpHotPathTests(unittest.TestCase):
     def test_draft_has_no_host_copy_or_device_fence(self):
-        draft = body("DeviceDraftView NativeExecutor::draft", "void NativeExecutor::publish")
+        draft = body("DeviceDraftView NativeExecutor::draft", "void NativeExecutor::stage_accept")
         self.assertNotIn("cudaMemcpy", draft)
         self.assertNotIn("Synchronize", draft)
 
     def test_publish_uses_device_widths_without_fence(self):
         publish = body(
-            "void NativeExecutor::publish", "void NativeExecutor::export_telemetry_after_fence"
+            "void NativeExecutor::stage_accept", "void NativeExecutor::commit"
         )
         self.assertNotIn("cudaMemcpy", publish)
         self.assertNotIn("Synchronize", publish)
