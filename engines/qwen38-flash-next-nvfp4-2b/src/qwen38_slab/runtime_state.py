@@ -179,6 +179,18 @@ class CudaStateBinding:
 
         return self._phase
 
+    @property
+    def rank(self) -> int:
+        """Return the fixed TP rank owned by this binding."""
+
+        return self._rank
+
+    @property
+    def state_owner(self) -> object | None:
+        """Return the runtime's fixed gate owner when the adapter exposes it."""
+
+        return getattr(self._runtime, "owner", None)
+
     def capture(
         self,
         boundary: RuntimeBoundary,

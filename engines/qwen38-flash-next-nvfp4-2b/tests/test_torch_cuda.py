@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import unittest
 
+from qwen38_slab.device_decode import DevicePhase, DevicePublication
 from qwen38_slab.runtime_state import (
     BindingPhase,
     CudaStateBinding,
@@ -10,6 +11,7 @@ from qwen38_slab.runtime_state import (
     RuntimeBoundary,
     RuntimeStateError,
 )
+from qwen38_slab.state_owner import DecoderStateOwner, OwnerPhase
 from qwen38_slab.state_txn import AuthenticatedState, FamilyPayload, STATE_FAMILIES
 from qwen38_slab.torch_cuda import TorchCudaRuntime, TorchCudaRuntimeError
 
@@ -140,6 +142,16 @@ class Owner:
         if self.fail_open: raise FakeCudaError("open")
 
 
+class SpecializedDecoder:
+    def __init__(self):
+        self.phase = DevicePhase.IDLE
+        self.publication = None
+
+    def upload_and_launch(self, generation):
+        self.publication = DevicePublication(generation, 1, generation % 2)
+        return self.publication
+
+
 class TorchCudaTests(unittest.TestCase):
     def setUp(self):
         self.torch = FakeTorch()
@@ -206,6 +218,26 @@ class TorchCudaTests(unittest.TestCase):
             == self.authenticated.rank_payload(0)[family].accepted
             for family in STATE_FAMILIES
         ))
+
+    def test_concrete_adapter_uses_specialized_decoder_owner_gate_and_table(self):
+        decoder = SpecializedDecoder()
+        owner = DecoderStateOwner(rank=0, decoder=decoder, tracer=Tracer())
+        owner.accept_boundary(owner.upload_and_launch(7), self.boundary)
+        runtime = TorchCudaRuntime(
+            owner=owner,
+            compute_streams=self.compute,
+            torch_api=self.torch,
+            device="cuda:0",
+        )
+        binding = CudaStateBinding(0, runtime, Tracer())
+
+        binding.restore(self.authenticated, generation_epoch=7)
+
+        self.assertEqual(binding.rank, 0)
+        self.assertIs(binding.state_owner, owner)
+        self.assertEqual(owner.phase, OwnerPhase.OPEN)
+        self.assertEqual(tuple(owner.active_state), STATE_FAMILIES)
+        self.assertEqual(owner.upload_and_launch(8).generation, 8)
 
     def test_tensor_contract_drift_fails_without_publication_and_reopens_gate(self):
         first = STATE_FAMILIES[0]

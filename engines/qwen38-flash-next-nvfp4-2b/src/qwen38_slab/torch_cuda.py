@@ -150,6 +150,12 @@ class TorchCudaRuntime:
         self._gate_boundary: RuntimeBoundary | None = None
         self._pinned_staging: list[TorchTensor] = []
 
+    @property
+    def owner(self) -> TorchStateOwner:
+        """Return the fixed launch-gate and pointer-table owner."""
+
+        return self._owner
+
     def quiesce(self, boundary: RuntimeBoundary) -> QuiesceReceipt:
         """Close the launch gate and fence all enumerated mutating streams."""
 
