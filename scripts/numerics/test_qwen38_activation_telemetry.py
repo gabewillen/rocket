@@ -85,6 +85,15 @@ layer = type("Layer", (), {
 model = type("Model", (), {
     "layers": [layer], "config": type("Config", (), config)(),
 })()
+assert _rocket_router_cohort(torch.zeros((2, 512)), 10) is None
+os.environ["ROCKET_ROUTER_COHORT"] = "partial-metadata-must-fail"
+try:
+    _rocket_router_cohort(torch.zeros((2, 512)), 10)
+except RuntimeError as error:
+    assert "sequences and verify_width" in str(error)
+else:
+    raise AssertionError("partial router cohort metadata did not fail")
+os.environ.pop("ROCKET_ROUTER_COHORT")
 os.environ.update({
     "ROCKET_NVFP4_CALIBRATE": "1",
     "ROCKET_ROUTER_COHORT": "contract-c2-k0",

@@ -108,16 +108,19 @@ def _rocket_router_cohort(tensor, top_k):
     rows = int(tensor.shape[0])
     sequences = int(os.getenv("ROCKET_ROUTER_SEQUENCES", "0"))
     verify_width = int(os.getenv("ROCKET_ROUTER_VERIFY_WIDTH", "0"))
+    cohort = os.getenv("ROCKET_ROUTER_COHORT", "")
+    rank_text = os.getenv("ROCKET_ROUTER_RANK", "")
+    if not cohort and not rank_text and sequences == 0 and verify_width == 0:
+        return None
     if sequences < 1 or verify_width < 1:
         raise RuntimeError(
             "router cohort sequences and verify_width must both be positive"
         )
     if sequences * verify_width != rows:
         return None
-    rank = int(os.getenv("ROCKET_ROUTER_RANK", "-1"))
+    rank = int(rank_text or "-1")
     if rank not in (0, 1):
         raise RuntimeError(f"router cohort rank must be 0 or 1, got {rank}")
-    cohort = os.getenv("ROCKET_ROUTER_COHORT", "")
     if not cohort:
         raise RuntimeError("ROCKET_ROUTER_COHORT is required for router telemetry")
 
