@@ -540,7 +540,8 @@ check_port_available "0.0.0.0" "$API_PORT" || \
     fail "head API port is unavailable: 0.0.0.0:$API_PORT"
 
 REMOTE_OUTPUT="$OUTPUT_DIR"
-ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p '$REMOTE_OUTPUT/artifacts' '$REMOTE_OUTPUT/logs'"
+ssh -o BatchMode=yes "$SSH_TARGET" \
+    "mkdir -p '$REMOTE_OUTPUT/artifacts' '$REMOTE_OUTPUT/logs' '$REMOTE_OUTPUT/work'"
 scp -q "$ARTIFACT_DIR"/* "$SSH_TARGET:$REMOTE_OUTPUT/artifacts/"
 ssh -o BatchMode=yes "$SSH_TARGET" \
     "cd '$REMOTE_OUTPUT/artifacts' && sha256sum --check SHA256SUMS"

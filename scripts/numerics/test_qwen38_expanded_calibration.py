@@ -151,6 +151,12 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertLess(self.source.index(master), self.source.index(transfer))
         self.assertLess(self.source.index(api), self.source.index(transfer))
 
+    def test_remote_immutable_view_parent_exists_before_device_check(self):
+        mkdir = '"mkdir -p \'$REMOTE_OUTPUT/artifacts\' \'$REMOTE_OUTPUT/logs\' \'$REMOTE_OUTPUT/work\'"'
+        stat = 'worker_output_device=$(ssh'
+        self.assertIn(mkdir, self.source)
+        self.assertLess(self.source.index(mkdir), self.source.index(stat))
+
     def test_timeout_budget_is_recorded_and_used_in_failure(self):
         self.assertIn(
             '"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS', self.source
