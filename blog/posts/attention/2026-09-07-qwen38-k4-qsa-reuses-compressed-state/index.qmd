@@ -1,0 +1,74 @@
+---
+title: "K4 QSA state reuse cuts c16 full-attention to 3.90 ms"
+description: "Five verifier rows share one authenticated compressed-state read, reducing c16 median layer time to 3.90 ms while c1 remains 0.62 ms."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, attention, kernels, cache, numerics, telemetry]
+verdict: accepted
+rocket: "#kernels"
+supersedes: posts/attention/2026-09-07-qwen38-native-qsa-score-bound
+---
+
+**Question.** Can c16 K4 reuse compressed QSA keys across its five verifier rows without changing accepted state or the scalar attention reference?
+
+| setup | |
+| --- | --- |
+| nodes | `gx10-5e36` and physical peer, one GB10 each |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| Rocket | `4005f83` |
+| mechanism commits | `22b43e9`, `925a4f8`, `4fd86e1`, `4005f83` |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| rank slab | `a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4` |
+
+```bash
+build-qwen38-attention/qwen38-full-attention-native-smoke \
+  /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank0-target.slab \
+  /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank1-target.slab \
+  0 5 16
+```
+
+```text
+samples_ms=3.99157,3.88833,3.88683,3.89568,3.90206 median_ms=3.89568 p95_ms=3.99157
+output_hash=14543349815314973281 state_hash=156413646661139179 generation=2 graph_hash=14543349815314973281
+scalar_control_max_abs=0.000976562 scalar_control_mean_abs=2.40745e-06
+```
+
+| K4 bucket | rows | rank-0 median | rank-0 p95 | peer median | peer p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| c1 | 5 | 0.621839 ms | 0.665520 ms | 0.630673 ms | 0.666337 ms |
+| c4 | 20 | 1.217380 ms | 1.243660 ms | 1.224310 ms | 1.258900 ms |
+| c8 | 40 | 2.001520 ms | 2.050020 ms | 2.012180 ms | 2.055220 ms |
+| c16 | 80 | 3.895680 ms | 3.991570 ms | 4.010710 ms | 4.432060 ms |
+
+| rank-0 c16 phase | latency |
+| --- | ---: |
+| five fixed-M16 QKV tiles | 0.308608 ms |
+| Q/K norm, MRoPE, gate, index projection | 0.462752 ms |
+| state format and private fork | 0.032800 ms |
+| shared compressed-state score | 1.265660 ms |
+| fixed-K512 select | 0.584704 ms |
+| tensorized FP8 QK/PV | 1.072130 ms |
+| gate and five output tiles | 0.169792 ms |
+
+The score reads 268,435,456 B of compressed state per layer instead of 1,342,177,280 B. A 64-key gathered CTA shares one query load at K0. K4 groups five rows per sequence around one 16-key tile and corrects newly completed private compressed rows before score publication.
+
+All buckets use one caller stream with no host synchronization between M16 tiles. Two captured launches reproduced the output hash. Reset left active state unchanged. One accept published all 16 width-five prefixes and advanced the state generation once.
+
+| numeric check | largest result |
+| --- | ---: |
+| selected versus scalar output max absolute error | 0.00195312 |
+| selected versus scalar output mean absolute error | 4.01723e-06 |
+| graph replay hash mismatches | 0 |
+| state publication mismatches | 0 |
+
+**Verdict.** Accepted as the selected rank-local K4 QSA primitive from c1 through c16. This does not establish full-model token parity, accepted accuracy, prefill performance, or sustained serving throughput.
+
+**Next.**
+
+- Compose all 12 full-attention layers with authenticated K4 GDN and routed MoE.
+- Compare pinned model intermediates and generated tokens at c1 and c16.
+- Measure prefill and sustained decode across the full concurrency curve.
+
+**Reopen if.**
+
+- An SM121 compiler or attention library provides a faster exact grouped-query score and FP8-state path.
