@@ -71,6 +71,8 @@ struct MtpGraphRuntime::Impl {
     if (capture_stream) cudaStreamDestroy(capture_stream);
     if (head_handle) cublasDestroy(head_handle);
     cudaFree(arena.local_winners);
+    cudaFree(arena.rank_winners);
+    cudaFree(arena.proposal_tokens);
     cudaFree(arena.rank_logits);
     cudaFree(arena.token_hidden);
     cudaFree(arena.updated_multi_hidden);
@@ -131,6 +133,8 @@ MtpGraphRuntime::MtpGraphRuntime(GraphRuntimeBinding binding)
     allocate(&impl_->arena.rank_logits,
              16 * static_cast<std::size_t>(output::kLocalVocab));
     allocate(&impl_->arena.local_winners, 16);
+    allocate(&impl_->arena.rank_winners, 16 * output::kTpSize);
+    allocate(&impl_->arena.proposal_tokens, 16);
     check(cudaMemset(impl_->arena.token_hidden, 0,
                      16 * kFusionHidden * sizeof(__nv_bfloat16)),
           "initialize head warmup input");
@@ -242,6 +246,19 @@ void MtpGraphRuntime::launch_final_local(int m, cudaStream_t stream) {
   if (!stream) throw std::invalid_argument("MTP final-local stream changed");
   check(cudaGraphLaunch(impl_->final_local[bucket_index(m)], stream),
         "launch final local");
+}
+
+const std::int32_t* MtpGraphRuntime::enqueue_winner_exchange_and_greedy(
+    WinnerExchangePort& exchange, int m, cudaStream_t stream) {
+  if (!stream) throw std::invalid_argument("MTP winner-exchange stream changed");
+  bucket_index(m);
+  exchange.enqueue(impl_->arena.local_winners, impl_->arena.rank_winners, m,
+                   impl_->binding.rank, stream);
+  check(output::global_greedy(impl_->arena.rank_winners,
+                              impl_->arena.proposal_tokens, m, 0.0F, 1.0F,
+                              stream),
+        "launch global greedy");
+  return impl_->arena.proposal_tokens;
 }
 
 }  // namespace rocket::qwen38::mtp

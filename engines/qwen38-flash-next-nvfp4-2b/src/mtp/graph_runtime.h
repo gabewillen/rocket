@@ -53,6 +53,20 @@ struct GraphArenaView {
   __nv_bfloat16* token_hidden;
   float* rank_logits;
   output::Winner* local_winners;
+  output::Winner* rank_winners;
+  std::int32_t* proposal_tokens;
+};
+
+// A fabric implementation must enqueue a same-stream device-to-device
+// exchange and write [m,2] in rank0,rank1 order. It may not synchronize the
+// stream or expose host winner values. Throwing leaves proposal_tokens
+// unpublished and faults the enclosing decoder transaction.
+class WinnerExchangePort {
+ public:
+  virtual ~WinnerExchangePort() = default;
+  virtual void enqueue(const output::Winner* local,
+                       output::Winner* rank_ordered, int m, int rank,
+                       cudaStream_t stream) = 0;
 };
 
 // Owns fixed c16 storage and immutable CUDA graphs for the native non-QSA MTP
@@ -69,6 +83,8 @@ class MtpGraphRuntime final {
   void launch_input_local(int m, cudaStream_t stream);
   void launch_input_finish(int m, cudaStream_t stream);
   void launch_final_local(int m, cudaStream_t stream);
+  const std::int32_t* enqueue_winner_exchange_and_greedy(
+      WinnerExchangePort& exchange, int m, cudaStream_t stream);
 
  private:
   struct Impl;

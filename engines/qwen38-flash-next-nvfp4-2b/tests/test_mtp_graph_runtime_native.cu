@@ -25,6 +25,31 @@ std::uint64_t append(mtp::TensorExtent& extent, std::uint64_t offset,
   extent = {offset, bytes};
   return offset + bytes;
 }
+
+__global__ void order_winners(const rocket::qwen38::output::Winner* local,
+                              rocket::qwen38::output::Winner* ordered, int m,
+                              int rank, float peer_value) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= m) return;
+  ordered[row * 2 + rank] = local[row];
+  ordered[row * 2 + 1 - rank] =
+      {peer_value, (1 - rank) * rocket::qwen38::output::kLocalVocab};
+}
+
+class FakeWinnerExchange final : public mtp::WinnerExchangePort {
+ public:
+  explicit FakeWinnerExchange(float peer_value) : peer_value_(peer_value) {}
+  void enqueue(const rocket::qwen38::output::Winner* local,
+               rocket::qwen38::output::Winner* ordered, int m, int rank,
+               cudaStream_t stream) override {
+    if (fault_) throw std::runtime_error("injected winner exchange fault");
+    order_winners<<<(m + 31) / 32, 32, 0, stream>>>(local, ordered, m, rank,
+                                                    peer_value_);
+    cuda_check(cudaPeekAtLastError(), "enqueue fake winner exchange");
+  }
+  float peer_value_;
+  bool fault_ = false;
+};
 }  // namespace
 
 int main() {
@@ -95,6 +120,8 @@ int main() {
       runtime.launch_input_local(m, stream);
       runtime.launch_input_finish(m, stream);
       runtime.launch_final_local(m, stream);
+      FakeWinnerExchange ties(0.0F);
+      runtime.enqueue_winner_exchange_and_greedy(ties, m, stream);
       cuda_check(cudaStreamSynchronize(stream), "complete runtime graphs");
     }
     std::array<rocket::qwen38::output::Winner, 16> winners{};
@@ -104,7 +131,38 @@ int main() {
     for (const auto winner : winners)
       check(winner.token == 0 && winner.value == 0.0F,
             "zero-weight local winner drift");
-    std::printf("qwen38_mtp_graph_runtime graphs=input_local,input_finish,final_local buckets=1,16 result=match\n");
+    std::array<std::int32_t, 16> tokens{};
+    cuda_check(cudaMemcpy(tokens.data(), arena.proposal_tokens, sizeof(tokens),
+                          cudaMemcpyDeviceToHost),
+               "copy tie tokens");
+    for (const int token : tokens)
+      check(token == 0, "global greedy tie ordering drift");
+    FakeWinnerExchange better_peer(1.0F);
+    runtime.enqueue_winner_exchange_and_greedy(better_peer, 16, stream);
+    cuda_check(cudaStreamSynchronize(stream), "complete better-peer greedy");
+    cuda_check(cudaMemcpy(tokens.data(), arena.proposal_tokens, sizeof(tokens),
+                          cudaMemcpyDeviceToHost),
+               "copy better-peer tokens");
+    for (const int token : tokens)
+      check(token == rocket::qwen38::output::kLocalVocab,
+            "global greedy rank ordering drift");
+    cuda_check(cudaMemset(arena.proposal_tokens, 0xff, sizeof(tokens)),
+               "poison proposal tokens");
+    FakeWinnerExchange fault(0.0F);
+    fault.fault_ = true;
+    bool exchange_failed = false;
+    try {
+      runtime.enqueue_winner_exchange_and_greedy(fault, 16, stream);
+    } catch (const std::runtime_error&) {
+      exchange_failed = true;
+    }
+    check(exchange_failed, "winner exchange fault was accepted");
+    cuda_check(cudaMemcpy(tokens.data(), arena.proposal_tokens, sizeof(tokens),
+                          cudaMemcpyDeviceToHost),
+               "copy unpublished tokens");
+    for (const int token : tokens)
+      check(token == -1, "exchange fault published proposal tokens");
+    std::printf("qwen38_mtp_graph_runtime graphs=input_local,input_finish,final_local winner_exchange=device buckets=1,16 result=match\n");
     cudaStreamDestroy(stream);
     cudaFree(mtp_slab);
     cudaFree(target_slab);
