@@ -21,6 +21,63 @@ VLLM_READ_BYTES = 242_288_619_520
 IMAGE = "vllm/vllm-openai:qwen38-flash-next"
 CONTAINER_REPO = "/rocket"
 SCRIPT = "scripts/runtime/qwen38-cuda-slab-load.py"
+TOTAL_READY_STAGES = (
+    "weights_loaded",
+    "allocations_complete",
+    "kernels_initialized",
+    "graphs_captured",
+    "scheduler_ready",
+    "api_ready",
+    "first_token_generated",
+)
+
+
+def total_cold_start_status(
+    process_exec_started_ns: int,
+    stage_completed_ns: dict[str, int],
+    first_token_id: int | None,
+) -> dict[str, object]:
+    """Validate the total cold-start terminal boundary without inventing readiness."""
+
+    if (
+        isinstance(process_exec_started_ns, bool)
+        or not isinstance(process_exec_started_ns, int)
+        or process_exec_started_ns <= 0
+        or set(stage_completed_ns) - set(TOTAL_READY_STAGES)
+    ):
+        raise ValueError("invalid total cold-start evidence")
+    for stage, completed_ns in stage_completed_ns.items():
+        if (
+            isinstance(completed_ns, bool)
+            or not isinstance(completed_ns, int)
+            or completed_ns < process_exec_started_ns
+        ):
+            raise ValueError(f"invalid monotonic timestamp for {stage}")
+    if first_token_id is not None and (
+        isinstance(first_token_id, bool)
+        or not isinstance(first_token_id, int)
+        or first_token_id < 0
+    ):
+        raise ValueError("invalid first generated token")
+    missing_values = [
+        stage for stage in TOTAL_READY_STAGES if stage not in stage_completed_ns
+    ]
+    if first_token_id is None:
+        missing_values.append("first_token_id")
+    missing = tuple(missing_values)
+    first_token_ns = stage_completed_ns.get("first_token_generated")
+    complete = not missing
+    if complete and first_token_ns != max(stage_completed_ns.values()):
+        raise ValueError("first token is not the terminal cold-start event")
+    return {
+        "status": "complete" if complete else "incomplete_engine",
+        "process_exec_started_ns": process_exec_started_ns,
+        "first_token_completed_ns": first_token_ns if complete else None,
+        "first_token_id": first_token_id if complete else None,
+        "total_cold_load_ns": first_token_ns - process_exec_started_ns if complete else None,
+        "missing_evidence": missing,
+        "comparison_scope_match": complete,
+    }
 
 
 class Owner:
@@ -34,6 +91,19 @@ class Owner:
             raise RuntimeError("rank slab publication contract changed")
         self.slabs = slabs
         self.publish_ns = time.perf_counter_ns()
+
+
+def stage_summary(receipt) -> dict[str, int]:
+    chunks = receipt.chunks
+    return {
+        "chunks": len(chunks),
+        "direct_read_ns_sum": sum(chunk.direct_read_ns for chunk in chunks),
+        "direct_read_ns_max": max(chunk.direct_read_ns for chunk in chunks),
+        "sha256_ns_sum": sum(chunk.sha256_ns for chunk in chunks),
+        "sha256_ns_max": max(chunk.sha256_ns for chunk in chunks),
+        "h2d_fence_ns_sum": sum(chunk.h2d_fence_ns for chunk in chunks),
+        "h2d_fence_ns_max": max(chunk.h2d_fence_ns for chunk in chunks),
+    }
 
 
 def verify(rank: int, artifact: Path) -> dict[str, object]:
@@ -63,7 +133,7 @@ def verify(rank: int, artifact: Path) -> dict[str, object]:
 
 def load(rank: int, artifact: Path, device: str) -> dict[str, object]:
     import torch
-    from opentelemetry import trace
+    from opentelemetry import metrics, trace
 
     tracer = trace.get_tracer("rocket.qwen38.cuda_slab_loader")
     owner = Owner()
@@ -73,7 +143,7 @@ def load(rank: int, artifact: Path, device: str) -> dict[str, object]:
         raise RuntimeError("owner-local target or MTP slab is absent")
     payload_bytes = target.stat().st_size + mtp.stat().st_size
     free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
-    staging_bytes = 4 * 256 * 1024**2
+    staging_bytes = 6 * 256 * 1024**2
     required_bytes = payload_bytes + staging_bytes + 2 * 1024**3
     if free_bytes < required_bytes:
         raise RuntimeError(
@@ -84,6 +154,7 @@ def load(rank: int, artifact: Path, device: str) -> dict[str, object]:
         rank=rank,
         owner=owner,
         tracer=tracer,
+        meter=metrics.get_meter("rocket.qwen38.cuda_slab_loader"),
         torch_api=torch,
         device=device,
     )
@@ -108,8 +179,10 @@ def load(rank: int, artifact: Path, device: str) -> dict[str, object]:
         "h2d_copies": receipt.target.h2d_copies + receipt.mtp.h2d_copies,
         "target_started_ns": receipt.target.started_ns,
         "target_completed_ns": receipt.target.completed_ns,
+        "target_stages": stage_summary(receipt.target),
         "mtp_started_ns": receipt.mtp.started_ns,
         "mtp_completed_ns": receipt.mtp.completed_ns,
+        "mtp_stages": stage_summary(receipt.mtp),
         "reader_overlap_ns": receipt.reader_overlap_ns,
         "allocation_ns": receipt.allocation_ns,
         "publish_ns": receipt.publish_ns,
@@ -167,6 +240,7 @@ def coordinate(repo: Path, artifact: Path, image: str, remote: str) -> dict[str,
     ranks = tuple(item[0] for item in collected)
     aggregate_bytes = sum(int(item["bytes_read"]) for item in ranks)
     elapsed_ns = max(completed) - coordinator_started_ns
+    total_status = total_cold_start_status(coordinator_started_ns, {}, None)
     return {
         "result": "qwen38_two_node_cuda_slab_load",
         "clock": "time.perf_counter_ns on coordinator",
@@ -174,13 +248,16 @@ def coordinate(repo: Path, artifact: Path, image: str, remote: str) -> dict[str,
         "aggregate_bytes_read": aggregate_bytes,
         "aggregate_h2d_bytes": sum(int(item["h2d_bytes"]) for item in ranks),
         "rank_process_overlap_ns": min(completed) - coordinator_started_ns,
-        "load_to_both_published_ns": elapsed_ns,
+        "subphase_load_to_both_published_ns": elapsed_ns,
         "aggregate_effective_gbps": aggregate_bytes / elapsed_ns,
-        "comparison_vllm_model_ready_seconds": BASELINE_MODEL_READY_SECONDS,
-        "comparison_vllm_process_read_bytes": VLLM_READ_BYTES,
-        "comparison_checkpoint_bytes": CHECKPOINT_BYTES,
-        "comparison_vllm_read_amplification": VLLM_READ_BYTES / CHECKPOINT_BYTES,
-        "speedup_claimed": False,
+        "total_cold_start": total_status,
+        "comparison": {
+            "vllm_model_ready_seconds": BASELINE_MODEL_READY_SECONDS,
+            "vllm_process_read_bytes": VLLM_READ_BYTES,
+            "checkpoint_bytes": CHECKPOINT_BYTES,
+            "vllm_read_amplification": VLLM_READ_BYTES / CHECKPOINT_BYTES,
+            "speedup_claimed": False,
+        },
     }
 
 

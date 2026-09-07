@@ -23,7 +23,8 @@ from typing import Mapping, Protocol
 from .contract import PINNED_CONTRACT, SlabContract
 from .loader import DirectSlabLoader, OtelTracer, SlabDescriptor
 
-_PIPELINE_SLOTS = 2
+_TARGET_PIPELINE_SLOTS = 4
+_MTP_PIPELINE_SLOTS = 2
 _RANKS = (0, 1)
 
 
@@ -74,6 +75,25 @@ class RankSlabOwner(Protocol):
     def publish_rank_slabs(self, rank: int, slabs: Mapping[str, _Tensor]) -> None: ...
 
 
+class _Metric(Protocol):
+    def add(self, amount: int, attributes: Mapping[str, str | int]) -> None: ...
+    def record(self, amount: int, attributes: Mapping[str, str | int]) -> None: ...
+
+
+class OtelMeter(Protocol):
+    def create_counter(self, name: str, *, unit: str) -> _Metric: ...
+    def create_histogram(self, name: str, *, unit: str) -> _Metric: ...
+
+
+@dataclass(frozen=True)
+class ChunkTransferReceipt:
+    index: int
+    bytes: int
+    direct_read_ns: int
+    sha256_ns: int
+    h2d_fence_ns: int
+
+
 @dataclass(frozen=True)
 class SlabTransferReceipt:
     key: str
@@ -83,6 +103,7 @@ class SlabTransferReceipt:
     h2d_copies: int
     started_ns: int
     completed_ns: int
+    chunks: tuple[ChunkTransferReceipt, ...]
 
 
 @dataclass(frozen=True)
@@ -115,24 +136,24 @@ class LoadedRankSlabs:
 
 @dataclass
 class _Pipeline:
-    stream: _Stream
-    slots: tuple[_Tensor, _Tensor]
-    views: tuple[memoryview, memoryview]
-    events: tuple[_Event, _Event]
+    slots: tuple[_Tensor, ...]
+    views: tuple[memoryview, ...]
+    streams: tuple[_Stream, ...]
+    events: tuple[_Event, ...]
 
 
 class CudaRankSlabLoader:
     """Non-reentrant owner-local loader for one fixed TP rank.
 
     The artifact and destination tensors are borrowed until ``load`` returns.
-    The loader owns two 2-slot pinned rings and two CUDA streams for that call.
+    The loader owns a 4-slot target ring and 2-slot MTP ring for that call.
     Failure drains both streams and publishes nothing. Calls are not thread-safe.
 
-    OTEL cardinality is bounded: ``rank`` has 2 values, ``outcome`` has 2,
-    ``io.direct`` is boolean, and the span name is fixed, for at most 8 series.
-    Exact byte/copy counters and monotonic clocks are returned in the receipt,
-    not attached as attributes. No path, digest, tensor name, request id, byte
-    count, or timestamp is attached as an attribute.
+    OTEL cardinality is bounded: span dimensions produce at most 8 series.
+    Post-publication stage histograms use rank(2) x slab kind(2) x stage(3) =
+    12 series; byte/copy counters use rank(2) x kind(2) x direction(2) = 8.
+    Measurements do not create series. No path, digest, tensor name, request id,
+    byte count, duration, or timestamp is used as an attribute.
     """
 
     def __init__(
@@ -142,6 +163,7 @@ class CudaRankSlabLoader:
         rank: int,
         owner: RankSlabOwner,
         tracer: OtelTracer,
+        meter: OtelMeter,
         torch_api: _Torch,
         device: str,
         contract: SlabContract = PINNED_CONTRACT,
@@ -152,6 +174,8 @@ class CudaRankSlabLoader:
             raise CudaSlabLoadError("rank slab owner contract is incomplete")
         if tracer is None:
             raise CudaSlabLoadError("an OpenTelemetry tracer is required")
+        if meter is None:
+            raise CudaSlabLoadError("an OpenTelemetry meter is required")
         if torch_api is None or not torch_api.cuda.is_available():
             raise CudaSlabLoadError("Torch CUDA is unavailable")
         if not isinstance(device, str) or not device.startswith("cuda:"):
@@ -159,6 +183,15 @@ class CudaRankSlabLoader:
         self._rank = rank
         self._owner = owner
         self._tracer = tracer
+        self._stage_duration = meter.create_histogram(
+            "rocket.qwen38.rank_slab.stage.duration", unit="ns"
+        )
+        self._byte_counter = meter.create_counter(
+            "rocket.qwen38.rank_slab.transfer", unit="By"
+        )
+        self._copy_counter = meter.create_counter(
+            "rocket.qwen38.rank_slab.copy", unit="{copy}"
+        )
         self._torch = torch_api
         self._device = device
         self._contract = contract
@@ -227,6 +260,7 @@ class CudaRankSlabLoader:
                         - max(receipts[0].started_ns, receipts[1].started_ns),
                     ),
                 )
+                self._record_metrics(receipt)
                 span.set_attribute("outcome", "success")
                 return LoadedRankSlabs(published, receipt)
             except BaseException as exc:
@@ -236,11 +270,49 @@ class CudaRankSlabLoader:
                     raise
                 raise CudaSlabLoadError("rank slab load failed before publication") from exc
 
+    def _record_metrics(self, receipt: RankLoadReceipt) -> None:
+        """Record bounded metrics after publication, outside load-to-publish."""
+
+        try:
+            for slab in (receipt.target, receipt.mtp):
+                kind = "target" if slab.key.endswith("-target") else "mtp"
+                base = {"rank": self._rank, "slab.kind": kind}
+                self._byte_counter.add(
+                    slab.bytes_read, {**base, "direction": "direct_read"}
+                )
+                self._byte_counter.add(
+                    slab.h2d_bytes, {**base, "direction": "h2d"}
+                )
+                self._copy_counter.add(
+                    slab.direct_reads, {**base, "direction": "direct_read"}
+                )
+                self._copy_counter.add(
+                    slab.h2d_copies, {**base, "direction": "h2d"}
+                )
+                for chunk in slab.chunks:
+                    self._stage_duration.record(
+                        chunk.direct_read_ns, {**base, "stage": "direct_read"}
+                    )
+                    self._stage_duration.record(
+                        chunk.sha256_ns, {**base, "stage": "sha256"}
+                    )
+                    self._stage_duration.record(
+                        chunk.h2d_fence_ns, {**base, "stage": "h2d_fence"}
+                    )
+        except Exception:
+            # Telemetry is outside the publication boundary and cannot revoke it.
+            return
+
     def _pipeline(self, descriptor: SlabDescriptor) -> _Pipeline:
         slot_bytes = max(chunk.length_bytes for chunk in descriptor.chunks)
+        slot_count = (
+            _TARGET_PIPELINE_SLOTS
+            if descriptor.key.endswith("-target")
+            else _MTP_PIPELINE_SLOTS
+        )
         slots: list[_Tensor] = []
         views: list[memoryview] = []
-        for _ in range(_PIPELINE_SLOTS):
+        for _ in range(slot_count):
             raw = self._torch.empty(
                 slot_bytes + self._contract.page_bytes,
                 dtype=self._torch.uint8,
@@ -254,10 +326,47 @@ class CudaRankSlabLoader:
             slots.append(slot)
             views.append(memoryview(slot.numpy()))
         return _Pipeline(
-            stream=self._torch.cuda.Stream(device=self._device),
-            slots=(slots[0], slots[1]),
-            views=(views[0], views[1]),
-            events=(self._torch.cuda.Event(), self._torch.cuda.Event()),
+            slots=tuple(slots),
+            views=tuple(views),
+            streams=tuple(
+                self._torch.cuda.Stream(device=self._device)
+                for _ in range(slot_count)
+            ),
+            events=tuple(self._torch.cuda.Event() for _ in range(slot_count)),
+        )
+
+    def _authenticate_and_copy(
+        self,
+        *,
+        chunk_index: int,
+        chunk_bytes: int,
+        expected_sha256: str,
+        view: memoryview,
+        destination: _Tensor,
+        destination_offset: int,
+        slot: _Tensor,
+        stream: _Stream,
+        event: _Event,
+        direct_read_ns: int,
+    ) -> ChunkTransferReceipt:
+        sha_started = time.perf_counter_ns()
+        observed_sha256 = hashlib.sha256(view).hexdigest()
+        sha256_ns = time.perf_counter_ns() - sha_started
+        if observed_sha256 != expected_sha256:
+            raise CudaSlabLoadError("rank slab chunk digest changed")
+        h2d_started = time.perf_counter_ns()
+        with self._torch.cuda.stream(stream):
+            destination.narrow(0, destination_offset, chunk_bytes).copy_(
+                slot.narrow(0, 0, chunk_bytes), non_blocking=True
+            )
+            event.record(stream)
+        event.synchronize()
+        return ChunkTransferReceipt(
+            index=chunk_index,
+            bytes=chunk_bytes,
+            direct_read_ns=direct_read_ns,
+            sha256_ns=sha256_ns,
+            h2d_fence_ns=time.perf_counter_ns() - h2d_started,
         )
 
     def _load_one(
@@ -266,7 +375,9 @@ class CudaRankSlabLoader:
         started_ns = time.perf_counter_ns()
         fd = -1
         reads = 0
-        copies = 0
+        chunk_receipts: list[ChunkTransferReceipt | None] = [
+            None for _ in descriptor.chunks
+        ]
         try:
             flags = getattr(os, "O_DIRECT", None)
             if flags is None:
@@ -274,40 +385,69 @@ class CudaRankSlabLoader:
             fd = os.open(descriptor.path, os.O_RDONLY | os.O_NOFOLLOW | flags)
             if os.fstat(fd).st_size != descriptor.bytes:
                 raise CudaSlabLoadError("rank slab byte count changed after validation")
-            for index, chunk in enumerate(descriptor.chunks):
-                slot_index = index % _PIPELINE_SLOTS
-                if index >= _PIPELINE_SLOTS:
-                    pipeline.events[slot_index].synchronize()
-                view = pipeline.views[slot_index][:chunk.length_bytes]
-                count = os.preadv(fd, [view], chunk.offset_bytes)
-                reads += 1
-                if count != chunk.length_bytes:
-                    raise CudaSlabLoadError("short O_DIRECT rank slab read")
-                if hashlib.sha256(view).hexdigest() != chunk.sha256:
-                    raise CudaSlabLoadError("rank slab chunk digest changed")
-                with self._torch.cuda.stream(pipeline.stream):
-                    destination.narrow(0, chunk.offset_bytes, chunk.length_bytes).copy_(
-                        pipeline.slots[slot_index].narrow(0, 0, chunk.length_bytes),
-                        non_blocking=True,
+            pending = [None for _ in pipeline.slots]
+            with ThreadPoolExecutor(
+                max_workers=len(pipeline.slots),
+                thread_name_prefix=f"{descriptor.key}-auth",
+            ) as pool:
+                for index, chunk in enumerate(descriptor.chunks):
+                    slot_index = index % len(pipeline.slots)
+                    previous = pending[slot_index]
+                    if previous is not None:
+                        previous_index, future = previous
+                        chunk_receipts[previous_index] = future.result()
+                    view = pipeline.views[slot_index][:chunk.length_bytes]
+                    read_started = time.perf_counter_ns()
+                    count = os.preadv(fd, [view], chunk.offset_bytes)
+                    direct_read_ns = time.perf_counter_ns() - read_started
+                    reads += 1
+                    if count != chunk.length_bytes:
+                        raise CudaSlabLoadError("short O_DIRECT rank slab read")
+                    pending[slot_index] = (
+                        index,
+                        pool.submit(
+                            self._authenticate_and_copy,
+                            chunk_index=index,
+                            chunk_bytes=chunk.length_bytes,
+                            expected_sha256=chunk.sha256,
+                            view=view,
+                            destination=destination,
+                            destination_offset=chunk.offset_bytes,
+                            slot=pipeline.slots[slot_index],
+                            stream=pipeline.streams[slot_index],
+                            event=pipeline.events[slot_index],
+                            direct_read_ns=direct_read_ns,
+                        ),
                     )
-                    pipeline.events[slot_index].record(pipeline.stream)
-                copies += 1
+                for previous in pending:
+                    if previous is not None:
+                        previous_index, future = previous
+                        chunk_receipts[previous_index] = future.result()
         except OSError as exc:
             raise CudaSlabLoadError("O_DIRECT rank slab read failed") from exc
         finally:
             if fd >= 0:
                 os.close(fd)
-            try:
-                pipeline.stream.synchronize()
-            except BaseException as exc:
-                raise CudaSlabLoadError("CUDA slab copy stream could not be fenced") from exc
+            for stream in pipeline.streams:
+                try:
+                    stream.synchronize()
+                except BaseException as exc:
+                    raise CudaSlabLoadError(
+                        "CUDA slab copy stream could not be fenced"
+                    ) from exc
         completed_ns = time.perf_counter_ns()
+        if any(receipt is None for receipt in chunk_receipts):
+            raise CudaSlabLoadError("rank slab chunk pipeline did not drain")
+        completed_chunks = tuple(
+            receipt for receipt in chunk_receipts if receipt is not None
+        )
         return SlabTransferReceipt(
             key=descriptor.key,
             bytes_read=descriptor.bytes,
             h2d_bytes=descriptor.bytes,
             direct_reads=reads,
-            h2d_copies=copies,
+            h2d_copies=len(completed_chunks),
             started_ns=started_ns,
             completed_ns=completed_ns,
+            chunks=completed_chunks,
         )

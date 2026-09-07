@@ -12,6 +12,8 @@ from test_stage_a import Fixture, Tracer
 
 
 class FakeTensor:
+    copies = 0
+
     def __init__(self, backing: bytearray, offset: int, length: int):
         self.backing = backing
         self.offset = offset
@@ -31,6 +33,7 @@ class FakeTensor:
         self.backing[self.offset:self.offset + self.length] = (
             source.backing[source.offset:source.offset + source.length]
         )
+        type(self).copies += 1
         return self
 
     def numpy(self):
@@ -96,6 +99,22 @@ class Owner:
         self.calls.append((rank, dict(slabs)))
 
 
+class Metric:
+    def __init__(self, name, records): self.name = name; self.records = records
+    def add(self, amount, attributes): self.records.append((self.name, amount, dict(attributes)))
+    def record(self, amount, attributes): self.records.append((self.name, amount, dict(attributes)))
+
+
+class Meter:
+    def __init__(self): self.records = []
+    def create_counter(self, name, *, unit):
+        self.records.append(("created", name, unit))
+        return Metric(name, self.records)
+    def create_histogram(self, name, *, unit):
+        self.records.append(("created", name, unit))
+        return Metric(name, self.records)
+
+
 class BarrierLoader(CudaRankSlabLoader):
     def __init__(self, *args, **kwargs):
         self.barrier = threading.Barrier(2)
@@ -113,8 +132,10 @@ class CudaRankSlabLoaderTests(unittest.TestCase):
         self.fixture = Fixture(Path(self.temp.name))
         self.artifact = self.fixture.build()
         self.torch = FakeTorch()
+        FakeTensor.copies = 0
         self.owner = Owner(self.torch)
         self.tracer = Tracer()
+        self.meter = Meter()
 
     def tearDown(self): self.temp.cleanup()
 
@@ -124,6 +145,7 @@ class CudaRankSlabLoaderTests(unittest.TestCase):
             rank=0,
             owner=self.owner,
             tracer=self.tracer,
+            meter=self.meter,
             torch_api=self.torch,
             device="cuda:0",
             contract=self.fixture.contract,
@@ -148,6 +170,11 @@ class CudaRankSlabLoaderTests(unittest.TestCase):
         self.assertEqual(loaded.receipt.mtp.direct_reads, 1)
         self.assertEqual(loaded.receipt.target.h2d_copies, 1)
         self.assertEqual(loaded.receipt.mtp.h2d_copies, 1)
+        self.assertEqual(FakeTensor.copies, 2)
+        self.assertEqual(loaded.receipt.target.chunks[0].bytes, 65_536)
+        self.assertGreater(loaded.receipt.target.chunks[0].direct_read_ns, 0)
+        self.assertGreater(loaded.receipt.target.chunks[0].sha256_ns, 0)
+        self.assertGreater(loaded.receipt.target.chunks[0].h2d_fence_ns, 0)
         self.assertGreater(loaded.receipt.reader_overlap_ns, 0)
         for key, tensor in loaded.slabs.items():
             self.assertEqual(tensor.bytes(), (self.artifact / f"{key}.slab").read_bytes())
@@ -158,6 +185,15 @@ class CudaRankSlabLoaderTests(unittest.TestCase):
             {"rank", "io.direct", "outcome"},
         )
         self.assertEqual(span.attributes["outcome"], "success")
+        measurements = [record for record in self.meter.records if record[0] != "created"]
+        self.assertEqual(len(measurements), 14)
+        self.assertEqual(
+            {frozenset(record[2]) for record in measurements},
+            {
+                frozenset(("rank", "slab.kind", "direction")),
+                frozenset(("rank", "slab.kind", "stage")),
+            },
+        )
 
     def test_digest_failure_drains_both_streams_and_never_publishes(self):
         path = self.artifact / "rank0-mtp.slab"
@@ -168,19 +204,22 @@ class CudaRankSlabLoaderTests(unittest.TestCase):
         with self.assertRaisesRegex(CudaSlabLoadError, "digest"):
             self.loader().load()
         self.assertEqual(self.owner.calls, [])
-        self.assertEqual(len(self.torch.cuda.streams), 2)
+        self.assertEqual(len(self.torch.cuda.streams), 6)
         self.assertTrue(all(stream.synchronized for stream in self.torch.cuda.streams))
+        self.assertEqual(FakeTensor.copies, 1)
         self.assertEqual(self.tracer.spans[-1].attributes["outcome"], "failure")
 
     def test_rank_and_owner_contracts_fail_closed(self):
         with self.assertRaisesRegex(CudaSlabLoadError, "rank"):
             CudaRankSlabLoader(
                 self.artifact, rank=2, owner=self.owner, tracer=self.tracer,
+                meter=self.meter,
                 torch_api=self.torch, device="cuda:0", contract=self.fixture.contract,
             )
         with self.assertRaisesRegex(CudaSlabLoadError, "owner"):
             CudaRankSlabLoader(
                 self.artifact, rank=0, owner=None, tracer=self.tracer,
+                meter=self.meter,
                 torch_api=self.torch, device="cuda:0", contract=self.fixture.contract,
             )
 
