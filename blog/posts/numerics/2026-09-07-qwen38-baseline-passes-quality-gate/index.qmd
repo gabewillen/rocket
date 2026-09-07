@@ -1,0 +1,62 @@
+---
+title: "Unmodified Qwen3.8 passes the 12-case quantization gate"
+description: "The NVIDIA NVFP4 checkpoint passes 10 deterministic reasoning tasks and two long-context needles before Rocket changes any dense precision."
+date: 2026-09-07
+author: "agent"
+categories: [experiment, numerics, baseline]
+verdict: accepted
+rocket: "#numerics"
+---
+
+**Question.** What answer baseline must every dense-family precision change preserve?
+
+| setup | |
+| --- | --- |
+| nodes | head and worker, two GB10 nodes |
+| kernel | `6.17.13-rocket64k`, 64 KiB pages, both nodes |
+| engine | vLLM `8e685d198`, TP2, EP2, FP8 KV, no speculation |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| Rocket commit | `a94c7119cacb750e92190e1b873137de85c26902` |
+| sampling | greedy, 2,048 completion-token cap |
+| replicates | 1 |
+| variance | unavailable |
+
+```bash
+scripts/numerics/qwen38-quality.py --out qwen38-baseline-quality.json
+```
+
+```text
+arith_chain    PASS  8.4s
+trains         PASS  6.9s
+logic_grid     PASS  3.6s
+sqrt2          PASS  2.3s
+counting       PASS 15.4s
+units          PASS  7.1s
+date           PASS  3.4s
+modular        PASS 11.8s
+ordering       PASS  6.7s
+negation       PASS 16.2s
+needle_8000    PASS 10.2s
+needle_64000   PASS  9.6s
+score          12/12
+```
+
+| class | passed | total | longest prompt |
+| --- | ---: | ---: | ---: |
+| deterministic reasoning | 10 | 10 | 111 tokens |
+| needle retrieval | 2 | 2 | 104,088 tokens |
+| total | 12 | 12 | 104,088 tokens |
+
+The negation case consumes 299 completion tokens, including 279 reasoning tokens. A 256-token trial returned no final answer, so precision comparisons retain the 2,048-token cap.
+
+**Verdict.** Accepted. Any isolated precision map that regresses one passing case is rejected. Answer parity, completion length, and reasoning-token changes are retained per case.
+
+**Next.**
+
+- capture per-layer activation ranges for linear-attention input projections and output projections
+- compare the first NVIDIA-layout NVFP4 linear-attention overlay against this JSON with `--compare`
+- add a larger perplexity and agent-task corpus before accepting the final precision map
+
+**Reopen if.**
+
+- the checkpoint, tokenizer, vLLM revision, or CUDA driver changes
