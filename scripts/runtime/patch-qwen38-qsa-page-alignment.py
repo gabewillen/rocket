@@ -13,7 +13,7 @@ ANCHOR = """            if model_config.use_mla:
                 # multiple of 128 so split kernel blocks keep that invariant.
                 kernel_block_alignment_size = max(kernel_block_alignment_size, 128)
 """
-PATCH = ANCHOR + MARKER + """            if model_config.hf_text_config.model_type == "qwen3_8_flash_next":
+PATCH = ANCHOR + MARKER + """            if model_config.hf_text_config.model_type == "qwen4_exp_text":
                 # QSA keeps an open compression group plus every speculative
                 # row until acceptance. Include that whole-group ring in the
                 # same LCM used to size the hybrid attention/Mamba page.

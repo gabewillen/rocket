@@ -29,6 +29,12 @@ class QsaPageAlignmentPatchTests(unittest.TestCase):
         return result, platform_py
 
     def test_original_k5_failure_becomes_aligned_without_changing_ring(self) -> None:
+        # The served Qwen3.8 checkpoint identifies its text config with the
+        # upstream internal model type, not its public architecture name.
+        pinned_text_model_type = "qwen4_exp_text"
+        self.assertNotEqual(pinned_text_model_type, "qwen3_8_flash_next")
+        self.assertEqual(pinned_text_model_type, "qwen4_exp_text")
+
         required_tokens = 3232
         compression_ratio = 4
         speculative_tokens = 5
@@ -55,6 +61,9 @@ class QsaPageAlignmentPatchTests(unittest.TestCase):
         patched = platform_py.read_text()
         compile(patched, str(platform_py), "exec")
         self.assertEqual(patched.count("ROCKET_QWEN38_QSA_PAGE_ALIGNMENT_V1"), 1)
+        self.assertIn(
+            'model_config.hf_text_config.model_type == "qwen4_exp_text"', patched
+        )
         self.assertIn("qsa_capacity = compress_ratio * cdiv", patched)
         self.assertIn("kernel_block_alignment_size, qsa_capacity", patched)
 
