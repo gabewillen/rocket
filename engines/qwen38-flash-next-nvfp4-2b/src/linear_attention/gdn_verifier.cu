@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Model-specific speculative state fork for Qwen3.8 GDN. The prefix snapshots
-// remove the general-engine rollback and token-replay paths from publication.
+// Model-specific speculative state fork for Qwen3.8 GDN. Verification keeps
+// recurrent tiles register-resident; publication replays only accepted tokens.
 #include "linear_attention/gdn_verifier.h"
 
 #include <cuda_bf16.h>
@@ -24,50 +24,6 @@ void cuda_check(cudaError_t status, const char* operation) {
     throw std::runtime_error(std::string(operation) + ": " +
                              cudaGetErrorString(status));
   }
-}
-
-template <typename T>
-__global__ void gather_slots(const T* source, T* destination,
-                             const std::int32_t* source_slots,
-                             std::size_t slot_stride, int sequences) {
-  const std::size_t index =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const std::size_t count = static_cast<std::size_t>(sequences) * slot_stride;
-  if (index >= count) return;
-  const int sequence = static_cast<int>(index / slot_stride);
-  const std::size_t element = index % slot_stride;
-  const int source_slot = source_slots[sequence];
-  if (source_slot > 0) {
-    destination[static_cast<std::size_t>(sequence + 1) * slot_stride + element] =
-        source[static_cast<std::size_t>(source_slot) * slot_stride + element];
-  } else {
-    destination[static_cast<std::size_t>(sequence + 1) * slot_stride + element] =
-        T{};
-  }
-}
-
-template <typename T>
-__global__ void publish_prefixes(const T* snapshots, T* accepted_state,
-                                 const std::int32_t* accepted_slots,
-                                 const std::int32_t* accepted_prefixes,
-                                 std::size_t slot_stride, int sequences,
-                                 int verify_width, int state_pool_slots) {
-  const std::size_t index =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const std::size_t count = static_cast<std::size_t>(sequences) * slot_stride;
-  if (index >= count) return;
-  const int sequence = static_cast<int>(index / slot_stride);
-  const std::size_t element = index % slot_stride;
-  const int prefix = accepted_prefixes[sequence];
-  const int slot = accepted_slots[sequence];
-  if (prefix <= 0 || prefix > verify_width || slot <= 0 ||
-      slot >= state_pool_slots) {
-    return;
-  }
-  const std::size_t snapshot =
-      (static_cast<std::size_t>(prefix - 1) * kMaxRows + sequence) * slot_stride;
-  accepted_state[static_cast<std::size_t>(slot) * slot_stride + element] =
-      snapshots[snapshot + element];
 }
 
 std::uint64_t elapsed_ns(std::chrono::steady_clock::time_point begin) noexcept {
@@ -94,14 +50,11 @@ struct GdnVerifier::Impl {
   __nv_bfloat16* accepted_conv = nullptr;
   float* accepted_recurrent = nullptr;
   const std::int32_t* accepted_slots = nullptr;
-  __nv_bfloat16* dense_conv = nullptr;
-  float* dense_recurrent = nullptr;
-  __nv_bfloat16* prefix_conv = nullptr;
-  float* prefix_recurrent = nullptr;
   __nv_bfloat16* compact_input = nullptr;
   __nv_bfloat16* output = nullptr;
   std::int32_t* accepted_prefixes = nullptr;
   std::uint64_t stage_bytes = 0;
+  std::uint64_t accept_bytes = 0;
   cudaStream_t bound_stream = nullptr;
 
   void emit(std::string_view stage, pair_reduce::Outcome outcome,
@@ -126,21 +79,6 @@ GdnVerifier::GdnVerifier(int device, CutlassGdnGraph& graph,
   }
   try {
     cuda_check(cudaSetDevice(device), "cudaSetDevice");
-    cuda_check(cudaMalloc(&impl_->dense_conv,
-                          (kMaxRows + 1ULL) * kConvStride *
-                              sizeof(__nv_bfloat16)),
-               "malloc verifier convolution fork");
-    cuda_check(cudaMalloc(&impl_->dense_recurrent,
-                          (kMaxRows + 1ULL) * kRecurrentStride * sizeof(float)),
-               "malloc verifier recurrent fork");
-    cuda_check(cudaMalloc(&impl_->prefix_conv,
-                          kMaxVerifyWidth * kMaxRows * kConvStride *
-                              sizeof(__nv_bfloat16)),
-               "malloc verifier convolution prefixes");
-    cuda_check(cudaMalloc(&impl_->prefix_recurrent,
-                          kMaxVerifyWidth * kMaxRows * kRecurrentStride *
-                              sizeof(float)),
-               "malloc verifier recurrent prefixes");
     cuda_check(cudaMalloc(&impl_->compact_input,
                           kMaxVerifyRows * kHidden * sizeof(__nv_bfloat16)),
                "malloc verifier compact input");
@@ -162,10 +100,6 @@ GdnVerifier::~GdnVerifier() {
   cudaFree(impl_->accepted_prefixes);
   cudaFree(impl_->output);
   cudaFree(impl_->compact_input);
-  cudaFree(impl_->prefix_recurrent);
-  cudaFree(impl_->prefix_conv);
-  cudaFree(impl_->dense_recurrent);
-  cudaFree(impl_->dense_conv);
   delete impl_;
 }
 
@@ -186,22 +120,13 @@ void GdnVerifier::stage(const __nv_bfloat16* input,
     throw std::invalid_argument("GDN verifier stage contract changed");
   }
   impl_->shape = shape;
+  impl_->accept_bytes = 0;
   impl_->bound_stream = stream;
   impl_->accepted_conv = accepted_conv;
   impl_->accepted_recurrent = accepted_recurrent;
   impl_->accepted_slots = accepted_slots;
   try {
     cuda_check(cudaSetDevice(impl_->device), "cudaSetDevice");
-    const std::size_t conv_count =
-        static_cast<std::size_t>(shape.sequences) * kConvStride;
-    const std::size_t recurrent_count =
-        static_cast<std::size_t>(shape.sequences) * kRecurrentStride;
-    gather_slots<<<(conv_count + 255) / 256, 256, 0, stream>>>(
-        accepted_conv, impl_->dense_conv, accepted_slots, kConvStride,
-        shape.sequences);
-    gather_slots<<<(recurrent_count + 255) / 256, 256, 0, stream>>>(
-        accepted_recurrent, impl_->dense_recurrent, accepted_slots,
-        kRecurrentStride, shape.sequences);
     cuda_check(cudaMemsetAsync(impl_->compact_input, 0,
                                kMaxVerifyRows * kHidden *
                                    sizeof(__nv_bfloat16),
@@ -214,9 +139,8 @@ void GdnVerifier::stage(const __nv_bfloat16* input,
                    cudaMemcpyDeviceToDevice, stream),
                "compact verifier rows");
     impl_->graph.launch_verifier(
-        impl_->compact_input, impl_->dense_conv, impl_->dense_recurrent,
-        impl_->prefix_conv, impl_->prefix_recurrent, shape.sequences,
-        shape.verify_width, stream);
+        impl_->compact_input, accepted_conv, accepted_recurrent,
+        accepted_slots, shape.sequences, shape.verify_width, stream);
     cuda_check(cudaMemcpyAsync(
                    impl_->output, impl_->graph.verifier_output(),
                    static_cast<std::size_t>(shape.token_rows()) * kHidden *
@@ -231,10 +155,9 @@ void GdnVerifier::stage(const __nv_bfloat16* input,
     constexpr std::uint64_t weight_bytes =
         static_cast<std::uint64_t>(8'240 + 48) * 2'560 * 9 / 16 +
         static_cast<std::uint64_t>(2'560) * 3'072 * 9 / 16 + 41'312;
-    impl_->stage_bytes =
-        static_cast<std::uint64_t>(shape.verify_width + 4) * fork_bytes +
-        weight_bytes + static_cast<std::uint64_t>(shape.token_rows()) *
-                           (2ULL * kHidden + 2ULL * kHidden);
+    impl_->stage_bytes = fork_bytes + weight_bytes +
+        static_cast<std::uint64_t>(shape.token_rows()) *
+            (2ULL * kHidden + 2ULL * kHidden);
     impl_->state = VerifierState::kStaged;
     impl_->emit("rocket.qwen38.gdn.verifier.stage",
                 pair_reduce::Outcome::kOk, trace_id, request_id,
@@ -266,28 +189,30 @@ void GdnVerifier::accept(const std::int32_t* prefixes,
         throw std::invalid_argument("GDN accepted prefix is out of range");
       }
     }
+    int accepted_sequences = 0;
+    int accepted_tokens = 0;
+    for (int sequence = 0; sequence < impl_->shape.sequences; ++sequence) {
+      accepted_sequences += prefixes[sequence] > 0;
+      accepted_tokens += prefixes[sequence];
+    }
     cuda_check(cudaMemcpyAsync(impl_->accepted_prefixes, prefixes,
                                impl_->shape.sequences * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream),
                "copy GDN accepted prefixes");
-    const std::size_t conv_count =
-        static_cast<std::size_t>(impl_->shape.sequences) * kConvStride;
-    const std::size_t recurrent_count =
-        static_cast<std::size_t>(impl_->shape.sequences) * kRecurrentStride;
-    publish_prefixes<<<(conv_count + 255) / 256, 256, 0, stream>>>(
-        impl_->prefix_conv, impl_->accepted_conv, impl_->accepted_slots,
-        impl_->accepted_prefixes, kConvStride, impl_->shape.sequences,
-        impl_->shape.verify_width, impl_->state_pool_slots);
-    publish_prefixes<<<(recurrent_count + 255) / 256, 256, 0, stream>>>(
-        impl_->prefix_recurrent, impl_->accepted_recurrent,
-        impl_->accepted_slots, impl_->accepted_prefixes, kRecurrentStride,
-        impl_->shape.sequences, impl_->shape.verify_width,
-        impl_->state_pool_slots);
+    impl_->graph.accept_verifier(
+        impl_->accepted_conv, impl_->accepted_recurrent, impl_->accepted_slots,
+        impl_->accepted_prefixes, impl_->shape.sequences,
+        impl_->shape.verify_width, stream);
     cuda_check(cudaPeekAtLastError(), "publish GDN verifier prefixes");
+    const std::uint64_t state_bytes =
+        2ULL * (kConvStride * sizeof(__nv_bfloat16) +
+                kRecurrentStride * sizeof(float));
+    const std::uint64_t token_bytes =
+        2ULL * (kQkvWidth + kGateWidth + 2 * kValueHeads);
     const std::uint64_t bytes =
-        static_cast<std::uint64_t>(impl_->shape.sequences) *
-        (kConvStride * sizeof(__nv_bfloat16) +
-         kRecurrentStride * sizeof(float));
+        static_cast<std::uint64_t>(accepted_sequences) * state_bytes +
+        static_cast<std::uint64_t>(accepted_tokens) * token_bytes;
+    impl_->accept_bytes = bytes;
     impl_->emit("rocket.qwen38.gdn.verifier.accept",
                 pair_reduce::Outcome::kOk, trace_id, request_id,
                 elapsed_ns(begin), bytes);
@@ -336,6 +261,10 @@ VerifierShape GdnVerifier::staged_shape() const noexcept {
 
 std::uint64_t GdnVerifier::logical_stage_bytes() const noexcept {
   return impl_ ? impl_->stage_bytes : 0;
+}
+
+std::uint64_t GdnVerifier::logical_accept_bytes() const noexcept {
+  return impl_ ? impl_->accept_bytes : 0;
 }
 
 }  // namespace rocket::qwen38::linear_attention

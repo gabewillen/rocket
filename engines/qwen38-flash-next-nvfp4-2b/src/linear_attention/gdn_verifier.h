@@ -13,7 +13,6 @@
 
 namespace rocket::qwen38::linear_attention {
 
-inline constexpr int kMaxVerifyWidth = 8;
 inline constexpr int kMaxVerifyRows = kMaxRows * kMaxVerifyWidth;
 
 struct VerifierShape {
@@ -35,9 +34,9 @@ struct VerifierShape {
 enum class VerifierState : std::uint8_t { kReady, kStaged, kFaulted };
 
 // Position-major input and output use [verify_width, sequences, hidden]. Stage
-// gathers accepted slots into private dense slots, advances those slots in
-// causal draft order, and snapshots every prefix. Accept publishes exactly the
-// selected prefix per sequence. A zero prefix leaves that accepted slot intact.
+// reads each authenticated accepted slot once, advances it in registers in
+// causal draft order, and writes no recurrent snapshots. Accept replays only
+// the selected prefix into inactive state. A zero prefix leaves that slot intact.
 // One borrowed CUDA stream is bound for the verifier lifetime so reset and the
 // next stage cannot race queued private-state work.
 // accepted_state_indices is a device array authenticated by the state owner:
@@ -66,6 +65,7 @@ class GdnVerifier final {
   [[nodiscard]] VerifierState state() const noexcept;
   [[nodiscard]] VerifierShape staged_shape() const noexcept;
   [[nodiscard]] std::uint64_t logical_stage_bytes() const noexcept;
+  [[nodiscard]] std::uint64_t logical_accept_bytes() const noexcept;
 
  private:
   struct Impl;

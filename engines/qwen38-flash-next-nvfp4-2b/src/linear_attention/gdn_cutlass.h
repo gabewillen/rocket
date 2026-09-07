@@ -62,9 +62,15 @@ class CutlassGdnGraph final : public decode::LinearAttentionGraph {
               cudaStream_t stream) override;
   void launch_verifier(
       const __nv_bfloat16* position_major_input,
-      __nv_bfloat16* dense_conv_state, float* dense_recurrent_state,
-      __nv_bfloat16* prefix_conv_state, float* prefix_recurrent_state,
-      int sequences, int verify_width, cudaStream_t stream);
+      const __nv_bfloat16* accepted_conv_state,
+      const float* accepted_recurrent_state,
+      const std::int32_t* accepted_state_indices, int sequences,
+      int verify_width, cudaStream_t stream);
+  void accept_verifier(__nv_bfloat16* accepted_conv_state,
+                       float* accepted_recurrent_state,
+                       const std::int32_t* accepted_state_indices,
+                       const std::int32_t* accepted_prefixes, int sequences,
+                       int verify_width, cudaStream_t stream);
   const __nv_bfloat16* verifier_output() const noexcept;
   const __nv_bfloat16* projected_output() const noexcept override;
 

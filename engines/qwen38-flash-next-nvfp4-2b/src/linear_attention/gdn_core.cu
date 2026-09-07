@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Fixed-shape adaptation of vLLM 8e685d198
 // vllm/third_party/flash_linear_attention/ops/fused_recurrent.py and
-// FlashInfer's Apache-2.0 gdn_decode_pretranspose.py. General sequence,
-// layout, dtype, and head-shape dispatch are removed for Qwen3.8 TP2 K0.
+// FlashInfer's Apache-2.0 gdn_decode_pretranspose.py and gdn_decode_mtp.py.
+// General sequence, layout, dtype, and head-shape dispatch are removed for
+// Qwen3.8 TP2.
 #include "linear_attention/gdn_core.h"
 
 #include <cuda_bf16.h>
@@ -84,13 +85,23 @@ __global__ void causal_conv_update(
 
 __global__ void causal_conv_verify(
     const __nv_bfloat16* qkvz, const __nv_bfloat16* weight,
-    __nv_bfloat16* dense_state, __nv_bfloat16* prefix_state, int sequences,
-    int verify_width) {
+    const __nv_bfloat16* accepted_state,
+    const std::int32_t* accepted_indices, __nv_bfloat16* mixed_qkv,
+    int sequences, int verify_width) {
   const int sequence = blockIdx.y;
   const int dim = blockIdx.x * blockDim.x + threadIdx.x;
   if (sequence >= sequences || dim >= kQkvWidth) return;
-  __nv_bfloat16* history = dense_state +
-      static_cast<std::size_t>(sequence + 1) * kConvStateRows * kQkvWidth;
+  const int slot = accepted_indices[sequence];
+  if (slot <= 0) {
+    for (int prefix = 0; prefix < verify_width; ++prefix) {
+      const int row = prefix * sequences + sequence;
+      mixed_qkv[static_cast<std::size_t>(row) * kQkvWidth + dim] =
+          __float2bfloat16(0.0F);
+    }
+    return;
+  }
+  const __nv_bfloat16* history = accepted_state +
+      static_cast<std::size_t>(slot) * kConvStateRows * kQkvWidth;
   float x0 = __bfloat162float(history[dim]);
   float x1 = __bfloat162float(history[kQkvWidth + dim]);
   float x2 = __bfloat162float(history[2 * kQkvWidth + dim]);
@@ -104,24 +115,36 @@ __global__ void causal_conv_verify(
                   x2 * __bfloat162float(weight[w + 2]) +
                   x3 * __bfloat162float(weight[w + 3]);
     value *= 1.0F / (1.0F + __expf(-value));
-    // Reuse the graph-owned mixed buffer as the post-convolution QKV rows.
-    const_cast<__nv_bfloat16*>(qkvz)[
-        static_cast<std::size_t>(row) * (kQkvWidth + kGateWidth) + dim] =
+    mixed_qkv[static_cast<std::size_t>(row) * kQkvWidth + dim] =
         __float2bfloat16(value);
     x0 = x1;
     x1 = x2;
     x2 = x3;
-    const std::size_t snapshot =
-        (static_cast<std::size_t>(prefix) * kMaxRows + sequence) *
-        kConvStateRows * kQkvWidth;
-    prefix_state[snapshot + dim] = __float2bfloat16(x0);
-    prefix_state[snapshot + kQkvWidth + dim] = __float2bfloat16(x1);
-    prefix_state[snapshot + 2 * kQkvWidth + dim] = __float2bfloat16(x2);
-    // The state allocation carries six rows for ABI parity. Rows 3..5 retain
-    // their accepted values and are copied once per prefix.
-    prefix_state[snapshot + 3 * kQkvWidth + dim] = history[3 * kQkvWidth + dim];
-    prefix_state[snapshot + 4 * kQkvWidth + dim] = history[4 * kQkvWidth + dim];
-    prefix_state[snapshot + 5 * kQkvWidth + dim] = history[5 * kQkvWidth + dim];
+  }
+}
+
+__global__ void causal_conv_accept(
+    const __nv_bfloat16* qkvz, __nv_bfloat16* accepted_state,
+    const std::int32_t* accepted_indices,
+    const std::int32_t* accepted_prefixes, int sequences) {
+  const int sequence = blockIdx.y;
+  const int dim = blockIdx.x * blockDim.x + threadIdx.x;
+  if (sequence >= sequences || dim >= kQkvWidth) return;
+  const int prefix_count = accepted_prefixes[sequence];
+  const int slot = accepted_indices[sequence];
+  if (prefix_count <= 0 || slot <= 0) return;
+  __nv_bfloat16* history = accepted_state +
+      static_cast<std::size_t>(slot) * kConvStateRows * kQkvWidth;
+  float x0 = __bfloat162float(history[dim]);
+  float x1 = __bfloat162float(history[kQkvWidth + dim]);
+  float x2 = __bfloat162float(history[2 * kQkvWidth + dim]);
+  for (int prefix = 0; prefix < prefix_count; ++prefix) {
+    const int row = prefix * sequences + sequence;
+    const float x3 = __bfloat162float(
+        qkvz[static_cast<std::size_t>(row) * (kQkvWidth + kGateWidth) + dim]);
+    x0 = x1;
+    x1 = x2;
+    x2 = x3;
   }
   history[dim] = __float2bfloat16(x0);
   history[kQkvWidth + dim] = __float2bfloat16(x1);
@@ -195,63 +218,175 @@ __global__ __launch_bounds__(kThreads) void recurrent_gdn(
 }
 
 __global__ __launch_bounds__(kThreads) void recurrent_gdn_verify(
-    const __nv_bfloat16* mixed_qkvz, const __nv_bfloat16* ba,
+    const __nv_bfloat16* mixed_qkv, const __nv_bfloat16* ba,
     const __nv_bfloat16* a_log, const __nv_bfloat16* dt_bias,
-    float* dense_state, float* prefix_state, __nv_bfloat16* output,
-    int sequences, int verify_width) {
+    const float* accepted_state, const std::int32_t* accepted_indices,
+    __nv_bfloat16* output, int sequences, int verify_width) {
   const int tile = blockIdx.x;
   const int hv = blockIdx.y;
   const int sequence = blockIdx.z;
   const int k_dim = threadIdx.x;
   if (sequence >= sequences) return;
+  const int slot = accepted_indices[sequence];
   const int v0 = tile * kRowsPerBlock;
-  __shared__ float q[kHeadDim];
-  __shared__ float key[kHeadDim];
+  if (slot <= 0) {
+    for (int prefix = 0; prefix < verify_width; ++prefix) {
+      const int row = prefix * sequences + sequence;
+      for (int v = v0 + k_dim; v < v0 + kRowsPerBlock; v += kThreads) {
+        output[(static_cast<std::size_t>(row) * kValueHeads + hv) *
+                   kHeadDim + v] = __float2bfloat16(0.0F);
+      }
+    }
+    return;
+  }
+  __shared__ float q[kMaxVerifyWidth][kHeadDim];
+  __shared__ float key[kMaxVerifyWidth][kHeadDim];
+  __shared__ float decay[kMaxVerifyWidth];
+  __shared__ float beta[kMaxVerifyWidth];
   __shared__ float warp_sums[4];
   const int h = hv / (kValueHeads / kKeyHeads);
-  float* head_state = dense_state +
-      static_cast<std::size_t>(sequence + 1) * kValueHeads * kHeadDim * kHeadDim +
+  const float* head_state = accepted_state +
+      static_cast<std::size_t>(slot) * kValueHeads * kHeadDim * kHeadDim +
       static_cast<std::size_t>(hv) * kHeadDim * kHeadDim;
+
+  // FlashInfer's MTP loop order: normalize each time step once, then keep
+  // four independent V rows resident in registers across every prefix.
   for (int prefix = 0; prefix < verify_width; ++prefix) {
     const int row = prefix * sequences + sequence;
-    const std::size_t mixed_base =
-        static_cast<std::size_t>(row) * (kQkvWidth + kGateWidth);
-    q[k_dim] = __bfloat162float(mixed_qkvz[mixed_base + h * kHeadDim + k_dim]);
-    key[k_dim] = __bfloat162float(
-        mixed_qkvz[mixed_base + kKeyHeads * kHeadDim + h * kHeadDim + k_dim]);
-    __syncthreads();
-    q[k_dim] *= rsqrtf(block_sum(q[k_dim] * q[k_dim], warp_sums) + kEpsilon) *
-                0.08838834764831845F;
-    key[k_dim] *= rsqrtf(block_sum(key[k_dim] * key[k_dim], warp_sums) +
-                         kEpsilon);
-    __syncthreads();
+    const std::size_t mixed_base = static_cast<std::size_t>(row) * kQkvWidth;
+    float q_value = __bfloat162float(
+        mixed_qkv[mixed_base + h * kHeadDim + k_dim]);
+    float key_value = __bfloat162float(
+        mixed_qkv[mixed_base + kKeyHeads * kHeadDim + h * kHeadDim + k_dim]);
+    q_value *= rsqrtf(block_sum(q_value * q_value, warp_sums) + kEpsilon) *
+               0.08838834764831845F;
+    key_value *= rsqrtf(block_sum(key_value * key_value, warp_sums) +
+                        kEpsilon);
+    q[prefix][k_dim] = q_value;
+    key[prefix][k_dim] = key_value;
     const float a = __bfloat162float(
         ba[row * (2 * kValueHeads) + kValueHeads + hv]);
-    const float beta = 1.0F /
+    beta[prefix] = 1.0F /
         (1.0F + __expf(-__bfloat162float(ba[row * (2 * kValueHeads) + hv])));
     const float x = a + __bfloat162float(dt_bias[hv]);
     const float softplus = x <= 20.0F ? log1pf(__expf(x)) : x;
-    const float decay =
+    decay[prefix] =
         __expf(-__expf(__bfloat162float(a_log[hv])) * softplus);
-    for (int v = v0; v < v0 + kRowsPerBlock; ++v) {
-      float current = head_state[v * kHeadDim + k_dim] * decay;
-      const float prediction = block_sum(current * key[k_dim], warp_sums);
-      const float v_value = __bfloat162float(
-          mixed_qkvz[mixed_base + 2 * kKeyHeads * kHeadDim +
-                     hv * kHeadDim + v]);
-      current += beta * (v_value - prediction) * key[k_dim];
-      head_state[v * kHeadDim + k_dim] = current;
-      const std::size_t snapshot =
-          (static_cast<std::size_t>(prefix) * kMaxRows + sequence) *
-              kValueHeads * kHeadDim * kHeadDim +
-          static_cast<std::size_t>(hv) * kHeadDim * kHeadDim +
-          v * kHeadDim + k_dim;
-      prefix_state[snapshot] = current;
-      const float projected = block_sum(current * q[k_dim], warp_sums);
-      if (k_dim == 0) {
-        output[(static_cast<std::size_t>(row) * kValueHeads + hv) * kHeadDim +
-               v] = __float2bfloat16(projected);
+  }
+  __syncthreads();
+  #pragma unroll
+  for (int v_offset = 0; v_offset < kRowsPerBlock; v_offset += 4) {
+    float current[4];
+    #pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+      current[lane] = head_state[(v0 + v_offset + lane) * kHeadDim + k_dim];
+    }
+    for (int prefix = 0; prefix < verify_width; ++prefix) {
+      const int row = prefix * sequences + sequence;
+      const std::size_t mixed_base = static_cast<std::size_t>(row) * kQkvWidth;
+      float prediction[4];
+      #pragma unroll
+      for (int lane = 0; lane < 4; ++lane) {
+        current[lane] *= decay[prefix];
+        prediction[lane] =
+            block_sum(current[lane] * key[prefix][k_dim], warp_sums);
       }
+      #pragma unroll
+      for (int lane = 0; lane < 4; ++lane) {
+        const int v = v0 + v_offset + lane;
+        const float v_value = __bfloat162float(
+            mixed_qkv[mixed_base + 2 * kKeyHeads * kHeadDim +
+                      hv * kHeadDim + v]);
+        current[lane] += beta[prefix] * (v_value - prediction[lane]) *
+                         key[prefix][k_dim];
+      }
+      float projected[4];
+      #pragma unroll
+      for (int lane = 0; lane < 4; ++lane) {
+        projected[lane] =
+            block_sum(current[lane] * q[prefix][k_dim], warp_sums);
+      }
+      if (k_dim == 0) {
+        #pragma unroll
+        for (int lane = 0; lane < 4; ++lane) {
+          const int v = v0 + v_offset + lane;
+          output[(static_cast<std::size_t>(row) * kValueHeads + hv) *
+                     kHeadDim + v] = __float2bfloat16(projected[lane]);
+        }
+      }
+    }
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void recurrent_gdn_accept(
+    const __nv_bfloat16* mixed_qkv, const __nv_bfloat16* ba,
+    const __nv_bfloat16* a_log, const __nv_bfloat16* dt_bias, float* state,
+    const std::int32_t* accepted_indices,
+    const std::int32_t* accepted_prefixes, int sequences) {
+  const int tile = blockIdx.x;
+  const int hv = blockIdx.y;
+  const int sequence = blockIdx.z;
+  const int k_dim = threadIdx.x;
+  if (sequence >= sequences) return;
+  const int prefix_count = accepted_prefixes[sequence];
+  const int slot = accepted_indices[sequence];
+  if (prefix_count <= 0 || slot <= 0) return;
+  const int v0 = tile * kRowsPerBlock;
+  __shared__ float key[kMaxVerifyWidth][kHeadDim];
+  __shared__ float decay[kMaxVerifyWidth];
+  __shared__ float beta[kMaxVerifyWidth];
+  __shared__ float warp_sums[4];
+  const int h = hv / (kValueHeads / kKeyHeads);
+  for (int prefix = 0; prefix < prefix_count; ++prefix) {
+    const int row = prefix * sequences + sequence;
+    const std::size_t base = static_cast<std::size_t>(row) * kQkvWidth;
+    float key_value = __bfloat162float(
+        mixed_qkv[base + kKeyHeads * kHeadDim + h * kHeadDim + k_dim]);
+    key_value *= rsqrtf(block_sum(key_value * key_value, warp_sums) +
+                        kEpsilon);
+    key[prefix][k_dim] = key_value;
+    const float a = __bfloat162float(
+        ba[row * (2 * kValueHeads) + kValueHeads + hv]);
+    beta[prefix] = 1.0F /
+        (1.0F + __expf(-__bfloat162float(ba[row * (2 * kValueHeads) + hv])));
+    const float x = a + __bfloat162float(dt_bias[hv]);
+    const float softplus = x <= 20.0F ? log1pf(__expf(x)) : x;
+    decay[prefix] =
+        __expf(-__expf(__bfloat162float(a_log[hv])) * softplus);
+  }
+  __syncthreads();
+  float* head_state = state +
+      static_cast<std::size_t>(slot) * kValueHeads * kHeadDim * kHeadDim +
+      static_cast<std::size_t>(hv) * kHeadDim * kHeadDim;
+  #pragma unroll
+  for (int v_offset = 0; v_offset < kRowsPerBlock; v_offset += 4) {
+    float current[4];
+    #pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+      current[lane] = head_state[(v0 + v_offset + lane) * kHeadDim + k_dim];
+    }
+    for (int prefix = 0; prefix < prefix_count; ++prefix) {
+      const int row = prefix * sequences + sequence;
+      const std::size_t base = static_cast<std::size_t>(row) * kQkvWidth;
+      float prediction[4];
+      #pragma unroll
+      for (int lane = 0; lane < 4; ++lane) {
+        current[lane] *= decay[prefix];
+        prediction[lane] =
+            block_sum(current[lane] * key[prefix][k_dim], warp_sums);
+      }
+      #pragma unroll
+      for (int lane = 0; lane < 4; ++lane) {
+        const int v = v0 + v_offset + lane;
+        const float v_value = __bfloat162float(
+            mixed_qkv[base + 2 * kKeyHeads * kHeadDim + hv * kHeadDim + v]);
+        current[lane] += beta[prefix] * (v_value - prediction[lane]) *
+                         key[prefix][k_dim];
+      }
+    }
+    #pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+      head_state[(v0 + v_offset + lane) * kHeadDim + k_dim] = current[lane];
     }
   }
 }
@@ -350,11 +485,12 @@ CorePlan::CorePlan(int device, const __nv_bfloat16* conv_weight,
 
 void CorePlan::launch_verifier(
     const __nv_bfloat16* qkvz, const __nv_bfloat16* ba,
-    __nv_bfloat16* dense_conv_state, float* dense_recurrent_state,
-    __nv_bfloat16* prefix_conv_state, float* prefix_recurrent_state,
-    int sequences, int verify_width, cudaStream_t stream) {
-  if (!qkvz || !ba || !dense_conv_state || !dense_recurrent_state ||
-      !prefix_conv_state || !prefix_recurrent_state || !allowed_m(sequences) ||
+    const __nv_bfloat16* accepted_conv_state,
+    const float* accepted_recurrent_state,
+    const std::int32_t* accepted_state_indices, int sequences,
+    int verify_width, cudaStream_t stream) {
+  if (!qkvz || !ba || !accepted_conv_state || !accepted_recurrent_state ||
+      !accepted_state_indices || !allowed_m(sequences) ||
       verify_width < 1 || verify_width > 8 ||
       sequences * verify_width > kMaxVerifierRows || !stream) {
     throw std::invalid_argument("exact Qwen GDN verifier core contract changed");
@@ -370,15 +506,41 @@ void CorePlan::launch_verifier(
                "clear inactive GDN verifier rows");
   }
   causal_conv_verify<<<dim3((kQkvWidth + 255) / 256, sequences), 256, 0,
-                       stream>>>(qkvz, impl_->conv_weight, dense_conv_state,
-                                 prefix_conv_state, sequences, verify_width);
+                       stream>>>(qkvz, impl_->conv_weight,
+                                 accepted_conv_state, accepted_state_indices,
+                                 impl_->mixed_qkv, sequences, verify_width);
   recurrent_gdn_verify<<<dim3(kValueTiles, kValueHeads, sequences), kThreads,
                          0, stream>>>(
-      qkvz, ba, impl_->a_log, impl_->dt_bias, dense_recurrent_state,
-      prefix_recurrent_state, impl_->core, sequences, verify_width);
+      impl_->mixed_qkv, ba, impl_->a_log, impl_->dt_bias,
+      accepted_recurrent_state, accepted_state_indices, impl_->core,
+      sequences, verify_width);
   gated_rmsnorm_verify<<<dim3(kValueHeads, rows), kThreads, 0, stream>>>(
       impl_->core, qkvz, impl_->norm_weight, impl_->output, rows);
   cuda_check(cudaPeekAtLastError(), "Qwen GDN verifier core launch");
+}
+
+void CorePlan::accept_verifier(
+    const __nv_bfloat16* qkvz, const __nv_bfloat16* ba,
+    __nv_bfloat16* accepted_conv_state, float* accepted_recurrent_state,
+    const std::int32_t* accepted_state_indices,
+    const std::int32_t* accepted_prefixes, int sequences, int verify_width,
+    cudaStream_t stream) {
+  if (!qkvz || !ba || !accepted_conv_state || !accepted_recurrent_state ||
+      !accepted_state_indices || !accepted_prefixes || !allowed_m(sequences) ||
+      verify_width < 1 || verify_width > kMaxVerifyWidth || !stream) {
+    throw std::invalid_argument(
+        "exact Qwen GDN verifier acceptance contract changed");
+  }
+  causal_conv_accept<<<dim3((kQkvWidth + 255) / 256, sequences), 256, 0,
+                       stream>>>(qkvz, accepted_conv_state,
+                                 accepted_state_indices, accepted_prefixes,
+                                 sequences);
+  recurrent_gdn_accept<<<dim3(kValueTiles, kValueHeads, sequences), kThreads,
+                         0, stream>>>(
+      impl_->mixed_qkv, ba, impl_->a_log, impl_->dt_bias,
+      accepted_recurrent_state, accepted_state_indices, accepted_prefixes,
+      sequences);
+  cuda_check(cudaPeekAtLastError(), "Qwen GDN verifier accepted replay");
 }
 
 CorePlan::~CorePlan() {

@@ -432,13 +432,13 @@ const __nv_bfloat16* CutlassGdnGraph::projected_output() const noexcept {
 }
 
 void CutlassGdnGraph::launch_verifier(
-    const __nv_bfloat16* input, __nv_bfloat16* dense_conv_state,
-    float* dense_recurrent_state, __nv_bfloat16* prefix_conv_state,
-    float* prefix_recurrent_state, int sequences, int verify_width,
-    cudaStream_t stream) {
+    const __nv_bfloat16* input, const __nv_bfloat16* accepted_conv_state,
+    const float* accepted_recurrent_state,
+    const std::int32_t* accepted_state_indices, int sequences,
+    int verify_width, cudaStream_t stream) {
   const int rows = sequences * verify_width;
-  if (!input || !dense_conv_state || !dense_recurrent_state ||
-      !prefix_conv_state || !prefix_recurrent_state || !allowed_m(sequences) ||
+  if (!input || !accepted_conv_state || !accepted_recurrent_state ||
+      !accepted_state_indices || !allowed_m(sequences) ||
       verify_width < 1 || verify_width > 8 || rows > kMaxVerifierRows ||
       !stream) {
     throw decode::DecodeExecutionContractError(
@@ -461,9 +461,9 @@ void CutlassGdnGraph::launch_verifier(
       impl_->verify_ba, kBaN, kBN, impl_->globals.b.global_scale,
       impl_->globals.a.global_scale);
   impl_->core->launch_verifier(
-      impl_->verify_qkvz, impl_->verify_ba, dense_conv_state,
-      dense_recurrent_state, prefix_conv_state, prefix_recurrent_state,
-      sequences, verify_width, stream);
+      impl_->verify_qkvz, impl_->verify_ba, accepted_conv_state,
+      accepted_recurrent_state, accepted_state_indices, sequences,
+      verify_width, stream);
   quantize_fixed<kOutputK><<<kMaxVerifierRows, 256, 0, stream>>>(
       impl_->verify_output_packed, impl_->verify_output_sfa,
       impl_->core->output(), kOutputActivationGlobal);
@@ -476,6 +476,25 @@ void CutlassGdnGraph::launch_verifier(
       impl_->globals.output.global_scale * kOutputActivationGlobal,
       impl_->globals.output.global_scale * kOutputActivationGlobal);
   cuda_check(cudaGetLastError(), "fixed Qwen GDN verifier launch");
+}
+
+void CutlassGdnGraph::accept_verifier(
+    __nv_bfloat16* accepted_conv_state, float* accepted_recurrent_state,
+    const std::int32_t* accepted_state_indices,
+    const std::int32_t* accepted_prefixes, int sequences, int verify_width,
+    cudaStream_t stream) {
+  if (!accepted_conv_state || !accepted_recurrent_state ||
+      !accepted_state_indices || !accepted_prefixes || !allowed_m(sequences) ||
+      verify_width < 1 || verify_width > 8 ||
+      sequences * verify_width > kMaxVerifierRows || !stream) {
+    throw decode::DecodeExecutionContractError(
+        "fixed Qwen GDN verifier acceptance arguments changed");
+  }
+  impl_->core->accept_verifier(
+      impl_->verify_qkvz, impl_->verify_ba, accepted_conv_state,
+      accepted_recurrent_state, accepted_state_indices, accepted_prefixes,
+      sequences, verify_width, stream);
+  cuda_check(cudaGetLastError(), "fixed Qwen GDN verifier acceptance");
 }
 
 const __nv_bfloat16* CutlassGdnGraph::verifier_output() const noexcept {

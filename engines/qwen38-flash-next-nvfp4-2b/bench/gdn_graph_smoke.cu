@@ -103,6 +103,28 @@ __global__ void initialize_rows(__nv_bfloat16* input, int rows) {
   }
 }
 
+__global__ void initialize_conv_state(__nv_bfloat16* state,
+                                      std::size_t elements_per_slot) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= 17 * elements_per_slot) return;
+  const std::size_t slot = index / elements_per_slot;
+  state[index] = slot == 0 ? __float2bfloat16(0.0F) :
+      __float2bfloat16(
+          static_cast<float>(static_cast<int>((index * 13) % 31) - 15) /
+          128.0F);
+}
+
+__global__ void initialize_recurrent_state(float* state,
+                                           std::size_t elements_per_slot) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= 17 * elements_per_slot) return;
+  const std::size_t slot = index / elements_per_slot;
+  state[index] = slot == 0 ? 0.0F :
+      static_cast<float>(static_cast<int>((index * 17) % 37) - 18) / 256.0F;
+}
+
 struct Telemetry final : rocket::qwen38::pair_reduce::OtelStageSink {
   std::uint64_t spans = 0, metrics = 0;
   void emit_span_and_log(
@@ -299,15 +321,22 @@ int main(int argc, char** argv) try {
       device, *typed_graph, 17, telemetry);
 
   const auto prove_shape = [&](int sequences, int width, bool profile) {
-    check(cudaMemsetAsync(conv_state.pointer, 0, conv_bytes, stream),
-          "clear verifier accepted conv");
-    check(cudaMemsetAsync(recurrent.pointer, 0, recurrent_bytes, stream),
-          "clear verifier accepted recurrent");
-    check(cudaMemsetAsync(reference_conv.pointer, 0, conv_bytes, stream),
-          "clear verifier reference conv");
-    check(cudaMemsetAsync(reference_recurrent.pointer, 0, recurrent_bytes,
-                          stream),
-          "clear verifier reference recurrent");
+    constexpr std::size_t conv_per_slot =
+        static_cast<std::size_t>(kConvRows) * kConvWidth;
+    constexpr std::size_t recurrent_per_slot =
+        static_cast<std::size_t>(kHeads) * kDim * kDim;
+    initialize_conv_state<<<(17 * conv_per_slot + 255) / 256, 256, 0,
+                            stream>>>(
+        static_cast<__nv_bfloat16*>(conv_state.pointer), conv_per_slot);
+    initialize_recurrent_state<<<
+        (17 * recurrent_per_slot + 255) / 256, 256, 0, stream>>>(
+        static_cast<float*>(recurrent.pointer), recurrent_per_slot);
+    initialize_conv_state<<<(17 * conv_per_slot + 255) / 256, 256, 0,
+                            stream>>>(
+        static_cast<__nv_bfloat16*>(reference_conv.pointer), conv_per_slot);
+    initialize_recurrent_state<<<
+        (17 * recurrent_per_slot + 255) / 256, 256, 0, stream>>>(
+        static_cast<float*>(reference_recurrent.pointer), recurrent_per_slot);
     check(cudaStreamSynchronize(stream), "sync verifier reset");
     std::vector<std::uint8_t> before_conv(conv_bytes), before_recurrent(recurrent_bytes);
     check(cudaMemcpy(before_conv.data(), conv_state.pointer, conv_bytes,
@@ -381,11 +410,12 @@ int main(int argc, char** argv) try {
     if (direct_output != staged_output) {
       throw std::runtime_error("GDN verifier output differs from sequential K0");
     }
-    check(cudaMemsetAsync(reference_conv.pointer, 0, conv_bytes, stream),
-          "reset prefix reference conv");
-    check(cudaMemsetAsync(reference_recurrent.pointer, 0, recurrent_bytes,
-                          stream),
-          "reset prefix reference recurrent");
+    initialize_conv_state<<<(17 * conv_per_slot + 255) / 256, 256, 0,
+                            stream>>>(
+        static_cast<__nv_bfloat16*>(reference_conv.pointer), conv_per_slot);
+    initialize_recurrent_state<<<
+        (17 * recurrent_per_slot + 255) / 256, 256, 0, stream>>>(
+        static_cast<float*>(reference_recurrent.pointer), recurrent_per_slot);
 
     for (int prefix = 0; prefix < width; ++prefix) {
       std::array<std::int32_t, kRows> active{};
@@ -430,7 +460,7 @@ int main(int argc, char** argv) try {
       throw std::runtime_error("GDN verifier published a non-prefix state");
     }
 
-    std::array<float, 20> samples{};
+    std::array<float, 100> samples{};
     std::uint64_t profiled_bytes = 0;
     if (profile) {
       cudaEvent_t begin, end;
@@ -460,6 +490,7 @@ int main(int argc, char** argv) try {
     const float mean = profile
         ? std::accumulate(samples.begin(), samples.end(), 0.0F) / samples.size()
         : 0.0F;
+    if (profile) std::sort(samples.begin(), samples.end());
     const auto [minimum, maximum] =
         std::minmax_element(samples.begin(), samples.end());
     const auto bytes = profiled_bytes;
@@ -472,11 +503,59 @@ int main(int argc, char** argv) try {
     if (profile) {
       std::cout << " mean_ms=" << mean << " min_ms=" << *minimum
                 << " max_ms=" << *maximum
+                << " median_ms=" << samples[samples.size() / 2]
+                << " p95_ms=" << samples[(samples.size() * 95) / 100]
                 << " spread_percent=" << ((*maximum - *minimum) / mean * 100.0F)
                 << " traffic_bytes=" << bytes << " effective_GBps=" << gbps
                 << " local_roof_fraction=" << gbps / kLocalRoofGbps;
     }
     std::cout << '\n';
+
+    if (profile) {
+      std::vector<int> accepted_widths{0, 1, width};
+      std::sort(accepted_widths.begin(), accepted_widths.end());
+      accepted_widths.erase(
+          std::unique(accepted_widths.begin(), accepted_widths.end()),
+          accepted_widths.end());
+      for (const int accepted_width : accepted_widths) {
+        std::array<float, 100> accept_samples{};
+        std::uint64_t accept_bytes = 0;
+        std::array<std::int32_t, kRows> accepted{};
+        accepted.fill(accepted_width);
+        cudaEvent_t accept_begin, accept_end;
+        check(cudaEventCreate(&accept_begin), "create accept begin event");
+        check(cudaEventCreate(&accept_end), "create accept end event");
+        for (float& sample : accept_samples) {
+          check(cudaMemsetAsync(conv_state.pointer, 0, conv_bytes, stream),
+                "profile accept conv reset");
+          check(cudaMemsetAsync(recurrent.pointer, 0, recurrent_bytes, stream),
+                "profile accept recurrent reset");
+          verifier.stage(static_cast<__nv_bfloat16*>(verify_input.pointer),
+                         static_cast<__nv_bfloat16*>(conv_state.pointer),
+                         static_cast<float*>(recurrent.pointer),
+                         static_cast<std::int32_t*>(indices.pointer), shape,
+                         "gdn-accept-profile", "shape", stream);
+          check(cudaEventRecord(accept_begin, stream), "record accept begin");
+          verifier.accept(accepted.data(), "gdn-accept-profile", "shape",
+                          stream);
+          accept_bytes = verifier.logical_accept_bytes();
+          check(cudaEventRecord(accept_end, stream), "record accept end");
+          check(cudaEventSynchronize(accept_end), "sync accept profile");
+          check(cudaEventElapsedTime(&sample, accept_begin, accept_end),
+                "elapsed accept profile");
+        }
+        cudaEventDestroy(accept_end);
+        cudaEventDestroy(accept_begin);
+        std::sort(accept_samples.begin(), accept_samples.end());
+        std::cout << "verifier_accept_sequences=" << sequences
+                  << " verify_width=" << width
+                  << " accepted_width=" << accepted_width
+                  << " median_ms=" << accept_samples[accept_samples.size() / 2]
+                  << " p95_ms="
+                  << accept_samples[(accept_samples.size() * 95) / 100]
+                  << " traffic_bytes=" << accept_bytes << '\n';
+      }
+    }
   };
 
   // K0 equivalence is covered by width 1 and the same unchanged graph. K1,
@@ -490,6 +569,78 @@ int main(int argc, char** argv) try {
   prove_shape(4, 8, true);
   prove_shape(8, 8, true);
   prove_shape(1, 1, false);
+
+  // Capture the complete production stage boundary, including input/output
+  // retention. Replay must leave accepted state untouched.
+  constexpr std::size_t verifier_conv_per_slot =
+      static_cast<std::size_t>(kConvRows) * kConvWidth;
+  constexpr std::size_t verifier_recurrent_per_slot =
+      static_cast<std::size_t>(kHeads) * kDim * kDim;
+  initialize_conv_state<<<(17 * verifier_conv_per_slot + 255) / 256, 256, 0,
+                          stream>>>(
+      static_cast<__nv_bfloat16*>(conv_state.pointer), verifier_conv_per_slot);
+  initialize_recurrent_state<<<
+      (17 * verifier_recurrent_per_slot + 255) / 256, 256, 0, stream>>>(
+      static_cast<float*>(recurrent.pointer), verifier_recurrent_per_slot);
+  check(cudaStreamSynchronize(stream), "sync verifier graph seed");
+  std::vector<std::uint8_t> graph_conv_before(conv_bytes);
+  std::vector<std::uint8_t> graph_recurrent_before(recurrent_bytes);
+  check(cudaMemcpy(graph_conv_before.data(), conv_state.pointer, conv_bytes,
+                   cudaMemcpyDeviceToHost), "copy verifier graph conv before");
+  check(cudaMemcpy(graph_recurrent_before.data(), recurrent.pointer,
+                   recurrent_bytes, cudaMemcpyDeviceToHost),
+        "copy verifier graph recurrent before");
+  cudaGraph_t verifier_graph = nullptr;
+  cudaGraphExec_t verifier_executable = nullptr;
+  check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+        "begin verifier stage capture");
+  verifier.stage(static_cast<__nv_bfloat16*>(verify_input.pointer),
+                 static_cast<__nv_bfloat16*>(conv_state.pointer),
+                 static_cast<float*>(recurrent.pointer),
+                 static_cast<std::int32_t*>(indices.pointer), {16, 5},
+                 "gdn-verifier-capture", "c16-k4", stream);
+  const __nv_bfloat16* captured_output = verifier.staged_output();
+  check(cudaStreamEndCapture(stream, &verifier_graph),
+        "end verifier stage capture");
+  check(cudaGraphInstantiate(&verifier_executable, verifier_graph, 0),
+        "instantiate verifier stage graph");
+  verifier.reset("gdn-verifier-capture", "c16-k4");
+  std::vector<std::uint8_t> graph_output(16ULL * 5 * kHidden * 2);
+  check(cudaGraphLaunch(verifier_executable, stream), "verifier graph replay 1");
+  check(cudaStreamSynchronize(stream), "sync verifier graph replay 1");
+  check(cudaMemcpy(graph_output.data(), captured_output, graph_output.size(),
+                   cudaMemcpyDeviceToHost), "copy verifier graph output 1");
+  const auto verifier_graph_hash = hash(graph_output.data(), graph_output.size());
+  check(cudaGraphLaunch(verifier_executable, stream), "verifier graph replay 2");
+  check(cudaStreamSynchronize(stream), "sync verifier graph replay 2");
+  check(cudaMemcpy(graph_output.data(), captured_output, graph_output.size(),
+                   cudaMemcpyDeviceToHost), "copy verifier graph output 2");
+  if (hash(graph_output.data(), graph_output.size()) != verifier_graph_hash) {
+    throw std::runtime_error("GDN verifier captured replay output drift");
+  }
+  std::vector<std::uint8_t> graph_conv_after(conv_bytes);
+  std::vector<std::uint8_t> graph_recurrent_after(recurrent_bytes);
+  check(cudaMemcpy(graph_conv_after.data(), conv_state.pointer, conv_bytes,
+                   cudaMemcpyDeviceToHost), "copy verifier graph conv after");
+  check(cudaMemcpy(graph_recurrent_after.data(), recurrent.pointer,
+                   recurrent_bytes, cudaMemcpyDeviceToHost),
+        "copy verifier graph recurrent after");
+  if (graph_conv_after != graph_conv_before ||
+      graph_recurrent_after != graph_recurrent_before) {
+    throw std::runtime_error("GDN verifier captured replay mutated accepted state");
+  }
+  cudaGraphExecDestroy(verifier_executable);
+  cudaGraphDestroy(verifier_graph);
+  std::cout << "verifier_graph=captured replay=bit-exact accepted_state=unchanged"
+            << " output_fnv64=" << verifier_graph_hash << '\n';
+
+  verifier.stage(static_cast<__nv_bfloat16*>(verify_input.pointer),
+                 static_cast<__nv_bfloat16*>(conv_state.pointer),
+                 static_cast<float*>(recurrent.pointer),
+                 static_cast<std::int32_t*>(indices.pointer), {1, 1},
+                 "gdn-verifier-tail", "k0", stream);
+  check(cudaStreamSynchronize(stream), "sync verifier K0 tail proof");
+  verifier.reset("gdn-verifier-tail", "k0");
   std::vector<std::uint8_t> verifier_tail(8ULL * kRows * kHidden * 2ULL);
   check(cudaMemcpy(verifier_tail.data(), typed_graph->verifier_output(),
                    verifier_tail.size(), cudaMemcpyDeviceToHost),
