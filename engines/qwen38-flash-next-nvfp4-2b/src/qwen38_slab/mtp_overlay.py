@@ -18,8 +18,10 @@ from .contract import MODEL_NVFP4_ABI, MTP_FP8_ABI
 
 FP8_SOURCE_BYTES_PER_EXPERT = 4_915_800
 NVFP4_SERVING_BYTES_PER_EXPERT = 2_764_824
-MERGED_SLAB_K4_CURRENT_TOK_S = 500.247
-MERGED_SLAB_K4_NVFP4_HYPOTHETICAL_TOK_S = 514.470
+MERGED_SLAB_K4_CURRENT_AGGREGATE_TOK_S = 457.524496688903
+MERGED_SLAB_K4_CURRENT_STREAM_TOK_S = 28.59528104305644
+MERGED_SLAB_K4_NVFP4_AGGREGATE_TOK_S = 469.3926469156607
+MERGED_SLAB_K4_NVFP4_STREAM_TOK_S = 29.337040432228793
 PROJECTION_FAMILIES = ("gate_proj", "up_proj", "down_proj")
 INTERACTION_FAMILIES = (
     "target_attention_nvfp4",
@@ -52,6 +54,8 @@ class MtpOverlayTraffic:
     saved_weight_bytes: int
     current_control_tokens_per_second: float
     hypothetical_tokens_per_second: float
+    current_control_stream_tokens_per_second: float
+    hypothetical_stream_tokens_per_second: float
     quality_evidence_complete: bool
 
 
@@ -80,8 +84,10 @@ def compare_mtp_expert_overlay(
         source,
         serving,
         source - serving,
-        MERGED_SLAB_K4_CURRENT_TOK_S,
-        MERGED_SLAB_K4_NVFP4_HYPOTHETICAL_TOK_S,
+        MERGED_SLAB_K4_CURRENT_AGGREGATE_TOK_S,
+        MERGED_SLAB_K4_NVFP4_AGGREGATE_TOK_S,
+        MERGED_SLAB_K4_CURRENT_STREAM_TOK_S,
+        MERGED_SLAB_K4_NVFP4_STREAM_TOK_S,
         _complete_evidence(evidence),
     )
 

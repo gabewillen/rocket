@@ -20,8 +20,10 @@ class MtpOverlayTests(unittest.TestCase):
         self.assertEqual(result.source_weight_bytes, 23 * FP8_SOURCE_BYTES_PER_EXPERT)
         self.assertEqual(result.serving_weight_bytes, 23 * NVFP4_SERVING_BYTES_PER_EXPERT)
         self.assertEqual(result.saved_weight_bytes, 49_472_448)
-        self.assertEqual(result.current_control_tokens_per_second, 500.247)
-        self.assertEqual(result.hypothetical_tokens_per_second, 514.470)
+        self.assertAlmostEqual(result.current_control_tokens_per_second, 457.524496688903)
+        self.assertAlmostEqual(result.hypothetical_tokens_per_second, 469.3926469156607)
+        self.assertAlmostEqual(result.current_control_stream_tokens_per_second, 28.59528104305644)
+        self.assertAlmostEqual(result.hypothetical_stream_tokens_per_second, 29.337040432228793)
         self.assertFalse(result.quality_evidence_complete)
 
     def test_quality_claim_fails_closed_until_all_interactions_are_measured(self):
