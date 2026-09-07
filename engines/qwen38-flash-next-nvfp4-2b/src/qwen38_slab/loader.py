@@ -60,6 +60,8 @@ class DirectSlabLoader:
                     "overlay_sha256": contract.overlay_sha256, "tp_size": contract.tp_size,
                     "page_bytes": contract.page_bytes, "tensor_alignment_bytes": contract.tensor_alignment_bytes,
                     "chunk_bytes": contract.chunk_bytes}
+        if contract.plan_sha256 is not None:
+            expected["plan_sha256"] = contract.plan_sha256
         drift = {key: (self._manifest.get(key), value) for key, value in expected.items()
                  if self._manifest.get(key) != value}
         if drift or self._manifest.get("direct_io") != {

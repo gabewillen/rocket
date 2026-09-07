@@ -17,6 +17,9 @@ REVISION = "fc694b54fb0174e0913e6adf86691ef85a4ead47"
 ARTIFACT_KEY = "23d2c39e9c2cf36a832cb1750f6542fa46f11f1befe195d80c082051a5a772b4"
 OVERLAY_SHA256 = "57c5f07d518d302349c1f0f6f8ae75276ae9de602a8b6faadce4faf98a198d6f"
 OVERLAY_TENSORS = 278
+PINNED_PLAN_BYTES = 545_726_297
+PINNED_PLAN_SHA256 = "8035c520827bece63756138c820593cad91b68ac3388424d7482c184f19b49d6"
+GENERIC_PLAN_BYTES = 64 * 1024 * 1024
 TP_SIZE = 2
 PAGE_BYTES = 65_536
 TENSOR_ALIGNMENT_BYTES = 256
@@ -46,6 +49,8 @@ class SlabContract:
     page_bytes: int = PAGE_BYTES
     tensor_alignment_bytes: int = TENSOR_ALIGNMENT_BYTES
     chunk_bytes: int = CHUNK_BYTES
+    plan_bytes: int | None = None
+    plan_sha256: str | None = None
 
 
 PINNED_CONTRACT = SlabContract(
@@ -53,6 +58,8 @@ PINNED_CONTRACT = SlabContract(
     artifact_key=ARTIFACT_KEY,
     overlay_sha256=OVERLAY_SHA256,
     overlay_tensors=OVERLAY_TENSORS,
+    plan_bytes=PINNED_PLAN_BYTES,
+    plan_sha256=PINNED_PLAN_SHA256,
 )
 
 
@@ -79,6 +86,30 @@ def load_json(path: Path, maximum_bytes: int = 64 * 1024 * 1024) -> dict[str, An
     if not isinstance(value, dict):
         raise SlabError(f"JSON root is not an object: {path}")
     return value
+
+
+def load_plan(path: Path, contract: SlabContract) -> dict[str, Any]:
+    """Load a bounded plan after checking its pinned byte and content identity.
+
+    Generic test contracts remain capped at 64 MiB. The production contract accepts
+    one deterministic planner rendering only. Its 545,726,297-byte bound is therefore
+    derived from the frozen plan artifact, rather than from an allocation guess.
+    """
+    if (contract.plan_bytes is None) != (contract.plan_sha256 is None):
+        raise SlabError("plan byte count and digest must be specified together")
+    if contract.plan_bytes is None:
+        return load_json(path, GENERIC_PLAN_BYTES)
+    try:
+        observed_bytes = path.stat().st_size
+    except OSError as exc:
+        raise SlabError(f"cannot stat plan {path}: {exc}") from exc
+    if observed_bytes != contract.plan_bytes:
+        raise SlabError(
+            f"pinned plan byte count mismatch: {observed_bytes}/{contract.plan_bytes}"
+        )
+    if sha256_file(path) != contract.plan_sha256:
+        raise SlabError("pinned plan digest mismatch")
+    return load_json(path, contract.plan_bytes)
 
 
 def validate_plan(plan: dict[str, Any], contract: SlabContract) -> None:

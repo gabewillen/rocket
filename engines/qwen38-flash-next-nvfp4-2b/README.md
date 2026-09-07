@@ -19,6 +19,9 @@ Stage A freezes the rank-local weight ABI for checkpoint
 The materializer is offline. It validates all source provenance before publishing an
 immutable content-addressed directory. The production loader requires an
 OpenTelemetry tracer and Linux `O_DIRECT`; either missing contract fails closed.
+The production plan is pinned at 545,726,297 bytes and SHA-256
+`8035c520827bece63756138c820593cad91b68ac3388424d7482c184f19b49d6`.
+Its deterministic identity replaces a generic JSON allocation ceiling.
 
 ```bash
 PYTHONPATH=engines/qwen38-flash-next-nvfp4-2b/src python3 -m qwen38_slab.materialize \

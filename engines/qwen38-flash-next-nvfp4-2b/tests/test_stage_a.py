@@ -10,7 +10,19 @@ from pathlib import Path
 from unittest import mock
 
 from qwen38_slab import DirectSlabLoader, SlabContract, SlabError, materialize
-from qwen38_slab.contract import MODEL_NVFP4_ABI, MTP_FP8_ABI, PAGE_BYTES, SCHEMA, sf_swizzle
+from qwen38_slab.contract import (
+    GENERIC_PLAN_BYTES,
+    MODEL_NVFP4_ABI,
+    MTP_FP8_ABI,
+    PAGE_BYTES,
+    PINNED_CONTRACT,
+    PINNED_PLAN_BYTES,
+    SCHEMA,
+    load_plan,
+    sf_swizzle,
+)
+
+REAL_PLAN = Path("/home/glwillen/calibration/qwen38-rank-slab-plan-fc694.json")
 
 
 class Span:
@@ -214,6 +226,46 @@ class StageAContractTests(unittest.TestCase):
         second.plan.write_text(json.dumps(value))
         with self.assertRaisesRegex(SlabError, "exactly four"):
             second.build()
+
+    def test_pinned_plan_uses_exact_identity_instead_of_generic_size_guess(self):
+        self.assertGreater(PINNED_PLAN_BYTES, 512 * 1024 * 1024)
+        self.assertGreater(PINNED_PLAN_BYTES, GENERIC_PLAN_BYTES)
+        exact = self.fixture.plan.read_bytes()
+        contract = SlabContract(
+            "synthetic", "a" * 64, self.fixture.contract.overlay_sha256, 1,
+            chunk_bytes=PAGE_BYTES, plan_bytes=len(exact),
+            plan_sha256=hashlib.sha256(exact).hexdigest(),
+        )
+        self.assertEqual(load_plan(self.fixture.plan, contract)["schema"],
+                         "rocket.qwen38-rank-slab-plan.v2")
+        contract = SlabContract(
+            "synthetic", "a" * 64, self.fixture.contract.overlay_sha256, 1,
+            chunk_bytes=PAGE_BYTES, plan_bytes=len(exact), plan_sha256="0" * 64,
+        )
+        with self.assertRaisesRegex(SlabError, "digest mismatch"):
+            load_plan(self.fixture.plan, contract)
+
+    @unittest.skipUnless(REAL_PLAN.is_file(), "pinned real plan unavailable")
+    def test_real_pinned_plan_crosses_previous_size_boundary(self):
+        self.assertEqual(REAL_PLAN.stat().st_size, PINNED_PLAN_BYTES)
+
+        class ReachedOverlayValidation(Exception):
+            pass
+
+        output = Path(self.temp.name) / "must-not-exist"
+        with mock.patch(
+            "qwen38_slab.materialize.validate_overlay",
+            side_effect=ReachedOverlayValidation,
+        ):
+            with self.assertRaises(ReachedOverlayValidation):
+                materialize(
+                    REAL_PLAN,
+                    Path("/unused-checkpoint"),
+                    Path("/unused-overlay"),
+                    output,
+                    PINNED_CONTRACT,
+                )
+        self.assertFalse(output.exists())
 
     def test_swizzle_matches_documented_cutlass_atom(self):
         linear = bytes(range(128))

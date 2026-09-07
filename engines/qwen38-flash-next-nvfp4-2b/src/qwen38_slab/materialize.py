@@ -8,7 +8,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any
 
 from .contract import (
     MODEL_NVFP4_ABI,
@@ -20,7 +20,7 @@ from .contract import (
     SlabError,
     align_up,
     canonical_bytes,
-    load_json,
+    load_plan,
     read_safetensors_index,
     sf_swizzle,
     sha256_file,
@@ -270,7 +270,7 @@ def _write_slab(path: Path, components: list[dict[str, Any]], contract: SlabCont
 def materialize(plan_path: Path, checkpoint: Path, overlay_root: Path, output_root: Path,
                 contract: SlabContract = PINNED_CONTRACT) -> Path:
     """Create one immutable artifact. Inputs are read-only; failure leaves no final path."""
-    plan = load_json(plan_path, 512 * 1024 * 1024)
+    plan = load_plan(plan_path, contract)
     validate_plan(plan, contract)
     overlay_manifest, overlay_path = validate_overlay(overlay_root, contract)
     overlay_names = {item["name"] for item in overlay_manifest["source"]["tensors"]}
