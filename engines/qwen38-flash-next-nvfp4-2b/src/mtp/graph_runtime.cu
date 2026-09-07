@@ -60,8 +60,11 @@ struct MtpGraphRuntime::Impl {
   std::array<cudaGraphExec_t, 5> input_local{};
   std::array<cudaGraphExec_t, 5> input_finish{};
   std::array<cudaGraphExec_t, 5> final_local{};
+  std::array<cudaGraphExec_t, 5> logits_local{};
 
   ~Impl() {
+    for (cudaGraphExec_t graph : logits_local)
+      if (graph) cudaGraphExecDestroy(graph);
     for (cudaGraphExec_t graph : final_local)
       if (graph) cudaGraphExecDestroy(graph);
     for (cudaGraphExec_t graph : input_finish)
@@ -206,6 +209,8 @@ MtpGraphRuntime::MtpGraphRuntime(GraphRuntimeBinding binding)
             impl_->arena.reduced_moe_output, impl_->arena.final_injection,
             impl_->arena.updated_multi_hidden, impl_->arena.token_hidden, m,
             impl_->capture_stream);
+      });
+      capture(impl_->logits_local[index], [&] {
         if (output::lm_head(
                 impl_->head_handle, impl_->arena.token_hidden,
                 reinterpret_cast<const __nv_bfloat16*>(
@@ -246,6 +251,12 @@ void MtpGraphRuntime::launch_final_local(int m, cudaStream_t stream) {
   if (!stream) throw std::invalid_argument("MTP final-local stream changed");
   check(cudaGraphLaunch(impl_->final_local[bucket_index(m)], stream),
         "launch final local");
+}
+
+void MtpGraphRuntime::launch_logits_local(int m, cudaStream_t stream) {
+  if (!stream) throw std::invalid_argument("MTP logits-local stream changed");
+  check(cudaGraphLaunch(impl_->logits_local[bucket_index(m)], stream),
+        "launch logits local");
 }
 
 const std::int32_t* MtpGraphRuntime::enqueue_winner_exchange_and_greedy(

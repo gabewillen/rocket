@@ -120,6 +120,7 @@ int main() {
       runtime.launch_input_local(m, stream);
       runtime.launch_input_finish(m, stream);
       runtime.launch_final_local(m, stream);
+      runtime.launch_logits_local(m, stream);
       FakeWinnerExchange ties(0.0F);
       runtime.enqueue_winner_exchange_and_greedy(ties, m, stream);
       cuda_check(cudaStreamSynchronize(stream), "complete runtime graphs");
@@ -162,7 +163,7 @@ int main() {
                "copy unpublished tokens");
     for (const int token : tokens)
       check(token == -1, "exchange fault published proposal tokens");
-    std::printf("qwen38_mtp_graph_runtime graphs=input_local,input_finish,final_local winner_exchange=device buckets=1,16 result=match\n");
+    std::printf("qwen38_mtp_graph_runtime graphs=input_local,input_finish,final_local,logits_local winner_exchange=device buckets=1,16 result=match\n");
     cudaStreamDestroy(stream);
     cudaFree(mtp_slab);
     cudaFree(target_slab);

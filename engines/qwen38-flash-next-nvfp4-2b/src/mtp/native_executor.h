@@ -1,159 +1,82 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
-
 #include <cuda_runtime_api.h>
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
-#include <string_view>
-
 #include "decode/decoder_verifier.h"
+#include "mtp/graph_runtime.h"
 #include "mtp/state_arena.h"
 
 namespace rocket::qwen38::mtp {
-
-inline constexpr int kMaxDepth = 7;
-inline constexpr int kMaxSequences = 16;
-inline constexpr int kLocalExperts = 256;
-inline constexpr int kRouterTopK = 8;
-inline constexpr std::size_t kNativeRankSlabBytes = 1'370'161'152;
-// Three TP2 projections: 3 * 1,638,400 FP8 bytes plus three 200-byte
-// block-128 inverse-scale tensors in the authenticated rank slab.
+inline constexpr int kMaxDepth = 7, kMaxSequences = 16, kLocalExperts = 256,
+                     kRouterTopK = 8;
 inline constexpr std::uint64_t kNvidiaFp8BytesPerLocalExpert = 4'915'800;
-
-enum class Phase : std::uint8_t {
-  kInputFusion,
-  kAttention,
-  kAttentionReduce,
-  kRoutedAndSharedMoe,
-  kMoeReduce,
-  kFinalHyperconnection,
-  kLogits,
-  kProposalSample,
-  kCount,
-};
-
+enum class Phase : std::uint8_t { kInputFusion, kAttention, kAttentionReduce,
+  kRoutedAndSharedMoe, kMoeReduce, kFinalHyperconnection, kLogits,
+  kProposalSample, kCount };
 enum class Outcome : std::uint8_t { kOk, kContractError, kCudaError };
 enum class ExecutorPhase : std::uint8_t { kReady, kDrafted, kFaulted };
-
-struct GraphKey {
-  int depth;
-  int sequences;
-};
-
-[[nodiscard]] constexpr bool allowed_graph_key(GraphKey key) noexcept {
-  const bool batch = key.sequences == 1 || key.sequences == 2 ||
-                     key.sequences == 4 || key.sequences == 8 ||
-                     key.sequences == 16;
-  return key.depth >= 1 && key.depth <= kMaxDepth && batch &&
-         (key.depth <= 4 || key.sequences <= 4);
+struct GraphKey { int depth; int sequences; };
+constexpr bool allowed_graph_key(GraphKey k) noexcept {
+  const bool b = k.sequences == 1 || k.sequences == 2 || k.sequences == 4 ||
+                 k.sequences == 8 || k.sequences == 16;
+  return k.depth >= 1 && k.depth <= 7 && b &&
+         (k.depth <= 4 || k.sequences <= 4);
 }
+struct PhaseMetric { Phase phase; Outcome outcome; int depth; int sequences;
+  std::uint64_t duration_ns; };
+struct ExpertUsageMetric { Outcome outcome; int depth; int sequences;
+  int draft_step; int unique_local_experts; std::uint64_t resident_expert_bytes; };
+class TelemetrySink { public: virtual ~TelemetrySink() = default;
+  virtual void record_phase(const PhaseMetric&) noexcept = 0;
+  virtual void record_expert_usage(const ExpertUsageMetric&) noexcept = 0; };
+struct DeviceDraftView { const std::int32_t* verification_tokens = nullptr;
+  int depth = 0; int sequences = 0; std::uint64_t generation = 0; };
 
-struct PhaseMetric {
-  Phase phase;
-  Outcome outcome;
-  int depth;
-  int sequences;
-  std::uint64_t duration_ns;
-};
-
-struct ExpertUsageMetric {
-  Outcome outcome;
-  int depth;
-  int sequences;
-  int draft_step;
-  int unique_local_experts;
-  std::uint64_t resident_expert_bytes;
-};
-
-// All metric dimensions are bounded enums or graph buckets. Correlation IDs,
-// sequence slots, token IDs, and expert IDs are intentionally absent.
-class TelemetrySink {
- public:
-  virtual ~TelemetrySink() = default;
-  virtual void record_phase(const PhaseMetric& metric) noexcept = 0;
-  virtual void record_expert_usage(const ExpertUsageMetric& metric) noexcept = 0;
-};
-
-struct ImmutableSlabs {
-  const void* target_rank_slab;
-  std::size_t target_rank_slab_bytes;
-  const void* mtp_rank_slab;
-  std::size_t mtp_rank_slab_bytes;
-  // SHA-256 bytes returned by mtp_source.inspect_native_mtp_source().
-  std::array<std::uint8_t, 32> source_contract_digest;
-};
-
-struct BoundGraph {
-  GraphKey key;
-  // Exact captured graphs for every phase and draft position. The native
-  // executor owns no graph nodes and never mutates an exec after binding.
-  std::array<std::array<cudaGraphExec_t, static_cast<int>(Phase::kCount)>,
-             kMaxDepth>
-      phase_graphs{};
-  // Actual post-router expert IDs, laid out [sequences, top_k], per step.
-  std::array<const std::int32_t*, kMaxDepth> router_expert_ids{};
-  // Captured target+proposal output, position-major [depth + 1, sequences].
-  const std::int32_t* verification_tokens = nullptr;
-};
-
-struct DeviceDraftView {
-  const std::int32_t* verification_tokens = nullptr;
-  int depth = 0;
-  int sequences = 0;
-  std::uint64_t generation = 0;
-};
-
-class NativeExecutorError : public std::runtime_error {
- public:
-  using std::runtime_error::runtime_error;
-};
-
-// One logical writer. draft() performs every MTP layer and proposal step in
-// native code. stage_accept() writes only the shared transaction's inactive
-// state. commit() advances generation after DecoderVerifier publishes it.
+// Required native QSA/MoE and PairReduce boundary. Methods enqueue only on the
+// caller stream and may write fixed runtime/StateArena storage, never active state.
+class MtpMiddleStagePort { public: virtual ~MtpMiddleStagePort() = default;
+  virtual const std::int32_t* prepare(GraphArenaView, StateArena&, GraphKey,
+                                      cudaStream_t) = 0;
+  virtual void reduce_input(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
+  virtual void stage_attention(GraphArenaView, PrefixStateView, int, GraphKey,
+                               cudaStream_t) = 0;
+  virtual void reduce_attention(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
+  virtual void stage_moe(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
+  virtual void reduce_moe(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
+  virtual const std::int32_t* router_expert_ids(int) const noexcept = 0;
+  virtual void advance(GraphArenaView, StateArena&, int, GraphKey,
+                       const std::int32_t*, cudaStream_t) = 0; };
+class NativeExecutorError : public std::runtime_error { public:
+  using std::runtime_error::runtime_error; };
 class NativeExecutor final : public decode::AcceptedStateParticipant {
  public:
-  NativeExecutor(ImmutableSlabs slabs, BoundGraph graph, StateArena& state,
-                 TelemetrySink& telemetry, cudaStream_t stream);
+  NativeExecutor(GraphKey, MtpGraphRuntime&, MtpMiddleStagePort&,
+                 WinnerExchangePort&, StateArena&, TelemetrySink&, cudaStream_t);
   ~NativeExecutor();
-
   NativeExecutor(const NativeExecutor&) = delete;
   NativeExecutor& operator=(const NativeExecutor&) = delete;
-
   DeviceDraftView draft(std::uint64_t generation);
   std::size_t state_bytes_per_sequence() const noexcept override {
-    return state_.transaction_bytes();
-  }
-  void stage_accept(std::uint64_t generation, std::byte* inactive_state,
-                    const std::int32_t* accepted_widths_device,
-                    decode::DecoderVerifierShape shape,
-                    cudaStream_t stream) override;
-  void commit(std::uint64_t generation) noexcept override;
-  // Invoke only after DecoderVerifier's terminal fence. This method performs
-  // no CUDA synchronization and launches no device work.
-  void export_telemetry_after_fence(std::uint64_t generation) noexcept;
-  void discard(std::uint64_t generation) noexcept override;
-
-  [[nodiscard]] ExecutorPhase phase() const noexcept { return phase_; }
-  [[nodiscard]] GraphKey key() const noexcept { return graph_.key; }
-
+    return state_.transaction_bytes(); }
+  void stage_accept(std::uint64_t, std::byte*, const std::int32_t*,
+                    decode::DecoderVerifierShape, cudaStream_t) override;
+  void commit(std::uint64_t) noexcept override;
+  void export_telemetry_after_fence(std::uint64_t) noexcept;
+  void discard(std::uint64_t) noexcept override;
+  ExecutorPhase phase() const noexcept { return phase_; }
+  GraphKey key() const noexcept { return key_; }
  private:
-  ImmutableSlabs slabs_;
-  BoundGraph graph_;
-  StateArena& state_;
-  TelemetrySink& telemetry_;
+  GraphKey key_; MtpGraphRuntime& runtime_; MtpMiddleStagePort& middle_;
+  WinnerExchangePort& exchange_; StateArena& state_; TelemetrySink& telemetry_;
   cudaStream_t stream_;
-  std::array<std::array<cudaEvent_t, static_cast<int>(Phase::kCount) + 1>,
-             kMaxDepth>
-      events_{};
+  std::array<std::array<cudaEvent_t, static_cast<int>(Phase::kCount) + 1>, 7> events_{};
   std::uint32_t* expert_masks_device_ = nullptr;
-  std::array<std::array<std::uint32_t, 8>, kMaxDepth> expert_masks_host_{};
+  std::array<std::array<std::uint32_t, 8>, 7> expert_masks_host_{};
   ExecutorPhase phase_ = ExecutorPhase::kReady;
-  std::uint64_t active_generation_ = 0;
-  std::uint64_t pending_generation_ = 0;
+  std::uint64_t active_generation_ = 0, pending_generation_ = 0;
+  const std::int32_t* verification_tokens_ = nullptr;
 };
-
 }  // namespace rocket::qwen38::mtp

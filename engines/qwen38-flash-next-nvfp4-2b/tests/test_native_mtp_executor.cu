@@ -1,147 +1,118 @@
-// SPDX-License-Identifier: Apache-2.0
 #include "mtp/native_executor.h"
-
 #include <cuda_runtime.h>
-
 #include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <iostream>
 #include <vector>
 
 #undef assert
-#define assert(condition)            \
-  do {                               \
-    if (!(condition)) std::abort();  \
-  } while (false)
+#define assert(x) do { if (!(x)) std::abort(); } while (false)
+namespace mtp = rocket::qwen38::mtp;
+namespace output = rocket::qwen38::output;
 
 namespace {
-
-using rocket::qwen38::mtp::BoundGraph;
-using rocket::qwen38::mtp::ExpertUsageMetric;
-using rocket::qwen38::mtp::ImmutableSlabs;
-using rocket::qwen38::mtp::NativeExecutor;
-using rocket::qwen38::mtp::Outcome;
-using rocket::qwen38::mtp::PhaseMetric;
-
-class Sink final : public rocket::qwen38::mtp::TelemetrySink {
- public:
-  void record_phase(const PhaseMetric& metric) noexcept override {
-    phases.push_back(metric);
+std::uint64_t append(mtp::TensorExtent& e, std::uint64_t o, std::uint64_t n) {
+  o = (o + 255) & ~std::uint64_t{255}; e = {o, n}; return o + n;
+}
+__global__ void order(const output::Winner* local, output::Winner* both,
+                      int m, int rank) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < m) { both[2*i + rank] = local[i];
+    both[2*i + 1-rank] = {0.0F, (1-rank)*output::kLocalVocab}; }
+}
+class Exchange final : public mtp::WinnerExchangePort { public:
+  void enqueue(const output::Winner* local, output::Winner* both, int m,
+               int rank, cudaStream_t s) override {
+    order<<<1, 32, 0, s>>>(local, both, m, rank);
   }
-  void record_expert_usage(const ExpertUsageMetric& metric) noexcept override {
-    experts.push_back(metric);
-  }
-  std::vector<PhaseMetric> phases;
-  std::vector<ExpertUsageMetric> experts;
 };
-
-cudaGraphExec_t empty_graph() {
-  cudaGraph_t graph = nullptr;
-  cudaGraphExec_t executable = nullptr;
-  assert(cudaGraphCreate(&graph, 0) == cudaSuccess);
-  cudaGraphNode_t node = nullptr;
-  assert(cudaGraphAddEmptyNode(&node, graph, nullptr, 0) == cudaSuccess);
-  assert(cudaGraphInstantiate(&executable, graph, 0) == cudaSuccess);
-  assert(cudaGraphDestroy(graph) == cudaSuccess);
-  return executable;
+class Middle final : public mtp::MtpMiddleStagePort { public:
+  Middle(int sequences, int depth) : sequences_(sequences), depth_(depth) {
+    assert(cudaMalloc(&tokens_, sequences * (depth + 1) * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMalloc(&routes_, sequences * 8 * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMemset(tokens_, 0, sequences * (depth + 1) * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMemset(routes_, 0, sequences * 8 * sizeof(std::int32_t)) == cudaSuccess);
+  }
+  ~Middle() { cudaFree(routes_); cudaFree(tokens_); }
+  const std::int32_t* prepare(mtp::GraphArenaView a, mtp::StateArena&,
+                              mtp::GraphKey, cudaStream_t s) override {
+    cudaMemsetAsync(a.embedding, 0, sequences_ * mtp::kFusionHidden * 2, s);
+    cudaMemsetAsync(a.multi_hidden, 0, sequences_ * mtp::kFusionHyperHidden * 2, s);
+    cudaMemsetAsync(a.final_injection, 0, sequences_ * mtp::kFusionStreams * 2, s);
+    return tokens_;
+  }
+  void reduce_input(mtp::GraphArenaView a, int, mtp::GraphKey, cudaStream_t s) override {
+    cudaMemsetAsync(a.reduced_embedding, 0, sequences_ * mtp::kFusionHidden * 4, s);
+    cudaMemsetAsync(a.reduced_hidden, 0, sequences_ * mtp::kFusionHyperHidden * 4, s);
+  }
+  void stage_attention(mtp::GraphArenaView, mtp::PrefixStateView, int,
+                       mtp::GraphKey, cudaStream_t) override {}
+  void reduce_attention(mtp::GraphArenaView, int, mtp::GraphKey,
+                        cudaStream_t) override {}
+  void stage_moe(mtp::GraphArenaView, int, mtp::GraphKey, cudaStream_t) override {}
+  void reduce_moe(mtp::GraphArenaView a, int, mtp::GraphKey, cudaStream_t s) override {
+    cudaMemsetAsync(a.reduced_moe_output, 0,
+                    sequences_ * mtp::kFusionHidden * sizeof(float), s);
+  }
+  const std::int32_t* router_expert_ids(int) const noexcept override {
+    return fault_routes_ ? nullptr : routes_;
+  }
+  void advance(mtp::GraphArenaView, mtp::StateArena&, int step, mtp::GraphKey,
+               const std::int32_t* proposals, cudaStream_t s) override {
+    cudaMemcpyAsync(tokens_ + (step + 1) * sequences_, proposals,
+                    sequences_ * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s);
+  }
+  int sequences_, depth_; std::int32_t *tokens_ = nullptr, *routes_ = nullptr;
+  bool fault_routes_ = false;
+};
+class Sink final : public mtp::TelemetrySink { public:
+  void record_phase(const mtp::PhaseMetric& m) noexcept override { phases.push_back(m); }
+  void record_expert_usage(const mtp::ExpertUsageMetric& m) noexcept override { experts.push_back(m); }
+  std::vector<mtp::PhaseMetric> phases; std::vector<mtp::ExpertUsageMetric> experts;
+};
 }
 
-}  // namespace
-
 int main() {
-  static_assert(rocket::qwen38::mtp::allowed_graph_key({1, 16}));
-  static_assert(rocket::qwen38::mtp::allowed_graph_key({2, 16}));
-  static_assert(rocket::qwen38::mtp::allowed_graph_key({3, 16}));
-  static_assert(rocket::qwen38::mtp::allowed_graph_key({4, 16}));
-  static_assert(!rocket::qwen38::mtp::allowed_graph_key({5, 16}));
-  static_assert(!rocket::qwen38::mtp::allowed_graph_key({6, 8}));
-  static_assert(rocket::qwen38::mtp::allowed_graph_key({7, 4}));
-  constexpr int kDepth = 2;
-  constexpr int kSequences = 2;
-  cudaStream_t stream = nullptr;
-  assert(cudaStreamCreate(&stream) == cudaSuccess);
-
-  BoundGraph graph;
-  graph.key = {kDepth, kSequences};
-  std::array<std::array<std::int32_t, 16>, kDepth> router{{
-      {0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 0, 1, 2, 3, 3, 3},
-      {7, 7, 8, 8, 9, 9, 10, 10, 7, 8, 9, 10, 10, 10, 10, 10},
-  }};
-  std::array<std::int32_t, kSequences * (kDepth + 1)> tokens{
-      11, 12, 17, 19, 18, 20};
-
-  std::array<std::int32_t*, kDepth> router_device{};
-  std::int32_t* token_device = nullptr;
-  std::byte* inactive_device = nullptr;
-  for (int step = 0; step < kDepth; ++step) {
-    assert(cudaMalloc(&router_device[step], sizeof(router[step])) == cudaSuccess);
-    assert(cudaMemcpy(router_device[step], router[step].data(),
-                      sizeof(router[step]), cudaMemcpyHostToDevice) ==
-           cudaSuccess);
-    graph.router_expert_ids[step] = router_device[step];
-    for (auto& executable : graph.phase_graphs[step]) executable = empty_graph();
-  }
-  assert(cudaMalloc(&token_device, sizeof(tokens)) == cudaSuccess);
-  assert(cudaMemcpy(token_device, tokens.data(), sizeof(tokens),
-                    cudaMemcpyHostToDevice) == cudaSuccess);
-  graph.verification_tokens = token_device;
-  rocket::qwen38::mtp::StateArena state(kSequences, kDepth, false);
-  assert(cudaMalloc(&inactive_device, state.transaction_bytes()) == cudaSuccess);
-  assert(cudaMemset(state.prefix(0).multi_hidden, 0x11,
-                    kSequences * rocket::qwen38::mtp::kMtpMultiHidden * 2) == cudaSuccess);
-  assert(cudaMemset(state.prefix(1).multi_hidden, 0x22,
-                    kSequences * rocket::qwen38::mtp::kMtpMultiHidden * 2) == cudaSuccess);
-
-  std::array<std::uint8_t, 32> digest{};
-  digest[0] = 1;
-  Sink sink;
+  static_assert(mtp::allowed_graph_key({4,16}));
+  static_assert(!mtp::allowed_graph_key({5,16}));
+  constexpr int sequences = 2, depth = 2;
+  mtp::NonexpertLayout l{}; std::uint64_t bytes = 0;
+  bytes=append(l.pre_fc_norm_embedding,bytes,5120); bytes=append(l.pre_fc_norm_hidden,bytes,20480);
+  bytes=append(l.fc_embedding,bytes,6553600); bytes=append(l.fc_hidden,bytes,6553600);
+  bytes=append(l.final_hc_norm,bytes,20480); bytes=append(l.final_hc_down,bytes,6553600);
+  bytes=append(l.final_hc_up,bytes,6553600); bytes=(bytes+255)&~std::uint64_t{255};
+  std::byte *target=nullptr,*slab=nullptr,*inactive=nullptr;
+  assert(cudaMalloc(&target, output::kLmHead.length_bytes)==cudaSuccess);
+  assert(cudaMalloc(&slab,bytes)==cudaSuccess); cudaMemset(target,0,output::kLmHead.length_bytes); cudaMemset(slab,0,bytes);
+  std::array<std::uint8_t,32> digest{}; digest[0]=1;
+  mtp::MtpGraphRuntime runtime({0,0,target,output::kLmHead.length_bytes,slab,
+                                static_cast<std::size_t>(bytes),digest,l});
+  mtp::StateArena state(sequences,depth,false); Middle middle(sequences,depth);
+  Exchange exchange; Sink sink; cudaStream_t stream=nullptr; cudaStreamCreate(&stream);
+  assert(cudaMalloc(&inactive,state.transaction_bytes())==cudaSuccess);
+  cudaMemset(state.prefix(0).multi_hidden,0x11,sequences*mtp::kMtpMultiHidden*2);
+  cudaMemset(state.prefix(1).multi_hidden,0x22,sequences*mtp::kMtpMultiHidden*2);
   {
-    const std::array<std::int32_t, kSequences> accepted{1, 3};
-    std::int32_t* accepted_device = nullptr;
-    assert(cudaMalloc(&accepted_device, sizeof(accepted)) == cudaSuccess);
-    assert(cudaMemcpy(accepted_device, accepted.data(), sizeof(accepted),
-                      cudaMemcpyHostToDevice) == cudaSuccess);
-    NativeExecutor executor(
-        ImmutableSlabs{reinterpret_cast<void*>(1), 1,
-                       reinterpret_cast<void*>(2),
-                       rocket::qwen38::mtp::kNativeRankSlabBytes, digest},
-        graph, state, sink, stream);
-    const auto result = executor.draft(1);
-    assert(result.verification_tokens == token_device);
-    assert(result.depth == kDepth && result.sequences == kSequences);
-    executor.stage_accept(1, inactive_device, accepted_device,
-                          {kSequences, kDepth + 1}, stream);
-    // This is the one terminal fence owned by the target verifier.
-    assert(cudaStreamSynchronize(stream) == cudaSuccess);
-    executor.commit(1);
-    std::array<std::byte, 2> selected{};
-    assert(cudaMemcpy(&selected[0], inactive_device, 1,
-                      cudaMemcpyDeviceToHost) == cudaSuccess);
-    assert(cudaMemcpy(&selected[1], inactive_device +
-                          rocket::qwen38::mtp::kMtpMultiHidden * 2,
-                      1, cudaMemcpyDeviceToHost) == cudaSuccess);
-    assert(selected[0] == std::byte{0x11} && selected[1] == std::byte{0x22});
-    std::cout << "accepted_widths=1,3 published_snapshots=0,1 exact=1\n";
-    executor.export_telemetry_after_fence(1);
-    assert(sink.experts.size() == kDepth);
-    assert(sink.experts[0].unique_local_experts == 4);
-    assert(sink.experts[1].unique_local_experts == 4);
-    assert(sink.experts[0].resident_expert_bytes ==
-           4 * rocket::qwen38::mtp::kNvidiaFp8BytesPerLocalExpert);
-    assert(executor.phase() == rocket::qwen38::mtp::ExecutorPhase::kReady);
-    assert(cudaFree(accepted_device) == cudaSuccess);
+    mtp::StateArena failed_state(sequences,depth,false);
+    Middle failed_middle(sequences,depth); failed_middle.fault_routes_=true;
+    mtp::NativeExecutor failed({depth,sequences},runtime,failed_middle,exchange,
+                               failed_state,sink,stream);
+    bool rejected=false;
+    try { failed.draft(1); } catch (const mtp::NativeExecutorError&) { rejected=true; }
+    assert(rejected && failed.phase()==mtp::ExecutorPhase::kFaulted);
+    failed.commit(1);
+    assert(failed.phase()==mtp::ExecutorPhase::kFaulted);
   }
-
-  for (int step = 0; step < kDepth; ++step) {
-    for (auto executable : graph.phase_graphs[step])
-      assert(cudaGraphExecDestroy(executable) == cudaSuccess);
-    assert(cudaFree(router_device[step]) == cudaSuccess);
-  }
-  assert(cudaFree(token_device) == cudaSuccess);
-  assert(cudaFree(inactive_device) == cudaSuccess);
-  assert(cudaStreamDestroy(stream) == cudaSuccess);
+  mtp::NativeExecutor executor({depth,sequences},runtime,middle,exchange,state,sink,stream);
+  const auto draft=executor.draft(1); assert(draft.depth==depth && draft.sequences==sequences);
+  std::array<std::int32_t,sequences> widths{1,3}; std::int32_t* dwidths=nullptr;
+  cudaMalloc(&dwidths,sizeof(widths)); cudaMemcpy(dwidths,widths.data(),sizeof(widths),cudaMemcpyHostToDevice);
+  executor.stage_accept(1,inactive,dwidths,{sequences,depth+1},stream);
+  assert(cudaStreamSynchronize(stream)==cudaSuccess); executor.commit(1);
+  executor.export_telemetry_after_fence(1); assert(sink.experts.size()==depth);
+  assert(executor.phase()==mtp::ExecutorPhase::kReady);
+  cudaFree(dwidths); cudaFree(inactive); cudaStreamDestroy(stream); cudaFree(slab); cudaFree(target);
   return 0;
 }

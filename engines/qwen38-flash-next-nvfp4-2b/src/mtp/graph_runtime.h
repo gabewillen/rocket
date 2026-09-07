@@ -83,6 +83,7 @@ class MtpGraphRuntime final {
   void launch_input_local(int m, cudaStream_t stream);
   void launch_input_finish(int m, cudaStream_t stream);
   void launch_final_local(int m, cudaStream_t stream);
+  void launch_logits_local(int m, cudaStream_t stream);
   const std::int32_t* enqueue_winner_exchange_and_greedy(
       WinnerExchangePort& exchange, int m, cudaStream_t stream);
 
