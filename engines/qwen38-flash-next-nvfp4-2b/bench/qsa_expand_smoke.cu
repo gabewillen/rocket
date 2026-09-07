@@ -3,6 +3,7 @@
 #include <cuda_runtime_api.h>
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <cstdio>
@@ -88,6 +89,11 @@ int main() {
   __nv_bfloat16* d_qkv = nullptr;
   std::vector<__nv_bfloat16> qkv(kFullRows * kQkvWidth,
                                  __float2bfloat16(0.0f));
+  constexpr int kNonzeroQueryRow = 2;
+  for (int head = 0; head < 12; ++head)
+    for (int dim = 0; dim < 256; ++dim)
+      qkv[kNonzeroQueryRow * kQkvWidth + head * 256 + dim] =
+          __float2bfloat16(((head * 13 + dim * 5) % 31 - 15) / 32.0f);
   constexpr int kSentinelRow = kFullRows - 2;
   qkv[kSentinelRow * kQkvWidth + 6144 + 256] = __float2bfloat16(1024.0f);
   cudaGraph_t index_graph = nullptr;
@@ -179,6 +185,20 @@ int main() {
   for (int element = (kFullRows - 1) * 12 * 256;
        ok && element < kFullRows * 12 * 256; ++element)
     ok = __bfloat162float(attention_first[element]) == 0.0f;
+  std::vector<__nv_bfloat16> attention_control(attention_first.size());
+  if (ok) ok = qwen38_qsa_sparse_attention_control(
+                   plan, d_qkv, d_positions, d_requests, stream) == 0 &&
+               cuda_ok(cudaStreamSynchronize(stream), "sync scalar QSA control") &&
+               cuda_ok(cudaMemcpy(attention_control.data(), d_attention,
+                                  attention_control.size() * 2,
+                                  cudaMemcpyDeviceToHost), "copy scalar QSA control");
+  float control_max_error = 0.0f;
+  for (std::size_t index = 0; ok && index < attention_first.size(); ++index)
+    control_max_error = std::max(
+        control_max_error,
+        std::abs(__bfloat162float(attention_first[index]) -
+                 __bfloat162float(attention_control[index])));
+  ok = ok && control_max_error <= 0.004f;
   void* d_projected = nullptr;
   std::size_t projected_elements = 0;
   std::vector<__nv_bfloat16> projected(kFullRows * 2560);
@@ -194,25 +214,33 @@ int main() {
     for (int warm = 0; warm < 3; ++warm)
       (operation == 0 ? qwen38_qsa_indexer_score(plan, d_positions, d_lengths, d_requests, stream)
        : operation == 1 ? qwen38_qsa_indexer_select_expand(plan, d_positions, d_lengths, d_requests, stream)
-                        : qwen38_qsa_attention_launch(plan, d_qkv, d_positions, d_requests, stream));
+       : operation == 2 ? qwen38_qsa_attention_launch(plan, d_qkv, d_positions, d_requests, stream)
+       : operation == 3 ? qwen38_qsa_sparse_attention(plan, d_qkv, d_positions, d_requests, stream)
+                        : qwen38_qsa_sparse_attention_control(plan, d_qkv, d_positions, d_requests, stream));
     cudaStreamSynchronize(stream); cudaEventRecord(start, stream);
     constexpr int iterations = 20;
     for (int iteration = 0; iteration < iterations; ++iteration)
       (operation == 0 ? qwen38_qsa_indexer_score(plan, d_positions, d_lengths, d_requests, stream)
        : operation == 1 ? qwen38_qsa_indexer_select_expand(plan, d_positions, d_lengths, d_requests, stream)
-                        : qwen38_qsa_attention_launch(plan, d_qkv, d_positions, d_requests, stream));
+       : operation == 2 ? qwen38_qsa_attention_launch(plan, d_qkv, d_positions, d_requests, stream)
+       : operation == 3 ? qwen38_qsa_sparse_attention(plan, d_qkv, d_positions, d_requests, stream)
+                        : qwen38_qsa_sparse_attention_control(plan, d_qkv, d_positions, d_requests, stream));
     cudaEventRecord(end, stream); cudaEventSynchronize(end);
     float ms = 0; cudaEventElapsedTime(&ms, start, end);
     cudaEventDestroy(end); cudaEventDestroy(start); return ms / iterations;
   };
   const float score_ms = elapsed(0), select_ms = elapsed(1), attention_ms = elapsed(2);
+  const float tiled_ms = elapsed(3), control_ms = elapsed(4);
   const double physical_gb =
       (15.0 * kColumns * (128.0 * 2.0 + 4.0)) / 1.0e9;
   const double bandwidth = physical_gb / (score_ms / 1000.0);
   std::printf("qsa_indexer rows=16 columns=65536 score_ms=%.6f "
               "score_gbps=%.3f local_roof_pct=%.3f select_expand_ms=%.6f "
-              "attention_output_ms=%.6f repeat=%s result=%s\n", score_ms, bandwidth,
-              bandwidth / 238.0 * 100.0, select_ms, attention_ms,
+              "attention_output_ms=%.6f tiled_ms=%.6f control_ms=%.6f "
+              "speedup=%.3f control_max_error=%.7f repeat=%s result=%s\n",
+              score_ms, bandwidth,
+              bandwidth / 238.0 * 100.0, select_ms, attention_ms, tiled_ms,
+              control_ms, control_ms / tiled_ms, control_max_error,
               first == second ? "bit-exact" : "mismatch", ok ? "match" : "failure");
   if (index_exec) cudaGraphExecDestroy(index_exec);
   if (index_graph) cudaGraphDestroy(index_graph);

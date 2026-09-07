@@ -77,6 +77,10 @@ int qwen38_qsa_sparse_attention(void* plan, const void* qkv_output_bf16,
                                const std::int64_t* logical_positions,
                                const std::int32_t* token_to_request,
                                cudaStream_t stream);
+int qwen38_qsa_sparse_attention_control(
+    void* plan, const void* qkv_output_bf16,
+    const std::int64_t* logical_positions,
+    const std::int32_t* token_to_request, cudaStream_t stream);
 int qwen38_qsa_output_project(void* plan, cudaStream_t stream);
 int qwen38_qsa_attention_output(void* plan, void** output_bf16,
                                std::size_t* elements);

@@ -444,6 +444,10 @@ class CutlassQkvRuntime:
             finally:
                 self._api.call("cudaEventDestroy", end)
                 self._api.call("cudaEventDestroy", start)
+        scalar_control = measured_attention(
+            "qwen38_qsa_sparse_attention_control",
+            (self._qsa_plan, self._output, logical_positions, token_to_request),
+        )
         sparse_attention = measured_attention(
             "qwen38_qsa_sparse_attention",
             (self._qsa_plan, self._output, logical_positions, token_to_request),
@@ -454,6 +458,7 @@ class CutlassQkvRuntime:
         attention = sparse_attention + output_projection
         return MappingProxyType({"score_ms": score, "select_expand_ms": select,
                                  "sparse_attention_ms": sparse_attention,
+                                 "sparse_attention_control_ms": scalar_control,
                                  "output_projection_ms": output_projection,
                                  "attention_ms": attention,
                                  "total_ms": score + select + attention})
@@ -487,6 +492,7 @@ class CutlassQkvRuntime:
             "qwen38_qsa_indexer_inputs", "qwen38_qsa_indexer_output",
             "qwen38_qsa_indexer_destroy",
             "qwen38_qsa_attention_launch", "qwen38_qsa_sparse_attention",
+            "qwen38_qsa_sparse_attention_control",
             "qwen38_qsa_output_project", "qwen38_qsa_attention_output",
             "qwen38_qsa_projected_output",
         ):

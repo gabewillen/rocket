@@ -319,6 +319,13 @@ def run(
             "select_expand_ms": qsa_timing["select_expand_ms"],
             "total_ms": qsa_timing["total_ms"],
             "sparse_attention_ms": qsa_timing["sparse_attention_ms"],
+            "sparse_attention_control_ms": qsa_timing[
+                "sparse_attention_control_ms"
+            ],
+            "sparse_attention_speedup_vs_control": (
+                qsa_timing["sparse_attention_control_ms"]
+                / qsa_timing["sparse_attention_ms"]
+            ),
             "sparse_attention_physical_gbps": sparse_attention_gbps,
             "sparse_attention_tflops": sparse_attention_tflops,
             "sparse_attention_fraction_of_238_gbps_rank_local_roof": (

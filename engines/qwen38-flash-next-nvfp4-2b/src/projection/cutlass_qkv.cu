@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <mma.h>
 #include <cub/device/device_segmented_radix_sort.cuh>
 
 #include <cmath>
@@ -364,7 +365,7 @@ __global__ void store_attention_kv(const __nv_bfloat16* qkv,
 // 12 local query heads for one row/split, so a selected key and value are read
 // once per group instead of once per head. FP32 online softmax state matches
 // the reference's partial-output/LSE merge contract.
-__global__ void qsa_sparse_splitk(
+__global__ void qsa_sparse_splitk_control(
     const __nv_bfloat16* __restrict__ qkv,
     const __nv_bfloat16* __restrict__ keys,
     const __nv_bfloat16* __restrict__ values,
@@ -448,6 +449,168 @@ __global__ void qsa_sparse_splitk(
     if (dim == 0)
       partial_lse[(split * kM + row) * kAttentionHeads + head] =
           norm > 0.0f ? maxima[head] + logf(norm) : -INFINITY;
+  }
+}
+
+// SM121 fixed form of vLLM's BLOCK_N=16 profile. Eight warps stage a gathered
+// K/V tile once, use BF16 tensor-core MMA for QK and PV, share the 12x16
+// probabilities, and retain FP32 online-softmax state between the four tiles
+// in each 32-way split. The scalar kernel above remains the control.
+__global__ void qsa_sparse_splitk_block16(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ keys,
+    const __nv_bfloat16* __restrict__ values,
+    const std::int32_t* __restrict__ logical_indices,
+    const std::int32_t* __restrict__ block_table,
+    const std::int32_t* __restrict__ token_to_request,
+    float* __restrict__ partial_output, float* __restrict__ partial_lse) {
+  using namespace nvcuda;
+  __shared__ __align__(16) __nv_bfloat16 query_tile[16 * kAttentionDim];
+  __shared__ __align__(16) __nv_bfloat16 key_tile[16 * kAttentionDim];
+  __shared__ __align__(16) __nv_bfloat16 value_tile[16 * kAttentionDim];
+  __shared__ __align__(16) __nv_bfloat16 probabilities[16 * 16];
+  __shared__ __align__(16) float scores[16 * 16];
+  __shared__ __align__(16) float accumulator[16 * kAttentionDim];
+  __shared__ float maxima[16], normalizers[16], alpha[16];
+  __shared__ std::int32_t valid_tokens[16];
+
+  const int row = blockIdx.x;
+  const int split = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int request = token_to_request[row];
+  for (int index = tid; index < 16 * kAttentionDim; index += blockDim.x) {
+    const int head = index / kAttentionDim;
+    const int dim = index % kAttentionDim;
+    query_tile[index] = head < kAttentionHeads
+                            ? qkv[row * kN + head * kAttentionDim + dim]
+                            : __float2bfloat16(0.0f);
+    accumulator[index] = 0.0f;
+  }
+  if (tid < 16) {
+    maxima[tid] = -INFINITY;
+    normalizers[tid] = 0.0f;
+  }
+  __syncthreads();
+
+  const int split_start = split * kExpandedWidth / kAttentionSplits;
+  const int split_end = (split + 1) * kExpandedWidth / kAttentionSplits;
+  for (int tile_start = split_start; tile_start < split_end;
+       tile_start += 16) {
+    if (tid < 16) {
+      const int selected = tile_start + tid;
+      const int logical = selected < split_end
+                              ? logical_indices[row * kExpandedWidth + selected]
+                              : -1;
+      int physical = -1;
+      if (request >= 0 && request < kM && logical >= 0) {
+        const int logical_page = logical / kQsaPageSize;
+        if (logical_page < kQsaPages * kCompressRatio)
+          physical = block_table[
+              request * (kQsaPages * kCompressRatio) + logical_page];
+      }
+      valid_tokens[tid] =
+          physical >= 0 && physical < kQsaPages * kCompressRatio ? logical : -1;
+      scores[tid] = static_cast<float>(physical);
+    }
+    __syncthreads();
+    for (int index = tid; index < 16 * kAttentionDim; index += blockDim.x) {
+      const int token = index / kAttentionDim;
+      const int dim = index % kAttentionDim;
+      const int logical = valid_tokens[token];
+      const int physical = static_cast<int>(scores[token]);
+      const std::size_t cache =
+          (static_cast<std::size_t>(max(physical, 0)) * kQsaPageSize +
+           max(logical, 0) % kQsaPageSize) * kAttentionDim + dim;
+      key_tile[index] = logical >= 0 ? keys[cache] : __float2bfloat16(0.0f);
+      value_tile[index] = logical >= 0 ? values[cache] : __float2bfloat16(0.0f);
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> product;
+      wmma::fill_fragment(product, 0.0f);
+#pragma unroll
+      for (int k = 0; k < kAttentionDim; k += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
+                       wmma::row_major> q_fragment;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
+                       wmma::col_major> k_fragment;
+        wmma::load_matrix_sync(q_fragment, query_tile + k, kAttentionDim);
+        wmma::load_matrix_sync(k_fragment, key_tile + k, kAttentionDim);
+        wmma::mma_sync(product, q_fragment, k_fragment, product);
+      }
+      wmma::store_matrix_sync(scores, product, 16, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    if (tid < kAttentionHeads) {
+      float tile_maximum = -INFINITY;
+#pragma unroll
+      for (int token = 0; token < 16; ++token)
+        if (valid_tokens[token] >= 0)
+          tile_maximum = fmaxf(tile_maximum, scores[tid * 16 + token] * 0.0625f);
+      const float next = fmaxf(maxima[tid], tile_maximum);
+      const float rescale = isfinite(maxima[tid]) ? expf(maxima[tid] - next) : 0.0f;
+      float tile_normalizer = 0.0f;
+#pragma unroll
+      for (int token = 0; token < 16; ++token) {
+        const float probability = valid_tokens[token] >= 0
+                                      ? expf(scores[tid * 16 + token] * 0.0625f - next)
+                                      : 0.0f;
+        probabilities[tid * 16 + token] = __float2bfloat16(probability);
+        tile_normalizer += probability;
+      }
+      alpha[tid] = rescale;
+      normalizers[tid] = normalizers[tid] * rescale + tile_normalizer;
+      maxima[tid] = next;
+    }
+    if (tid >= kAttentionHeads && tid < 16) {
+#pragma unroll
+      for (int token = 0; token < 16; ++token)
+        probabilities[tid * 16 + token] = __float2bfloat16(0.0f);
+      alpha[tid] = 0.0f;
+    }
+    __syncthreads();
+    for (int index = tid; index < 16 * kAttentionDim; index += blockDim.x)
+      accumulator[index] *= alpha[index / kAttentionDim];
+    __syncthreads();
+
+    {
+      const int dimension_tile = warp;
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
+                     wmma::row_major> p_fragment;
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
+                     wmma::row_major> v_fragment;
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> output_fragment;
+      wmma::load_matrix_sync(p_fragment, probabilities, 16);
+      wmma::load_matrix_sync(v_fragment,
+                             value_tile + dimension_tile * 16,
+                             kAttentionDim);
+      wmma::load_matrix_sync(output_fragment,
+                             accumulator + dimension_tile * 16,
+                             kAttentionDim, wmma::mem_row_major);
+      wmma::mma_sync(output_fragment, p_fragment, v_fragment, output_fragment);
+      wmma::store_matrix_sync(accumulator + dimension_tile * 16,
+                              output_fragment, kAttentionDim,
+                              wmma::mem_row_major);
+    }
+    __syncthreads();
+  }
+
+  for (int index = tid; index < kAttentionHeads * kAttentionDim;
+       index += blockDim.x) {
+    const int head = index / kAttentionDim;
+    const int dim = index % kAttentionDim;
+    const float norm = normalizers[head];
+    partial_output[
+        ((split * kM + row) * kAttentionHeads + head) * kAttentionDim + dim] =
+        norm > 0.0f ? accumulator[head * kAttentionDim + dim] / norm : 0.0f;
+  }
+  if (tid < kAttentionHeads) {
+    const float norm = normalizers[tid];
+    partial_lse[(split * kM + row) * kAttentionHeads + tid] =
+        norm > 0.0f ? maxima[tid] + logf(norm) : -INFINITY;
   }
 }
 
@@ -867,14 +1030,38 @@ extern "C" int qwen38_qsa_sparse_attention(
       qkv, logical_positions, token_to_request, plan->attention_table,
       plan->attention_keys, plan->attention_values);
   if (!cuda_ok(cudaGetLastError(), "store QSA K/V")) return 1;
-  qsa_sparse_splitk<<<dim3(kM, kAttentionSplits), kAttentionDim, 0, stream>>>(
+  qsa_sparse_splitk_block16<<<dim3(kM, kAttentionSplits), 512, 0, stream>>>(
       qkv, plan->attention_keys, plan->attention_values, plan->output,
       plan->attention_table, token_to_request, plan->partial_output,
       plan->partial_lse);
-  if (!cuda_ok(cudaGetLastError(), "QSA sparse split-K")) return 1;
+  if (!cuda_ok(cudaGetLastError(), "QSA BLOCK_N=16 sparse split-K")) return 1;
   qsa_merge_splitk<<<dim3(kM, kAttentionHeads), kAttentionDim, 0, stream>>>(
       plan->partial_output, plan->partial_lse, plan->attention_output);
   return cuda_ok(cudaGetLastError(), "merge QSA sparse split-K") ? 0 : 1;
+}
+
+extern "C" int qwen38_qsa_sparse_attention_control(
+    void* opaque, const void* qkv_output,
+    const std::int64_t* logical_positions,
+    const std::int32_t* token_to_request, cudaStream_t stream) {
+  last_error.clear();
+  if (!opaque || !qkv_output || !logical_positions || !token_to_request) {
+    last_error = "null fixed QSA control argument"; return 1;
+  }
+  auto* plan = static_cast<QsaPlan*>(opaque);
+  auto* qkv = static_cast<const __nv_bfloat16*>(qkv_output);
+  store_attention_kv<<<kM, kAttentionDim, 0, stream>>>(
+      qkv, logical_positions, token_to_request, plan->attention_table,
+      plan->attention_keys, plan->attention_values);
+  if (!cuda_ok(cudaGetLastError(), "store control QSA K/V")) return 1;
+  qsa_sparse_splitk_control<<<dim3(kM, kAttentionSplits), kAttentionDim, 0, stream>>>(
+      qkv, plan->attention_keys, plan->attention_values, plan->output,
+      plan->attention_table, token_to_request, plan->partial_output,
+      plan->partial_lse);
+  if (!cuda_ok(cudaGetLastError(), "control QSA sparse split-K")) return 1;
+  qsa_merge_splitk<<<dim3(kM, kAttentionHeads), kAttentionDim, 0, stream>>>(
+      plan->partial_output, plan->partial_lse, plan->attention_output);
+  return cuda_ok(cudaGetLastError(), "merge control QSA sparse split-K") ? 0 : 1;
 }
 
 extern "C" int qwen38_qsa_output_project(void* opaque, cudaStream_t stream) {
