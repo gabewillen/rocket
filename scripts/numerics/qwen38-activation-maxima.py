@@ -1,38 +1,189 @@
 #!/usr/bin/env python3
-"""Reduce Rocket Qwen3.8 calibration log lines into a checked JSON map."""
+"""Reduce legacy or v2 Qwen3.8 activation telemetry into checked JSON."""
 
 import argparse
 import json
 import re
 import sys
 
-LINE = re.compile(r"ROCKET_NVFP4_CALIBRATION\t(layer\.(\d+)\.linear_attn\.(in_proj_qkvz|in_proj_ba|out_proj))\t([0-9.eE+-]+)")
+LEGACY_LINE = re.compile(
+    r"ROCKET_NVFP4_CALIBRATION\t"
+    r"(layer\.(\d+)\.linear_attn\.(in_proj_qkvz|in_proj_ba|out_proj))\t"
+    r"([0-9.eE+-]+)"
+)
+V2_PREFIX = "ROCKET_NVFP4_TELEMETRY\t"
+V2_REQUIRED_STATS = {
+    "source_numel",
+    "sample_numel",
+    "absmax",
+    "mean",
+    "rms",
+    "abs_p50",
+    "abs_p90",
+    "abs_p99",
+    "histogram_log2",
+}
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--layers", type=int, default=36)
-    args = parser.parse_args()
+def parse_stream(lines):
     maxima = {}
-    for line in sys.stdin:
-        match = LINE.search(line)
-        if not match:
+    telemetry = {}
+    for line in lines:
+        match = LEGACY_LINE.search(line)
+        if match:
+            name, _, _, raw_value = match.groups()
+            value = float(raw_value)
+            maxima[name] = max(value, maxima.get(name, 0.0))
+        marker = line.find(V2_PREFIX)
+        if marker < 0:
             continue
-        name, _, _, raw_value = match.groups()
-        value = float(raw_value)
-        maxima[name] = max(value, maxima.get(name, 0.0))
+        try:
+            record = json.loads(line[marker + len(V2_PREFIX) :])
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid v2 telemetry JSON: {error}") from error
+        if record.get("schema") != "rocket.qwen38.activation-telemetry.v2":
+            raise ValueError(f"unsupported telemetry schema: {record.get('schema')!r}")
+        channel = record.get("channel")
+        call = record.get("call")
+        if not isinstance(channel, str) or not isinstance(call, int):
+            raise ValueError("v2 telemetry requires string channel and integer call")
+        missing = V2_REQUIRED_STATS - record.keys()
+        if missing:
+            raise ValueError(f"v2 telemetry missing fields: {sorted(missing)}")
+        if (
+            not isinstance(record["histogram_log2"], list)
+            or len(record["histogram_log2"]) != 10
+        ):
+            raise ValueError("v2 telemetry histogram_log2 must contain 10 bins")
+        if not 0 < record["sample_numel"] <= record["source_numel"]:
+            raise ValueError("v2 telemetry sample_numel is outside source bounds")
+        previous = telemetry.get(channel)
+        if previous is None or call >= previous["call"]:
+            telemetry[channel] = record
+    return maxima, telemetry
+
+
+def legacy_layers(maxima):
     by_layer = {}
     for name, value in sorted(maxima.items()):
         _, layer, _, projection = name.split(".")
         by_layer.setdefault(layer, {})[projection] = value
     complete = [layer for layer, values in by_layer.items() if len(values) == 3]
-    if len(complete) != args.layers or len(maxima) != args.layers * 3:
-        print(f"incomplete calibration: {len(complete)}/{args.layers} layers, "
-              f"{len(maxima)}/{args.layers * 3} channels", file=sys.stderr)
+    return by_layer, complete
+
+
+def layer_count(telemetry, suffix):
+    return len(
+        {
+            channel.split(".")[1]
+            for channel in telemetry
+            if channel.endswith(suffix) and channel.startswith("layer.")
+        }
+    )
+
+
+def channel_count(telemetry, fragment):
+    return sum(fragment in channel for channel in telemetry)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--layers", type=int, default=36)
+    parser.add_argument("--require-expanded", action="store_true")
+    parser.add_argument("--full-attention-layers", type=int, default=12)
+    parser.add_argument("--ple-layers", type=int)
+    parser.add_argument("--router-layers", type=int)
+    parser.add_argument("--recurrent-state-layers", type=int)
+    args = parser.parse_args()
+    try:
+        maxima, telemetry = parse_stream(sys.stdin)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        raise SystemExit(1) from error
+
+    _, complete = legacy_layers(maxima)
+    expected_channels = args.layers * 3
+    if len(complete) != args.layers or len(maxima) != expected_channels:
+        print(
+            f"incomplete calibration: {len(complete)}/{args.layers} layers, "
+            f"{len(maxima)}/{expected_channels} channels",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
-    json.dump({"schema": "rocket.qwen38.activation-maxima.v1",
-               "linear_attention_layers": len(complete), "channels": maxima},
-              sys.stdout, indent=2, sort_keys=True)
+
+    coverage = {
+        "linear_attention_layers": len(complete),
+        "linear_projection_input_channels": sum(
+            channel.endswith(".input")
+            and any(
+                marker in channel
+                for marker in (
+                    ".linear_attn.in_proj_qkvz.",
+                    ".linear_attn.in_proj_ba.",
+                    ".linear_attn.out_proj.",
+                )
+            )
+            for channel in telemetry
+        ),
+        "linear_projection_output_channels": sum(
+            channel.endswith(".output")
+            and any(
+                marker in channel
+                for marker in (
+                    ".linear_attn.in_proj_qkvz.",
+                    ".linear_attn.in_proj_ba.",
+                    ".linear_attn.out_proj.",
+                )
+            )
+            for channel in telemetry
+        ),
+        "full_attention_layers": layer_count(telemetry, ".full_attn.output"),
+        "full_qkv_projection_layers": layer_count(
+            telemetry, ".full_attn.qkv_proj.output"
+        ),
+        "full_output_projection_layers": layer_count(
+            telemetry, ".full_attn.o_proj.output"
+        ),
+        "ple_layers": layer_count(telemetry, ".ple.output"),
+        "router_layers": layer_count(telemetry, ".router.topk.output"),
+        "recurrent_state_layers": layer_count(
+            telemetry, ".linear_attn.recurrent_state.output"
+        ),
+    }
+    if args.require_expanded:
+        requirements = {
+            "linear_projection_input_channels": args.layers * 3,
+            "linear_projection_output_channels": args.layers * 3,
+            "full_attention_layers": args.full_attention_layers,
+            "full_qkv_projection_layers": args.full_attention_layers,
+            "full_output_projection_layers": args.full_attention_layers,
+            "ple_layers": args.ple_layers,
+            "router_layers": args.router_layers,
+            "recurrent_state_layers": args.recurrent_state_layers,
+        }
+        failures = [
+            f"{name}={coverage[name]}/{expected}"
+            for name, expected in requirements.items()
+            if expected is not None and coverage[name] != expected
+        ]
+        if not telemetry:
+            failures.append("v2 telemetry absent")
+        if failures:
+            print("incomplete expanded telemetry: " + ", ".join(failures), file=sys.stderr)
+            raise SystemExit(1)
+
+    json.dump(
+        {
+            "schema": "rocket.qwen38.activation-summary.v2",
+            "legacy_schema": "rocket.qwen38.activation-maxima.v1",
+            "coverage": coverage,
+            "channels": maxima,
+            "telemetry": telemetry,
+        },
+        sys.stdout,
+        indent=2,
+        sort_keys=True,
+    )
     print()
 
 
