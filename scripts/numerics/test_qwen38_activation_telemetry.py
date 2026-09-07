@@ -93,6 +93,92 @@ class ReducerTests(unittest.TestCase):
             }
         ) + "\n"
 
+    def expanded_records(self, layers=36, full_layers=12, call=8):
+        lines = []
+        for layer in range(layers):
+            for projection in ("in_proj_qkvz", "in_proj_ba", "out_proj"):
+                lines += [
+                    self.record(f"layer.{layer}.linear_attn.{projection}.input", call),
+                    self.record(f"layer.{layer}.linear_attn.{projection}.output", call),
+                ]
+            lines += [
+                self.record(f"layer.{layer}.linear_attn.output", call),
+                self.record(
+                    f"layer.{layer}.linear_attn.recurrent_state.output", call
+                ),
+            ]
+        for layer in range(layers, layers + full_layers):
+            lines += [
+                self.record(f"layer.{layer}.full_attn.qkv_proj.output", call),
+                self.record(f"layer.{layer}.full_attn.o_proj.output", call),
+                self.record(f"layer.{layer}.full_attn.output", call),
+            ]
+        lines += [self.record("layer.1.ple.output", call)]
+        for layer in range(layers + full_layers):
+            lines += [self.record(f"layer.{layer}.router.topk.output", call)]
+        return lines
+
+    def test_v2_only_gate_accepts_complete_call8_with_106_legacy_channels(self):
+        legacy = list(self.legacy_lines(36))[:-2]
+        lines = legacy + self.expanded_records()
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(REDUCER),
+                "--require-expanded",
+                "--expanded-v2-only",
+                "--min-emission-call", "8",
+                "--ple-layers", "1",
+                "--router-layers", "48",
+                "--recurrent-state-layers", "36",
+            ],
+            input="".join(lines),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["gate"]["source"], "v2_only")
+        self.assertEqual(payload["gate"]["min_emission_call"], 8)
+        self.assertEqual(len(payload["channels"]), 106)
+
+    def test_v2_only_gate_rejects_startup_only_and_incomplete_call8(self):
+        lines = list(self.legacy_lines(36))
+        lines += self.expanded_records(call=4)
+        real_records = self.expanded_records(call=8)
+        lines += real_records[:-1]
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(REDUCER),
+                "--require-expanded",
+                "--expanded-v2-only",
+                "--min-emission-call", "8",
+                "--ple-layers", "1",
+                "--router-layers", "48",
+                "--recurrent-state-layers", "36",
+            ],
+            input="".join(lines),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("router_layers=47/48", result.stderr)
+
+    def test_default_mode_still_requires_complete_legacy_channels(self):
+        lines = list(self.legacy_lines(36))[:-2] + self.expanded_records()
+        result = subprocess.run(
+            [sys.executable, str(REDUCER), "--require-expanded"],
+            input="".join(lines),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("106/108 channels", result.stderr)
+
     def test_preserves_legacy_108_channel_compatibility(self):
         reducer = load_reducer()
         maxima, telemetry = reducer.parse_stream(self.legacy_lines(36))

@@ -287,9 +287,13 @@ scp -q "$OUTPUT_DIR/launch-worker.sh" "$SSH_TARGET:$REMOTE_OUTPUT/launch-worker.
 
 head_log_pid=""
 worker_log_pid=""
+head_workload_log_pid=""
+worker_workload_log_pid=""
 cleanup() {
     [[ -n "$head_log_pid" ]] && kill "$head_log_pid" >/dev/null 2>&1 || true
     [[ -n "$worker_log_pid" ]] && kill "$worker_log_pid" >/dev/null 2>&1 || true
+    [[ -n "$head_workload_log_pid" ]] && kill "$head_workload_log_pid" >/dev/null 2>&1 || true
+    [[ -n "$worker_workload_log_pid" ]] && kill "$worker_workload_log_pid" >/dev/null 2>&1 || true
     if [[ "$KEEP_RUNNING" != true ]]; then
         docker rm -f "$HEAD_CONTAINER" >/dev/null 2>&1 || true
         ssh -o BatchMode=yes "$SSH_TARGET" \
@@ -318,6 +322,22 @@ until curl -fsS "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; do
     sleep 10
 done
 
+# Move past the health-check second before opening the workload-only log window.
+# This prevents a final startup/profiling record with the same timestamp second
+# from entering the calibration gate.
+sleep 1
+head_workload_since=$(date --iso-8601=seconds)
+worker_workload_since=$(ssh -o BatchMode=yes "$SSH_TARGET" date --iso-8601=seconds)
+printf 'head=%s\nworker=%s\n' "$head_workload_since" "$worker_workload_since" \
+    > "$LOG_DIR/workload-since.txt"
+docker logs --timestamps --since "$head_workload_since" -f "$HEAD_CONTAINER" \
+    >"$LOG_DIR/head-workload.log" 2>&1 &
+head_workload_log_pid=$!
+ssh -o BatchMode=yes "$SSH_TARGET" \
+    "docker logs --timestamps --since '$worker_workload_since' -f '$WORKER_CONTAINER'" \
+    >"$LOG_DIR/worker-workload.log" 2>&1 &
+worker_workload_log_pid=$!
+
 python3 "$SCRIPT_DIR/qwen38-attention-calibration.py" \
     --endpoint "http://127.0.0.1:$API_PORT" --mtp --concurrent-streams 4 \
     --long-decode-tokens 2048 --mtp-tokens 512 \
@@ -325,16 +345,24 @@ python3 "$SCRIPT_DIR/qwen38-attention-calibration.py" \
 sleep 5
 
 # Stop followers so all buffered telemetry is visible before reduction.
-kill "$head_log_pid" "$worker_log_pid" >/dev/null 2>&1 || true
-wait "$head_log_pid" "$worker_log_pid" 2>/dev/null || true
+kill "$head_log_pid" "$worker_log_pid" "$head_workload_log_pid" \
+    "$worker_workload_log_pid" >/dev/null 2>&1 || true
+wait "$head_log_pid" "$worker_log_pid" "$head_workload_log_pid" \
+    "$worker_workload_log_pid" 2>/dev/null || true
 head_log_pid=""
 worker_log_pid=""
+head_workload_log_pid=""
+worker_workload_log_pid=""
 cat "$LOG_DIR/head.log" "$LOG_DIR/worker.log" > "$LOG_DIR/combined.log"
+cat "$LOG_DIR/head-workload.log" "$LOG_DIR/worker-workload.log" \
+    > "$LOG_DIR/combined-workload.log"
 for node in head worker combined; do
     python3 "$SCRIPT_DIR/qwen38-activation-maxima.py" \
-        --require-expanded --layers 36 --full-attention-layers 12 \
+        --require-expanded --expanded-v2-only --min-emission-call 8 \
+        --layers 36 --full-attention-layers 12 \
         --ple-layers 1 --router-layers 48 --recurrent-state-layers 36 \
-        < "$LOG_DIR/$node.log" > "$OUTPUT_DIR/$node-activation-summary.json"
+        < "$LOG_DIR/$node-workload.log" \
+        > "$OUTPUT_DIR/$node-activation-summary.json"
 done
 
 printf 'Expanded calibration complete: %s\n' "$OUTPUT_DIR"

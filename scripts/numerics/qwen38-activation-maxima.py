@@ -90,29 +90,60 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--layers", type=int, default=36)
     parser.add_argument("--require-expanded", action="store_true")
+    parser.add_argument(
+        "--expanded-v2-only",
+        action="store_true",
+        help="gate expanded coverage from v2 records without requiring legacy maxima",
+    )
+    parser.add_argument(
+        "--min-emission-call",
+        type=int,
+        help="ignore v2 records below this emission call (required with --expanded-v2-only)",
+    )
     parser.add_argument("--full-attention-layers", type=int, default=12)
     parser.add_argument("--ple-layers", type=int)
     parser.add_argument("--router-layers", type=int)
     parser.add_argument("--recurrent-state-layers", type=int)
     args = parser.parse_args()
+    if args.expanded_v2_only:
+        if not args.require_expanded:
+            parser.error("--expanded-v2-only requires --require-expanded")
+        if args.min_emission_call is None or args.min_emission_call < 1:
+            parser.error(
+                "--expanded-v2-only requires --min-emission-call >= 1"
+            )
+    elif args.min_emission_call is not None:
+        parser.error("--min-emission-call requires --expanded-v2-only")
     try:
         maxima, telemetry = parse_stream(sys.stdin)
     except ValueError as error:
         print(error, file=sys.stderr)
         raise SystemExit(1) from error
 
-    _, complete = legacy_layers(maxima)
+    _, legacy_complete = legacy_layers(maxima)
     expected_channels = args.layers * 3
-    if len(complete) != args.layers or len(maxima) != expected_channels:
+    if not args.expanded_v2_only and (
+        len(legacy_complete) != args.layers or len(maxima) != expected_channels
+    ):
         print(
-            f"incomplete calibration: {len(complete)}/{args.layers} layers, "
+            f"incomplete calibration: {len(legacy_complete)}/{args.layers} layers, "
             f"{len(maxima)}/{expected_channels} channels",
             file=sys.stderr,
         )
         raise SystemExit(1)
 
+    minimum_call = args.min_emission_call or 1
+    gated_telemetry = {
+        channel: record
+        for channel, record in telemetry.items()
+        if record["call"] >= minimum_call
+    }
+    v2_linear_layers = layer_count(gated_telemetry, ".linear_attn.output")
+
     coverage = {
-        "linear_attention_layers": len(complete),
+        "linear_attention_layers": (
+            v2_linear_layers if args.expanded_v2_only else len(legacy_complete)
+        ),
         "linear_projection_input_channels": sum(
             channel.endswith(".input")
             and any(
@@ -123,7 +154,7 @@ def main():
                     ".linear_attn.out_proj.",
                 )
             )
-            for channel in telemetry
+            for channel in gated_telemetry
         ),
         "linear_projection_output_channels": sum(
             channel.endswith(".output")
@@ -135,21 +166,28 @@ def main():
                     ".linear_attn.out_proj.",
                 )
             )
-            for channel in telemetry
+            for channel in gated_telemetry
         ),
-        "full_attention_layers": layer_count(telemetry, ".full_attn.output"),
+        "full_attention_layers": layer_count(
+            gated_telemetry, ".full_attn.output"
+        ),
         "full_qkv_projection_layers": layer_count(
-            telemetry, ".full_attn.qkv_proj.output"
+            gated_telemetry, ".full_attn.qkv_proj.output"
         ),
         "full_output_projection_layers": layer_count(
-            telemetry, ".full_attn.o_proj.output"
+            gated_telemetry, ".full_attn.o_proj.output"
         ),
-        "ple_layers": layer_count(telemetry, ".ple.output"),
-        "router_layers": layer_count(telemetry, ".router.topk.output"),
+        "ple_layers": layer_count(gated_telemetry, ".ple.output"),
+        "router_layers": layer_count(
+            gated_telemetry, ".router.topk.output"
+        ),
         "recurrent_state_layers": layer_count(
-            telemetry, ".linear_attn.recurrent_state.output"
+            gated_telemetry, ".linear_attn.recurrent_state.output"
         ),
     }
+    if args.expanded_v2_only:
+        coverage["legacy_linear_attention_layers"] = len(legacy_complete)
+        coverage["legacy_channels"] = len(maxima)
     if args.require_expanded:
         requirements = {
             "linear_projection_input_channels": args.layers * 3,
@@ -166,24 +204,25 @@ def main():
             for name, expected in requirements.items()
             if expected is not None and coverage[name] != expected
         ]
-        if not telemetry:
+        if not gated_telemetry:
             failures.append("v2 telemetry absent")
         if failures:
             print("incomplete expanded telemetry: " + ", ".join(failures), file=sys.stderr)
             raise SystemExit(1)
 
-    json.dump(
-        {
-            "schema": "rocket.qwen38.activation-summary.v2",
-            "legacy_schema": "rocket.qwen38.activation-maxima.v1",
-            "coverage": coverage,
-            "channels": maxima,
-            "telemetry": telemetry,
-        },
-        sys.stdout,
-        indent=2,
-        sort_keys=True,
-    )
+    result = {
+        "schema": "rocket.qwen38.activation-summary.v2",
+        "legacy_schema": "rocket.qwen38.activation-maxima.v1",
+        "coverage": coverage,
+        "channels": maxima,
+        "telemetry": gated_telemetry,
+    }
+    if args.expanded_v2_only:
+        result["gate"] = {
+            "source": "v2_only",
+            "min_emission_call": minimum_call,
+        }
+    json.dump(result, sys.stdout, indent=2, sort_keys=True)
     print()
 
 

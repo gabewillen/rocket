@@ -59,8 +59,23 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn('if [[ "$LAUNCH" != true ]]', self.source)
         self.assertIn("qwen38-attention-calibration.py", self.source)
         self.assertIn("--require-expanded", self.source)
+        self.assertIn("--expanded-v2-only", self.source)
+        self.assertIn("--min-emission-call 8", self.source)
         self.assertIn("--recurrent-state-layers 36", self.source)
         self.assertIn("--speculative-config", self.source)
+
+    def test_reducer_input_is_bounded_to_post_health_workload_logs(self):
+        self.assertIn('head_workload_since=$(date --iso-8601=seconds)', self.source)
+        self.assertIn(
+            'worker_workload_since=$(ssh -o BatchMode=yes "$SSH_TARGET" date --iso-8601=seconds)',
+            self.source,
+        )
+        self.assertIn("Move past the health-check second", self.source)
+        self.assertIn('--since "$head_workload_since"', self.source)
+        self.assertIn("--since '$worker_workload_since'", self.source)
+        self.assertIn('$LOG_DIR/head-workload.log', self.source)
+        self.assertIn('$LOG_DIR/worker-workload.log', self.source)
+        self.assertIn('$LOG_DIR/$node-workload.log', self.source)
 
     def test_uses_only_durable_output_for_generated_launch_scripts(self):
         self.assertNotIn("/tmp/", self.source)
