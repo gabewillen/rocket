@@ -146,7 +146,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("ROCKET_QWEN38_FP8_QUANT_CONFIG", self.source)
         self.assertIn('quant_config_source="$artifact_dir/hf_quant_config_patched.json"', self.source)
         self.assertIn('quant_config_source="$fp8_host_dir/hf_quant_config.json"', self.source)
-        self.assertIn("assert len(result['selected']) == 180", self.source)
+        self.assertIn("assert len(result['selected']) == $NVFP4_EXPECTED_COUNT", self.source)
         self.assertIn('if [[ -z "$FP8_ARTIFACT_DIR" && -z "$NVFP4_ARTIFACT_DIR" ]]', self.source)
         self.assertEqual(self.source.count("linear-attention-fp8.safetensors"), 2)
         self.assertIn('basename "$FP8_ARTIFACT_DIR"', self.source)
@@ -171,9 +171,24 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         ):
             self.assertIn(checksum, self.source)
             self.assertLess(self.source.index(checksum), launch_offset)
-        worker_preflight = "validated worker NVFP4 overlay: 180 tensors"
+        worker_preflight = "validated worker NVFP4 overlay: $NVFP4_EXPECTED_COUNT tensors"
         self.assertIn(worker_preflight, self.source)
         self.assertLess(self.source.index(worker_preflight), launch_offset)
+
+    def test_nvfp4_manifest_drives_family_count_payload_and_embed_policy(self):
+        for schema in (
+            "rocket.qwen38.linear-nvfp4-overlay.v1",
+            "rocket.qwen38.nvfp4-overlay.v2",
+        ):
+            self.assertIn(schema, self.source)
+        self.assertIn('contracts = {"linear_attention": 180, "full_attention": 48}', self.source)
+        self.assertIn('NVFP4_OVERLAY_FILE=$(read_nvfp4_manifest file)', self.source)
+        self.assertIn('NVFP4_EXPECTED_COUNT=$(read_nvfp4_manifest count)', self.source)
+        self.assertIn('mapfile -t NVFP4_FAMILIES', self.source)
+        self.assertIn('nvfp4_family_args+=(--family "$family")', self.source)
+        self.assertIn('"${nvfp4_family_args[@]}"', self.source)
+        self.assertIn('sha256sum manifest.json hf_quant_config.json "$NVFP4_OVERLAY_FILE"', self.source)
+        self.assertIn('"$NVFP4_ARTIFACT_DIR/$NVFP4_OVERLAY_FILE"', self.source)
 
     def test_generated_launch_scripts_are_single_commands(self):
         function = self.source[
@@ -299,6 +314,16 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
 
     def test_launch_is_explicit_and_reduction_requires_expanded_coverage(self):
         self.assertIn('if [[ "$LAUNCH" != true ]]', self.source)
+        self.assertIn("--two-node-preflight", self.source)
+        self.assertIn(
+            'if [[ "$LAUNCH" != true && "$TWO_NODE_PREFLIGHT" != true ]]',
+            self.source,
+        )
+        worker_preflight = "validated worker NVFP4 overlay: $NVFP4_EXPECTED_COUNT tensors"
+        preflight_exit = "Two-node preflight complete. Re-run with a new empty --output-dir"
+        worker_launch = 'ssh -o BatchMode=yes "$SSH_TARGET" "bash \'$REMOTE_OUTPUT/launch-worker.sh\'"'
+        self.assertLess(self.source.index(worker_preflight), self.source.index(preflight_exit))
+        self.assertLess(self.source.index(preflight_exit), self.source.index(worker_launch))
         self.assertIn("qwen38-attention-calibration.py", self.source)
         self.assertIn("--require-expanded", self.source)
         self.assertIn("--expanded-v2-only", self.source)

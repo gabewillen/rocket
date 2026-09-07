@@ -36,9 +36,13 @@ OUTPUT_DIR=""
 MIA_SOURCE=""
 FP8_ARTIFACT_DIR=""
 NVFP4_ARTIFACT_DIR=""
+NVFP4_OVERLAY_FILE=""
+NVFP4_EXPECTED_COUNT=""
+NVFP4_FAMILIES=()
 LAUNCH=false
 KEEP_RUNNING=false
 PRODUCTION=false
+TWO_NODE_PREFLIGHT=false
 STARTUP_TIMEOUT_SECONDS=3600
 
 usage() {
@@ -53,6 +57,7 @@ Required:
 
 Options:
   --launch               Launch both nodes, run the corpus, reduce telemetry
+  --two-node-preflight   Transfer and verify both nodes without launching
   --production           Launch without telemetry/eager mode and benchmark throughput
   --keep-running         Leave containers running after a successful calibration
   --mia-source DIR       Existing checkout at the pinned MiaAI-Lab commit
@@ -82,6 +87,7 @@ while (($#)); do
     case "$1" in
         --output-dir) OUTPUT_DIR=${2:?missing value}; shift 2 ;;
         --launch) LAUNCH=true; shift ;;
+        --two-node-preflight) TWO_NODE_PREFLIGHT=true; shift ;;
         --production) PRODUCTION=true; LAUNCH=true; shift ;;
         --keep-running) KEEP_RUNNING=true; shift ;;
         --mia-source) MIA_SOURCE=${2:?missing value}; shift 2 ;;
@@ -135,6 +141,50 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         "$NVFP4_ARTIFACT_DIR/manifest.json") || fail "NVFP4 artifact manifest is unreadable"
     [[ "$(basename "$NVFP4_ARTIFACT_DIR")" == "$nvfp4_artifact_key" ]] || \
         fail "NVFP4 artifact directory is not keyed by its manifest"
+    read_nvfp4_manifest() {
+        python3 - "$NVFP4_ARTIFACT_DIR/manifest.json" "$1" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest = json.load(open(sys.argv[1]))
+schema = manifest.get("schema")
+source = manifest.get("source")
+overlay = manifest.get("overlay")
+if not isinstance(source, dict) or not isinstance(overlay, dict):
+    raise SystemExit("NVFP4 manifest source/overlay contract missing")
+if schema == "rocket.qwen38.linear-nvfp4-overlay.v1":
+    families = ["linear_attention"]
+elif schema == "rocket.qwen38.nvfp4-overlay.v2":
+    families = source.get("families")
+else:
+    raise SystemExit("NVFP4 manifest schema mismatch")
+contracts = {"linear_attention": 180, "full_attention": 48}
+if families not in (["full_attention"], ["linear_attention"], ["full_attention", "linear_attention"]):
+    raise SystemExit("NVFP4 manifest family selection is invalid")
+expected = sum(contracts[family] for family in families)
+if not isinstance(source.get("tensors"), list) or len(source["tensors"]) != expected:
+    raise SystemExit("NVFP4 manifest source tensor count mismatch")
+filename = overlay.get("file")
+if not isinstance(filename, str) or pathlib.Path(filename).name != filename:
+    raise SystemExit("NVFP4 manifest overlay file is unsafe")
+field = sys.argv[2]
+if field == "file":
+    print(filename)
+elif field == "count":
+    print(expected)
+elif field == "families":
+    print("\n".join(families))
+else:
+    raise SystemExit("unknown NVFP4 manifest field")
+PY
+    }
+    NVFP4_OVERLAY_FILE=$(read_nvfp4_manifest file) || fail "NVFP4 artifact manifest is invalid"
+    NVFP4_EXPECTED_COUNT=$(read_nvfp4_manifest count) || fail "NVFP4 artifact manifest is invalid"
+    mapfile -t NVFP4_FAMILIES < <(read_nvfp4_manifest families)
+    [[ ${#NVFP4_FAMILIES[@]} -gt 0 ]] || fail "NVFP4 artifact has no selected families"
+    [[ -f "$NVFP4_ARTIFACT_DIR/$NVFP4_OVERLAY_FILE" ]] || \
+        fail "NVFP4 overlay payload missing: $NVFP4_OVERLAY_FILE"
 fi
 if [[ -e "$OUTPUT_DIR" ]] && [[ -n "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     fail "--output-dir must be empty: $OUTPUT_DIR"
@@ -255,10 +305,15 @@ if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
         "$ARTIFACT_DIR/config_fp8_patched.json"
 fi
 if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
+    nvfp4_family_args=()
+    for family in "${NVFP4_FAMILIES[@]}"; do
+        nvfp4_family_args+=(--family "$family")
+    done
     python3 "$REPO_ROOT/scripts/runtime/qwen38-embed-fp8-config.py" \
         "$ARTIFACT_DIR/config_patched.json" \
         "$NVFP4_ARTIFACT_DIR/hf_quant_config.json" \
-        "$ARTIFACT_DIR/config_nvfp4_patched.json" --quant-algo NVFP4
+        "$ARTIFACT_DIR/config_nvfp4_patched.json" --quant-algo NVFP4 \
+        "${nvfp4_family_args[@]}"
 fi
 
 verify_sha() {
@@ -282,7 +337,7 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         -e "ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=$NVFP4_CONTAINER_DIR/manifest.json" \
         -e "ROCKET_QWEN38_NVFP4_QUANT_CONFIG=$NVFP4_CONTAINER_DIR/hf_quant_config.json" \
         --entrypoint /usr/bin/python3 "$IMAGE_TAG" -c \
-        "import glob; from vllm.model_executor.model_loader.weight_utils import _rocket_qwen38_nvfp4_overlay_preflight as check; files=glob.glob('/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/*.safetensors'); result=check(sorted(files), 'lazy'); assert len(result['selected']) == 180; print('validated NVFP4 overlay: 180 tensors')"
+        "import glob; from vllm.model_executor.model_loader.weight_utils import _rocket_qwen38_nvfp4_overlay_preflight as check; files=glob.glob('/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/*.safetensors'); result=check(sorted(files), 'lazy'); assert len(result['selected']) == $NVFP4_EXPECTED_COUNT; print('validated NVFP4 overlay: $NVFP4_EXPECTED_COUNT tensors')"
     docker run --rm \
         -v "$ARTIFACT_DIR/modelopt_patched.py:$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro" \
         -v "$NVFP4_ARTIFACT_DIR/hf_quant_config.json:/work/hf_quant_config.json:ro" \
@@ -317,7 +372,7 @@ cat > "$OUTPUT_DIR/run.json" <<EOF
 EOF
 
 printf 'Prepared and verified pinned calibration artifacts in %s\n' "$ARTIFACT_DIR"
-if [[ "$LAUNCH" != true ]]; then
+if [[ "$LAUNCH" != true && "$TWO_NODE_PREFLIGHT" != true ]]; then
     printf 'Preparation complete. Re-run with a new empty --output-dir and --launch to execute.\n'
     exit 0
 fi
@@ -431,11 +486,11 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
     ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p '$REMOTE_NVFP4_ARTIFACT'"
     (
         cd "$NVFP4_ARTIFACT_DIR"
-        sha256sum manifest.json hf_quant_config.json linear-attention-nvfp4.safetensors \
+        sha256sum manifest.json hf_quant_config.json "$NVFP4_OVERLAY_FILE" \
             > "$WORK_DIR/nvfp4-artifact-SHA256SUMS"
     )
     scp -q "$NVFP4_ARTIFACT_DIR/manifest.json" "$NVFP4_ARTIFACT_DIR/hf_quant_config.json" \
-        "$NVFP4_ARTIFACT_DIR/linear-attention-nvfp4.safetensors" \
+        "$NVFP4_ARTIFACT_DIR/$NVFP4_OVERLAY_FILE" \
         "$WORK_DIR/nvfp4-artifact-SHA256SUMS" \
         "$SSH_TARGET:$REMOTE_NVFP4_ARTIFACT/"
     ssh -o BatchMode=yes "$SSH_TARGET" \
@@ -448,7 +503,7 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         -e ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=/rocket/qwen38-linear-nvfp4/manifest.json \
         -e ROCKET_QWEN38_NVFP4_QUANT_CONFIG=/rocket/qwen38-linear-nvfp4/hf_quant_config.json \
         --entrypoint /usr/bin/python3 '$IMAGE_TAG' -c \
-        \"import glob; from vllm.model_executor.model_loader.weight_utils import _rocket_qwen38_nvfp4_overlay_preflight as check; files=glob.glob('/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/*.safetensors'); result=check(sorted(files), 'lazy'); assert len(result['selected']) == 180; print('validated worker NVFP4 overlay: 180 tensors')\""
+        \"import glob; from vllm.model_executor.model_loader.weight_utils import _rocket_qwen38_nvfp4_overlay_preflight as check; files=glob.glob('/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/*.safetensors'); result=check(sorted(files), 'lazy'); assert len(result['selected']) == $NVFP4_EXPECTED_COUNT; print('validated worker NVFP4 overlay: $NVFP4_EXPECTED_COUNT tensors')\""
 fi
 write_launch_script "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE" \
     "$WORKER_HCA" "$WORKER_HF_VOLUME" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT" "$REMOTE_NVFP4_ARTIFACT"
@@ -467,6 +522,11 @@ if [[ "$PRODUCTION" == true ]]; then
     done
 fi
 scp -q "$OUTPUT_DIR/launch-worker.sh" "$SSH_TARGET:$REMOTE_OUTPUT/launch-worker.sh"
+
+if [[ "$LAUNCH" != true ]]; then
+    printf 'Two-node preflight complete. Re-run with a new empty --output-dir and --launch to execute.\n'
+    exit 0
+fi
 
 head_log_pid=""
 worker_log_pid=""
