@@ -5,7 +5,10 @@ from dataclasses import FrozenInstanceError
 
 from qwen38_slab.decode import (
     GRAPH_BATCHES,
+    LAZY_DEPTHS,
+    LAZY_MAX_STREAMS,
     MAX_CONTEXT_TOKENS,
+    MAX_QUERY_ROWS,
     PAD,
     DecodeContractError,
     Depth,
@@ -57,6 +60,40 @@ class DecodeContractTests(unittest.TestCase):
         self.assertEqual(plan.active_streams, 4)
         with self.assertRaises(FrozenInstanceError):
             plan.buckets[-1].graph_batch = 16
+
+    def test_k0_through_k7_are_fixed_and_deep_depths_are_lazy_c2_only(self):
+        self.assertEqual(tuple(int(depth) for depth in Depth), tuple(range(8)))
+        self.assertEqual(LAZY_DEPTHS, frozenset(Depth(value) for value in range(4, 8)))
+        self.assertEqual(LAZY_MAX_STREAMS, 2)
+        planner = DepthBucketPlanner(Depth, self.tracer)
+        deep = planner.plan(
+            [StreamStep(1, 100, Depth.K7), StreamStep(4, 200, Depth.K7)]
+        )
+        bucket = deep.buckets[0]
+        self.assertEqual((bucket.query_width, bucket.actual_rows, bucket.graph_rows), (8, 16, 16))
+        with self.assertRaisesRegex(DecodeContractError, "lazy-only"):
+            planner.plan(
+                [
+                    StreamStep(0, 1, Depth.K7),
+                    StreamStep(1, 1, Depth.K0),
+                    StreamStep(2, 1, Depth.K0),
+                ]
+            )
+        hot = planner.plan(
+            [StreamStep(slot, 1, Depth.K0) for slot in range(16)]
+        )
+        self.assertEqual((hot.buckets[0].graph_batch, hot.buckets[0].graph_rows), (16, 16))
+        self.assertEqual(MAX_QUERY_ROWS, 128)
+
+    def test_k7_metadata_carries_all_eight_continuation_positions(self):
+        bucket = DepthBucketPlanner(Depth, self.tracer).plan(
+            [StreamStep(3, 7, Depth.K7)]
+        ).buckets[0]
+        metadata = QsaContinuationMetadata(self.tracer)
+        lease = metadata.update(bucket)
+        self.assertEqual((lease.actual_rows, lease.graph_rows), (8, 8))
+        self.assertEqual(list(metadata.buffers.logical_positions[:8]), list(range(7, 15)))
+        self.assertEqual(list(metadata.buffers.token_to_req[:8]), [0] * 8)
 
     def test_depth_zero_executor_rejects_mtp_residency_and_speculation(self):
         with self.assertRaisesRegex(DecodeContractError, "resident MTP"):
@@ -146,7 +183,7 @@ class DecodeContractTests(unittest.TestCase):
         )
         self.assertEqual(self.tracer.spans[-1].attributes["outcome"], "failure")
         malformed_depth = DepthBucket(99, 1, (StreamStep(4, 10, 99),))
-        with self.assertRaisesRegex(DecodeContractError, "depth must be K0 through K3"):
+        with self.assertRaisesRegex(DecodeContractError, "depth must be K0 through K7"):
             metadata.update(malformed_depth)
 
     def test_stream_and_context_bounds_fail_closed(self):
@@ -194,7 +231,7 @@ class DecodeContractTests(unittest.TestCase):
         self.assertTrue(
             all(
                 span.attributes["depth"]
-                in {"k0", "k1", "k2", "k3", "mixed"}
+                in {"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "mixed"}
                 for span in self.tracer.spans
             )
         )

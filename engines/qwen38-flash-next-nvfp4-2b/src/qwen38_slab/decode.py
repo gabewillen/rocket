@@ -7,8 +7,9 @@ and rewrites their contents in place for one depth bucket at a time. Its buffers
 are borrowed read-only views valid until the next ``update``.
 
 ``DepthZeroDecodeExecutor`` is the K0 preparation boundary. It rejects loaded
-MTP state and every speculative depth. The general planner still describes K0
-through K3 so later adaptive executors can reuse the same graph ABI.
+MTP state and every speculative depth. The general planner describes K0
+through K7. K4 through K7 are lazy-only and capped at c2 so high concurrency
+cannot inherit their residency cost before live taper thresholds exist.
 
 Expected validation failures raise :class:`DecodeContractError` before QSA
 metadata changes. Callers must externally serialize ``prepare`` and ``update``.
@@ -16,7 +17,7 @@ The module does not access a filesystem or network and does not launch a model
 kernel. Its required tracer is the explicit observability boundary.
 
 OpenTelemetry cardinality: span attributes are ``phase`` (plan or metadata),
-``depth`` (k0 through k3 or mixed), ``graph_batch`` (1, 2, 4, 8, 16, or mixed),
+``depth`` (k0 through k7 or mixed), ``graph_batch`` (1, 2, 4, 8, 16, or mixed),
 and ``outcome`` (success or failure). Stream and request identifiers are never
 attributes.
 """
@@ -31,12 +32,13 @@ from typing import Iterable, Iterator, Protocol, Sequence
 
 MAX_STREAMS = 16
 MAX_CONTEXT_TOKENS = 262_144
-MAX_DEPTH = 3
+MAX_DEPTH = 7
 MAX_QUERY_ROWS = MAX_STREAMS * (MAX_DEPTH + 1)
 QSA_COMPRESS_RATIO = 4
 QSA_RAW_RING_ROWS = 8
 GRAPH_BATCHES = (1, 2, 4, 8, 16)
 PAD = -1
+LAZY_MAX_STREAMS = 2
 
 
 class DecodeContractError(ValueError):
@@ -50,6 +52,13 @@ class Depth(IntEnum):
     K1 = 1
     K2 = 2
     K3 = 3
+    K4 = 4
+    K5 = 5
+    K6 = 6
+    K7 = 7
+
+
+LAZY_DEPTHS = frozenset((Depth.K4, Depth.K5, Depth.K6, Depth.K7))
 
 
 @dataclass(frozen=True)
@@ -113,7 +122,12 @@ class OtelTracer(Protocol):
 
 
 class DepthBucketPlanner:
-    """Deterministic bounded planner for K0 through K3 CUDA graph buckets."""
+    """Deterministic bounded planner for K0 through K7 CUDA graph buckets.
+
+    K0 through K3 may remain resident. K4 through K7 are admitted only when
+    total active concurrency is at most two. This is a safety bound, not a
+    measured taper threshold.
+    """
 
     def __init__(self, enabled_depths: Iterable[Depth], tracer: OtelTracer):
         try:
@@ -122,7 +136,7 @@ class DepthBucketPlanner:
                 raise ValueError("boolean depth")
             depths = frozenset(Depth(value) for value in raw_depths)
         except (TypeError, ValueError) as exc:
-            raise DecodeContractError("enabled depths must be K0 through K3") from exc
+            raise DecodeContractError("enabled depths must be K0 through K7") from exc
         if not depths:
             raise DecodeContractError("at least one decode depth must be enabled")
         if tracer is None:
@@ -142,7 +156,7 @@ class DepthBucketPlanner:
         The returned schedule owns immutable tuples and has no alias to the
         borrowed input sequence. Validation failure emits one failure span but
         does not mutate planner or QSA state. Runtime work is bounded by 16
-        streams and four depth values.
+        streams and eight depth values.
         """
 
         depth_label = self._depth_label(streams)
@@ -162,6 +176,7 @@ class DepthBucketPlanner:
             raise DecodeContractError("decode step requires 1 through 16 streams")
         owned = []
         seen_slots = set()
+        has_lazy = False
         for value in streams:
             if not isinstance(value, StreamStep):
                 raise DecodeContractError("decode inputs must be StreamStep values")
@@ -170,9 +185,10 @@ class DepthBucketPlanner:
                     raise ValueError("boolean depth")
                 depth = Depth(value.depth)
             except (TypeError, ValueError) as exc:
-                raise DecodeContractError("stream depth must be K0 through K3") from exc
+                raise DecodeContractError("stream depth must be K0 through K7") from exc
             if depth not in self._enabled_depths:
                 raise DecodeContractError(f"decode depth k{int(depth)} is not resident")
+            has_lazy |= depth in LAZY_DEPTHS
             if isinstance(value.slot, bool) or not isinstance(value.slot, int):
                 raise DecodeContractError("stream slot must be an integer")
             if not 0 <= value.slot < MAX_STREAMS or value.slot in seen_slots:
@@ -191,6 +207,10 @@ class DepthBucketPlanner:
                 )
             seen_slots.add(value.slot)
             owned.append(StreamStep(value.slot, value.accepted_tokens, depth))
+        if has_lazy and len(owned) > LAZY_MAX_STREAMS:
+            raise DecodeContractError(
+                "lazy-only K4 through K7 require at most 2 active streams"
+            )
         return tuple(sorted(owned, key=lambda step: (int(step.depth), step.slot)))
 
     @staticmethod
@@ -233,7 +253,7 @@ class QsaMetadataLease:
 class QsaContinuationMetadata:
     """Single-writer, allocation-stable QSA decode metadata storage.
 
-    All arrays are allocated at construction for c16 K3. ``update`` validates
+    All arrays are allocated at construction for c16 K7. ``update`` validates
     the complete bucket before changing them, clears unused graph rows, and
     returns a lease identifying the contents. The stored logical positions
     match vLLM's QSA formula ``seq_len - query_len + within_query``.
@@ -340,7 +360,7 @@ class QsaContinuationMetadata:
                 raise ValueError("boolean depth")
             depth = Depth(bucket.depth)
         except (TypeError, ValueError) as exc:
-            raise DecodeContractError("bucket depth must be K0 through K3") from exc
+            raise DecodeContractError("bucket depth must be K0 through K7") from exc
         if not 0 < len(bucket.streams) <= MAX_STREAMS:
             raise DecodeContractError("QSA bucket requires 1 through 16 streams")
         if (
@@ -363,7 +383,7 @@ class QsaContinuationMetadata:
                 stream_depth = Depth(stream.depth)
             except (TypeError, ValueError) as exc:
                 raise DecodeContractError(
-                    "QSA bucket stream depth must be K0 through K3"
+                    "QSA bucket stream depth must be K0 through K7"
                 ) from exc
             if stream_depth is not depth:
                 raise DecodeContractError("QSA bucket contains a mismatched stream depth")
