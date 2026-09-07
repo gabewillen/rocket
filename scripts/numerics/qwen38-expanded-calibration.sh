@@ -34,8 +34,10 @@ HF_CACHE="${HOME}/.cache/huggingface"
 WORKER_HF_VOLUME="vllm-fn-hf"
 OUTPUT_DIR=""
 MIA_SOURCE=""
+FP8_ARTIFACT_DIR=""
 LAUNCH=false
 KEEP_RUNNING=false
+STARTUP_TIMEOUT_SECONDS=3600
 
 usage() {
     cat <<'EOF'
@@ -51,6 +53,7 @@ Options:
   --launch               Launch both nodes, run the corpus, reduce telemetry
   --keep-running         Leave containers running after a successful calibration
   --mia-source DIR       Existing checkout at the pinned MiaAI-Lab commit
+  --fp8-artifact-dir DIR Immutable linear-attention FP8 artifact directory
   --worker USER@HOST     Worker SSH destination (default: glwillen@192.168.100.11)
   --head-ip IP           Head fabric address (default: 192.168.100.10)
   --worker-ip IP         Worker fabric address (default: 192.168.100.11)
@@ -60,6 +63,8 @@ Options:
   --worker-hca NAME      Worker RDMA HCA (default: rocep1s0f1)
   --hf-cache DIR         Head Hugging Face cache
   --worker-hf-volume V   Worker read-only HF volume (default: vllm-fn-hf)
+  --startup-timeout-seconds N
+                         Health deadline in seconds (default: 3600)
   --help                 Show this help
 EOF
 }
@@ -75,6 +80,7 @@ while (($#)); do
         --launch) LAUNCH=true; shift ;;
         --keep-running) KEEP_RUNNING=true; shift ;;
         --mia-source) MIA_SOURCE=${2:?missing value}; shift 2 ;;
+        --fp8-artifact-dir) FP8_ARTIFACT_DIR=${2:?missing value}; shift 2 ;;
         --worker)
             worker_arg=${2:?missing value}
             [[ "$worker_arg" == *@* ]] || fail "--worker must be USER@HOST"
@@ -90,6 +96,10 @@ while (($#)); do
         --worker-hca) WORKER_HCA=${2:?missing value}; shift 2 ;;
         --hf-cache) HF_CACHE=${2:?missing value}; shift 2 ;;
         --worker-hf-volume) WORKER_HF_VOLUME=${2:?missing value}; shift 2 ;;
+        --startup-timeout-seconds)
+            STARTUP_TIMEOUT_SECONDS=${2:?missing value}
+            shift 2
+            ;;
         --help|-h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
@@ -97,6 +107,17 @@ done
 
 [[ -n "$OUTPUT_DIR" ]] || fail "--output-dir is required"
 [[ "$OUTPUT_DIR" == /* ]] || fail "--output-dir must be absolute"
+[[ "$STARTUP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
+    fail "--startup-timeout-seconds must be a positive integer"
+if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
+    [[ "$FP8_ARTIFACT_DIR" == /* ]] || fail "--fp8-artifact-dir must be absolute"
+    [[ -d "$FP8_ARTIFACT_DIR" ]] || fail "FP8 artifact directory missing: $FP8_ARTIFACT_DIR"
+    FP8_ARTIFACT_DIR=$(cd "$FP8_ARTIFACT_DIR" && pwd)
+    fp8_artifact_key=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_key"])' \
+        "$FP8_ARTIFACT_DIR/manifest.json") || fail "FP8 artifact manifest is unreadable"
+    [[ "$(basename "$FP8_ARTIFACT_DIR")" == "$fp8_artifact_key" ]] || \
+        fail "FP8 artifact directory is not keyed by its manifest"
+fi
 if [[ -e "$OUTPUT_DIR" ]] && [[ -n "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     fail "--output-dir must be empty: $OUTPUT_DIR"
 fi
@@ -160,7 +181,7 @@ extract_image_file() {
 RUNTIME_FILES="$WORK_DIR/runtime/files"
 mkdir -p "$RUNTIME_FILES"
 for generator in patch_ple_layer.py patch_modelopt_mxfp8.py \
-    patch_modelopt_fp8_block_moe.py patch_qsa_fp8_kv.py patch_checkpoint_config.py; do
+    patch_qsa_fp8_kv.py patch_checkpoint_config.py; do
     cp "$MIA_WORK/files/$generator" "$RUNTIME_FILES/$generator"
 done
 extract_image_file "$CONTAINER_MODEL_DIR/ple_layer.py" "$RUNTIME_FILES/ple_layer_patched.py.orig"
@@ -174,10 +195,18 @@ extract_image_file "$CONTAINER_MODEL_DIR/model.py" "$ARTIFACT_DIR/model_telemetr
 
 python3 "$RUNTIME_FILES/patch_ple_layer.py" >/dev/null
 python3 "$RUNTIME_FILES/patch_modelopt_mxfp8.py" >/dev/null
-python3 "$RUNTIME_FILES/patch_modelopt_fp8_block_moe.py" >/dev/null
+python3 "$SCRIPT_DIR/patch-qwen38-modelopt-fp8-block-moe.py" \
+    "$RUNTIME_FILES/modelopt_patched.py"
 python3 "$RUNTIME_FILES/patch_qsa_fp8_kv.py" >/dev/null
 python3 "$RUNTIME_FILES/patch_checkpoint_config.py" "$HEAD_SNAPSHOT" "$RUNTIME_FILES" >/dev/null
 python3 "$REPO_ROOT/scripts/runtime/patch-vllm-64k-loader.py" "$ARTIFACT_DIR/weight_utils_64k.py"
+weight_utils_64k_sha=$(sha256sum "$ARTIFACT_DIR/weight_utils_64k.py" | cut -d' ' -f1)
+[[ "$weight_utils_64k_sha" == "6cbca7f793403b0d169e0d8a60f100a4c721d3ec008404eab0ddfa0b81389c0e" ]] || \
+    fail "64 KiB loader checksum mismatch: $weight_utils_64k_sha"
+if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
+    python3 "$REPO_ROOT/scripts/runtime/patch-qwen38-fp8-overlay-loader.py" \
+        "$ARTIFACT_DIR/weight_utils_64k.py"
+fi
 python3 "$SCRIPT_DIR/patch-qwen38-activation-telemetry.py" "$ARTIFACT_DIR/model_telemetry.py"
 
 for file in ple_layer_patched.py modelopt_patched.py qsa_ops_patched.py \
@@ -193,8 +222,10 @@ verify_sha() {
         "overlay checksum mismatch for $(basename "$file"): expected $expected, got $actual"
 }
 verify_sha fae9fd5242748e8cdb314445a25ad628a0ce335cf26f794623f8679497a65186 "$ARTIFACT_DIR/ple_layer_patched.py"
-verify_sha 5cb67475490badba79ab2b8f6d2527a985a52848bb63055cba84e0b2ea89163a "$ARTIFACT_DIR/modelopt_patched.py"
-verify_sha 6cbca7f793403b0d169e0d8a60f100a4c721d3ec008404eab0ddfa0b81389c0e "$ARTIFACT_DIR/weight_utils_64k.py"
+verify_sha 3f75c2ca00048a2ca5db24bc440e0a2210a115fda0e8a953bcb98072779ef2d7 "$ARTIFACT_DIR/modelopt_patched.py"
+if [[ -z "$FP8_ARTIFACT_DIR" ]]; then
+    verify_sha 6cbca7f793403b0d169e0d8a60f100a4c721d3ec008404eab0ddfa0b81389c0e "$ARTIFACT_DIR/weight_utils_64k.py"
+fi
 verify_sha 0669d6334f58a624c89c15f3e46c90f28e59b0b913507101dec1c5765e3c3b12 "$ARTIFACT_DIR/qsa_ops_patched.py"
 verify_sha ee5de40742ad48a6064ea24b99a285ff69c47d57bbb170f57c4eef71567a1df3 "$ARTIFACT_DIR/qsa_nvidia_patched.py"
 verify_sha c3864cf981365bfe6b40deaaaa6d12e8402e60a3cef03d009c29f95b4e995403 "$ARTIFACT_DIR/config_patched.json"
@@ -202,12 +233,24 @@ verify_sha dd8727422cafbb0257d11a7163442bda46421f6e67c78eb9acd58669cb6eb5f8 "$AR
 
 docker run --rm -v "$ARTIFACT_DIR/model_telemetry.py:/work/model.py:ro" \
     --entrypoint /usr/bin/python3 "$IMAGE_TAG" -m py_compile /work/model.py
+if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
+    FP8_CONTAINER_DIR="/rocket/qwen38-linear-fp8"
+    docker run --rm \
+        -v "$HF_CACHE:/root/.cache/huggingface:ro" \
+        -v "$FP8_ARTIFACT_DIR:$FP8_CONTAINER_DIR:ro" \
+        -v "$FP8_ARTIFACT_DIR/hf_quant_config.json:/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/hf_quant_config.json:ro" \
+        -v "$ARTIFACT_DIR/weight_utils_64k.py:$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py:ro" \
+        -e "ROCKET_QWEN38_FP8_OVERLAY_MANIFEST=$FP8_CONTAINER_DIR/manifest.json" \
+        -e "ROCKET_QWEN38_FP8_QUANT_CONFIG=$FP8_CONTAINER_DIR/hf_quant_config.json" \
+        --entrypoint /usr/bin/python3 "$IMAGE_TAG" -c \
+        "import glob; from vllm.model_executor.model_loader.weight_utils import _rocket_qwen38_fp8_overlay_preflight as check; files=glob.glob('/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/*.safetensors'); result=check(sorted(files), 'lazy'); assert len(result['selected']) == 180; print('validated FP8 overlay: 180 tensors')"
+fi
 (
     cd "$ARTIFACT_DIR"
     sha256sum ./* > SHA256SUMS
 )
 cat > "$OUTPUT_DIR/run.json" <<EOF
-{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size}
+{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size,"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS}
 EOF
 
 printf 'Prepared and verified pinned calibration artifacts in %s\n' "$ARTIFACT_DIR"
@@ -235,7 +278,15 @@ ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p '$REMOTE_OUTPUT/artifacts' '$REMOTE
 scp -q "$ARTIFACT_DIR"/* "$SSH_TARGET:$REMOTE_OUTPUT/artifacts/"
 
 write_launch_script() {
-    local destination=$1 node_rank=$2 node_ip=$3 iface=$4 hca=$5 cache_mount=$6 artifact_dir=$7 mode=$8 cache_access=$9
+    local destination=$1 node_rank=$2 node_ip=$3 iface=$4 hca=$5 cache_mount=$6 artifact_dir=$7 mode=$8 cache_access=$9 fp8_host_dir=${10}
+    local fp8_options="" quant_config_source="$artifact_dir/hf_quant_config_patched.json"
+    if [[ -n "$fp8_host_dir" ]]; then
+        quant_config_source="$fp8_host_dir/hf_quant_config.json"
+        fp8_options="
+  -v $(printf '%q' "$fp8_host_dir"):/rocket/qwen38-linear-fp8:ro \\
+  -e ROCKET_QWEN38_FP8_OVERLAY_MANIFEST=/rocket/qwen38-linear-fp8/manifest.json \\
+  -e ROCKET_QWEN38_FP8_QUANT_CONFIG=/rocket/qwen38-linear-fp8/hf_quant_config.json \\"
+    fi
     cat > "$destination" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -251,7 +302,7 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
   -e VLLM_HOST_IP=$(printf '%q' "$node_ip") -e HF_HOME=/root/.cache/huggingface \\
   -e ROCKET_NVFP4_CALIBRATE=1 -e ROCKET_NVFP4_SAMPLE_ELEMENTS=2048 \\
-  -e ROCKET_NVFP4_MAX_EMISSIONS=12 \\
+  -e ROCKET_NVFP4_MAX_EMISSIONS=12 \\$fp8_options
   -v $(printf '%q' "$artifact_dir/ple_layer_patched.py"):$CONTAINER_MODEL_DIR/ple_layer.py:ro \\
   -v $(printf '%q' "$artifact_dir/modelopt_patched.py"):$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro \\
   -v $(printf '%q' "$artifact_dir/weight_utils_64k.py"):$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py:ro \\
@@ -259,7 +310,7 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   -v $(printf '%q' "$artifact_dir/qsa_ops_patched.py"):$CONTAINER_MODEL_DIR/ops/qsa.py:ro \\
   -v $(printf '%q' "$artifact_dir/qsa_nvidia_patched.py"):$CONTAINER_MODEL_DIR/qsa.py:ro \\
   -v $(printf '%q' "$artifact_dir/config_patched.json"):/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/config.json:ro \\
-  -v $(printf '%q' "$artifact_dir/hf_quant_config_patched.json"):/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/hf_quant_config.json:ro \\
+  -v $(printf '%q' "$quant_config_source"):/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/hf_quant_config.json:ro \\
   -v $(printf '%q' "$cache_mount"):/root/.cache/huggingface:$cache_access \\
   -v \$HOME/.cache/vllm:/root/.cache/vllm \\
   $IMAGE_TAG $MODEL_ID \\
@@ -279,10 +330,18 @@ EOF
     chmod +x "$destination"
 }
 
+REMOTE_FP8_ARTIFACT=""
+if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
+    REMOTE_FP8_ARTIFACT="$REMOTE_OUTPUT/fp8-artifact"
+    ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p '$REMOTE_FP8_ARTIFACT'"
+    scp -q "$FP8_ARTIFACT_DIR/manifest.json" "$FP8_ARTIFACT_DIR/hf_quant_config.json" \
+        "$FP8_ARTIFACT_DIR/linear-attention-fp8.safetensors" \
+        "$SSH_TARGET:$REMOTE_FP8_ARTIFACT/"
+fi
 write_launch_script "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE" \
-    "$WORKER_HCA" "$WORKER_HF_VOLUME" "$REMOTE_OUTPUT/artifacts" "--headless" "ro"
+    "$WORKER_HCA" "$WORKER_HF_VOLUME" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT"
 write_launch_script "$OUTPUT_DIR/launch-head.sh" 0 "$HEAD_IP" "$HEAD_IFACE" \
-    "$HEAD_HCA" "$HF_CACHE" "$ARTIFACT_DIR" "--host 0.0.0.0 --port $API_PORT" "rw"
+    "$HEAD_HCA" "$HF_CACHE" "$ARTIFACT_DIR" "--host 0.0.0.0 --port $API_PORT" "rw" "$FP8_ARTIFACT_DIR"
 scp -q "$OUTPUT_DIR/launch-worker.sh" "$SSH_TARGET:$REMOTE_OUTPUT/launch-worker.sh"
 
 head_log_pid=""
@@ -311,9 +370,10 @@ ssh -o BatchMode=yes "$SSH_TARGET" \
     "docker logs --timestamps -f '$WORKER_CONTAINER'" >"$LOG_DIR/worker.log" 2>&1 &
 worker_log_pid=$!
 
-deadline=$((SECONDS + 1200))
+deadline=$((SECONDS + STARTUP_TIMEOUT_SECONDS))
 until curl -fsS "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; do
-    ((SECONDS < deadline)) || fail "server did not become healthy within 1200 seconds"
+    ((SECONDS < deadline)) || fail \
+        "server did not become healthy within ${STARTUP_TIMEOUT_SECONDS} seconds (startup timeout budget exhausted)"
     docker inspect -f '{{.State.Running}}' "$HEAD_CONTAINER" 2>/dev/null | grep -qx true || \
         fail "head container exited during startup"
     ssh -o BatchMode=yes "$SSH_TARGET" \
@@ -356,6 +416,15 @@ worker_workload_log_pid=""
 cat "$LOG_DIR/head.log" "$LOG_DIR/worker.log" > "$LOG_DIR/combined.log"
 cat "$LOG_DIR/head-workload.log" "$LOG_DIR/worker-workload.log" \
     > "$LOG_DIR/combined-workload.log"
+
+# Public model metadata can omit speculative_config. Runtime interval metrics
+# from the workload window are the execution proof and are required to proceed.
+python3 "$SCRIPT_DIR/qwen38-mtp-runtime-evidence.py" \
+    --log "$LOG_DIR/head-workload.log" \
+    --not-before "$head_workload_since" \
+    --min-records 2 --positions 3 \
+    > "$OUTPUT_DIR/mtp-runtime-evidence.json"
+
 for node in head worker combined; do
     python3 "$SCRIPT_DIR/qwen38-activation-maxima.py" \
         --require-expanded --expanded-v2-only --min-emission-call 8 \
