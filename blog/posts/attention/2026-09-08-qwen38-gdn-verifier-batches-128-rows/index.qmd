@@ -1,0 +1,76 @@
+---
+title: "One M128 projection cuts Qwen GDN K7 verification to 2.02 ms"
+description: "The c16 K7 GDN verifier preserves exact K0 output and prefix state while reducing one layer from 5.65 ms to 2.02 ms."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, attention, kernels, cache, numerics]
+verdict: accepted
+rocket: "#kernels"
+---
+
+**Question.** Can 16 sequences verify up to eight causal GDN positions while
+publishing only each sequence's accepted prefix?
+
+| setup | |
+| --- | --- |
+| node | gx10-5e36, GB10, 6.17.13-rocket64k, 64 KiB pages |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| slab | rank 0 target, artifact `a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4` |
+| source base | Rocket `bf1aa08636890e8ce491eab4f5f1079d783f402d` |
+| reference | vLLM `8e685d198`, Qwen GDN and fused FLA post-convolution paths, Apache-2.0 |
+| samples | 20 CUDA-event measurements per verifier shape |
+
+```bash
+cmake -S engines/qwen38-flash-next-nvfp4-2b \
+  -B engines/qwen38-flash-next-nvfp4-2b/build-make \
+  -DROCKET_QWEN38_CUTLASS_DIR="$PWD/engines/glm5-moe-nvfp4-2b/third_party/cutlass"
+cmake --build engines/qwen38-flash-next-nvfp4-2b/build-make -j2
+ctest --test-dir engines/qwen38-flash-next-nvfp4-2b/build-make --output-on-failure
+engines/qwen38-flash-next-nvfp4-2b/build-make/qwen38-gdn-graph-smoke \
+  /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank0-target.slab 0
+```
+
+```text
+100% tests passed, 0 tests failed out of 11
+verifier_sequences=16 verify_width=2 token_rows=32 acceptance=exact-prefix stage_state=isolated output_drift_bytes=0 mean_ms=0.928867 min_ms=0.923264 max_ms=0.943840 traffic_bytes=173620576 effective_GBps=186.916 local_roof_fraction=0.785363
+verifier_sequences=16 verify_width=5 token_rows=80 acceptance=exact-prefix stage_state=isolated output_drift_bytes=0 mean_ms=1.461310 min_ms=1.447650 max_ms=1.472290 traffic_bytes=252558688 effective_GBps=172.830 local_roof_fraction=0.726176
+verifier_sequences=16 verify_width=8 token_rows=128 acceptance=exact-prefix stage_state=isolated output_drift_bytes=0 mean_ms=2.017950 min_ms=2.003680 max_ms=2.034400 traffic_bytes=331496800 effective_GBps=164.274 local_roof_fraction=0.690226
+verifier_k7_to_k0=exact inactive-output-zero
+verifier_reset=discarded replay=bit-exact telemetry_spans=302 telemetry_metrics=302
+```
+
+| shape | rows | mean | min | max | spread | traffic | effective bandwidth | local 238 GB/s roof | 36-layer time |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| c16 K1 | 32 | 0.928867 ms | 0.923264 ms | 0.943840 ms | 2.215% | 173,620,576 B | 186.92 GB/s | 78.54% | 33.439 ms |
+| c16 K4 | 80 | 1.461310 ms | 1.447650 ms | 1.472290 ms | 1.686% | 252,558,688 B | 172.83 GB/s | 72.62% | 52.607 ms |
+| c16 K7 | 128 | 2.017950 ms | 2.003680 ms | 2.034400 ms | 1.522% | 331,496,800 B | 164.27 GB/s | 69.02% | 72.646 ms |
+| c1 K7 | 8 | 0.330005 ms | 0.326464 ms | 0.334560 ms | 2.453% | 36,093,280 B | 109.37 GB/s | 45.95% | 11.880 ms |
+| c2 K7 | 16 | 0.460862 ms | 0.418528 ms | 0.642112 ms | 48.514% | 55,786,848 B | 121.05 GB/s | 50.86% | 16.591 ms |
+| c4 K7 | 32 | 0.662195 ms | 0.644864 ms | 0.738464 ms | 14.135% | 95,173,984 B | 143.73 GB/s | 60.39% | 23.839 ms |
+| c8 K7 | 64 | 1.116340 ms | 1.096420 ms | 1.195970 ms | 8.918% | 173,948,256 B | 155.82 GB/s | 65.47% | 40.188 ms |
+
+| decision | result |
+| --- | --- |
+| position loop | rejected on value at 5.65059 ms per c16 K7 layer |
+| fixed M128 projection | accepted at 2.01795 ms per c16 K7 layer |
+| causal order | one kernel block owns one sequence and advances width 1 through 8 |
+| state isolation | accepted convolution and recurrent pools are byte-identical before and after stage |
+| prefix publication | mixed prefixes 0 through width match sequential K0 state byte for byte |
+| numeric parity | every staged output matches sequential K0, 0 differing bytes |
+| reset | discards private state without writing the accepted pools |
+| telemetry cardinality | stage is one of 3 values, sequence bucket is one of 5 values, outcome is one of 4 values |
+
+**Verdict.** Accepted for the rank-0 layer-0 GDN verifier primitive. One M128
+projection replaces eight M16 projections. K7 state snapshots are written by
+the causal kernels that produce them.
+
+**Next.**
+
+- bind the verifier to all 36 GDN layers and both ranks
+- include the 72.646 ms K7 contribution in the assembled decoder roofline
+- profile the c2 and c4 K7 variance in the assembled captured graph
+
+**Reopen if.**
+
+- a CUDA, CUTLASS, firmware, checkpoint, or GB10 revision changes the fixed
+  projection or recurrent-state layout
