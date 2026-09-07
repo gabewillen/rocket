@@ -40,6 +40,9 @@ CHECKPOINT_SHARD_COUNT=0
 HEAD_CACHE_FILESYSTEM=""
 WORKER_CACHE_FILESYSTEM=""
 WORKER_SNAPSHOT=""
+HEAD_RUNTIME_CACHE_MOUNT="$HF_CACHE"
+WORKER_RUNTIME_CACHE_MOUNT="$WORKER_HF_VOLUME"
+USE_IMMUTABLE_CACHE_VIEW=false
 OUTPUT_DIR=""
 MIA_SOURCE=""
 FP8_ARTIFACT_DIR=""
@@ -152,6 +155,7 @@ if [[ -n "$WORKER_HF_CACHE" ]]; then
     [[ "$WORKER_HF_CACHE" == /* ]] || fail "--worker-hf-cache must be absolute"
     WORKER_CACHE_KIND="host_ext4"
     WORKER_CACHE_MOUNT="$WORKER_HF_CACHE"
+    USE_IMMUTABLE_CACHE_VIEW=true
 fi
 [[ "$MTP_DEPTH" =~ ^[0-7]$ ]] || fail "--mtp-depth must be one of 0,1,2,3,4,5,6,7"
 # Pinned image d464f3b4 declares SpeculativeConfig.num_speculative_tokens with
@@ -316,9 +320,10 @@ if [[ "$WORKER_CACHE_KIND" == host_ext4 ]]; then
     [[ "$head_safetensor_count" == 11 && "$worker_safetensor_count" == 11 ]] || \
         fail "pinned checkpoint requires 11 safetensor shards on each node"
     CHECKPOINT_SHARD_COUNT=11
-    head_manifest=$(find "$HEAD_SNAPSHOT" -maxdepth 1 -type l -printf '%f\t%l\n' | sort | sha256sum | cut -d' ' -f1)
+    manifest_program='import hashlib,pathlib,sys; p=pathlib.Path(sys.argv[1]); rows=[f"{x.name}\t{x.resolve().name}\t{x.stat().st_size}\n" for x in sorted(p.glob("*.safetensors"))]; print(hashlib.sha256("".join(rows).encode()).hexdigest())'
+    head_manifest=$(python3 -c "$manifest_program" "$HEAD_SNAPSHOT")
     worker_manifest=$(ssh -o BatchMode=yes "$SSH_TARGET" \
-        "find $worker_snapshot_q -maxdepth 1 -type l -printf '%f\\t%l\\n' | sort | sha256sum | cut -d' ' -f1")
+        "python3 -c $(printf '%q' "$manifest_program") $worker_snapshot_q")
     [[ -n "$head_manifest" && "$worker_manifest" == "$head_manifest" ]] || \
         fail "worker local checkpoint manifest differs from head"
     CHECKPOINT_MANIFEST_SHA256="$head_manifest"
@@ -474,12 +479,40 @@ if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
         --entrypoint /usr/bin/python3 "$IMAGE_TAG" -c \
         "import glob; from vllm.model_executor.model_loader.weight_utils import _rocket_qwen38_fp8_overlay_preflight as check; files=glob.glob('/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/*.safetensors'); result=check(sorted(files), 'lazy'); assert len(result['selected']) == 180; print('validated FP8 overlay: 180 tensors')"
 fi
+
+# A host cache cannot accept child bind mounts beneath a read-only parent. Build
+# one immutable cache view per node with hard-linked content-addressed blobs and
+# the selected patched metadata, then mount that view once as read-only.
+if [[ "$WORKER_CACHE_KIND" == host_ext4 ]]; then
+    HEAD_RUNTIME_CACHE_MOUNT="$WORK_DIR/hf-cache-view"
+    WORKER_RUNTIME_CACHE_MOUNT="$OUTPUT_DIR/work/hf-cache-view"
+    head_cache_device=$(stat -c %d "$HF_CACHE")
+    head_output_device=$(stat -c %d "$WORK_DIR")
+    [[ "$head_cache_device" == "$head_output_device" ]] || \
+        fail "head immutable cache view must share the checkpoint ext4 filesystem"
+    mkdir -p "$HEAD_RUNTIME_CACHE_MOUNT/hub"
+    cp -al "$HF_CACHE/hub/$MODEL_CACHE_NAME" "$HEAD_RUNTIME_CACHE_MOUNT/hub/"
+    head_view_snapshot="$HEAD_RUNTIME_CACHE_MOUNT/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION"
+    rm "$head_view_snapshot/config.json" "$head_view_snapshot/hf_quant_config.json"
+    if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
+        cp "$ARTIFACT_DIR/config_nvfp4_patched.json" "$head_view_snapshot/config.json"
+        cp "$NVFP4_ARTIFACT_DIR/hf_quant_config.json" "$head_view_snapshot/hf_quant_config.json"
+    elif [[ -n "$FP8_ARTIFACT_DIR" ]]; then
+        cp "$ARTIFACT_DIR/config_fp8_patched.json" "$head_view_snapshot/config.json"
+        cp "$FP8_ARTIFACT_DIR/hf_quant_config.json" "$head_view_snapshot/hf_quant_config.json"
+    else
+        cp "$ARTIFACT_DIR/config_patched.json" "$head_view_snapshot/config.json"
+        cp "$ARTIFACT_DIR/hf_quant_config_patched.json" "$head_view_snapshot/hf_quant_config.json"
+    fi
+    [[ "$(find -L "$head_view_snapshot" -maxdepth 1 -name '*.safetensors' -type f | wc -l)" == 11 ]] || \
+        fail "head immutable cache view has unresolved checkpoint shards"
+fi
 (
     cd "$ARTIFACT_DIR"
     sha256sum ./* > SHA256SUMS
 )
 cat > "$OUTPUT_DIR/run.json" <<EOF
-{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size,"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS,"gpu_memory_utilization":$GPU_MEMORY_UTILIZATION,"mtp_depth":$MTP_DEPTH,"worker_cache_kind":"$WORKER_CACHE_KIND","head_cache_filesystem":"$HEAD_CACHE_FILESYSTEM","worker_cache_filesystem":"$WORKER_CACHE_FILESYSTEM","head_snapshot_path":"$HEAD_SNAPSHOT","worker_snapshot_path":"$WORKER_SNAPSHOT","checkpoint_manifest_sha256":"$CHECKPOINT_MANIFEST_SHA256","checkpoint_safetensor_shards":$CHECKPOINT_SHARD_COUNT}
+{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size,"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS,"gpu_memory_utilization":$GPU_MEMORY_UTILIZATION,"mtp_depth":$MTP_DEPTH,"worker_cache_kind":"$WORKER_CACHE_KIND","head_cache_filesystem":"$HEAD_CACHE_FILESYSTEM","worker_cache_filesystem":"$WORKER_CACHE_FILESYSTEM","head_snapshot_path":"$HEAD_SNAPSHOT","worker_snapshot_path":"$WORKER_SNAPSHOT","head_runtime_cache_path":"$HEAD_RUNTIME_CACHE_MOUNT","worker_runtime_cache_path":"$WORKER_RUNTIME_CACHE_MOUNT","checkpoint_manifest_sha256":"$CHECKPOINT_MANIFEST_SHA256","checkpoint_safetensor_shards":$CHECKPOINT_SHARD_COUNT}
 EOF
 
 printf 'Prepared and verified pinned calibration artifacts in %s\n' "$ARTIFACT_DIR"
@@ -514,6 +547,7 @@ ssh -o BatchMode=yes "$SSH_TARGET" \
 
 write_launch_script() {
     local destination=$1 node_rank=$2 node_ip=$3 iface=$4 hca=$5 cache_mount=$6 artifact_dir=$7 mode=$8 cache_access=$9 fp8_host_dir=${10} nvfp4_host_dir=${11}
+    local use_immutable_cache_view=${12:-false}
     local fp8_options="" nvfp4_options="" quant_config_source="$artifact_dir/hf_quant_config_patched.json" config_source="$artifact_dir/config_patched.json"
     if [[ -n "$fp8_host_dir" ]]; then
         quant_config_source="$fp8_host_dir/hf_quant_config.json"
@@ -573,6 +607,12 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   --hf-overrides '{"text_config":{"ple_embedding_dtype":"float8_e4m3fn"}}' \\
   --enforce-eager --node-rank $node_rank $mode
 EOF
+    if [[ "$use_immutable_cache_view" == true ]]; then
+        sed -i \
+            -e '\|/snapshots/.*/config.json:ro|d' \
+            -e '\|/snapshots/.*/hf_quant_config.json:ro|d' \
+            "$destination"
+    fi
     chmod +x "$destination"
 }
 
@@ -626,10 +666,37 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         --entrypoint /usr/bin/python3 '$IMAGE_TAG' -c \
         \"import json,os,pathlib; from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig; config=ModelOptMixedPrecisionConfig.from_config(json.load(open('/work/hf_quant_config.json'))); families=set(os.environ['ROCKET_NVFP4_FAMILIES'].split(',')); checks={'base_routers':'model.language_model.model.layers.0.mlp.gate','base_ple':'model.language_model.model.layers.1.ple.value_proj'}; [(_ for _ in ()).throw(AssertionError((family, config._resolve_quant_algo(target)))) for family,target in checks.items() if family in families and config._resolve_quant_algo(target) != 'NVFP4']; telemetry=pathlib.Path('/work/model.py').read_text(); runtime=pathlib.Path('/work/model_router.py').read_text(); selected='base_routers' in families; assert ('ROCKET_QWEN38_NVFP4_ROUTER_V1' in telemetry) == selected; assert ('ROCKET_QWEN38_NVFP4_ROUTER_V1' in runtime) == selected; assert 'ROCKET_NVFP4_TELEMETRY' in telemetry; assert 'ROCKET_NVFP4_TELEMETRY' not in runtime; print(f'validated worker NVFP4 mounted-model semantics: {sorted(families)}')\""
 fi
+if [[ "$WORKER_CACHE_KIND" == host_ext4 ]]; then
+    printf -v worker_cache_q '%q' "$WORKER_HF_CACHE"
+    printf -v remote_work_q '%q' "$REMOTE_OUTPUT/work"
+    printf -v remote_view_q '%q' "$WORKER_RUNTIME_CACHE_MOUNT"
+    printf -v remote_model_q '%q' "$WORKER_HF_CACHE/hub/$MODEL_CACHE_NAME"
+    printf -v remote_view_snapshot_q '%q' "$WORKER_RUNTIME_CACHE_MOUNT/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION"
+    worker_cache_device=$(ssh -o BatchMode=yes "$SSH_TARGET" "stat -c %d $worker_cache_q")
+    worker_output_device=$(ssh -o BatchMode=yes "$SSH_TARGET" "stat -c %d $remote_work_q")
+    [[ "$worker_cache_device" == "$worker_output_device" ]] || \
+        fail "worker immutable cache view must share the checkpoint ext4 filesystem"
+    ssh -o BatchMode=yes "$SSH_TARGET" \
+        "mkdir -p $remote_view_q/hub && cp -al $remote_model_q $remote_view_q/hub/ && rm $remote_view_snapshot_q/config.json $remote_view_snapshot_q/hf_quant_config.json"
+    if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
+        ssh -o BatchMode=yes "$SSH_TARGET" \
+            "cp '$REMOTE_OUTPUT/artifacts/config_nvfp4_patched.json' $remote_view_snapshot_q/config.json && cp '$REMOTE_NVFP4_ARTIFACT/hf_quant_config.json' $remote_view_snapshot_q/hf_quant_config.json"
+    elif [[ -n "$FP8_ARTIFACT_DIR" ]]; then
+        ssh -o BatchMode=yes "$SSH_TARGET" \
+            "cp '$REMOTE_OUTPUT/artifacts/config_fp8_patched.json' $remote_view_snapshot_q/config.json && cp '$REMOTE_FP8_ARTIFACT/hf_quant_config.json' $remote_view_snapshot_q/hf_quant_config.json"
+    else
+        ssh -o BatchMode=yes "$SSH_TARGET" \
+            "cp '$REMOTE_OUTPUT/artifacts/config_patched.json' $remote_view_snapshot_q/config.json && cp '$REMOTE_OUTPUT/artifacts/hf_quant_config_patched.json' $remote_view_snapshot_q/hf_quant_config.json"
+    fi
+    resolved_worker_shards=$(ssh -o BatchMode=yes "$SSH_TARGET" \
+        "find -L $remote_view_snapshot_q -maxdepth 1 -name '*.safetensors' -type f | wc -l")
+    [[ "$resolved_worker_shards" == 11 ]] || \
+        fail "worker immutable cache view has unresolved checkpoint shards"
+fi
 write_launch_script "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE" \
-    "$WORKER_HCA" "$WORKER_CACHE_MOUNT" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT" "$REMOTE_NVFP4_ARTIFACT"
+    "$WORKER_HCA" "$WORKER_RUNTIME_CACHE_MOUNT" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT" "$REMOTE_NVFP4_ARTIFACT" "$USE_IMMUTABLE_CACHE_VIEW"
 write_launch_script "$OUTPUT_DIR/launch-head.sh" 0 "$HEAD_IP" "$HEAD_IFACE" \
-    "$HEAD_HCA" "$HF_CACHE" "$ARTIFACT_DIR" "--host 0.0.0.0 --port $API_PORT" "rw" "$FP8_ARTIFACT_DIR" "$NVFP4_ARTIFACT_DIR"
+    "$HEAD_HCA" "$HEAD_RUNTIME_CACHE_MOUNT" "$ARTIFACT_DIR" "--host 0.0.0.0 --port $API_PORT" "ro" "$FP8_ARTIFACT_DIR" "$NVFP4_ARTIFACT_DIR" "$USE_IMMUTABLE_CACHE_VIEW"
 if [[ "$PRODUCTION" == true ]]; then
     for launch_script in "$OUTPUT_DIR/launch-head.sh" "$OUTPUT_DIR/launch-worker.sh"; do
         sed -i \

@@ -57,8 +57,17 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             '"checkpoint_safetensor_shards":$CHECKPOINT_SHARD_COUNT', self.source
         )
         self.assertIn(
-            '"$WORKER_HCA" "$WORKER_CACHE_MOUNT"', self.source
+            '"$WORKER_HCA" "$WORKER_RUNTIME_CACHE_MOUNT"', self.source
         )
+        self.assertIn('cp -al "$HF_CACHE/hub/$MODEL_CACHE_NAME"', self.source)
+        self.assertIn('cp -al $remote_model_q $remote_view_q/hub/', self.source)
+        self.assertIn('"$head_cache_device" == "$head_output_device"', self.source)
+        self.assertIn('"$worker_cache_device" == "$worker_output_device"', self.source)
+        self.assertIn('find -L "$head_view_snapshot"', self.source)
+        self.assertIn('find -L $remote_view_snapshot_q', self.source)
+        self.assertIn('HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1', self.source)
+        self.assertIn('"head_runtime_cache_path":"$HEAD_RUNTIME_CACHE_MOUNT"', self.source)
+        self.assertIn('"worker_runtime_cache_path":"$WORKER_RUNTIME_CACHE_MOUNT"', self.source)
 
     def test_production_mode_cuts_instrumentation_and_runs_ladder(self):
         self.assertIn('if [[ "$PRODUCTION" == true ]]', self.source)

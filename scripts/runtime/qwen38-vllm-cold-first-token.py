@@ -143,6 +143,10 @@ def validate_production_prepared(
                 "worker_snapshot_path"
             ):
                 raise ValueError("local cache preparation lacks exact snapshot paths")
+            if not run_record.get("head_runtime_cache_path") or not run_record.get(
+                "worker_runtime_cache_path"
+            ):
+                raise ValueError("local cache preparation lacks exact runtime cache paths")
     for name in ("launch-head.sh", "launch-worker.sh"):
         source = prepared.joinpath(name).read_text()
         forbidden = (

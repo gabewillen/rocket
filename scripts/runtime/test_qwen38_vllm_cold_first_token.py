@@ -136,6 +136,8 @@ class ColdFirstTokenTests(unittest.TestCase):
                         "checkpoint_safetensor_shards": 11,
                         "head_snapshot_path": "/cache/head/revision",
                         "worker_snapshot_path": "/cache/worker/revision",
+                        "head_runtime_cache_path": "/run/head-cache-view",
+                        "worker_runtime_cache_path": "/run/worker-cache-view",
                     }
                 )
             )
