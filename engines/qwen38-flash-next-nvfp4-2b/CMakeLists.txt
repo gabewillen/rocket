@@ -258,10 +258,18 @@ add_test(NAME qwen38-concrete-full-attention-graph-contract
 add_executable(qwen38-test-qsa-state-fork tests/test_qsa_state_fork.cu)
 target_link_libraries(qwen38-test-qsa-state-fork PRIVATE
   qwen38_qsa_state_fork CUDA::cudart)
+add_executable(qwen38-test-qsa-mtp-state-view
+  tests/test_qsa_mtp_state_view.cc)
+target_include_directories(qwen38-test-qsa-mtp-state-view PRIVATE src)
+target_link_libraries(qwen38-test-qsa-mtp-state-view PRIVATE CUDA::cudart)
+target_compile_options(qwen38-test-qsa-mtp-state-view PRIVATE
+  -Wall -Wextra -Werror)
 target_compile_options(qwen38-test-qsa-state-fork PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
 )
 add_test(NAME qwen38-qsa-state-fork-contract COMMAND qwen38-test-qsa-state-fork)
+add_test(NAME qwen38-qsa-mtp-state-view-contract
+  COMMAND qwen38-test-qsa-mtp-state-view)
 
 add_executable(qwen38-test-qsa-preprocess tests/test_qsa_preprocess.cu)
 target_link_libraries(qwen38-test-qsa-preprocess PRIVATE
