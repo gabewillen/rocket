@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include "decode/decoder_verifier.h"
+#include "mtp/state_arena.h"
 
 namespace rocket::qwen38::mtp {
 
@@ -96,9 +97,6 @@ struct BoundGraph {
   std::array<const std::int32_t*, kMaxDepth> router_expert_ids{};
   // Captured target+proposal output, position-major [depth + 1, sequences].
   const std::int32_t* verification_tokens = nullptr;
-  // Private causal snapshots, one [sequences, state_bytes] array per step.
-  std::array<const std::byte*, kMaxDepth> causal_snapshots{};
-  std::size_t state_bytes_per_sequence = 0;
 };
 
 struct DeviceDraftView {
@@ -118,7 +116,7 @@ class NativeExecutorError : public std::runtime_error {
 // state. commit() advances generation after DecoderVerifier publishes it.
 class NativeExecutor final : public decode::AcceptedStateParticipant {
  public:
-  NativeExecutor(ImmutableSlabs slabs, BoundGraph graph,
+  NativeExecutor(ImmutableSlabs slabs, BoundGraph graph, StateArena& state,
                  TelemetrySink& telemetry, cudaStream_t stream);
   ~NativeExecutor();
 
@@ -127,7 +125,7 @@ class NativeExecutor final : public decode::AcceptedStateParticipant {
 
   DeviceDraftView draft(std::uint64_t generation);
   std::size_t state_bytes_per_sequence() const noexcept override {
-    return graph_.state_bytes_per_sequence;
+    return state_.transaction_bytes();
   }
   void stage_accept(std::uint64_t generation, std::byte* inactive_state,
                     const std::int32_t* accepted_widths_device,
@@ -145,13 +143,13 @@ class NativeExecutor final : public decode::AcceptedStateParticipant {
  private:
   ImmutableSlabs slabs_;
   BoundGraph graph_;
+  StateArena& state_;
   TelemetrySink& telemetry_;
   cudaStream_t stream_;
   std::array<std::array<cudaEvent_t, static_cast<int>(Phase::kCount) + 1>,
              kMaxDepth>
       events_{};
   std::uint32_t* expert_masks_device_ = nullptr;
-  const std::byte** snapshots_device_ = nullptr;
   std::array<std::array<std::uint32_t, 8>, kMaxDepth> expert_masks_host_{};
   ExecutorPhase phase_ = ExecutorPhase::kReady;
   std::uint64_t active_generation_ = 0;

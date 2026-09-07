@@ -33,21 +33,6 @@ __global__ void aggregate_experts(const std::int32_t* ids, int count,
     atomicOr(mask + expert / 32, std::uint32_t{1} << (expert % 32));
 }
 
-__global__ void publish_accepted_snapshots(
-    std::byte* active, const std::byte* const* snapshots,
-    const std::int32_t* accepted_widths, int sequences, int depth,
-    std::size_t state_bytes) {
-  const std::size_t total = static_cast<std::size_t>(sequences) * state_bytes;
-  for (std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-       index < total; index += blockDim.x * gridDim.x) {
-    const int sequence = static_cast<int>(index / state_bytes);
-    const std::size_t offset = index % state_bytes;
-    const int step = min(accepted_widths[sequence], depth) - 1;
-    active[index] = snapshots[step][static_cast<std::size_t>(sequence) *
-                                      state_bytes + offset];
-  }
-}
-
 int popcount(const std::array<std::uint32_t, 8>& words) noexcept {
   int count = 0;
   for (std::uint32_t word : words) count += __builtin_popcount(word);
@@ -57,17 +42,19 @@ int popcount(const std::array<std::uint32_t, 8>& words) noexcept {
 }  // namespace
 
 NativeExecutor::NativeExecutor(ImmutableSlabs slabs, BoundGraph graph,
+                               StateArena& state,
                                TelemetrySink& telemetry, cudaStream_t stream)
-    : slabs_(slabs), graph_(graph), telemetry_(telemetry), stream_(stream) {
+    : slabs_(slabs), graph_(graph), state_(state), telemetry_(telemetry), stream_(stream) {
   if (!stream_ || !allowed_graph_key(graph_.key) ||
       !slabs_.target_rank_slab || slabs_.target_rank_slab_bytes == 0 ||
       !slabs_.mtp_rank_slab ||
       slabs_.mtp_rank_slab_bytes != kNativeRankSlabBytes ||
       !valid_digest(slabs_.source_contract_digest) ||
-      !graph_.verification_tokens || graph_.state_bytes_per_sequence == 0)
+      !graph_.verification_tokens || state_.depth() != graph_.key.depth ||
+      state_.sequences() != graph_.key.sequences)
     throw NativeExecutorError("native MTP binding contract changed");
   for (int step = 0; step < graph_.key.depth; ++step) {
-    if (!graph_.router_expert_ids[step] || !graph_.causal_snapshots[step])
+    if (!graph_.router_expert_ids[step])
       throw NativeExecutorError("native MTP step buffers are incomplete");
     for (int phase = 0; phase < kPhaseCount; ++phase)
       if (!graph_.phase_graphs[step][phase])
@@ -80,18 +67,11 @@ NativeExecutor::NativeExecutor(ImmutableSlabs slabs, BoundGraph graph,
     check(cudaMalloc(&expert_masks_device_,
                      kMaxDepth * 8 * sizeof(std::uint32_t)),
           "cudaMalloc expert masks");
-    check(cudaMalloc(&snapshots_device_, kMaxDepth * sizeof(std::byte*)),
-          "cudaMalloc snapshot table");
-    check(cudaMemcpy(snapshots_device_, graph_.causal_snapshots.data(),
-                     graph_.key.depth * sizeof(std::byte*),
-                     cudaMemcpyHostToDevice),
-          "bind immutable snapshot table");
   } catch (...) {
     for (const auto& step_events : events_)
       for (cudaEvent_t event : step_events)
         if (event) cudaEventDestroy(event);
     if (expert_masks_device_) cudaFree(expert_masks_device_);
-    if (snapshots_device_) cudaFree(snapshots_device_);
     throw;
   }
 }
@@ -101,7 +81,6 @@ NativeExecutor::~NativeExecutor() {
     for (cudaEvent_t event : step_events)
       if (event) cudaEventDestroy(event);
   if (expert_masks_device_) cudaFree(expert_masks_device_);
-  if (snapshots_device_) cudaFree(snapshots_device_);
 }
 
 DeviceDraftView NativeExecutor::draft(std::uint64_t generation) {
@@ -152,15 +131,7 @@ void NativeExecutor::stage_accept(
       shape.verify_width != graph_.key.depth + 1)
     throw NativeExecutorError("accepted-prefix publication contract changed");
   try {
-    const std::size_t bytes = static_cast<std::size_t>(graph_.key.sequences) *
-                              graph_.state_bytes_per_sequence;
-    const int blocks = static_cast<int>(std::min<std::size_t>(
-        4096, (bytes + 255) / 256));
-    publish_accepted_snapshots<<<blocks, 256, 0, stream_>>>(
-        inactive_state, snapshots_device_, accepted_widths_device,
-        graph_.key.sequences, graph_.key.depth,
-        graph_.state_bytes_per_sequence);
-    check(cudaGetLastError(), "publish accepted MTP snapshot");
+    state_.select(accepted_widths_device, generation, stream_, inactive_state);
   } catch (...) {
     phase_ = ExecutorPhase::kFaulted;
     throw;
@@ -170,6 +141,7 @@ void NativeExecutor::stage_accept(
 void NativeExecutor::commit(std::uint64_t generation) noexcept {
   if (phase_ == ExecutorPhase::kDrafted && generation == pending_generation_) {
     active_generation_ = generation;
+    state_.commit(generation);
     pending_generation_ = 0;
     phase_ = ExecutorPhase::kReady;
   } else {
@@ -212,6 +184,7 @@ void NativeExecutor::export_telemetry_after_fence(
 
 void NativeExecutor::discard(std::uint64_t generation) noexcept {
   if (phase_ == ExecutorPhase::kDrafted && generation == pending_generation_) {
+    state_.discard(generation);
     pending_generation_ = 0;
     phase_ = ExecutorPhase::kReady;
   }
