@@ -21,14 +21,17 @@ class TargetQsaK0LayerOwner final : public TargetK0LayerPort {
   static std::unique_ptr<TargetQsaK0LayerOwner> create(
       int device, const TargetLayerNativePlan& plan,
       void* accepted_loader_lease_handle,
-      const std::filesystem::path& sidecar_payload,
+      const attention::QsaSidecarPublication& sidecar,
+      const attention::Layer3RopeIdentity& rope_identity,
+      const attention::Layer3RopeView& rope,
       const attention::TargetQsaStateView& state,
+      cudaEvent_t state_ready,
       HiddenPartialReducer& attention_reducer,
       HiddenPartialReducer& moe_reducer,
       std::shared_ptr<pair_reduce::OtelStageSink> layer_telemetry,
       std::shared_ptr<moe::TargetFullMoeOtelSink> moe_telemetry,
       std::shared_ptr<moe::TargetMoeStageOtelSink> stage_telemetry,
-      int max_rows = 87);
+      int max_rows = 35);
   ~TargetQsaK0LayerOwner() override;
   TargetQsaK0LayerOwner(const TargetQsaK0LayerOwner&) = delete;
   TargetQsaK0LayerOwner& operator=(const TargetQsaK0LayerOwner&) = delete;
@@ -54,8 +57,11 @@ class TargetQsaK0LayerOwner final : public TargetK0LayerPort {
   TargetQsaK0LayerOwner(
       int device, const TargetLayerNativePlan& plan,
       void* accepted_loader_lease_handle,
-      const std::filesystem::path& sidecar_payload,
+      const attention::QsaSidecarPublication& sidecar,
+      const attention::Layer3RopeIdentity& rope_identity,
+      const attention::Layer3RopeView& rope,
       const attention::TargetQsaStateView& state,
+      cudaEvent_t state_ready,
       HiddenPartialReducer& attention_reducer,
       HiddenPartialReducer& moe_reducer,
       std::shared_ptr<pair_reduce::OtelStageSink> layer_telemetry,

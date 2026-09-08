@@ -329,6 +329,26 @@ target_compile_options(qwen38-test-target-qsa-shared-assets PRIVATE
 add_test(NAME qwen38-target-qsa-shared-assets-cpu-contract
   COMMAND qwen38-test-target-qsa-shared-assets)
 
+add_library(qwen38_target_k0_qsa_state_owner STATIC
+  src/attention/target_k0_qsa_state_owner.cu)
+target_include_directories(qwen38_target_k0_qsa_state_owner PUBLIC src)
+target_link_libraries(qwen38_target_k0_qsa_state_owner PUBLIC CUDA::cudart)
+target_compile_options(qwen38_target_k0_qsa_state_owner PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+set_target_properties(qwen38_target_k0_qsa_state_owner PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+
+add_executable(qwen38-test-target-k0-qsa-state-owner
+  tests/test_target_k0_qsa_state_owner.cc)
+target_link_libraries(qwen38-test-target-k0-qsa-state-owner PRIVATE
+  qwen38_target_k0_qsa_state_owner)
+target_compile_options(qwen38-test-target-k0-qsa-state-owner PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-k0-qsa-state-owner PROPERTIES
+  LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-target-k0-qsa-state-owner-cpu-contract
+  COMMAND qwen38-test-target-k0-qsa-state-owner)
+
 add_library(qwen38_target_slab_owner SHARED src/model/target_slab_owner.cc)
 target_include_directories(qwen38_target_slab_owner PUBLIC src)
 target_link_libraries(qwen38_target_slab_owner PUBLIC
@@ -803,6 +823,18 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
     LINKER_LANGUAGE CUDA)
   add_test(NAME qwen38-target-gdn-layer-owner-cpu-contract
     COMMAND qwen38-test-target-gdn-layer-owner)
+
+  add_library(qwen38_target_k0_physical_layer_owners STATIC
+    src/decode/target_k0_physical_layer_owners.cu)
+  target_include_directories(qwen38_target_k0_physical_layer_owners PUBLIC src)
+  target_link_libraries(qwen38_target_k0_physical_layer_owners PUBLIC
+    qwen38_target_gdn_layer_owner qwen38_target_qsa_k0_layer_owner
+    qwen38_target_k0_qsa_state_owner qwen38_target_k0_layer_owner_inventory
+    qwen38_target_layer_native_plan CUDA::cudart)
+  target_compile_options(qwen38_target_k0_physical_layer_owners PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+  set_target_properties(qwen38_target_k0_physical_layer_owners PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
 
   add_library(qwen38_target_layer3_moe_owner_preflight SHARED
     src/moe/target_layer3_moe_owner_preflight.cc)
@@ -1304,6 +1336,9 @@ add_test(NAME qwen38-gdn-prefill-projection-cpu-contract
   COMMAND qwen38-test-gdn-prefill-projection-contract)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME qwen38-target-k0-physical-layer-owners-source-contract
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_target_k0_physical_layer_owners_source.py)
 if(TARGET qwen38_target_layer3_moe_owner_preflight)
   add_test(NAME qwen38-target-layer3-moe-owner-preflight-cpu-contract
     COMMAND ${Python3_EXECUTABLE}

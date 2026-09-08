@@ -24,13 +24,12 @@ std::unique_ptr<TargetK0StartupOwner> TargetK0StartupOwner::create(
     int rank, std::unique_ptr<TargetK0PairReduceOwner> reductions,
     std::unique_ptr<TargetK0OracleComparator> comparator,
     std::unique_ptr<TargetK0TokenIoPort> token_io,
-    std::unique_ptr<TargetK0NativePlanInventory> plans,
-    std::unique_ptr<TargetK0LayerOwnerInventory> layers,
+    std::unique_ptr<TargetK0PhysicalLayers> layers,
     pair_reduce::OtelStageSink& telemetry,
     output::TokenIoArtifactRoots tokenizer, TargetK0ExecutorArena arena,
     cudaStream_t stream) {
   if ((rank != 0 && rank != 1) || !reductions || !comparator || !token_io ||
-      !plans || !layers || layers->rank() != rank || !layers->authenticated() ||
+      !layers || layers->rank() != rank || !layers->authenticated() ||
       token_io->rank() != rank || !token_io->authenticated() ||
       comparator->rank() != rank || !comparator->authenticated())
     throw std::invalid_argument("K0 startup dependencies are incomplete");
@@ -41,10 +40,9 @@ std::unique_ptr<TargetK0StartupOwner> TargetK0StartupOwner::create(
   owner->comparator_ = std::move(comparator);
   owner->token_io_ = std::move(token_io);
   owner->tokenizer_ = std::move(tokenizer);
-  owner->plans_ = std::move(plans);
   owner->layers_ = std::move(layers);
   owner->executor_ = std::make_unique<TargetK0Executor>(
-      rank, owner->layers_->ports(), *owner->token_io_,
+      rank, owner->layers_->inventory().ports(), *owner->token_io_,
       owner->reductions_->schedule(), *owner->comparator_, telemetry, arena,
       stream);
   return owner;

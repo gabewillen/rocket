@@ -49,8 +49,8 @@ struct TargetQsaK0LayerOwner::Bundle {
   std::shared_ptr<const model::TargetSlabLease> slab;
   std::shared_ptr<pair_reduce::OtelStageSink> layer_telemetry;
   std::unique_ptr<DeviceStorage> storage;
-  std::unique_ptr<attention::QsaSidecarDeviceOwner> sidecar;
-  std::unique_ptr<attention::Layer3RopeDeviceOwner> rope;
+  cudaEvent_t rope_ready = nullptr;
+  cudaEvent_t state_ready = nullptr;
   std::unique_ptr<moe::TargetLayerMoeDeviceOwner> moe;
   attention::TargetQsaGraphArena arena{};
   TargetLayer3RowBuffers rows{};
@@ -64,8 +64,11 @@ struct TargetQsaK0LayerOwner::Bundle {
 std::unique_ptr<TargetQsaK0LayerOwner> TargetQsaK0LayerOwner::create(
     int device, const TargetLayerNativePlan& plan,
     void* accepted_loader_lease_handle,
-    const std::filesystem::path& sidecar_payload,
+    const attention::QsaSidecarPublication& sidecar,
+    const attention::Layer3RopeIdentity& rope_identity,
+    const attention::Layer3RopeView& rope,
     const attention::TargetQsaStateView& state,
+    cudaEvent_t state_ready,
     HiddenPartialReducer& attention_reducer,
     HiddenPartialReducer& moe_reducer,
     std::shared_ptr<pair_reduce::OtelStageSink> layer_telemetry,
@@ -73,16 +76,20 @@ std::unique_ptr<TargetQsaK0LayerOwner> TargetQsaK0LayerOwner::create(
     std::shared_ptr<moe::TargetMoeStageOtelSink> stage_telemetry,
     int max_rows) {
   return std::unique_ptr<TargetQsaK0LayerOwner>(new TargetQsaK0LayerOwner(
-      device, plan, accepted_loader_lease_handle, sidecar_payload, state,
-      attention_reducer, moe_reducer, std::move(layer_telemetry),
+      device, plan, accepted_loader_lease_handle, sidecar, rope_identity, rope,
+      state, state_ready, attention_reducer, moe_reducer,
+      std::move(layer_telemetry),
       std::move(moe_telemetry), std::move(stage_telemetry), max_rows));
 }
 
 TargetQsaK0LayerOwner::TargetQsaK0LayerOwner(
     int device, const TargetLayerNativePlan& plan,
     void* accepted_loader_lease_handle,
-    const std::filesystem::path& sidecar_payload,
+    const attention::QsaSidecarPublication& sidecar,
+    const attention::Layer3RopeIdentity& rope_identity,
+    const attention::Layer3RopeView& rope,
     const attention::TargetQsaStateView& state,
+    cudaEvent_t state_ready,
     HiddenPartialReducer& attention_reducer,
     HiddenPartialReducer& moe_reducer,
     std::shared_ptr<pair_reduce::OtelStageSink> layer_telemetry,
@@ -103,17 +110,31 @@ TargetQsaK0LayerOwner::TargetQsaK0LayerOwner(
   bundle_->layer_telemetry = std::move(layer_telemetry);
   if (!bundle_->slab || device != bundle_->slab->publication().device)
     throw std::invalid_argument("target QSA K0 slab lease changed");
-  bundle_->sidecar = std::make_unique<attention::QsaSidecarDeviceOwner>(
-      device, sidecar_payload,
-      attention::target_qsa_sidecar_identity(plan.rank, plan.layer));
-  bundle_->rope = std::make_unique<attention::Layer3RopeDeviceOwner>(
-      device, attention::target_qsa_rope_identity(plan.rank, plan.layer));
+  const auto expected_sidecar =
+      attention::target_qsa_sidecar_identity(plan.rank, plan.layer);
+  const auto expected_rope =
+      attention::target_qsa_rope_identity(plan.rank, plan.layer);
+  if (!sidecar.device_base || sidecar.bytes != attention::kQsaSidecarBytes ||
+      sidecar.device != device ||
+      sidecar.identity.artifact_key != expected_sidecar.artifact_key ||
+      sidecar.identity.payload_sha256 != expected_sidecar.payload_sha256 ||
+      sidecar.identity.layer3_sha256 != expected_sidecar.layer3_sha256 ||
+      sidecar.identity.rank != plan.rank || sidecar.identity.layer != plan.layer ||
+      rope_identity.checkpoint_revision != expected_rope.checkpoint_revision ||
+      rope_identity.config_sha256 != expected_rope.config_sha256 ||
+      rope_identity.vllm_revision != expected_rope.vllm_revision ||
+      rope_identity.rank != plan.rank || rope_identity.layer != plan.layer ||
+      !rope.cos_sin || !rope.ready || rope.rows != 35 || rope.columns != 64 ||
+      rope.row_stride != 64 || !state_ready ||
+      rope.payload_sha256 != attention::kLayer3RopePayloadSha256)
+    throw std::invalid_argument("target QSA K0 shared assets changed");
+  bundle_->rope_ready = rope.ready;
+  bundle_->state_ready = state_ready;
   bundle_->moe = moe::TargetLayerMoeDeviceOwner::create(
       device, plan, accepted_loader_lease_handle, std::move(moe_telemetry),
       std::move(stage_telemetry));
   const auto weights = bind_target_qsa_layer_native_weights(
-      plan, bundle_->slab->publication(), bundle_->sidecar->publication(),
-      bundle_->rope->identity(), bundle_->rope->view());
+      plan, bundle_->slab->publication(), sidecar, rope_identity, rope);
   bundle_->storage = std::make_unique<DeviceStorage>(device);
   Cursor c{static_cast<std::uint8_t*>(bundle_->storage->pointer)};
   bundle_->arena = {
@@ -169,7 +190,10 @@ void TargetQsaK0LayerOwner::wait_source(cudaStream_t stream) {
   if (cudaStreamWaitEvent(stream, bundle_->slab->publication().ready_event, 0) !=
       cudaSuccess)
     throw std::runtime_error("target QSA slab wait failed");
-  bundle_->rope->wait(stream);
+  if (cudaStreamWaitEvent(stream, bundle_->rope_ready, 0) != cudaSuccess)
+    throw std::runtime_error("target QSA shared RoPE wait failed");
+  if (cudaStreamWaitEvent(stream, bundle_->state_ready, 0) != cudaSuccess)
+    throw std::runtime_error("target QSA oracle state wait failed");
   bundle_->moe->wait_source(stream);
 }
 
