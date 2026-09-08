@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string_view>
 
 namespace rocket::qwen38::moe {
 
@@ -82,6 +83,9 @@ enum class TargetMoeCreateFailure : std::uint8_t {
 [[nodiscard]] TargetMoeCreateFailure diagnose_target_moe_b12x_create(
     int device, const TargetMoeB12xIdentity& identity,
     const TargetMoeB12xWeights& weights) noexcept;
+[[nodiscard]] bool parse_target_moe_artifact_key(
+    std::string_view ascii, std::array<std::uint8_t, 32>* bytes) noexcept;
+[[nodiscard]] std::string_view target_moe_artifact_key_ascii() noexcept;
 
 // Owns the pinned fixed-c1 CuTe module only. All activations, dense routes,
 // weights, output, workspace, and stream remain caller-owned. Construction is

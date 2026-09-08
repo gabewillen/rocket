@@ -2,8 +2,8 @@
 #include "moe/target_moe_b12x_aot.h"
 
 #include <cstdlib>
-#include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace moe = rocket::qwen38::moe;
 
@@ -14,12 +14,10 @@ int main() {
   static_assert(moe::kTargetMoeStateExperts == 257);
   static_assert(moe::kTargetMoeMaxRows == 10);
   moe::TargetMoeB12xIdentity production_identity{};
-  const unsigned char artifact[32] = {
-      0xa9, 0xfc, 0xca, 0x02, 0x6a, 0x87, 0xad, 0x12,
-      0x85, 0xb9, 0x4f, 0xef, 0x19, 0x44, 0x48, 0xc5,
-      0x1b, 0x42, 0xd9, 0x75, 0x16, 0xf1, 0x62, 0x11,
-      0xc6, 0x1a, 0xe4, 0xc7, 0x70, 0xc6, 0xf0, 0xf4};
-  std::memcpy(production_identity.artifact_sha256.data(), artifact, 32);
+  if (!moe::parse_target_moe_artifact_key(
+          moe::target_moe_artifact_key_ascii(),
+          &production_identity.artifact_sha256))
+    std::abort();
   production_identity.layout_sha256[0] = 1;
   production_identity.rank = 0;
   production_identity.layer = 0;
@@ -33,13 +31,19 @@ int main() {
           0, production_identity, production_weights) !=
       moe::TargetMoeCreateFailure::kNone)
     std::abort();
+  const std::string artifact_key(moe::target_moe_artifact_key_ascii());
+  for (std::size_t position = 0; position < artifact_key.size(); ++position) {
+    std::string changed_key = artifact_key;
+    changed_key[position] = changed_key[position] == '0' ? '1' : '0';
+    auto changed_identity = production_identity;
+    if (!moe::parse_target_moe_artifact_key(
+            changed_key, &changed_identity.artifact_sha256) ||
+        moe::diagnose_target_moe_b12x_create(
+            0, changed_identity, production_weights) !=
+            moe::TargetMoeCreateFailure::kArtifactSha256)
+      std::abort();
+  }
   auto changed_identity = production_identity;
-  changed_identity.artifact_sha256[14] ^= 1;
-  if (moe::diagnose_target_moe_b12x_create(
-          0, changed_identity, production_weights) !=
-      moe::TargetMoeCreateFailure::kArtifactSha256)
-    std::abort();
-  changed_identity = production_identity;
   changed_identity.layout_sha256.fill(0);
   if (moe::diagnose_target_moe_b12x_create(
           0, changed_identity, production_weights) !=
