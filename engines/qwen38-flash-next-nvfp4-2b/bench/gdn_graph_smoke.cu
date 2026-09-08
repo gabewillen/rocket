@@ -184,9 +184,13 @@ std::pair<float, float> capture_measure(cudaStream_t stream, Launch launch) {
 }
 
 void run_prefill_projection(int device,
-                            rocket::qwen38::linear_attention::GdnWeights weights) {
+                            rocket::qwen38::linear_attention::GdnWeights weights,
+                            bool use_b12x) {
   using rocket::qwen38::linear_attention::CutlassGdnPrefillProjection;
-  CutlassGdnPrefillProjection projection(device, weights, true);
+  using rocket::qwen38::linear_attention::GdnPrefillInputBackend;
+  const auto backend = use_b12x ? GdnPrefillInputBackend::kB12x
+                                : GdnPrefillInputBackend::kCutlassControl;
+  CutlassGdnPrefillProjection projection(device, weights, true, backend);
   DeviceBlob hidden(8'192ULL * kHidden * 2);
   DeviceBlob normalized(8'192ULL * kHeads * kDim * 2);
   constexpr std::size_t hidden_elements = 8'192ULL * kHidden;
@@ -255,7 +259,8 @@ void run_prefill_projection(int device,
     const bool ba_parity = device_equal(
         projection.ba(tokens), projection.reference_ba(tokens),
         static_cast<std::size_t>(tokens) * 48 * 2);
-    std::cout << "prefill_tokens=" << tokens
+    std::cout << "prefill_backend=" << (use_b12x ? "b12x" : "cutlass_control")
+              << " prefill_tokens=" << tokens
               << " shared_input_quantizations=1 input_p50_us=" << input.first
               << " input_p95_us=" << input.second
               << " quantize_once_p50_us=" << quantize.first
@@ -283,8 +288,10 @@ void run_prefill_projection(int device,
 int main(int argc, char** argv) try {
   if (argc != 3 && argc != 4)
     throw std::invalid_argument(
-        "usage: qwen38-gdn-graph-smoke SLAB DEVICE [--prefill-projection]");
-  if (argc == 4 && std::string(argv[3]) != "--prefill-projection")
+        "usage: qwen38-gdn-graph-smoke SLAB DEVICE "
+        "[--prefill-projection|--prefill-projection-b12x]");
+  if (argc == 4 && std::string(argv[3]) != "--prefill-projection" &&
+      std::string(argv[3]) != "--prefill-projection-b12x")
     throw std::invalid_argument("unknown GDN graph smoke mode");
   const int device = std::stoi(argv[2]);
   check(cudaSetDevice(device), "cudaSetDevice");
@@ -327,7 +334,8 @@ int main(int argc, char** argv) try {
       static_cast<__nv_bfloat16*>(dt.pointer),
       static_cast<__nv_bfloat16*>(norm.pointer)};
   if (argc == 4) {
-    run_prefill_projection(device, weights);
+    run_prefill_projection(device, weights,
+                           std::string(argv[3]) == "--prefill-projection-b12x");
     return 0;
   }
 
