@@ -87,17 +87,44 @@ std::vector<std::uint8_t> read_exact(const std::filesystem::path& path) {
 }  // namespace
 
 QsaSidecarIdentity layer3_qsa_sidecar_identity(int rank) {
+  return target_qsa_sidecar_identity(rank, 3);
+}
+
+std::size_t target_qsa_sidecar_offset(int layer) {
+  if (layer < 0 || layer >= 48 || layer % 4 != 3)
+    throw std::invalid_argument("QSA sidecar layer changed");
+  return static_cast<std::size_t>(layer / 4) * kQsaIndexerLayer3Bytes;
+}
+
+QsaSidecarIdentity target_qsa_sidecar_identity(int rank, int layer) {
   if (rank != 0 && rank != 1)
     throw std::invalid_argument("QSA sidecar rank changed");
+  if (layer < 0 || layer >= 48 || layer % 4 != 3)
+    throw std::invalid_argument("QSA sidecar layer changed");
+  constexpr std::array<std::string_view, kQsaSidecarLayers> kLayerDigests{{
+      "741d5d2a31a217b922a9d4fb2dee1bdf015ca451d11c668b11b8e6afd00569d2",
+      "1cc4dd08119f13234254f4bde24bc578af7d8a4ee41e8eb86ec54678c32c4499",
+      "860cb2dfcdd33b14b23deacac9c371e3fbafaf31556cadddad05b3477f65951a",
+      "d797dd9eb2039987856c9773b03226044bef1bffff25838278741b44e9ba214c",
+      "a69ad1989ae82e6e5e2181ea79c2464fec4052ef36afd8023fc5589655341efd",
+      "cea120d2cbad7baab20a7c3a10fe0a2bfe9c2edac8608e005fb566f556088767",
+      "6647797d0e39c564cea1594bd1597ee44345a4ab8b5699cc9e3cf6e2dd00f7c0",
+      "9d64891ff226ce0df604f133d45534068ad5578b8725da4a5cae7aabe2f27011",
+      "68d19d331177d353f1616a6e4aba74738f2bdb0ad0083b1d2a15a1ea00392abc",
+      "10cd97aeacafef8153bb8954b5fd2368e1d0f7d71be1ccc277a0a196c4500be1",
+      "bdbbb8b15d882cd5885d3a4c2c43ac3bc6b61414c6f03b9cd6c382e5a46e2801",
+      "e8b0a895163c92e2d36997ec6110517b81da5aaea286fa8ebfd18008bfa63856",
+  }};
   return {kQsaSidecarArtifactKey,
           parse_digest("7752a9b9e0c4bed9f4e20ce4c0500866e98cfd760ff95a6e770aa0563ab03df3"),
-          parse_digest("741d5d2a31a217b922a9d4fb2dee1bdf015ca451d11c668b11b8e6afd00569d2"),
-          rank, 3};
+          parse_digest(kLayerDigests[static_cast<std::size_t>(layer / 4)]),
+          rank, layer};
 }
 
 std::vector<std::uint8_t> authenticate_qsa_sidecar_host(
     const std::filesystem::path& path, const QsaSidecarIdentity& identity) {
-  const auto expected = layer3_qsa_sidecar_identity(identity.rank);
+  const auto expected = target_qsa_sidecar_identity(identity.rank,
+                                                     identity.layer);
   if (identity.artifact_key != expected.artifact_key ||
       identity.payload_sha256 != expected.payload_sha256 ||
       identity.layer3_sha256 != expected.layer3_sha256 ||
@@ -107,7 +134,7 @@ std::vector<std::uint8_t> authenticate_qsa_sidecar_host(
     throw std::runtime_error("QSA sidecar requires OpenSSL 3 ABI");
   auto host = read_exact(path);
   if (sha256(host.data(), host.size()) != identity.payload_sha256 ||
-      sha256(host.data() + kQsaIndexerLayer3Offset,
+      sha256(host.data() + target_qsa_sidecar_offset(identity.layer),
              kQsaIndexerLayer3Bytes) != identity.layer3_sha256)
     throw std::invalid_argument("QSA sidecar payload hash changed");
   return host;
@@ -120,7 +147,7 @@ QsaSidecarDeviceOwner::QsaSidecarDeviceOwner(
       !nonzero(identity.layer3_sha256))
     throw std::invalid_argument("QSA sidecar identity changed");
   const auto host = authenticate_qsa_sidecar_host(path, identity);
-  identity_ = layer3_qsa_sidecar_identity(identity.rank);
+  identity_ = target_qsa_sidecar_identity(identity.rank, identity.layer);
   if (cudaSetDevice(device) != cudaSuccess)
     throw std::runtime_error("QSA sidecar device selection failed");
 

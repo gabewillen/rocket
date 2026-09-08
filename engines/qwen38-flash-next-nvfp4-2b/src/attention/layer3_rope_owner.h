@@ -54,6 +54,10 @@ struct Layer3RopeView {
 };
 
 Layer3RopeIdentity layer3_rope_identity(int rank);
+// The same position-only RoPE table is shared by all 12 target QSA layers.
+// The returned identity remains layer-bound so a layer owner cannot accept a
+// descriptor for another attention position in the schedule.
+Layer3RopeIdentity target_qsa_rope_identity(int rank, int layer);
 
 // Exact pinned-vLLM BF16 payload consumed by NativeQsaFullAttentionGraph,
 // row-major [35,64] with stride [64,1]. Columns [0,32) are cosine and

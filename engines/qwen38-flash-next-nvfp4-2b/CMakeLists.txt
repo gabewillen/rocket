@@ -226,6 +226,15 @@ target_link_libraries(qwen38-test-layer3-rope-owner PRIVATE
 target_compile_options(qwen38-test-layer3-rope-owner PRIVATE
   -Wall -Wextra -Werror)
 
+add_executable(qwen38-test-target-qsa-shared-assets
+  tests/test_target_qsa_shared_assets.cc)
+target_link_libraries(qwen38-test-target-qsa-shared-assets PRIVATE
+  qwen38_qsa_sidecar_owner qwen38_layer3_rope_owner)
+target_compile_options(qwen38-test-target-qsa-shared-assets PRIVATE
+  -Wall -Wextra -Werror)
+add_test(NAME qwen38-target-qsa-shared-assets-cpu-contract
+  COMMAND qwen38-test-target-qsa-shared-assets)
+
 add_library(qwen38_target_slab_owner SHARED src/model/target_slab_owner.cc)
 target_include_directories(qwen38_target_slab_owner PUBLIC src)
 target_link_libraries(qwen38_target_slab_owner PUBLIC
