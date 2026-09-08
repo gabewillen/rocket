@@ -1,0 +1,144 @@
+---
+title: "Pinned vLLM captures eight non-EOS Qwen3.8 decisions"
+description: "One prefill decision and seven one-token decode decisions produced a complete 408-artifact target-model reference oracle."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, numerics, runtime, baseline]
+verdict: accepted
+rocket: "#numerics"
+---
+
+**Question.** Can the pinned vLLM target produce a complete non-EOS short-generation reference for Rocket whole-engine parity?
+
+| setup | value |
+| --- | --- |
+| nodes | `gx10-5e36` and `gx10-2a13` |
+| kernel | `6.17.13-rocket64k`, 64 KiB |
+| capture commit | `34d2c6a8fba43ef9f93283361c9da549080ea288` |
+| validator commit | `a64edde1ab864ef585fb3d02524252d249b4d1ca` |
+| vLLM image | `vllm/vllm-openai:qwen38-flash-next` |
+| image ID | `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| image digest | `vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8` |
+| vLLM runtime | `v0.1.dev20073+g8e685d198` |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| checkpoint manifest | `105d7276c7d665164e6e419f20b9d15d5f667bcb9830ca81d84e0302476f5222` |
+| model source overlay | Mia `c2325b22602b51a5faf55fc2bebccc34f3f80b9f` |
+| NVFP4 manifest | `9fb50176ccfc8a916e33e85152be54e8aca60b174a92298fa0b82ff06051929b` |
+| NVFP4 payload | `57c5f07d518d302349c1f0f6f8ae75276ae9de602a8b6faadce4faf98a198d6f` |
+| NVFP4 quant config | `085c9a625bd271d1252b1298862fb7f898c14af558eb9968e5f1a0bcf908ad9b` |
+| execution | TP2, EP, K0, eager, chunked prefill, greedy, seed 0 |
+| rendezvous | port `62151`, candidate 0 of 32, request-derived |
+
+```bash
+cd /home/glwillen/Development/rocket-whole-decoder-worktree &&
+test "$(git rev-parse HEAD)" = 34d2c6a8fba43ef9f93283361c9da549080ea288 &&
+test ! -e /home/glwillen/calibration/qwen38-k0-decode-34d2c6a-01 &&
+scripts/numerics/qwen38-expanded-calibration.sh \
+  --output-dir /home/glwillen/calibration/qwen38-k0-decode-34d2c6a-01 \
+  --launch \
+  --oracle-k0-decode \
+  --mia-source /home/glwillen/Development/Qwen3.8-Flash-Next-Dual-DGX-Sparks \
+  --nvfp4-artifact-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-artifacts/23d2c39e9c2cf36a832cb1750f6542fa46f11f1befe195d80c082051a5a772b4 \
+  --worker-hf-cache /home/glwillen/.cache/huggingface \
+  --gpu-memory-utilization 0.6
+```
+
+| request | value |
+| --- | --- |
+| prompt | fixed public `is_prime` coding request through the OpenAI chat endpoint |
+| chat-template tokens | 87 |
+| request SHA-256 | `9f5abcfacbdb2ed24e5dfd880c10ca8b067173b458ab2410fb8a023db85d672c` |
+| tokenizer | `Qwen2Tokenizer` |
+| chat-template SHA-256 | `c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041` |
+| sampling | temperature 0, seed 0, maximum 8 tokens |
+| lifecycle | one prefill decision plus seven authenticated one-token decode decisions |
+| EOS gate | EOS token `248046`; none of the eight sampled tokens matched |
+| repetitions | 1 |
+| variance | cross-run artifact and token variance unmeasured; performance not measured |
+
+| tokenizer file | SHA-256 |
+| --- | --- |
+| `tokenizer.json` | `0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3` |
+| `tokenizer_config.json` | `b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27` |
+| `vocab.json` | `ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003` |
+| `merges.txt` | `a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d` |
+
+| startup lifecycle | result | evidence SHA-256 |
+| --- | --- | --- |
+| `eb2d706be30f22d04aeb261c2ef7fdf1b095d5fe` | rejected: static TCPStore port `50000` was already bound | `09c5fb15e3d4352e32c63c6681b0d1e9d5e5c1fe35b1dfd1c62eb5fa6d05163c` |
+| `34d2c6a8fba43ef9f93283361c9da549080ea288` | accepted startup: request-derived 32-candidate set selected `62151` before argv freeze | run `9a641dba0cf44f6a51d659723ec01b2c848b07778daf5c012ec0aa0eb3849ded` |
+
+```text
+TCPStore: The server socket has failed to listen on any local network address. port: 50000
+EADDRINUSE: address already in use
+```
+
+| decision | kind | input | sampled token | top logit |
+| ---: | --- | --- | ---: | ---: |
+| 0 | prefill | 87 chat-template tokens | 1596 | 24.375 BF16 |
+| 1 | decode | `[1596]` | 1144 | 29.750 BF16 |
+| 2 | decode | `[1144]` | 4087 | 29.375 BF16 |
+| 3 | decode | `[4087]` | 1156 | 20.125 BF16 |
+| 4 | decode | `[1156]` | 579 | 22.625 BF16 |
+| 5 | decode | `[579]` | 1622 | 26.875 BF16 |
+| 6 | decode | `[1622]` | 25 | 24.625 BF16 |
+| 7 | decode | `[25]` | 328 | 21.500 BF16 |
+
+| artifact group | count | shapes | dtype | bytes |
+| --- | ---: | --- | --- | ---: |
+| prefill embedding, 48 layers, final norm, logits | 51 | `[87,2560]`, `[87,10240]`, `[1,248320]` | bfloat16 | 86,912,000 |
+| seven decode embeddings, 336 layers, final norms, logits | 357 | `[1,2560]`, `[1,10240]`, `[1,248320]` | bfloat16 | 10,429,440 |
+| total | 408 | lossless contiguous tensors | bfloat16 | 97,341,440 |
+
+| capture identity | SHA-256 |
+| --- | --- |
+| failed validation telemetry | `12e446e31e2462dc9cf6c5725a035d779dc65f367e3e3b4e663123a3f9b202d1` |
+| OpenAI response | `79955351341dde13296bf78750a9018e85abfcd05952fbd0f2646619ba7943e4` |
+| run identity | `9a641dba0cf44f6a51d659723ec01b2c848b07778daf5c012ec0aa0eb3849ded` |
+| capture manifest | `04c5d4310f68aee54106940b916e8214d2836f8aa9c75a15c23b3960225c0465` |
+| immutable revalidation result | `591b0d91a75247912b7a67dd35244301b4fda8659d2b49d6f14f28bdf9271b00` |
+
+| response validation | result |
+| --- | --- |
+| original validator | rejected because it required `message.content` to be a string |
+| pinned Qwen3 parser | eight-token text in `message.reasoning`; `message.content: null` |
+| corrected validator | checks reasoning and content independently against tokenizer decode and parser output |
+
+```bash
+set -euo pipefail
+cd /home/glwillen/Development/rocket-whole-decoder-worktree
+test "$(git rev-parse HEAD)" = a64edde1ab864ef585fb3d02524252d249b4d1ca
+source_root=/home/glwillen/calibration/qwen38-k0-decode-34d2c6a-01
+revalidation_root=/home/glwillen/calibration/qwen38-k0-decode-34d2c6a-revalidation-02
+test ! -e "$revalidation_root"
+mkdir -- "$revalidation_root"
+docker run --rm \
+  -v "$source_root:/rocket/source:ro" \
+  -v "$revalidation_root:/rocket/revalidation" \
+  -v "$PWD/scripts/runtime/qwen38-k0-oracle.py:/rocket/qwen38-k0-oracle.py:ro" \
+  -v /home/glwillen/.cache/huggingface:/root/.cache/huggingface:ro \
+  --entrypoint /usr/bin/python3 vllm/vllm-openai:qwen38-flash-next \
+  /rocket/qwen38-k0-oracle.py validate \
+  --request /rocket/source/oracle-request.json \
+  --capture-dir /rocket/source/capture \
+  --response /rocket/source/oracle-response.json \
+  --output /rocket/revalidation/oracle-result.json \
+  --model-dir /root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47 \
+  --source-run /rocket/source/run.json \
+  --source-failure /rocket/source/oracle-failure.json
+```
+
+```json
+{"valid":true,"complete":true,"generated_token_ids":[1596,1144,4087,1156,579,1622,25,328],"response_channels":{"content":null,"parser":"vllm.parser.qwen3.Qwen3Parser","raw":"We need answer user's request: \"","reasoning":"We need answer user's request: \""},"artifact_hash_count":408}
+```
+
+**Verdict.** Accepted for pinned-vLLM reference-oracle artifact completeness. The sample count is one, cross-run variance is unknown, and this result makes no Rocket accuracy claim.
+
+**Next.**
+
+- Run Rocket whole-engine generation on the same 87 input tokens and eight decision positions.
+- Compare every Rocket boundary, logit vector, sampled token, and prior-token link against this oracle.
+
+**Reopen if.**
+
+- Rebuild the oracle when upstream vLLM changes Qwen3 response parsing or the forward/logits lifecycle, or when NVIDIA publishes a different checkpoint revision or container image.
