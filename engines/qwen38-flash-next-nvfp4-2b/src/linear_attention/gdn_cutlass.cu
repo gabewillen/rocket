@@ -126,7 +126,7 @@ __device__ __forceinline__ PackedE2m1x16 pack_e2m1x16(
 template <int K>
 __global__ void quantize_fixed(std::uint8_t* packed, std::uint8_t* scales,
                                const __nv_bfloat16* input,
-                               float activation_global) {
+                               float sf_scale) {
   const int row = blockIdx.x;
   for (int block = threadIdx.x; block < K / 16; block += blockDim.x) {
     float values[16];
@@ -136,10 +136,10 @@ __global__ void quantize_fixed(std::uint8_t* packed, std::uint8_t* scales,
       values[item] = __bfloat162float(input[row * K + block * 16 + item]);
       amax = fmaxf(amax, fabsf(values[item]));
     }
-    // Match pinned vLLM nvfp4_utils.cuh: SFScaleVal is the reciprocal of the
-    // authenticated input global scale, and both reciprocal operations use
-    // rcp.approx.ftz. Packing uses the hardware RN/satfinite E2M1 conversion.
-    const float sf_scale = reciprocal_approximate_ftz(activation_global);
+    // Match pinned vLLM nvfp4_utils.cuh: SFScaleVal is the caller-materialized
+    // float32 reciprocal of the authenticated input global scale. The later
+    // reciprocal operations use rcp.approx.ftz and packing uses the hardware
+    // RN/satfinite E2M1 conversion.
     float scale_value =
         sf_scale * (amax * reciprocal_approximate_ftz(6.0F));
     const std::uint8_t scale =

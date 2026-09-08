@@ -157,10 +157,8 @@ class LinearAttentionSlabTests(unittest.TestCase):
         ).read_text()
         body = source[source.index("__global__ void quantize_fixed") :]
         body = body[: body.index("struct alignas(32) PackedBf16x16")]
-        self.assertIn(
-            "const float sf_scale = reciprocal_approximate_ftz(activation_global)",
-            body,
-        )
+        self.assertIn("float sf_scale)", body)
+        self.assertNotIn("reciprocal_approximate_ftz(activation_global)", body)
         self.assertIn("amax * reciprocal_approximate_ftz(6.0F)", body)
         self.assertIn("reciprocal_approximate_ftz(sf_scale)", body)
         self.assertIn("pack_e2m1x16(converted)", body)

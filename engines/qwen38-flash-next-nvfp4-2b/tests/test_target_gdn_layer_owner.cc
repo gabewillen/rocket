@@ -33,9 +33,9 @@ int main() {
   static_assert(linear::gdn_bucket_rows(5) == 0);
   static_assert(linear::CutlassGdnGraph::decode_workspace_count() == 1);
   static_assert(linear::gdn_quantizer_scale(0.001331147737801075F) ==
-                0.001331147737801075F);
+                751.2314453125F);
   static_assert(linear::gdn_quantizer_scale(0.00039527530316263437F) ==
-                0.00039527530316263437F);
+                2529.88232421875F);
   static_assert(
       linear::gdn_projection_alpha(0.001331147737801075F,
                                    0.0003022693563F) > 4.02e-7F);
