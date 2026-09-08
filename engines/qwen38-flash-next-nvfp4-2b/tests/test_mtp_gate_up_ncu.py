@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,33 @@ SUMMARY = REPO / "scripts/moe/summarize-mtp-gate-up-ncu.py"
 
 
 class MtpGateUpNcuTest(unittest.TestCase):
+    @staticmethod
+    def metric_rows() -> list[tuple[str, str, str]]:
+        match = re.search(r"^metrics='([^']+)'$", RUNNER.read_text(), re.MULTILINE)
+        assert match
+        result = []
+        for name in match.group(1).split(","):
+            if name == "gpu__time_duration.sum":
+                result.append((name, "ms", "2.0"))
+            elif name.endswith(".pct") or "pct_of_peak" in name:
+                value = "30" if "long_scoreboard" in name else "25"
+                result.append((name, "%", value))
+            else:
+                result.append((name, "sector", "100"))
+        result.append(("profiler__replayer_passes", "pass", "19"))
+        return result
+
+    @staticmethod
+    def write_wide(path: Path, rows: list[tuple[str, str, str]], kernel: str = "gate_up_silu") -> None:
+        names = ("Kernel Name", *(row[0] for row in rows))
+        units = ("", *(row[1] for row in rows))
+        values = (kernel, *(row[2] for row in rows))
+        path.write_text(
+            ",".join(f'"{name}"' for name in names) + "\n" +
+            ",".join(f'"{unit}"' for unit in units) + "\n" +
+            ",".join(f'"{value}"' for value in values) + "\n"
+        )
+
     def test_profile_selectors_are_exact_and_default_is_preserved(self) -> None:
         source = PROFILE.read_text()
         self.assertIn('argc > 4 ? argv[4] : "all"', source)
@@ -41,18 +69,10 @@ class MtpGateUpNcuTest(unittest.TestCase):
             self.assertIn(required, runner)
 
     def test_summary_reports_reuse_and_stalls(self) -> None:
-        header = '"Metric Name","Metric Unit","Metric Value"\n'
-        rows = (
-            '"gpu__time_duration.sum","nsecond","2000000"\n'
-            '"smsp__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed","%","25"\n'
-            '"gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed","%","50"\n'
-            '"lts__throughput.avg.pct_of_peak_sustained_elapsed","%","40"\n'
-            '"sm__warps_active.avg.pct_of_peak_sustained_active","%","20"\n'
-            '"lts__t_sectors_srcunit_tex_lookup_hit.sum","sector","75"\n'
-            '"lts__t_sectors_srcunit_tex_lookup_miss.sum","sector","25"\n'
-            '"lts__t_sectors_aperture_device_op_read.sum","sector","100"\n'
-            '"lts__t_sectors_aperture_sysmem_op_read.sum","sector","50"\n'
-            '"smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct","%","30"\n'
+        header = '"Kernel Name","Metric Name","Metric Unit","Metric Value"\n'
+        rows = "".join(
+            f'"gate_up_silu","{name}","{unit}","{value}"\n'
+            for name, unit, value in self.metric_rows()
         )
         with tempfile.TemporaryDirectory() as directory:
             paths = []
@@ -68,8 +88,85 @@ class MtpGateUpNcuTest(unittest.TestCase):
             )
         self.assertIn("tensor issue %", result.stdout)
         self.assertIn("long_scoreboard:30.0%", result.stdout)
-        self.assertIn("75.00", result.stdout)
+        self.assertIn("50.00", result.stdout)
         self.assertIn("c16-k7-r1", result.stdout)
+
+    def test_summary_accepts_ncu_wide_raw_csv(self) -> None:
+        metric_rows = self.metric_rows()
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for case in ("c8-k7-r1", "c16-k7-r1"):
+                path = Path(directory) / f"{case}.csv"
+                self.write_wide(path, metric_rows)
+                paths.append(path)
+            result = subprocess.run(
+                ["python3", str(SUMMARY), *(str(path) for path in paths)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        self.assertIn("| c8-k7-r1 | 2.000 |", result.stdout)
+
+    def test_summary_rejects_semantic_drift(self) -> None:
+        mutations = {
+            "duplicate": lambda rows: rows + [rows[0]],
+            "missing": lambda rows: rows[:-1],
+            "unit": lambda rows: [(rows[0][0], "ns", rows[0][2]), *rows[1:]],
+            "locale": lambda rows: [(rows[0][0], rows[0][1], "1,5"), *rows[1:]],
+            "nonfinite": lambda rows: [(rows[0][0], rows[0][1], "nan"), *rows[1:]],
+            "passes": lambda rows: [
+                (name, unit, "20" if name == "profiler__replayer_passes" else value)
+                for name, unit, value in rows
+            ],
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                paths = [Path(directory) / f"{case}.csv" for case in ("c8-k7-r1", "c16-k7-r1")]
+                self.write_wide(paths[0], mutate(self.metric_rows()))
+                self.write_wide(paths[1], self.metric_rows())
+                result = subprocess.run(
+                    ["python3", str(SUMMARY), *(str(path) for path in paths)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / f"{case}.csv" for case in ("c8-k7-r1", "c16-k7-r1")]
+            self.write_wide(paths[0], self.metric_rows(), kernel="wrong_kernel")
+            self.write_wide(paths[1], self.metric_rows())
+            result = subprocess.run(
+                ["python3", str(SUMMARY), *(str(path) for path in paths)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_summary_rejects_mixed_schemas_and_wrong_cases(self) -> None:
+        rows = self.metric_rows()
+        with tempfile.TemporaryDirectory() as directory:
+            c8 = Path(directory) / "c8-k7-r1.csv"
+            c16 = Path(directory) / "c16-k7-r1.csv"
+            self.write_wide(c8, rows)
+            c16.write_text(
+                '"Kernel Name","Metric Name","Metric Unit","Metric Value"\n' +
+                "".join(
+                    f'"gate_up_silu","{name}","{unit}","{value}"\n'
+                    for name, unit, value in rows
+                )
+            )
+            mixed = subprocess.run(
+                ["python3", str(SUMMARY), str(c8), str(c16)],
+                capture_output=True,
+                text=True,
+            )
+            wrong = subprocess.run(
+                ["python3", str(SUMMARY), str(c8), str(c8)],
+                capture_output=True,
+                text=True,
+            )
+        self.assertNotEqual(mixed.returncode, 0)
+        self.assertNotEqual(wrong.returncode, 0)
 
 
 if __name__ == "__main__":
