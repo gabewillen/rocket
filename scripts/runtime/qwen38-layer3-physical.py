@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "engines/qwen38-flash-next-nvfp4-2b/src"))
 
 from qwen38_slab.layer3_factory import (  # noqa: E402
-    Layer3FactoryError, prepare_layer3_physical_plan, public_plan,
+    Layer3FactoryError, native_rank_descriptor, prepare_layer3_physical_plan,
+    public_plan,
 )
 
 
@@ -35,6 +38,8 @@ def main() -> int:
     parser.add_argument("--bootstrap-host", required=True)
     parser.add_argument("--bootstrap-port", type=int, required=True)
     parser.add_argument("--timeout-ms", type=int, default=120_000)
+    parser.add_argument("--rank", type=int, choices=(0, 1))
+    parser.add_argument("--native-plan", type=Path)
     parser.add_argument("--preflight-only", action="store_true", required=True)
     args = parser.parse_args()
     try:
@@ -56,6 +61,31 @@ def main() -> int:
             "reason": str(exc)[:512],
         }, sort_keys=True))
         return 1
+    if args.native_plan is not None or args.rank is not None:
+        if args.native_plan is None or args.rank is None:
+            print(json.dumps({
+                "schema": "rocket.qwen38.layer3-physical-plan.v1",
+                "valid": False, "complete": False, "phase": "handoff",
+                "failure_class": "contract",
+                "reason": "--rank and --native-plan must be supplied together",
+            }, sort_keys=True))
+            return 1
+        descriptor = dict(native_rank_descriptor(plan, args.rank))
+        args.native_plan.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n"
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{args.native_plan.name}.", dir=args.native_plan.parent,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, args.native_plan)
+        except Exception:
+            try: os.unlink(temporary)
+            except FileNotFoundError: pass
+            raise
     print(json.dumps(dict(public_plan(plan)), sort_keys=True))
     return 0
 

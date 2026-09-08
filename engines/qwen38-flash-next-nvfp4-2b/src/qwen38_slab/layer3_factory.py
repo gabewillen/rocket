@@ -10,11 +10,12 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .contract import PINNED_CONTRACT, SCHEMA, canonical_bytes
 from .qsa_weights import RankQsaWeights, load_qsa_weights
 from .routed_moe import OwnerLocalMoeSlab, load_owner_local_moe
+from .layer3_runtime import ARENA_SPECS
 
 ORACLE_MANIFEST_SHA256 = (
     "05ea3af1c4694a9c035ce2fe9ce006acc58881df0fe86771b1846f4bd8e5f48b"
@@ -24,6 +25,10 @@ LAYER03_SHA256 = "aa2d2a1454f0654ea2082d12e7e3284cad9304a7ede124303f99c52bbf9cdd
 TARGET_ARTIFACT = "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4"
 INDEXER_SIDECAR = "bdbebd4f45c398f090a41ab98cd3881b969d958d8ae0bc42f3411844d3262edd"
 PLAN_SCHEMA = "rocket.qwen38.layer3-physical-plan.v1"
+NATIVE_PLAN_SCHEMA = "rocket.qwen38.layer3-native-plan.v1"
+TARGET_MANIFEST_SHA256 = (
+    "a44a450d9c0b6fe3df904ad1a78ecee959f28d9f055301195181e986bdc7028b"
+)
 ROWS = 35
 HC_WIDTH = 10_240
 HIDDEN = 2_560
@@ -48,6 +53,28 @@ class Layer3RankPlan:
     qsa: RankQsaWeights
     moe: OwnerLocalMoeSlab
     hyperconnection_layout_sha256: str
+    extents: tuple["Layer3ExtentPlan", ...]
+
+
+@dataclass(frozen=True)
+class Layer3SourceChunk:
+    offset: int
+    length: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class Layer3ExtentPlan:
+    name: str
+    offset: int
+    length: int
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    dtype: str
+    layout: str
+    abi: str
+    storage: str
+    source_chunks: tuple[Layer3SourceChunk, ...]
 
 
 @dataclass(frozen=True)
@@ -126,7 +153,39 @@ def _oracle(capture: Path) -> tuple[Path, Path, tuple[int, ...]]:
     return paths[0], paths[1], tuple(tokens)
 
 
-def _hyperconnection_layout(artifact: Path, rank: int) -> str:
+def _strides(shape: Sequence[int]) -> tuple[int, ...]:
+    stride = 1
+    result = []
+    for dimension in reversed(shape):
+        result.append(stride)
+        stride *= dimension
+    return tuple(reversed(result))
+
+
+def _extent(entry: Mapping[str, object], chunks: Sequence[Mapping[str, object]],
+            *, storage: str) -> Layer3ExtentPlan:
+    offset = int(entry["offset_bytes"])
+    length = int(entry["length_bytes"])
+    sources = tuple(
+        Layer3SourceChunk(int(chunk["offset_bytes"]),
+                          int(chunk["length_bytes"]), str(chunk["sha256"]))
+        for chunk in chunks
+        if offset < int(chunk["offset_bytes"]) + int(chunk["length_bytes"])
+        and offset + length > int(chunk["offset_bytes"])
+    )
+    if not sources:
+        raise Layer3FactoryError("layer-3 extent has no authenticated source chunk")
+    shape = tuple(int(value) for value in entry["shape"])
+    return Layer3ExtentPlan(
+        str(entry["name"]), offset, length, shape, _strides(shape),
+        str(entry["dtype"]), str(entry["layout"]), str(entry["abi"]),
+        storage, sources,
+    )
+
+
+def _hyperconnection_layout(
+    artifact: Path, rank: int,
+) -> tuple[str, tuple[Layer3ExtentPlan, ...]]:
     try:
         manifest = json.loads((artifact / "manifest.json").read_bytes())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -193,11 +252,51 @@ def _hyperconnection_layout(artifact: Path, rank: int) -> str:
                 raise Layer3FactoryError("layer-3 HC chunk digest changed")
     finally:
         os.close(fd)
-    return hashlib.sha256(canonical_bytes([
+    layout = hashlib.sha256(canonical_bytes([
         {key: item[key] for key in ("name", "offset_bytes", "length_bytes",
                                     "shape", "dtype", "layout")}
         for item in selected
     ])).hexdigest()
+    return layout, tuple(_extent(item, chunks, storage="target_slab")
+                         for item in selected)
+
+
+def _rank_extents(rank: int, qsa: RankQsaWeights,
+                  moe: OwnerLocalMoeSlab,
+                  hc: tuple[Layer3ExtentPlan, ...]) -> tuple[Layer3ExtentPlan, ...]:
+    manifest = json.loads((qsa.slab_path.parent / "manifest.json").read_bytes())
+    slab = manifest["slabs"][f"rank{rank}-target"]
+    entries = {item["name"]: item for item in slab["entries"]}
+    chunks = slab["chunks"]
+    sidecar_manifest = json.loads(
+        (qsa.indexer_sidecar_path.parent / "manifest.json").read_bytes()
+    )
+    sidecar_entries = {
+        item["name"]: item for item in sidecar_manifest["components"]
+    }
+    result = list(hc)
+    for component in qsa.components:
+        if component.storage == "indexer-sidecar":
+            source = sidecar_entries.get(component.name)
+            if not isinstance(source, dict) or source.get("sha256") is None:
+                raise Layer3FactoryError("layer-3 sidecar source identity changed")
+            result.append(Layer3ExtentPlan(
+                component.name, component.offset, component.length,
+                component.shape, _strides(component.shape), component.dtype,
+                component.layout, component.abi, component.storage,
+                (Layer3SourceChunk(component.offset, component.length,
+                 str(source["sha256"])),),
+            ))
+        else:
+            result.append(_extent(entries[component.name], chunks,
+                                  storage="target_slab"))
+    for component in (*moe.router, *moe.routed, *moe.shared):
+        result.append(_extent(entries[component.name], chunks,
+                              storage="target_slab"))
+    names = [item.name for item in result]
+    if len(names) != len(set(names)):
+        raise Layer3FactoryError("layer-3 native extent inventory overlaps by name")
+    return tuple(sorted(result, key=lambda item: item.name))
 
 
 def prepare_layer3_physical_plan(
@@ -226,15 +325,16 @@ def prepare_layer3_physical_plan(
             before, after, tokens = _oracle(oracle_capture)
             if artifact.name != TARGET_ARTIFACT or indexer_sidecar.name != INDEXER_SIDECAR:
                 raise Layer3FactoryError("layer-3 slab or sidecar key changed")
-            ranks = tuple(
-                Layer3RankPlan(
-                    rank,
-                    load_qsa_weights(artifact, indexer_sidecar, rank, LAYER),
-                    load_owner_local_moe(artifact, rank, LAYER),
-                    _hyperconnection_layout(artifact, rank),
-                )
-                for rank in (0, 1)
-            )
+            rank_items = []
+            for rank in (0, 1):
+                qsa = load_qsa_weights(artifact, indexer_sidecar, rank, LAYER)
+                moe = load_owner_local_moe(artifact, rank, LAYER)
+                hc_layout, hc = _hyperconnection_layout(artifact, rank)
+                rank_items.append(Layer3RankPlan(
+                    rank, qsa, moe, hc_layout,
+                    _rank_extents(rank, qsa, moe, hc),
+                ))
+            ranks = tuple(rank_items)
         except Exception as exc:
             span.set_attribute("outcome", "failure")
             span.set_attribute("failure.class", _failure_class(exc))
@@ -285,5 +385,145 @@ def public_plan(plan: Layer3PhysicalPlan) -> Mapping[str, object]:
     })
 
 
-__all__ = ["Layer3FactoryError", "Layer3PairReducePlan", "Layer3PhysicalPlan", "Layer3RankPlan",
+_DTYPE_BYTES = MappingProxyType({
+    "uint8": 1, "int32": 4, "int64": 8, "float32": 4,
+    "bfloat16": 2,
+})
+
+
+def _buffer(name: str, shape: Sequence[int], dtype: str) -> dict[str, object]:
+    elements = 1
+    for dimension in shape:
+        elements *= dimension
+    return {
+        "name": name, "shape": list(shape), "strides": list(_strides(shape)),
+        "dtype": dtype, "bytes": elements * _DTYPE_BYTES[dtype],
+    }
+
+
+def native_rank_descriptor(plan: Layer3PhysicalPlan, rank: int) -> Mapping[str, object]:
+    """Canonical native handoff. It contains no device pointers."""
+
+    if rank not in (0, 1) or plan.schema != PLAN_SCHEMA:
+        raise Layer3FactoryError("layer-3 native descriptor rank changed")
+    item = plan.ranks[rank]
+    pair = plan.pair_reduce[rank]
+    extents = [
+        {
+            "name": extent.name, "offset_bytes": extent.offset,
+            "length_bytes": extent.length, "shape": list(extent.shape),
+            "strides": list(extent.strides), "dtype": extent.dtype,
+            "layout": extent.layout, "abi": extent.abi,
+            "storage": extent.storage,
+            "source_chunks": [
+                {"offset_bytes": chunk.offset, "length_bytes": chunk.length,
+                 "sha256": chunk.sha256}
+                for chunk in extent.source_chunks
+            ],
+        }
+        for extent in item.extents
+    ]
+    qsa_arena = [
+        _buffer(name, shape, dtype)
+        for name, (shape, dtype) in sorted(ARENA_SPECS.items())
+    ]
+    qsa_state = [
+        _buffer("main_key_cache", (1, 1600, 256), "bfloat16"),
+        _buffer("main_value_cache", (1, 1600, 256), "bfloat16"),
+        _buffer("raw_key_cache", (1, 8, 140), "bfloat16"),
+        _buffer("compressed_key_cache", (1, 400, 128), "bfloat16"),
+        *[_buffer(name, (164,), "int32") for name in
+          ("main_block_table", "compressed_block_table")],
+        *[_buffer(name, (1,), "int64") for name in
+          ("positions", "logical_positions")],
+        *[_buffer(name, (1,), "int32") for name in (
+            "main_slot_mapping", "raw_slot_mapping", "raw_block_table",
+            "compressed_slot_mapping", "query_start_locations",
+            "sequence_lengths", "token_to_request", "compression_work",
+        )],
+    ]
+    # Fixed FlashInfer 91bda04 static-c1 workspace with E257 state slots,
+    # E256 weights, max_rows=10, H2560, physical N768, top-k10.
+    moe_workspace = [
+        _buffer("router_logits", (512,), "float32"),
+        _buffer("global_ids", (10,), "int32"),
+        _buffer("routing_weights", (10,), "float32"),
+        _buffer("local_ids", (10,), "int32"),
+        _buffer("local_weights", (10,), "float32"),
+        _buffer("source_generation", (1,), "int64"),
+        _buffer("requested_generation", (1,), "int64"),
+        _buffer("route_summary", (16,), "uint8"),
+        _buffer("packed_a", (258, 10, 1280), "uint8"),
+        _buffer("packed_a_scale", (258, 128, 160), "uint8"),
+        _buffer("route_output_scratch", (10, 3, 2560), "bfloat16"),
+        _buffer("barrier_count", (1,), "int32"),
+        _buffer("barrier_epoch", (1,), "int32"),
+        _buffer("row_counts", (258,), "int32"),
+        _buffer("active_expert_count", (1,), "int32"),
+        _buffer("weight_expert_ids", (258,), "int32"),
+        _buffer("global_to_local_expert", (256,), "int32"),
+        _buffer("virtual_route_scratch", (520,), "int32"),
+        _buffer("token_map", (258, 10), "int32"),
+        _buffer("token_weights", (258, 10), "float32"),
+        _buffer("shared_gate_scratch", (160,), "float32"),
+        _buffer("shared_up_scratch", (160,), "float32"),
+        _buffer("shared_gate_scalar", (1,), "float32"),
+        _buffer("rank_local_partial", (1, HIDDEN), "bfloat16"),
+    ]
+    row_buffers = [
+        _buffer("replicated_layer02", (ROWS, HC_WIDTH), "bfloat16"),
+        _buffer("replicated_layer03", (ROWS, HC_WIDTH), "bfloat16"),
+        _buffer("attention_input", (1, HIDDEN), "bfloat16"),
+        _buffer("attention_injection", (1, 4), "bfloat16"),
+        _buffer("reduced_attention", (1, HIDDEN), "float32"),
+        _buffer("post_attention_hidden", (1, HC_WIDTH), "bfloat16"),
+        _buffer("moe_input", (1, HIDDEN), "bfloat16"),
+        _buffer("moe_injection", (1, 4), "bfloat16"),
+        _buffer("reduced_moe", (1, HIDDEN), "float32"),
+    ]
+    descriptor = {
+        "schema": NATIVE_PLAN_SCHEMA, "rank": rank, "peer_rank": 1 - rank,
+        "layer": LAYER, "artifact_key": TARGET_ARTIFACT,
+        "manifest_sha256": TARGET_MANIFEST_SHA256,
+        "slab_key": f"rank{rank}-target", "slab_bytes": item.qsa.slab_bytes,
+        "layout_sha256": item.moe.layout_sha256,
+        "indexer_sidecar_key": INDEXER_SIDECAR,
+        "oracle_manifest_sha256": plan.oracle_manifest_sha256,
+        "oracle_layer02_sha256": LAYER02_SHA256,
+        "oracle_layer03_sha256": LAYER03_SHA256,
+        "replay_rows": list(plan.replay_rows), "compare_row": plan.compare_row,
+        "extents": extents,
+        "buffers": {
+            "qsa_arena": qsa_arena, "qsa_state": qsa_state,
+            "target_moe_workspace": moe_workspace,
+            "row": row_buffers,
+        },
+        "pair_reduce": {
+            "bootstrap_host": pair.bootstrap_host,
+            "bootstrap_port": pair.bootstrap_port,
+            "timeout_ms": pair.timeout_ms,
+            "session_sha256": pair.session_sha256,
+            "rails": list(pair.rails), "gid_index": pair.gid_index,
+            "calls": pair.calls,
+        },
+        "native_abis": {
+            "target_slab_publication": 1, "qsa_c1": 1,
+            "hyperconnection": 1, "target_full_moe_c1": 1,
+            "pair_reduce_bootstrap": 3, "oracle_comparator": 1,
+        },
+    }
+    descriptor["extent_inventory_sha256"] = hashlib.sha256(
+        canonical_bytes(extents)
+    ).hexdigest()
+    descriptor["buffer_inventory_sha256"] = hashlib.sha256(
+        canonical_bytes(descriptor["buffers"])
+    ).hexdigest()
+    descriptor["descriptor_sha256"] = hashlib.sha256(
+        canonical_bytes(descriptor)
+    ).hexdigest()
+    return MappingProxyType(descriptor)
+
+
+__all__ = ["Layer3FactoryError", "Layer3ExtentPlan", "Layer3PairReducePlan",
+           "Layer3PhysicalPlan", "Layer3RankPlan", "native_rank_descriptor",
            "prepare_layer3_physical_plan", "public_plan"]

@@ -23,6 +23,18 @@ endif()
 find_library(ROCKET_QWEN38_IBVERBS ibverbs REQUIRED)
 find_library(ROCKET_QWEN38_NVML nvidia-ml REQUIRED)
 find_library(ROCKET_QWEN38_CRYPTO NAMES crypto libcrypto.so.3 REQUIRED)
+find_library(ROCKET_QWEN38_JSONC NAMES libjson-c.so.5 REQUIRED)
+if(NOT ROCKET_QWEN38_JSONC MATCHES "libjson-c\\.so\\.5$")
+  message(FATAL_ERROR "Qwen native plan parser requires json-c ABI 5")
+endif()
+file(SHA256 "${ROCKET_QWEN38_JSONC}" _rocket_qwen38_jsonc_sha256)
+if(NOT _rocket_qwen38_jsonc_sha256 STREQUAL
+   "773990495f98a200f449dc915a14709007ce4b09f41d08c8e46c8d04082df35b")
+  message(FATAL_ERROR "Qwen json-c runtime identity changed")
+endif()
+add_library(rocket_qwen38_jsonc SHARED IMPORTED GLOBAL)
+set_target_properties(rocket_qwen38_jsonc PROPERTIES
+  IMPORTED_LOCATION "${ROCKET_QWEN38_JSONC}")
 if(NOT ROCKET_QWEN38_CRYPTO MATCHES "libcrypto\\.so\\.3$")
   message(FATAL_ERROR "Qwen target MoE materializer requires OpenSSL 3 libcrypto ABI")
 endif()
@@ -132,6 +144,16 @@ target_compile_options(qwen38_decode_execution PRIVATE -Wall -Wextra -Werror)
 # Only this static archive needs host PIC because qwen38_gdn_graph links it into
 # a shared library. Keep the relocation fix local to its owner.
 set_target_properties(qwen38_decode_execution PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(qwen38_target_layer3_native_plan STATIC
+  src/decode/target_layer3_native_plan.cc)
+target_include_directories(qwen38_target_layer3_native_plan PUBLIC src)
+target_link_libraries(qwen38_target_layer3_native_plan PUBLIC
+  rocket_qwen38_openssl3_crypto rocket_qwen38_jsonc)
+target_compile_options(qwen38_target_layer3_native_plan PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_layer3_native_plan PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
 
 add_library(qwen38_target_layer3_generation STATIC
   src/decode/target_layer3_generation.cu)
@@ -628,6 +650,13 @@ set_target_properties(qwen38-test-target-layer3-pair-reduce PROPERTIES
   LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-target-layer3-pair-reduce-contract
   COMMAND qwen38-test-target-layer3-pair-reduce)
+
+add_executable(qwen38-test-target-layer3-native-plan
+  tests/test_target_layer3_native_plan.cc)
+target_link_libraries(qwen38-test-target-layer3-native-plan PRIVATE
+  qwen38_target_layer3_native_plan)
+target_compile_options(qwen38-test-target-layer3-native-plan PRIVATE
+  -Wall -Wextra -Werror)
 
 add_executable(qwen38-test-target-layer3-generation
   tests/test_target_layer3_generation.cc)

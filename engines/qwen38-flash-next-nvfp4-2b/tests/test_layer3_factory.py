@@ -8,6 +8,7 @@ from pathlib import Path
 from qwen38_slab.layer3_factory import (
     Layer3FactoryError,
     prepare_layer3_physical_plan,
+    native_rank_descriptor,
     public_plan,
 )
 
@@ -71,6 +72,16 @@ class Layer3FactoryTests(unittest.TestCase):
         self.assertEqual(record["pair_reduce"]["session_sha256"],
                          "05ea3af1c4694a9c035ce2fe9ce006acc58881df0fe86771b1846f4bd8e5f48b")
         self.assertEqual(tuple(item.rank for item in plan.ranks), (0, 1))
+        descriptors = [dict(native_rank_descriptor(plan, rank)) for rank in (0, 1)]
+        for rank, descriptor in enumerate(descriptors):
+            self.assertEqual(descriptor["rank"], rank)
+            self.assertEqual(len(descriptor["extents"]), 3_108)
+            self.assertEqual(len(descriptor["descriptor_sha256"]), 64)
+            self.assertTrue(all(item["source_chunks"]
+                                for item in descriptor["extents"]))
+            self.assertEqual(descriptor["native_abis"]["pair_reduce_bootstrap"], 3)
+        self.assertNotEqual(descriptors[0]["descriptor_sha256"],
+                            descriptors[1]["descriptor_sha256"])
         self.assertEqual(tracer.spans[-1].attributes, {
             "phase": "prepare", "outcome": "success",
             "failure.class": "none",
