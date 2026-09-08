@@ -11,6 +11,13 @@
 
 namespace rocket::qwen38::moe {
 
+enum class TargetLayerMoeConstructionStage : std::int32_t {
+  kUnknown = 0,
+  kPlanBinder = 1,
+  kStage = 2,
+  kAot = 3,
+};
+
 constexpr std::size_t target_layer_moe_owner_append(
     std::size_t offset, std::size_t bytes,
     std::size_t alignment = 256) noexcept {
@@ -82,7 +89,8 @@ class TargetLayerMoeDeviceOwner final {
       int device, const decode::TargetLayerNativePlan& plan,
       void* accepted_loader_lease_handle,
       std::shared_ptr<TargetFullMoeOtelSink> telemetry,
-      std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry);
+      std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry,
+      TargetLayerMoeConstructionStage* construction_stage = nullptr);
   ~TargetLayerMoeDeviceOwner();
   TargetLayerMoeDeviceOwner(const TargetLayerMoeDeviceOwner&) = delete;
   TargetLayerMoeDeviceOwner& operator=(const TargetLayerMoeDeviceOwner&) = delete;
@@ -101,7 +109,8 @@ class TargetLayerMoeDeviceOwner final {
       int device, const decode::TargetLayerNativePlan& plan,
       std::shared_ptr<const model::TargetSlabLease> slab_lease,
       std::shared_ptr<TargetFullMoeOtelSink> telemetry,
-      std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry);
+      std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry,
+      TargetLayerMoeConstructionStage* construction_stage);
   int device_ = -1;
   int rank_ = -1;
   int layer_ = -1;

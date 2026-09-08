@@ -311,7 +311,8 @@ TargetGdnLayerDeviceOwner::create(
     void* accepted_loader_lease_handle,
     std::unique_ptr<moe::TargetLayerMoeDeviceOwner> moe_owner,
     TargetK0PairReduceSchedule& reductions,
-    pair_reduce::OtelStageSink& telemetry) {
+    pair_reduce::OtelStageSink& telemetry,
+    TargetGdnOwnerConstructionStage* construction_stage) {
   auto lease = model::TargetSlabStartupFactory::lease_from_handle(
       accepted_loader_lease_handle);
   if (!lease)
@@ -319,7 +320,7 @@ TargetGdnLayerDeviceOwner::create(
   return std::unique_ptr<TargetGdnLayerDeviceOwner>(
       new TargetGdnLayerDeviceOwner(
           device, plan, std::move(lease), std::move(moe_owner), reductions,
-          telemetry));
+          telemetry, construction_stage));
 }
 
 TargetGdnLayerDeviceOwner::TargetGdnLayerDeviceOwner(
@@ -327,10 +328,15 @@ TargetGdnLayerDeviceOwner::TargetGdnLayerDeviceOwner(
     std::shared_ptr<const model::TargetSlabLease> slab_lease,
     std::unique_ptr<moe::TargetLayerMoeDeviceOwner> moe_owner,
     TargetK0PairReduceSchedule& reductions,
-    pair_reduce::OtelStageSink& telemetry)
+    pair_reduce::OtelStageSink& telemetry,
+    TargetGdnOwnerConstructionStage* construction_stage)
     : device_(device), rank_(plan.rank), layer_(plan.layer),
       bundle_(std::make_unique<Bundle>()) {
+  const auto mark = [construction_stage](TargetGdnOwnerConstructionStage stage) {
+    if (construction_stage) *construction_stage = stage;
+  };
   try {
+    mark(TargetGdnOwnerConstructionStage::kLease);
     bundle_->slab_lease = std::move(slab_lease);
     bundle_->moe_owner = std::move(moe_owner);
     if (!bundle_->slab_lease ||
@@ -342,8 +348,14 @@ TargetGdnLayerDeviceOwner::TargetGdnLayerDeviceOwner(
         bundle_->moe_owner->rank() != rank_ ||
         bundle_->moe_owner->layer() != layer_ || reductions.rank() != rank_)
       fail("owned dependency identity changed");
+    mark(TargetGdnOwnerConstructionStage::kPlanBinder);
     const auto weights = bind_target_gdn_native_weights(
         plan, bundle_->slab_lease->publication());
+    mark(TargetGdnOwnerConstructionStage::kGlobals);
+    for (const float value : plan.attention_projection_globals)
+      if (!std::isfinite(value) || value <= 0.0F)
+        fail("projection scalar changed");
+    mark(TargetGdnOwnerConstructionStage::kStorage);
     if (cudaSetDevice(device) != cudaSuccess ||
         cudaMalloc(&bundle_->storage, kTargetGdnOwnerStorageBytes) != cudaSuccess)
       throw std::runtime_error("target GDN storage allocation failed");
@@ -373,8 +385,10 @@ TargetGdnLayerDeviceOwner::TargetGdnLayerDeviceOwner(
       throw std::runtime_error("target GDN state publication failed");
     }
     release_init();
+    mark(TargetGdnOwnerConstructionStage::kCutlassGraph);
     bundle_->graph = std::make_unique<linear_attention::CutlassGdnGraph>(
         device, rank_, layer_, weights.attention);
+    mark(TargetGdnOwnerConstructionStage::kHyperconnection);
     bundle_->hyperconnection = std::make_unique<hyperconnection::Plan>(
         device, weights.attention_hyperconnection,
         weights.mlp_hyperconnection);
@@ -383,6 +397,7 @@ TargetGdnLayerDeviceOwner::TargetGdnLayerDeviceOwner(
         *bundle_->hyperconnection);
     bundle_->moe_generation = std::make_unique<NativeTargetGdnMoeGeneration>(
         rank_, layer_, bundle_->moe_owner->requested_generation());
+    mark(TargetGdnOwnerConstructionStage::kComposite);
     bundle_->layer = std::make_unique<TargetGdnLayer>(
         *bundle_->graph, bundle_->moe_owner->graph(),
         reductions.attention_port(layer_), reductions.moe_port(layer_),

@@ -13,6 +13,19 @@
 
 namespace rocket::qwen38::decode {
 
+enum class TargetGdnOwnerConstructionStage : std::int32_t {
+  kUnknown = 0,
+  kLease = 1,
+  kPlanBinder = 2,
+  kGlobals = 3,
+  kMoeStage = 4,
+  kMoeAot = 5,
+  kStorage = 6,
+  kCutlassGraph = 7,
+  kHyperconnection = 8,
+  kComposite = 9,
+};
+
 struct TargetGdnNativeWeightBindings {
   linear_attention::GdnWeights attention;
   hyperconnection::Weights attention_hyperconnection;
@@ -87,7 +100,8 @@ class TargetGdnLayerDeviceOwner final : public TargetK0LayerPort {
       void* accepted_loader_lease_handle,
       std::unique_ptr<moe::TargetLayerMoeDeviceOwner> moe_owner,
       TargetK0PairReduceSchedule& reductions,
-      pair_reduce::OtelStageSink& telemetry);
+      pair_reduce::OtelStageSink& telemetry,
+      TargetGdnOwnerConstructionStage* construction_stage = nullptr);
   ~TargetGdnLayerDeviceOwner() override;
   TargetGdnLayerDeviceOwner(const TargetGdnLayerDeviceOwner&) = delete;
   TargetGdnLayerDeviceOwner& operator=(const TargetGdnLayerDeviceOwner&) =
@@ -115,7 +129,8 @@ class TargetGdnLayerDeviceOwner final : public TargetK0LayerPort {
       std::shared_ptr<const model::TargetSlabLease> slab_lease,
       std::unique_ptr<moe::TargetLayerMoeDeviceOwner> moe_owner,
       TargetK0PairReduceSchedule& reductions,
-      pair_reduce::OtelStageSink& telemetry);
+      pair_reduce::OtelStageSink& telemetry,
+      TargetGdnOwnerConstructionStage* construction_stage);
 
   int device_ = -1;
   int rank_ = -1;

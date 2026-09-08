@@ -158,7 +158,8 @@ TargetLayerMoeDeviceOwner::create(
     int device, const decode::TargetLayerNativePlan& plan,
     void* accepted_loader_lease_handle,
     std::shared_ptr<TargetFullMoeOtelSink> telemetry,
-    std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry) {
+    std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry,
+    TargetLayerMoeConstructionStage* construction_stage) {
   auto lease = model::TargetSlabStartupFactory::lease_from_handle(
       accepted_loader_lease_handle);
   if (!lease)
@@ -166,7 +167,7 @@ TargetLayerMoeDeviceOwner::create(
   return std::unique_ptr<TargetLayerMoeDeviceOwner>(
       new TargetLayerMoeDeviceOwner(
           device, plan, std::move(lease), std::move(telemetry),
-          std::move(stage_telemetry)));
+          std::move(stage_telemetry), construction_stage));
 }
 
 TargetLayerMoeStorageBinding bind_target_layer_moe_storage(
@@ -194,9 +195,14 @@ TargetLayerMoeDeviceOwner::TargetLayerMoeDeviceOwner(
     int device, const decode::TargetLayerNativePlan& plan,
     std::shared_ptr<const model::TargetSlabLease> slab_lease,
     std::shared_ptr<TargetFullMoeOtelSink> telemetry,
-    std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry)
+    std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry,
+    TargetLayerMoeConstructionStage* construction_stage)
     : device_(device), rank_(plan.rank), layer_(plan.layer),
       bundle_(std::make_unique<Bundle>()) {
+  const auto mark = [construction_stage](TargetLayerMoeConstructionStage stage) {
+    if (construction_stage) *construction_stage = stage;
+  };
+  mark(TargetLayerMoeConstructionStage::kPlanBinder);
   bundle_->slab_lease = std::move(slab_lease);
   bundle_->telemetry = std::move(telemetry);
   bundle_->stage_telemetry = std::move(stage_telemetry);
@@ -256,10 +262,12 @@ TargetLayerMoeDeviceOwner::TargetLayerMoeDeviceOwner(
     bundle_->stage_scratch = storage.stage;
     bundle_->workspace = storage.runtime;
     bundle_->rank_local_output = storage.rank_local_output;
+    mark(TargetLayerMoeConstructionStage::kStage);
     bundle_->stage = std::make_unique<TargetMoeN640DeviceStage>(
         device, plan.rank, plan.layer, slab.ready_event,
         bindings.routed_source);
     const auto identity = dense_identity(plan);
+    mark(TargetLayerMoeConstructionStage::kAot);
     bundle_->participant = std::make_unique<TargetFullMoeC1>(
         device, identity,
         TargetFullMoeC1Weights{bindings.router, bindings.routed_identity,

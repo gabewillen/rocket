@@ -28,6 +28,8 @@ struct TargetK0PhysicalLayerConstructionProgress {
   TargetK0PhysicalLayerConstructionStage stage =
       TargetK0PhysicalLayerConstructionStage::kUnknown;
   int layer = -1;
+  TargetGdnOwnerConstructionStage gdn_stage =
+      TargetGdnOwnerConstructionStage::kUnknown;
 };
 
 bool validate_target_k0_physical_layer_plans(

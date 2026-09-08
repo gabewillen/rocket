@@ -48,17 +48,25 @@ PHYSICAL_LAYER_SUBSTAGES = {
     3: "sidecar", 4: "rope", 5: "gdn_owner", 6: "qsa_owner",
     7: "inventory_assembly",
 }
+GDN_OWNER_SUBSTAGES = {
+    0: "unknown", 1: "lease", 2: "plan_binder", 3: "globals",
+    4: "moe_stage", 5: "moe_aot", 6: "storage", 7: "cutlass_graph",
+    8: "hyperconnection", 9: "composite",
+}
 
 
 class NativeRunStatusError(RuntimeError):
     def __init__(self, status: int, physical_substage: int = 0,
-                 physical_layer: int = -1):
+                 physical_layer: int = -1, gdn_owner_substage: int = 0):
         self.stage = NATIVE_STATUS_STAGES.get(status, "unknown")
         self.physical_substage = PHYSICAL_LAYER_SUBSTAGES.get(
             physical_substage, "unknown")
         owner_stage = self.physical_substage in ("gdn_owner", "qsa_owner")
         self.physical_layer = (physical_layer if owner_stage
                                and 0 <= physical_layer < 48 else -1)
+        self.gdn_owner_substage = GDN_OWNER_SUBSTAGES.get(
+            gdn_owner_substage, "unknown") if self.physical_substage == (
+                "gdn_owner") else "unknown"
         super().__init__("native K0 run rejected")
 
 
@@ -86,6 +94,7 @@ class _NativeResult(ctypes.Structure):
         ("total_bytes", ctypes.c_uint64),
         ("physical_layer_substage", ctypes.c_int32),
         ("physical_layer_index", ctypes.c_int32),
+        ("gdn_owner_substage", ctypes.c_int32),
     )
 
 
@@ -141,6 +150,7 @@ def _emit_failure(counter: object, rank: int, phase: str,
             attributes["failure.physical_substage"] = error.physical_substage
             if error.physical_layer >= 0:
                 attributes["failure.layer"] = error.physical_layer
+            attributes["failure.gdn_owner_substage"] = error.gdn_owner_substage
         counter.add(1, attributes)
     except BaseException:
         pass
@@ -216,7 +226,7 @@ def _native_run(args: argparse.Namespace, lease: object,
     if status:
         raise NativeRunStatusError(
             status, result.physical_layer_substage,
-            result.physical_layer_index,
+            result.physical_layer_index, result.gdn_owner_substage,
         )
     return result
 
@@ -235,6 +245,8 @@ def _snapshot(result: _NativeResult) -> dict[str, object]:
         "total_bytes": result.total_bytes,
         "physical_layer_substage": PHYSICAL_LAYER_SUBSTAGES.get(
             result.physical_layer_substage, "unknown"),
+        "gdn_owner_substage": GDN_OWNER_SUBSTAGES.get(
+            result.gdn_owner_substage, "unknown"),
     }
 
 
@@ -289,6 +301,7 @@ def worker(args: argparse.Namespace) -> int:
             physical["physical_layer_substage"] = error.physical_substage
             if error.physical_layer >= 0:
                 physical["physical_layer_index"] = error.physical_layer
+            physical["gdn_owner_substage"] = error.gdn_owner_substage
         print(json.dumps({"schema": SCHEMA, "valid": False, "complete": False,
                           "rank": args.rank, "phase": phase,
                           "failure_class": failure["class"],

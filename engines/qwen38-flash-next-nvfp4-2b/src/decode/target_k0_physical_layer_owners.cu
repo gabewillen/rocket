@@ -38,7 +38,8 @@ TargetK0PhysicalLayerOwners::create(
     TargetK0PhysicalLayerConstructionProgress* progress) {
   const auto mark = [progress](TargetK0PhysicalLayerConstructionStage stage,
                                int layer = -1) {
-    if (progress) *progress = {stage, layer};
+    if (progress) *progress = {stage, layer,
+        TargetGdnOwnerConstructionStage::kUnknown};
   };
   if (device < 0 || !accepted_loader_lease_handle || !plans ||
       !validate_target_k0_physical_layer_plans(*plans, rank) ||
@@ -79,13 +80,29 @@ TargetK0PhysicalLayerOwners::create(
               layer_telemetry, moe_telemetry, stage_telemetry, 35);
     } else {
       mark(TargetK0PhysicalLayerConstructionStage::kGdnOwner, layer);
-      auto moe = moe::TargetLayerMoeDeviceOwner::create(
-          device, plan, accepted_loader_lease_handle, moe_telemetry,
-          stage_telemetry);
+      moe::TargetLayerMoeConstructionStage moe_stage =
+          moe::TargetLayerMoeConstructionStage::kUnknown;
+      std::unique_ptr<moe::TargetLayerMoeDeviceOwner> moe;
+      try {
+        moe = moe::TargetLayerMoeDeviceOwner::create(
+            device, plan, accepted_loader_lease_handle, moe_telemetry,
+            stage_telemetry, &moe_stage);
+      } catch (...) {
+        if (progress) {
+          progress->gdn_stage =
+              moe_stage == moe::TargetLayerMoeConstructionStage::kAot
+                  ? TargetGdnOwnerConstructionStage::kMoeAot
+                  : (moe_stage == moe::TargetLayerMoeConstructionStage::kStage
+                         ? TargetGdnOwnerConstructionStage::kMoeStage
+                         : TargetGdnOwnerConstructionStage::kPlanBinder);
+        }
+        throw;
+      }
       owners[static_cast<std::size_t>(layer)] =
           TargetGdnLayerDeviceOwner::create(
               device, plan, accepted_loader_lease_handle, std::move(moe),
-              reductions, *layer_telemetry);
+              reductions, *layer_telemetry,
+              progress ? &progress->gdn_stage : nullptr);
     }
   }
   mark(TargetK0PhysicalLayerConstructionStage::kInventoryAssembly);

@@ -113,6 +113,16 @@ class Oracle35LauncherTests(unittest.TestCase):
         )
         self.assertEqual(module.NativeRunStatusError(31, 5, 48).physical_layer,
                          -1)
+        self.assertEqual(set(module.GDN_OWNER_SUBSTAGES), set(range(10)))
+        for code, name in module.GDN_OWNER_SUBSTAGES.items():
+            self.assertEqual(
+                module.NativeRunStatusError(31, 5, 0, code).gdn_owner_substage,
+                name,
+            )
+        self.assertEqual(
+            module.NativeRunStatusError(31, 6, 3, 9).gdn_owner_substage,
+            "unknown",
+        )
 
     def test_secret_requires_exact_32_bytes(self):
         with tempfile.TemporaryDirectory() as root:
@@ -175,6 +185,7 @@ class Oracle35LauncherTests(unittest.TestCase):
             "nccl_stages", "nccl_outcomes",
             "duration_samples", "total_bytes",
             "physical_layer_substage",
+            "gdn_owner_substage",
         })
 
 

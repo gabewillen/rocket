@@ -120,6 +120,8 @@ extern "C" int qwen38_target_k0_oracle35_run(
     result->physical_layer_substage =
         static_cast<std::int32_t>(layer_progress.stage);
     result->physical_layer_index = layer_progress.layer;
+    result->gdn_owner_substage =
+        static_cast<std::int32_t>(layer_progress.gdn_stage);
     if (telemetry) publish(telemetry->snapshot(), *result);
   };
   try {
