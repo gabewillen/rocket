@@ -193,6 +193,26 @@ class LinearAttentionSlabTests(unittest.TestCase):
         before_verifier = launch[: launch.index("void CutlassGdnGraph::launch_verifier(")]
         self.assertNotIn("scale_projection<<<", before_verifier)
 
+    def test_decode_owner_binds_every_authenticated_input_scale(self):
+        source_root = Path(__file__).parents[1] / "src"
+        owner = (source_root / "decode" / "target_gdn_layer_owner.cu").read_text()
+        resolver = owner[owner.index("TargetGdnNativeWeightBindings resolve(") :]
+        resolver = resolver[: resolver.index("void validate_publication(")]
+        self.assertIn('std::string(root) + ".input_scale"', resolver)
+        self.assertIn("address<float>(base, extent(", resolver)
+
+        graph = (source_root / "linear_attention" / "gdn_cutlass.cu").read_text()
+        constructor = graph[graph.index("CutlassGdnGraph::CutlassGdnGraph(") :]
+        constructor = constructor[
+            : constructor.index("CutlassGdnGraph::~CutlassGdnGraph()")
+        ]
+        self.assertIn("!matrix.input_scale", constructor)
+        self.assertIn("matrices[index].input_scale", constructor)
+        self.assertIn("input_scales[0] != input_scales[1]", constructor)
+        self.assertIn("input_scales[0] != input_scales[2]", constructor)
+        self.assertIn("input_scales[0] != input_scales[3]", constructor)
+        self.assertIn("impl_->output_global_scale = input_scales[4]", constructor)
+
     def test_decode_quantizer_matches_pinned_vllm_nvfp4_rounding(self):
         source = (
             Path(__file__).parents[1] / "src" / "linear_attention" / "gdn_cutlass.cu"
