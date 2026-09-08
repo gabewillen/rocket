@@ -14,7 +14,8 @@ namespace rocket::qwen38::moe {
 inline constexpr int kTargetMoeHidden = 2'560;
 inline constexpr int kTargetMoeLogicalIntermediate = 640;
 inline constexpr int kTargetMoePhysicalIntermediate = 768;
-inline constexpr int kTargetMoeStateExperts = 257;
+inline constexpr int kTargetMoeWeightExperts = 10;
+inline constexpr int kTargetMoeStateExperts = 11;
 inline constexpr int kTargetMoeMaxRows = 10;
 
 struct TargetMoeB12xIdentity {
@@ -25,8 +26,9 @@ struct TargetMoeB12xIdentity {
 };
 
 struct TargetMoeB12xWeights {
-  // Init-padded physical N768 ModelOpt NVFP4 tensors. Logical source N640 is
-  // authenticated by TargetMoeB12xIdentity before module construction.
+  // Compact route-position E10, init-padded physical N768 ModelOpt NVFP4
+  // tensors. The staging owner authenticates logical source N640 and exposes
+  // stable pointers for this object's lifetime.
   const std::uint8_t* w13_packed;
   const std::uint8_t* w13_scale;
   const std::uint8_t* down_packed;
@@ -58,6 +60,8 @@ struct TargetMoeB12xWorkspace {
 
 struct TargetMoeB12xLaunch {
   const void* hidden_bf16;
+  // Dense compact route positions [0,9]. Remote positions carry ID 0 and
+  // weight 0. Positive routes are unique under the staging contract.
   const std::int32_t* local_expert_ids;
   const float* local_routing_weights;
   void* output_bf16;

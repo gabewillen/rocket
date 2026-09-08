@@ -11,12 +11,14 @@ int main() {
   static_assert(moe::kTargetMoeHidden == 2'560);
   static_assert(moe::kTargetMoeLogicalIntermediate == 640);
   static_assert(moe::kTargetMoePhysicalIntermediate == 768);
-  static_assert(moe::kTargetMoeStateExperts == 257);
+  static_assert(moe::kTargetMoeWeightExperts == 10);
+  static_assert(moe::kTargetMoeStateExperts == 11);
   static_assert(moe::kTargetMoeMaxRows == 10);
   moe::TargetMoeB12xIdentity production_identity{};
-  if (!moe::parse_target_moe_artifact_key(
-          moe::target_moe_artifact_key_ascii(),
-          &production_identity.artifact_sha256))
+  const auto artifact_key = moe::target_moe_artifact_key_ascii();
+  if (!artifact_key.empty() && !moe::parse_target_moe_artifact_key(
+                                   artifact_key,
+                                   &production_identity.artifact_sha256))
     std::abort();
   production_identity.layout_sha256[0] = 1;
   production_identity.rank = 0;
@@ -31,9 +33,8 @@ int main() {
           0, production_identity, production_weights) !=
       moe::TargetMoeCreateFailure::kNone)
     std::abort();
-  const std::string artifact_key(moe::target_moe_artifact_key_ascii());
   for (std::size_t position = 0; position < artifact_key.size(); ++position) {
-    std::string changed_key = artifact_key;
+    std::string changed_key(artifact_key);
     changed_key[position] = changed_key[position] == '0' ? '1' : '0';
     auto changed_identity = production_identity;
     if (!moe::parse_target_moe_artifact_key(

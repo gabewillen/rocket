@@ -21,6 +21,7 @@ ADAPTER = (
     / "moe"
     / "target_moe_b12x_aot.cc"
 )
+CONFIG = ROOT / "scripts" / "moe" / "qwen38-target-moe-compact-e10.json"
 SPEC = importlib.util.spec_from_file_location("target_moe_b12x_aot", SCRIPT)
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -39,25 +40,106 @@ class TargetMoeB12xAotContract(unittest.TestCase):
                 plan.physical_intermediate,
                 plan.top_k,
                 plan.max_rows,
-                plan.local_experts,
+                plan.weight_experts,
                 plan.state_experts,
                 plan.tile_m,
                 plan.tile_n,
                 plan.max_active_clusters,
             ),
-            (1, 2560, 640, 768, 10, 10, 256, 257, 64, 128, 20),
+            (1, 2560, 640, 768, 10, 10, 10, 11, 64, 128, 20),
         )
         self.assertEqual(plan.activation, "silu")
         self.assertTrue(plan.fast_math)
 
-    def test_source_and_measured_object_are_pinned(self) -> None:
+    def test_compact_config_authenticates_exact_stage_consumer_abi(self) -> None:
+        config = MODULE.authenticate_compact_config(
+            CONFIG,
+            "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4",
+        )
+        self.assertEqual(sum(item["bytes"] for item in config["planes"]), 33_177_760)
+        self.assertEqual(sum(item["bytes"] for item in config["control"]), 136)
+        self.assertEqual(config["shape"]["weight_experts"], 10)
+        self.assertEqual(config["shape"]["state_experts"], 11)
+        self.assertEqual(config["route_remap_abi"], MODULE.ROUTE_REMAP_ABI)
+        self.assertEqual(
+            MODULE.canonical_digest(config), MODULE.PINNED_COMPACT_CONFIG_SHA256
+        )
+
+    def test_compact_config_rejects_every_identity_and_layout_family(self) -> None:
+        original = json.loads(CONFIG.read_text(encoding="utf-8"))
+        artifact = original["target_artifact_key"]
+        mutations = []
+        for field in ("target_artifact_key", "source_abi", "transform_abi", "route_remap_abi"):
+            changed = json.loads(json.dumps(original))
+            changed[field] += "-changed"
+            mutations.append(changed)
+        for field in ("weight_experts", "state_experts", "physical_intermediate"):
+            changed = json.loads(json.dumps(original))
+            changed["shape"][field] += 1
+            mutations.append(changed)
+        for collection in ("planes", "control"):
+            changed = json.loads(json.dumps(original))
+            changed[collection][0]["bytes"] += 1
+            mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        changed["fc1_physical_rows"][1] = "nonzero[640:768]"
+        mutations.append(changed)
+        for rank in range(2):
+            for field in (
+                "descriptor_sha256",
+                "binding_inventory_sha256",
+                "publication_layout_sha256",
+            ):
+                changed = json.loads(json.dumps(original))
+                value = changed["ranks"][rank][field]
+                changed["ranks"][rank][field] = (
+                    ("1" if value[0] == "0" else "0") + value[1:]
+                )
+                mutations.append(changed)
+        changed = json.loads(json.dumps(original))
+        changed["unexpected"] = True
+        mutations.append(changed)
+
+        for changed in mutations:
+            with self.subTest(changed=changed):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = pathlib.Path(directory) / "config.json"
+                    path.write_text(json.dumps(changed), encoding="utf-8")
+                    with self.assertRaises(RuntimeError):
+                        MODULE.authenticate_compact_config(path, artifact)
+
+    def test_compact_header_carries_all_fixed_identities(self) -> None:
+        config = MODULE.authenticate_compact_config(
+            CONFIG,
+            "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            header, config_sha = MODULE.emit_compact_config_header(
+                pathlib.Path(directory), config
+            )
+            text = header.read_text(encoding="utf-8")
+        self.assertIn("TargetMoeWeightExperts = 10", text)
+        self.assertIn("TargetMoeStateExperts = 11", text)
+        self.assertIn("TargetMoePhysicalIntermediate = 768", text)
+        self.assertIn(config_sha, text)
+        self.assertIn(MODULE.compact_layout_identity(config), text)
+        for rank in config["ranks"]:
+            self.assertIn(rank["descriptor_sha256"], text)
+            self.assertIn(rank["binding_inventory_sha256"], text)
+            self.assertIn(rank["publication_layout_sha256"], text)
+
+    def test_unmodified_physical_n768_source_is_pinned(self) -> None:
         self.assertEqual(
             MODULE.PINNED_FLASHINFER_COMMIT,
             "91bda04c66f7cb851e1ab3b78b9fecea644b9844",
         )
         self.assertEqual(
-            MODULE.PINNED_TVM_FFI_OBJECT_SHA256,
-            "8cc49bdb4163b07338818bb7db482aea812d91cc1cbf3ef1eeecf0ee2756fef4",
+            MODULE.PINNED_DISPATCH_SHA256,
+            "c518e65d6bfd7f08db1e5261e20795fd020e82e681699729171bc2fd5331239a",
+        )
+        self.assertEqual(
+            MODULE.PINNED_KERNEL_SHA256,
+            "c7b6f24b94d7939cc0eb917ab15cef4c34f3dc12bf75e15fc9dc316ee7327f3f",
         )
 
     def test_export_replaces_tvm_ffi_stream_lookup(self) -> None:
@@ -136,6 +218,15 @@ class TargetMoeB12xAotContract(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, hot_path)
         self.assertIn("launch.stream", hot_path)
+
+    def test_build_requires_generated_compact_config(self) -> None:
+        cmake = (ROOT / "engines" / "qwen38-flash-next-nvfp4-2b" / "CMakeLists.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("target_moe_compact_config.h", cmake)
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('parser.add_argument("--compact-config", type=Path)', source)
+        self.assertIn("--compact-config is required", source)
 
     def test_production_has_no_manual_digest_byte_list(self) -> None:
         source = ADAPTER.read_text(encoding="utf-8")
