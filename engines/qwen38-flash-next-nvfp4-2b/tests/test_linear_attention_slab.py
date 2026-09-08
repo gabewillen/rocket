@@ -126,6 +126,19 @@ class LinearAttentionSlabTests(unittest.TestCase):
         )
         self.assertEqual(source.count("recurrent_beta(ba["), 2)
 
+    def test_gdn_debug_capture_is_layer0_once_and_bounded(self):
+        source = (
+            Path(__file__).parents[1] / "src" / "linear_attention" / "gdn_cutlass.cu"
+        ).read_text()
+        body = source[source.index("void debug_dump(") : source.index("~Impl()")]
+        self.assertIn("layer != 0", body)
+        self.assertIn("debug_dumped[stage]", body)
+        self.assertIn("bytes > kMaxDebugBytes", body)
+        launch = source[source.index("void CutlassGdnGraph::launch(") :]
+        self.assertLess(launch.index('"qkvz"'), launch.index('"ba"'))
+        self.assertLess(launch.index('"ba"'), launch.index('"core"'))
+        self.assertLess(launch.index('"core"'), launch.index('"projected"'))
+
 
 if __name__ == "__main__":
     unittest.main()

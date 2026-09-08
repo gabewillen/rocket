@@ -15,9 +15,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -401,6 +405,32 @@ struct CutlassGdnGraph::Impl {
                  *verify_projected = nullptr;
   FixedGemm verify_qkvz_gemm, verify_ba_gemm, verify_output_gemm;
   std::unique_ptr<CorePlan> core;
+  std::array<bool, 4> debug_dumped{};
+
+  void debug_dump(std::size_t stage, const char* name, const void* source,
+                  std::size_t bytes, cudaStream_t stream) {
+    constexpr std::size_t kMaxDebugBytes =
+        static_cast<std::size_t>(kQkvzN) * sizeof(__nv_bfloat16);
+    const char* directory = std::getenv("ROCKET_QWEN38_K0_GDN_DEBUG_DIR");
+    if (!directory || !*directory || layer != 0 || stage >= debug_dumped.size() ||
+        debug_dumped[stage])
+      return;
+    if (!source || bytes == 0 || bytes > kMaxDebugBytes)
+      throw std::logic_error("bounded GDN debug extent changed");
+    std::vector<std::uint8_t> host(bytes);
+    cuda_check(cudaMemcpyAsync(host.data(), source, bytes,
+                               cudaMemcpyDeviceToHost, stream),
+               "copy bounded GDN debug boundary");
+    cuda_check(cudaStreamSynchronize(stream),
+               "fence bounded GDN debug boundary");
+    const auto path = std::filesystem::path(directory) /
+        (std::string("rank") + std::to_string(rank) + "-" + name + ".bin");
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output.write(reinterpret_cast<const char*>(host.data()),
+                      static_cast<std::streamsize>(host.size())))
+      throw std::runtime_error("write bounded GDN debug boundary failed");
+    debug_dumped[stage] = true;
+  }
 
   ~Impl() {
     cudaSetDevice(device);
@@ -641,6 +671,10 @@ void CutlassGdnGraph::launch(
       impl_->ba, kBaN, kBN, impl_->globals.b.global_scale,
       impl_->globals.a.global_scale);
   cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN input scale launch");
+  impl_->debug_dump(0, "qkvz", impl_->qkvz,
+                    static_cast<std::size_t>(m) * kQkvzN * 2, stream);
+  impl_->debug_dump(1, "ba", impl_->ba,
+                    static_cast<std::size_t>(m) * kBaN * 2, stream);
   decode::target_k0_enter_gdn_graph(progress,
                                     decode::TargetK0GdnGraphStage::kCore);
   impl_->core->launch(
@@ -649,6 +683,8 @@ void CutlassGdnGraph::launch(
       static_cast<std::size_t>(kValueHeads) * kHeadDim * kHeadDim,
       state_indices, m, stream);
   cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN core launch");
+  impl_->debug_dump(2, "core", impl_->core->output(),
+                    static_cast<std::size_t>(m) * kOutputK * 2, stream);
   decode::target_k0_enter_gdn_graph(
       progress, decode::TargetK0GdnGraphStage::kOutputQuantize);
   quantize_fixed<kOutputK><<<m, 256, 0, stream>>>(
@@ -668,6 +704,8 @@ void CutlassGdnGraph::launch(
       impl_->projected, kOutputN, kOutputN,
       impl_->globals.output.global_scale * kOutputActivationGlobal,
       impl_->globals.output.global_scale * kOutputActivationGlobal);
+  impl_->debug_dump(3, "projected", impl_->projected,
+                    static_cast<std::size_t>(m) * kOutputN * 2, stream);
   decode::target_k0_enter_gdn_graph(progress,
                                     decode::TargetK0GdnGraphStage::kLaunchCheck);
   cuda_check(cudaGetLastError(), "fixed Qwen GDN graph launch");
