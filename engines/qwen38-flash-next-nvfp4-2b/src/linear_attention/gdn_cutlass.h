@@ -34,7 +34,10 @@ struct GdnWeights {
 
 [[nodiscard]] constexpr float gdn_quantizer_scale(
     float input_global_scale) noexcept {
-  return 1.0F / input_global_scale;
+  // Pinned vLLM passes SFScaleVal=1/g and stores SFScaleVal*amax/6.
+  // quantize_fixed stores amax/(6*activation_global), so its algebraically
+  // equivalent argument is g itself.
+  return input_global_scale;
 }
 
 [[nodiscard]] constexpr float gdn_projection_alpha(
