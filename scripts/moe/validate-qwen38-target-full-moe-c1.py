@@ -67,7 +67,7 @@ class FullLaunch(ctypes.Structure):
     ]
 
 
-def bind(path: Path):
+def bind(path: Path, routed_path: Path):
     library = ctypes.CDLL(path)
     library.rocket_qwen38_target_full_moe_c1_create.argtypes = [
         ctypes.c_int, ctypes.POINTER(ROUTED.Identity), ctypes.POINTER(FullWeights),
@@ -79,17 +79,18 @@ def bind(path: Path):
     ]
     library.rocket_qwen38_target_full_moe_c1_enqueue.restype = ctypes.c_int
     library.rocket_qwen38_target_full_moe_c1_destroy.argtypes = [ctypes.c_void_p]
-    library.rocket_qwen38_target_moe_b12x_create.argtypes = [
+    routed_library = ctypes.CDLL(routed_path)
+    routed_library.rocket_qwen38_target_moe_b12x_create.argtypes = [
         ctypes.c_int, ctypes.POINTER(ROUTED.Identity), ctypes.POINTER(ROUTED.Weights),
         ctypes.POINTER(ctypes.c_void_p),
     ]
-    library.rocket_qwen38_target_moe_b12x_create.restype = ctypes.c_int
-    library.rocket_qwen38_target_moe_b12x_enqueue.argtypes = [
+    routed_library.rocket_qwen38_target_moe_b12x_create.restype = ctypes.c_int
+    routed_library.rocket_qwen38_target_moe_b12x_enqueue.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(ROUTED.Launch),
     ]
-    library.rocket_qwen38_target_moe_b12x_enqueue.restype = ctypes.c_int
-    library.rocket_qwen38_target_moe_b12x_destroy.argtypes = [ctypes.c_void_p]
-    return library
+    routed_library.rocket_qwen38_target_moe_b12x_enqueue.restype = ctypes.c_int
+    routed_library.rocket_qwen38_target_moe_b12x_destroy.argtypes = [ctypes.c_void_p]
+    return library, routed_library
 
 
 def emit_failure(*, phase: str, status: int, rank: int, layer: int) -> None:
@@ -147,6 +148,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--native-library", type=Path, required=True)
+    parser.add_argument("--routed-native-library", type=Path, required=True)
     parser.add_argument("--rank", type=int, choices=(0, 1), required=True)
     parser.add_argument("--layer", type=int, choices=(3,), default=3)
     parser.add_argument("--atol", type=float, default=0.08)
@@ -295,7 +297,9 @@ def main() -> None:
         (ctypes.c_uint8 * 32).from_buffer_copy(bytes.fromhex(slab.layout_sha256)),
         args.rank, args.layer,
     )
-    library = bind(args.native_library)
+    library, routed_library = bind(
+        args.native_library, args.routed_native_library
+    )
     handle = ctypes.c_void_p()
     routed_handle = ctypes.c_void_p()
     status = library.rocket_qwen38_target_full_moe_c1_create(
@@ -307,7 +311,7 @@ def main() -> None:
             phase="create", status=status, rank=args.rank, layer=args.layer
         )
         raise RuntimeError(f"native full target MoE create failed: outcome={status}")
-    status = library.rocket_qwen38_target_moe_b12x_create(
+    status = routed_library.rocket_qwen38_target_moe_b12x_create(
         torch.cuda.current_device(), ctypes.byref(identity),
         ctypes.byref(routed_weights), ctypes.byref(routed_handle),
     )
@@ -347,7 +351,7 @@ def main() -> None:
                 ("zero_routed", zero_launch),
                 ("single_expert", single_launch),
             ):
-                status = library.rocket_qwen38_target_moe_b12x_enqueue(
+                status = routed_library.rocket_qwen38_target_moe_b12x_enqueue(
                     routed_handle, ctypes.byref(control_launch)
                 )
                 if status != 0:
@@ -483,7 +487,7 @@ def main() -> None:
         if not accepted:
             raise RuntimeError("native full target MoE differs from eager oracle")
     finally:
-        library.rocket_qwen38_target_moe_b12x_destroy(routed_handle)
+        routed_library.rocket_qwen38_target_moe_b12x_destroy(routed_handle)
         library.rocket_qwen38_target_full_moe_c1_destroy(handle)
 
 
