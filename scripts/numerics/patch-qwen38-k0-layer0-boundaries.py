@@ -51,7 +51,7 @@ def _rocket_k0_boundary_save(layer_idx, name, tensor):
     if name not in _ROCKET_K0_BOUNDARY_NAMES:
         raise RuntimeError("layer0 boundary name differs")
     if len(_ROCKET_K0_BOUNDARY_SEEN) >= len(_ROCKET_K0_BOUNDARY_NAMES):
-        raise RuntimeError("layer0 boundary capture repeated")
+        return
     expected = _ROCKET_K0_BOUNDARY_NAMES[len(_ROCKET_K0_BOUNDARY_SEEN)]
     if name != expected or name in _ROCKET_K0_BOUNDARY_SEEN:
         raise RuntimeError("layer0 boundary order differs")

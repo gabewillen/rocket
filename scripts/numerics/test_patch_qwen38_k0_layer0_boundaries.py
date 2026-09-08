@@ -30,6 +30,10 @@ class BoundaryPatchTest(unittest.TestCase):
             self.assertIn("not _ROCKET_K0_ORACLE.active_forward", patched)
             self.assertIn('phase != "embedding" and not oracle.active_forward', patched)
             self.assertIn("Leave the oracle disarmed until the exact request", patched)
+            self.assertIn(
+                "len(_ROCKET_K0_BOUNDARY_SEEN) >= len(_ROCKET_K0_BOUNDARY_NAMES)",
+                patched,
+            )
 
     def test_source_identity_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
