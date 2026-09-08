@@ -2,12 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ast
+import hashlib
+import importlib.util
+import json
 import pathlib
+import sys
+import tempfile
 import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts" / "moe" / "validate-qwen38-target-moe-b12x-native.py"
+SPEC = importlib.util.spec_from_file_location("target_moe_native_validation", SCRIPT)
+assert SPEC and SPEC.loader
+MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
 
 
 class TargetMoeB12xNativeValidationContract(unittest.TestCase):
@@ -37,6 +47,26 @@ class TargetMoeB12xNativeValidationContract(unittest.TestCase):
             self.assertNotIn(forbidden, source)
         self.assertIn('"rank": args.rank', source)
         self.assertIn('"layer": args.layer', source)
+
+    def test_content_addressed_mount_basename_is_mandatory(self) -> None:
+        payload = {"schema": "test"}
+        claimed = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        payload["artifact_key"] = claimed
+        with tempfile.TemporaryDirectory() as directory:
+            wrong = pathlib.Path(directory) / "artifact"
+            wrong.mkdir()
+            (wrong / "manifest.json").write_text(json.dumps(payload))
+            with self.assertRaisesRegex(RuntimeError, "mount basename"):
+                MODULE.validate_artifact_mount_identity(wrong, claimed)
+
+    def test_red_mount_name_is_rejected_before_torch_import(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        identity = source.index("artifact_key = validate_artifact_mount_identity")
+        torch_import = source.index("import torch", identity)
+        self.assertLess(identity, torch_import)
+        self.assertIn("--preflight-only", source)
 
 
 if __name__ == "__main__":

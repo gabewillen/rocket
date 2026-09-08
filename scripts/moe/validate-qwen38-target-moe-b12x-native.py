@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 from pathlib import Path
 
@@ -69,6 +70,31 @@ def bind_library(path: Path):
     return library
 
 
+def validate_artifact_mount_identity(
+    artifact: Path, expected_artifact_key: str = ARTIFACT_SHA256,
+) -> str:
+    """Fail before CUDA when a bind mount erases the content-addressed name."""
+
+    try:
+        manifest = json.loads((artifact / "manifest.json").read_bytes())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("target slab manifest is unavailable") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("target slab manifest root changed")
+    canonical = dict(manifest)
+    claimed = canonical.pop("artifact_key", None)
+    observed = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if claimed != expected_artifact_key or observed != claimed:
+        raise RuntimeError("target slab manifest artifact identity changed")
+    if artifact.name != claimed:
+        raise RuntimeError(
+            "target slab mount basename must equal manifest artifact_key"
+        )
+    return claimed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact", type=Path, required=True)
@@ -77,7 +103,17 @@ def main() -> None:
     parser.add_argument("--layer", type=int, choices=range(48), required=True)
     parser.add_argument("--atol", type=float, default=0.08)
     parser.add_argument("--rtol", type=float, default=0.08)
+    parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
+
+    artifact_key = validate_artifact_mount_identity(args.artifact)
+    if args.preflight_only:
+        print(json.dumps({
+            "abi": "rocket.qwen38.target-moe.native-preflight.v1",
+            "artifact_sha256": artifact_key,
+            "mount_basename_authenticated": True,
+        }, sort_keys=True))
+        return
 
     import torch
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
@@ -91,7 +127,7 @@ def main() -> None:
     if args.atol < 0.0 or args.rtol < 0.0:
         parser.error("tolerances must be nonnegative")
     slab = load_owner_local_moe(args.artifact, args.rank, args.layer)
-    if slab.artifact_key != ARTIFACT_SHA256:
+    if slab.artifact_key != artifact_key:
         raise RuntimeError("target slab artifact identity changed")
     source_weights = materialize_flashinfer_weights(slab)
     padded = moe_dispatch._pad_intermediate_to_tile(
