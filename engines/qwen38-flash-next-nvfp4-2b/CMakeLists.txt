@@ -140,6 +140,7 @@ add_library(qwen38_decode_execution STATIC
   src/decode/target_layer3_pair_reduce.cc
   src/decode/target_k0_pair_reduce.cc
   src/decode/target_k0_executor.cc
+  src/decode/target_k0_prefill_contract.cc
   src/decode/linear_attention_layer.cc
   src/decode/target_gdn_layer.cc
 )
@@ -1147,6 +1148,17 @@ set_target_properties(qwen38-test-target-k0-executor PROPERTIES
   LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-target-k0-executor-contract
   COMMAND qwen38-test-target-k0-executor)
+
+add_executable(qwen38-test-target-k0-prefill-contract
+  tests/test_target_k0_prefill_contract.cc)
+target_link_libraries(qwen38-test-target-k0-prefill-contract PRIVATE
+  qwen38_decode_execution)
+target_compile_options(qwen38-test-target-k0-prefill-contract PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-k0-prefill-contract PROPERTIES
+  LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-target-k0-prefill-contract
+  COMMAND qwen38-test-target-k0-prefill-contract)
 
 add_executable(qwen38-test-target-layer3-native-plan
   tests/test_target_layer3_native_plan.cc)
