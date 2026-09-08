@@ -844,6 +844,22 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
   target_compile_options(qwen38_target_k0_physical_startup_contract PRIVATE
     -Wall -Wextra -Werror)
 
+  add_library(qwen38_target_k0_bounded_telemetry STATIC
+    src/decode/target_k0_bounded_telemetry.cc)
+  target_include_directories(qwen38_target_k0_bounded_telemetry PUBLIC src)
+  target_link_libraries(qwen38_target_k0_bounded_telemetry PUBLIC CUDA::cudart)
+  target_compile_options(qwen38_target_k0_bounded_telemetry PRIVATE
+    -Wall -Wextra -Werror)
+
+  add_executable(qwen38-test-target-k0-bounded-telemetry
+    tests/test_target_k0_bounded_telemetry.cc)
+  target_link_libraries(qwen38-test-target-k0-bounded-telemetry PRIVATE
+    qwen38_target_k0_bounded_telemetry)
+  target_compile_options(qwen38-test-target-k0-bounded-telemetry PRIVATE
+    -Wall -Wextra -Werror)
+  add_test(NAME qwen38-target-k0-bounded-telemetry-cpu-contract
+    COMMAND qwen38-test-target-k0-bounded-telemetry)
+
   add_library(qwen38_target_k0_physical_startup STATIC
     src/decode/target_k0_physical_startup.cu)
   target_include_directories(qwen38_target_k0_physical_startup PUBLIC src)
