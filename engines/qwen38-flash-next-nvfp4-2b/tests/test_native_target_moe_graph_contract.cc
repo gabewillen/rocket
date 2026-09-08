@@ -95,6 +95,22 @@ int main() {
   auto stream = reinterpret_cast<cudaStream_t>(0x30);
   Telemetry telemetry;
   CudaApi cuda_api;
+  for (const int layer : {0, 47}) {
+    port.value.layer = layer;
+    moe::NativeTargetMoeGraph accepted(
+        port, workspace, output, telemetry, &cuda_api);
+    if (accepted.layer() != layer) return 1;
+  }
+  for (const int layer : {-1, 48}) {
+    port.value.layer = layer;
+    try {
+      moe::NativeTargetMoeGraph rejected(
+          port, workspace, output, telemetry, &cuda_api);
+      return 1;
+    } catch (const std::invalid_argument&) {
+    }
+  }
+  port.value.layer = 3;
   moe::NativeTargetMoeGraph graph(
       port, workspace, output, telemetry, &cuda_api);
   if (graph.rank() != 1 || graph.layer() != 3 || graph.projected_output())

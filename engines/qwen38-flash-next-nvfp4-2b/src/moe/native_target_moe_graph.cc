@@ -31,7 +31,7 @@ NativeTargetMoeGraph::NativeTargetMoeGraph(
       cuda_api_(cuda_api ? cuda_api : &runtime_cuda_api()),
       rank_(participant.identity().rank),
       layer_(participant.identity().layer) {
-  if ((rank_ != 0 && rank_ != 1) || layer_ != kTargetCompositionLayer ||
+  if ((rank_ != 0 && rank_ != 1) || layer_ < 0 || layer_ >= 48 ||
       !rank_local_partial_bf16_)
     throw std::invalid_argument("native target MoE graph identity changed");
 }
