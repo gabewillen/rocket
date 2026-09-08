@@ -6,6 +6,7 @@
 #include <string>
 
 #include "decode/target_k0_layer_owner_inventory.h"
+#include "decode/target_k0_native_plan_inventory.h"
 #include "decode/target_k0_oracle_comparator.h"
 #include "output/native_token_io.h"
 
@@ -28,6 +29,7 @@ class TargetK0StartupOwner final {
       int rank, std::unique_ptr<TargetK0PairReduceOwner> reductions,
       std::unique_ptr<TargetK0OracleComparator> comparator,
       std::unique_ptr<TargetK0TokenIoPort> token_io,
+      std::unique_ptr<TargetK0NativePlanInventory> plans,
       std::unique_ptr<TargetK0LayerOwnerInventory> layers,
       pair_reduce::OtelStageSink& telemetry,
       output::TokenIoArtifactRoots tokenizer,
@@ -44,6 +46,7 @@ class TargetK0StartupOwner final {
   std::unique_ptr<TargetK0OracleComparator> comparator_;
   std::unique_ptr<TargetK0TokenIoPort> token_io_;
   output::TokenIoArtifactRoots tokenizer_;
+  std::unique_ptr<TargetK0NativePlanInventory> plans_;
   std::unique_ptr<TargetK0LayerOwnerInventory> layers_;
   std::unique_ptr<TargetK0Executor> executor_;
 };

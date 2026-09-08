@@ -159,7 +159,8 @@ set_target_properties(qwen38_target_k0_layer_owner_inventory PROPERTIES
   POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
 
 add_library(qwen38_target_k0_startup STATIC
-  src/decode/target_k0_startup.cc)
+  src/decode/target_k0_startup.cc
+  src/decode/target_k0_native_plan_inventory.cc)
 target_include_directories(qwen38_target_k0_startup PUBLIC src)
 target_link_libraries(qwen38_target_k0_startup PUBLIC
   qwen38_target_k0_layer_owner_inventory
@@ -171,7 +172,8 @@ set_target_properties(qwen38_target_k0_startup PROPERTIES
 
 add_executable(qwen38-target-k0-startup
   src/decode/target_k0_startup_cli.cc)
-target_link_libraries(qwen38-target-k0-startup PRIVATE qwen38_native_token_io)
+target_link_libraries(qwen38-target-k0-startup PRIVATE
+  qwen38_target_k0_startup)
 target_compile_options(qwen38-target-k0-startup PRIVATE
   -Wall -Wextra -Werror)
 
@@ -182,6 +184,15 @@ target_link_libraries(qwen38-test-target-k0-startup PRIVATE
 target_compile_options(qwen38-test-target-k0-startup PRIVATE
   -Wall -Wextra -Werror)
 set_target_properties(qwen38-test-target-k0-startup PROPERTIES
+  LINKER_LANGUAGE CUDA)
+
+add_executable(qwen38-test-target-k0-native-plan-inventory
+  tests/test_target_k0_native_plan_inventory.cc)
+target_link_libraries(qwen38-test-target-k0-native-plan-inventory PRIVATE
+  qwen38_target_k0_startup)
+target_compile_options(qwen38-test-target-k0-native-plan-inventory PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-k0-native-plan-inventory PROPERTIES
   LINKER_LANGUAGE CUDA)
 
 add_library(qwen38_target_layer3_native_plan STATIC
@@ -203,6 +214,8 @@ target_compile_options(qwen38_target_layer_native_plan PRIVATE
   -Wall -Wextra -Werror)
 set_target_properties(qwen38_target_layer_native_plan PROPERTIES
   POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
+target_link_libraries(qwen38_target_k0_startup PUBLIC
+  qwen38_target_layer_native_plan)
 
 add_library(qwen38_target_layer_native_bindings STATIC
   src/decode/target_layer_native_bindings.cc)
