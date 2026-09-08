@@ -113,8 +113,38 @@ def invoke(endpoint: str, request_path: Path, output: Path, arm: Path) -> None:
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def validate_decode_choice(response: dict, expected_token_ids: list[int],
+                           raw_text: str, parsed_reasoning: str | None,
+                           parsed_content: str | None) -> dict:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise SystemExit("decode oracle response must contain exactly one choice")
+    choice = choices[0]
+    if not isinstance(choice, dict) or choice.get("finish_reason") != "length":
+        raise SystemExit("decode oracle response did not end at the eight-token length")
+    if choice.get("token_ids") != expected_token_ids:
+        raise SystemExit("decode oracle response/capture token IDs differ")
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise SystemExit("decode oracle response message is missing")
+    channels = {key: message.get(key) for key in ("reasoning", "content")}
+    if any(value is not None and not isinstance(value, str) for value in channels.values()):
+        raise SystemExit("decode oracle response channel has an invalid type")
+    parsed = {"reasoning": parsed_reasoning, "content": parsed_content}
+    if channels != parsed:
+        raise SystemExit("decode oracle response channels differ from Qwen3 parser semantics")
+    if not isinstance(raw_text, str):
+        raise SystemExit("decode oracle token decode has an invalid type")
+    return {
+        "parser": "vllm.parser.qwen3.Qwen3Parser",
+        "raw": raw_text,
+        **channels,
+    }
+
+
 def validate(request_path: Path, capture_dir: Path, response_path: Path, output: Path,
-             model_dir: Path | None = None) -> None:
+             model_dir: Path | None = None, source_run: Path | None = None,
+             source_failure: Path | None = None) -> None:
     request = json.loads(request_path.read_text())
     manifest_path = capture_dir / "manifest.json"
     if not manifest_path.is_file():
@@ -193,19 +223,19 @@ def validate(request_path: Path, capture_dir: Path, response_path: Path, output:
         raise SystemExit(f"oracle capture has missing or extra files: {sorted(actual_files ^ expected_files)}")
     response = json.loads(response_path.read_text())
     choices = response.get("choices")
-    text_key = "content" if decode else "text"
-    choice_text = choices[0].get("message", {}).get(text_key) if decode and isinstance(choices, list) and len(choices) == 1 else (choices[0].get(text_key) if isinstance(choices, list) and len(choices) == 1 else None)
-    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choice_text, str):
-        raise SystemExit("oracle response does not contain one detokenized choice")
+    response_channels = None
+    choice_text = None
+    if not decode:
+        choice_text = choices[0].get("text") if isinstance(choices, list) and len(choices) == 1 else None
+        if not isinstance(choice_text, str):
+            raise SystemExit("oracle response does not contain one detokenized choice")
     if decode:
-        token_ids = choices[0].get("token_ids")
         generations = manifest.get("generations")
-        if not isinstance(token_ids, list) or len(token_ids) != DECODE_DECISIONS:
-            raise SystemExit("decode oracle returned fewer than eight tokens")
         if not isinstance(generations, list) or len(generations) != DECODE_DECISIONS:
             raise SystemExit("decode oracle captured fewer than eight decision forwards")
-        if token_ids != [item.get("token_id") for item in generations]:
-            raise SystemExit("decode oracle response/capture token IDs differ")
+        token_ids = [item.get("token_id") for item in generations]
+        if any(not isinstance(token_id, int) for token_id in token_ids):
+            raise SystemExit("decode oracle captured an invalid token ID")
         for index, generation in enumerate(generations):
             if (
                 generation.get("request_sha256") != request_sha256
@@ -214,16 +244,51 @@ def validate(request_path: Path, capture_dir: Path, response_path: Path, output:
                 or generation.get("kind") != ("prefill" if index == 0 else "decode")
             ):
                 raise SystemExit("decode oracle phase identity differs")
+            expected_inputs = request["input_token_ids"] if index == 0 else [token_ids[index - 1]]
+            if generation.get("input_token_ids") != expected_inputs:
+                raise SystemExit("decode oracle prior-token phase chaining differs")
         if any(token in request.get("eos_token_ids", []) for token in token_ids):
             raise SystemExit("decode oracle encountered EOS before eight decisions")
         if model_dir is None:
             raise SystemExit("decode oracle validation requires the pinned tokenizer")
         from transformers import AutoTokenizer
+        from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+        from vllm.parser.qwen3 import Qwen3Parser
+
+        tokenizer_files = request.get("tokenizer_files")
+        if (
+            not isinstance(tokenizer_files, dict)
+            or set(tokenizer_files) != set(TOKENIZER_FILES)
+        ):
+            raise SystemExit("decode oracle tokenizer file identity set changed")
+        for name, file_identity in tokenizer_files.items():
+            path = model_dir / name
+            if (
+                not isinstance(file_identity, dict)
+                or not path.is_file()
+                or path.stat().st_size != file_identity.get("bytes")
+                or sha256(path) != file_identity.get("sha256")
+            ):
+                raise SystemExit(f"decode oracle tokenizer file identity changed: {name}")
         tokenizer = AutoTokenizer.from_pretrained(
             model_dir, local_files_only=True, trust_remote_code=False
         )
+        if type(tokenizer).__name__ != request.get("tokenizer_class"):
+            raise SystemExit("decode oracle tokenizer class changed")
         if hashlib.sha256(tokenizer.chat_template.encode()).hexdigest() != request["chat_template_sha256"]:
             raise SystemExit("decode oracle chat template identity changed")
+        raw_text = tokenizer.decode(token_ids, skip_special_tokens=True)
+        parser_request = ChatCompletionRequest(
+            model="qwen3.8-flash-next", messages=request["messages"],
+            temperature=0, max_tokens=DECODE_DECISIONS,
+        )
+        parsed_reasoning, parsed_content = Qwen3Parser(tokenizer).extract_reasoning(
+            raw_text, parser_request
+        )
+        response_channels = validate_decode_choice(
+            response, token_ids, raw_text, parsed_reasoning, parsed_content
+        )
+        choice_text = raw_text
         cumulative = []
         for index, generation in enumerate(generations):
             generation["token_text"] = tokenizer.decode(
@@ -233,8 +298,6 @@ def validate(request_path: Path, capture_dir: Path, response_path: Path, output:
             generation["cumulative_text"] = tokenizer.decode(
                 cumulative, skip_special_tokens=False
             )
-        if tokenizer.decode(token_ids, skip_special_tokens=True) != choice_text:
-            raise SystemExit("decode oracle token/text detokenization differs")
     result = {
         "schema": (
             "rocket.qwen38.k0-target-decode-oracle-result.v1" if decode
@@ -259,7 +322,26 @@ def validate(request_path: Path, capture_dir: Path, response_path: Path, output:
             "generated_token_ids": token_ids,
             "generations": generations,
             "chat_template_sha256": request["chat_template_sha256"],
+            "response_channels": response_channels,
         })
+    if (source_run is None) != (source_failure is None):
+        raise SystemExit("immutable revalidation requires both source run and failure")
+    if source_run is not None and source_failure is not None:
+        if not source_run.is_file() or not source_failure.is_file():
+            raise SystemExit("immutable revalidation source is missing")
+        if output.resolve().is_relative_to(capture_dir.parent.resolve()):
+            raise SystemExit("immutable revalidation output must be outside the failed run")
+        result["immutable_source"] = {
+            "run_sha256": sha256(source_run),
+            "failure_sha256": sha256(source_failure),
+            "request_sha256": sha256(request_path),
+            "response_sha256": sha256(response_path),
+            "manifest_sha256": sha256(manifest_path),
+            "artifacts": [
+                {"name": item["name"], "sha256": item["sha256"]}
+                for item in artifacts
+            ],
+        }
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
 
@@ -281,13 +363,18 @@ def main() -> None:
     validate_parser.add_argument("--response", type=Path, required=True)
     validate_parser.add_argument("--output", type=Path, required=True)
     validate_parser.add_argument("--model-dir", type=Path)
+    validate_parser.add_argument("--source-run", type=Path)
+    validate_parser.add_argument("--source-failure", type=Path)
     args = parser.parse_args()
     if args.command == "prepare":
         prepare(args.model_dir, args.output, args.decode_decisions)
     elif args.command == "invoke":
         invoke(args.endpoint, args.request, args.output, args.arm)
     else:
-        validate(args.request, args.capture_dir, args.response, args.output, args.model_dir)
+        validate(
+            args.request, args.capture_dir, args.response, args.output,
+            args.model_dir, args.source_run, args.source_failure,
+        )
 
 
 if __name__ == "__main__":

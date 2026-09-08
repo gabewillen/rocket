@@ -23,6 +23,13 @@ class K0OracleTest(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    @staticmethod
+    def load_client():
+        spec = importlib.util.spec_from_file_location("k0_oracle_client", CLIENT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
     def test_patcher_requires_exact_model_anchors_and_adds_all_boundaries(self):
         source = '''from itertools import islice
 
@@ -208,6 +215,37 @@ class Qwen3_8FlashNextModel(nn.Module):
             self.assertEqual(len(manifest["artifacts"]), 408)
             self.assertEqual(manifest["artifacts"][0]["name"], "prefill.embedding")
             self.assertEqual(manifest["artifacts"][-1]["name"], "decode.07.logits")
+
+    def test_real_reasoning_only_response_keeps_content_null(self):
+        client = self.load_client()
+        token_ids = [1596, 1144, 4087, 1156, 579, 1622, 25, 328]
+        reasoning = 'We need answer user\'s request: "'
+        response = {
+            "choices": [{
+                "finish_reason": "length",
+                "index": 0,
+                "message": {
+                    "content": None,
+                    "reasoning": reasoning,
+                    "role": "assistant",
+                },
+                "token_ids": token_ids,
+            }]
+        }
+        channels = client.validate_decode_choice(
+            response, token_ids, reasoning, reasoning, None
+        )
+        self.assertEqual(channels, {
+            "parser": "vllm.parser.qwen3.Qwen3Parser",
+            "raw": reasoning,
+            "reasoning": reasoning,
+            "content": None,
+        })
+        response["choices"][0]["message"]["content"] = reasoning
+        with self.assertRaisesRegex(SystemExit, "parser semantics"):
+            client.validate_decode_choice(
+                response, token_ids, reasoning, reasoning, None
+            )
 
     def test_validator_accepts_only_complete_lossless_contract(self):
         with tempfile.TemporaryDirectory() as directory:
