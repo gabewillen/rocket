@@ -165,6 +165,10 @@ CUresult launch_kernel(const ModuleFunction& kernel, dim3 grid,
                         nullptr);
 }
 
+bool record_stage(cudaEvent_t event, cudaStream_t stream) noexcept {
+  return event && cudaEventRecord(event, stream) == cudaSuccess;
+}
+
 }  // namespace
 
 struct Fp8RoutedExperts::Impl {
@@ -238,6 +242,9 @@ RoutedExpertOutcome Fp8RoutedExperts::enqueue(
   prepare_consumer<<<1, 256, 0, launch.stream>>>(args);
   if (cudaPeekAtLastError() != cudaSuccess)
     return RoutedExpertOutcome::kCudaError;
+  if (launch.stage_events &&
+      !record_stage(launch.stage_events->after_prepare, launch.stream))
+    return RoutedExpertOutcome::kCudaError;
 
   auto* hidden = launch.buffers.hidden;
   auto* quantized_hidden = launch.buffers.quantized_hidden;
@@ -255,6 +262,9 @@ RoutedExpertOutcome Fp8RoutedExperts::enqueue(
                     quantize_args.data()) != CUDA_SUCCESS) {
     return RoutedExpertOutcome::kCudaError;
   }
+  if (launch.stage_events &&
+      !record_stage(launch.stage_events->after_quantize, launch.stream))
+    return RoutedExpertOutcome::kCudaError;
 
   auto* gate_up = launch.buffers.gate_up;
   auto* active_routes = &launch.buffers.summary->active_routes;
@@ -278,6 +288,9 @@ RoutedExpertOutcome Fp8RoutedExperts::enqueue(
       CUDA_SUCCESS) {
     return RoutedExpertOutcome::kCudaError;
   }
+  if (launch.stage_events &&
+      !record_stage(launch.stage_events->after_gate_up, launch.stream))
+    return RoutedExpertOutcome::kCudaError;
 
   auto* activated = launch.buffers.activated;
   auto* activated_scales = launch.buffers.activated_scale_inv;
@@ -290,6 +303,9 @@ RoutedExpertOutcome Fp8RoutedExperts::enqueue(
       CUDA_SUCCESS) {
     return RoutedExpertOutcome::kCudaError;
   }
+  if (launch.stage_events &&
+      !record_stage(launch.stage_events->after_silu_quantize, launch.stream))
+    return RoutedExpertOutcome::kCudaError;
 
   auto* output = launch.buffers.rank_output;
   auto* owner_weights = launch.routes.owner_route_weights;
@@ -306,6 +322,9 @@ RoutedExpertOutcome Fp8RoutedExperts::enqueue(
       CUDA_SUCCESS) {
     return RoutedExpertOutcome::kCudaError;
   }
+  if (launch.stage_events &&
+      !record_stage(launch.stage_events->after_down_reduce, launch.stream))
+    return RoutedExpertOutcome::kCudaError;
   return RoutedExpertOutcome::kOk;
 }
 

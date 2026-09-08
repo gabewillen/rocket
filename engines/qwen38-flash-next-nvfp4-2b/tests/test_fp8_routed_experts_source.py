@@ -60,6 +60,10 @@ class Fp8RoutedExpertsSourceTest(unittest.TestCase):
             "down_and_reduce<<<",
         ):
             self.assertNotIn(scalar_production_path, cuda)
+        header = HEADER.read_text()
+        self.assertIn("RoutedExpertStageEvents", header)
+        self.assertIn("stage_events = nullptr", header)
+        self.assertIn("if (launch.stage_events", cuda)
 
     def test_aot_kernels_use_tensor_core_dot_and_active_prefix(self) -> None:
         generator = GENERATOR.read_text()

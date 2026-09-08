@@ -71,6 +71,18 @@ struct RoutedExpertBuffers {
   RoutedExpertDeviceSummary* summary;
 };
 
+// Optional caller-owned CUDA events for physical profiling. When non-null,
+// enqueue records each event after the named launch. Production leaves this
+// null, so graph replay retains the six-launch route/consumer path without
+// profiling nodes. Event lifetime must cover stream completion.
+struct RoutedExpertStageEvents {
+  cudaEvent_t after_prepare;
+  cudaEvent_t after_quantize;
+  cudaEvent_t after_gate_up;
+  cudaEvent_t after_silu_quantize;
+  cudaEvent_t after_down_reduce;
+};
+
 struct RoutedExpertLaunch {
   RouteCompactionShape shape;
   RouteCompactionCapacity capacity;
@@ -78,6 +90,7 @@ struct RoutedExpertLaunch {
   Fp8ExpertTables experts;
   RoutedExpertBuffers buffers;
   cudaStream_t stream;
+  const RoutedExpertStageEvents* stage_events = nullptr;
 };
 
 // Fixed-grid CUDA port of the selected vLLM Triton fallback dataflow:
