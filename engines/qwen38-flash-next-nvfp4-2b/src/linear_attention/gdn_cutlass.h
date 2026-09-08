@@ -43,6 +43,7 @@ struct GdnWeights {
 }
 
 inline constexpr int kPrefillInputQuantizationsPerLaunch = 1;
+inline constexpr int kPrefillReferenceInputQuantizationsPerLaunch = 2;
 
 #if defined(__CUDACC__)
 #define ROCKET_QWEN38_GDN_HOST_DEVICE __host__ __device__
@@ -109,7 +110,8 @@ class CutlassGdnGraph final : public decode::LinearAttentionGraph {
 // fixed arenas for both graph shapes.
 class CutlassGdnPrefillProjection final {
  public:
-  CutlassGdnPrefillProjection(int device, GdnWeights weights);
+  CutlassGdnPrefillProjection(int device, GdnWeights weights,
+                              bool enable_reference = false);
   ~CutlassGdnPrefillProjection();
   CutlassGdnPrefillProjection(const CutlassGdnPrefillProjection&) = delete;
   CutlassGdnPrefillProjection& operator=(
@@ -117,13 +119,38 @@ class CutlassGdnPrefillProjection final {
 
   void launch_input(const __nv_bfloat16* hidden, int tokens,
                     cudaStream_t stream);
+  void launch_input_quantize(const __nv_bfloat16* hidden, int tokens,
+                             cudaStream_t stream);
+  void launch_qkvz(int tokens, cudaStream_t stream);
+  void launch_ba(int tokens, cudaStream_t stream);
+  // Matched two-quant control over the same authenticated immutable weights.
+  // It exists for parity and phase attribution, not production dispatch.
+  void launch_reference_input(const __nv_bfloat16* hidden, int tokens,
+                              cudaStream_t stream);
   void launch_output(const __nv_bfloat16* normalized, int tokens,
                      cudaStream_t stream);
   [[nodiscard]] const __nv_bfloat16* qkvz(int tokens) const noexcept;
   [[nodiscard]] const __nv_bfloat16* ba(int tokens) const noexcept;
   [[nodiscard]] const __nv_bfloat16* output(int tokens) const noexcept;
+  [[nodiscard]] const std::uint8_t* input_packed(int tokens) const noexcept;
+  [[nodiscard]] const std::uint8_t* input_sfa(int tokens) const noexcept;
+  [[nodiscard]] const std::uint8_t* reference_qkvz_packed(
+      int tokens) const noexcept;
+  [[nodiscard]] const std::uint8_t* reference_qkvz_sfa(
+      int tokens) const noexcept;
+  [[nodiscard]] const std::uint8_t* reference_ba_packed(
+      int tokens) const noexcept;
+  [[nodiscard]] const std::uint8_t* reference_ba_sfa(
+      int tokens) const noexcept;
+  [[nodiscard]] const __nv_bfloat16* reference_qkvz(
+      int tokens) const noexcept;
+  [[nodiscard]] const __nv_bfloat16* reference_ba(int tokens) const noexcept;
   [[nodiscard]] static constexpr int input_quantizations_per_launch() noexcept {
     return kPrefillInputQuantizationsPerLaunch;
+  }
+  [[nodiscard]] static constexpr int
+  reference_input_quantizations_per_launch() noexcept {
+    return kPrefillReferenceInputQuantizationsPerLaunch;
   }
 
  private:

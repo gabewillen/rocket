@@ -484,6 +484,12 @@ namespace {
 struct PrefillProjectionBucket {
   explicit PrefillProjectionBucket(int selected_tokens) : tokens(selected_tokens) {}
   ~PrefillProjectionBucket() {
+    cudaFree(reference_ba);
+    cudaFree(reference_qkvz);
+    cudaFree(reference_ba_sfa);
+    cudaFree(reference_ba_packed);
+    cudaFree(reference_qkvz_sfa);
+    cudaFree(reference_qkvz_packed);
     cudaFree(projected);
     cudaFree(output_sfa);
     cudaFree(output_packed);
@@ -501,16 +507,26 @@ struct PrefillProjectionBucket {
   __nv_bfloat16* qkvz = nullptr;
   __nv_bfloat16* ba = nullptr;
   __nv_bfloat16* projected = nullptr;
+  std::uint8_t* reference_qkvz_packed = nullptr;
+  std::uint8_t* reference_qkvz_sfa = nullptr;
+  std::uint8_t* reference_ba_packed = nullptr;
+  std::uint8_t* reference_ba_sfa = nullptr;
+  __nv_bfloat16* reference_qkvz = nullptr;
+  __nv_bfloat16* reference_ba = nullptr;
   FixedGemm qkvz_gemm;
   FixedGemm ba_gemm;
   FixedGemm output_gemm;
+  FixedGemm reference_qkvz_gemm;
+  FixedGemm reference_ba_gemm;
 };
 
 }  // namespace
 
 struct CutlassGdnPrefillProjection::Impl {
-  Impl(int selected_device, GdnWeights selected_weights)
-      : device(selected_device), globals(selected_weights) {}
+  Impl(int selected_device, GdnWeights selected_weights,
+       bool selected_reference)
+      : device(selected_device), globals(selected_weights),
+        reference_enabled(selected_reference) {}
   ~Impl() {
     cudaSetDevice(device);
     cudaFree(output_scale);
@@ -531,6 +547,7 @@ struct CutlassGdnPrefillProjection::Impl {
 
   int device;
   GdnWeights globals;
+  bool reference_enabled;
   std::uint8_t* qkvz_weight = nullptr;
   std::uint8_t* qkvz_scale = nullptr;
   std::uint8_t* ba_weight = nullptr;
@@ -541,8 +558,9 @@ struct CutlassGdnPrefillProjection::Impl {
 };
 
 CutlassGdnPrefillProjection::CutlassGdnPrefillProjection(int device,
-                                                         GdnWeights weights)
-    : impl_(new Impl(device, weights)) {
+                                                         GdnWeights weights,
+                                                         bool enable_reference)
+    : impl_(new Impl(device, weights, enable_reference)) {
   const Nvfp4Matrix matrices[] = {weights.qkv, weights.z, weights.b,
                                   weights.a, weights.output};
   if (device < 0) {
@@ -643,6 +661,34 @@ CutlassGdnPrefillProjection::CutlassGdnPrefillProjection(int device,
                                bucket->output_packed, bucket->output_sfa,
                                impl_->output_weight, impl_->output_scale,
                                bucket->projected);
+      if (enable_reference) {
+        cuda_check(cudaMalloc(&bucket->reference_qkvz_packed,
+                              static_cast<std::size_t>(tokens) * kInputK / 2),
+                   "malloc reference QKVZ input A");
+        cuda_check(cudaMalloc(&bucket->reference_qkvz_sfa,
+                              prefill_sfa_bytes(tokens, kInputK)),
+                   "malloc reference QKVZ input SFA");
+        cuda_check(cudaMalloc(&bucket->reference_ba_packed,
+                              static_cast<std::size_t>(tokens) * kInputK / 2),
+                   "malloc reference BA input A");
+        cuda_check(cudaMalloc(&bucket->reference_ba_sfa,
+                              prefill_sfa_bytes(tokens, kInputK)),
+                   "malloc reference BA input SFA");
+        cuda_check(cudaMalloc(&bucket->reference_qkvz,
+                              static_cast<std::size_t>(tokens) * kQkvzN * 2),
+                   "malloc reference QKVZ output");
+        cuda_check(cudaMalloc(&bucket->reference_ba,
+                              static_cast<std::size_t>(tokens) * kBaN * 2),
+                   "malloc reference BA output");
+        bucket->reference_qkvz_gemm.init(
+            tokens, kQkvzN, kInputK, bucket->reference_qkvz_packed,
+            bucket->reference_qkvz_sfa, impl_->qkvz_weight,
+            impl_->qkvz_scale, bucket->reference_qkvz);
+        bucket->reference_ba_gemm.init(
+            tokens, kBaN, kInputK, bucket->reference_ba_packed,
+            bucket->reference_ba_sfa, impl_->ba_weight, impl_->ba_scale,
+            bucket->reference_ba);
+      }
       impl_->buckets[index] = std::move(bucket);
     }
     cuda_check(cudaDeviceSynchronize(),
@@ -659,21 +705,68 @@ CutlassGdnPrefillProjection::~CutlassGdnPrefillProjection() { delete impl_; }
 void CutlassGdnPrefillProjection::launch_input(const __nv_bfloat16* hidden,
                                                int tokens,
                                                cudaStream_t stream) {
+  launch_input_quantize(hidden, tokens, stream);
+  launch_qkvz(tokens, stream);
+  launch_ba(tokens, stream);
+}
+
+void CutlassGdnPrefillProjection::launch_input_quantize(
+    const __nv_bfloat16* hidden, int tokens, cudaStream_t stream) {
   auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
   if (!bucket || !hidden || !stream)
-    throw std::invalid_argument("prefill input projection contract changed");
+    throw std::invalid_argument("prefill input quantization contract changed");
   quantize_fixed<kInputK><<<tokens, 256, 0, stream>>>(
       bucket->input_packed, bucket->input_sfa, hidden, 1.0F);
-  if (bucket->qkvz_gemm.gemm.run(stream) != cutlass::Status::kSuccess ||
-      bucket->ba_gemm.gemm.run(stream) != cutlass::Status::kSuccess)
-    throw std::runtime_error("prefill input projection failed");
+  cuda_check(cudaPeekAtLastError(), "launch prefill input quantization");
+}
+
+void CutlassGdnPrefillProjection::launch_qkvz(int tokens,
+                                              cudaStream_t stream) {
+  auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  if (!bucket || !stream)
+    throw std::invalid_argument("prefill QKVZ projection contract changed");
+  if (bucket->qkvz_gemm.gemm.run(stream) != cutlass::Status::kSuccess)
+    throw std::runtime_error("prefill QKVZ projection failed");
   scale_projection<<<dim3((kQkvzN + 255) / 256, tokens), 256, 0, stream>>>(
       bucket->qkvz, kQkvzN, kQkvN, impl_->globals.qkv.global_scale,
       impl_->globals.z.global_scale);
+  cuda_check(cudaPeekAtLastError(), "launch prefill QKVZ projection");
+}
+
+void CutlassGdnPrefillProjection::launch_ba(int tokens,
+                                            cudaStream_t stream) {
+  auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  if (!bucket || !stream)
+    throw std::invalid_argument("prefill BA projection contract changed");
+  if (bucket->ba_gemm.gemm.run(stream) != cutlass::Status::kSuccess)
+    throw std::runtime_error("prefill BA projection failed");
   scale_projection<<<dim3((kBaN + 255) / 256, tokens), 256, 0, stream>>>(
       bucket->ba, kBaN, kBN, impl_->globals.b.global_scale,
       impl_->globals.a.global_scale);
-  cuda_check(cudaPeekAtLastError(), "launch prefill input projection");
+  cuda_check(cudaPeekAtLastError(), "launch prefill BA projection");
+}
+
+void CutlassGdnPrefillProjection::launch_reference_input(
+    const __nv_bfloat16* hidden, int tokens, cudaStream_t stream) {
+  auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  if (!bucket || !impl_->reference_enabled || !hidden || !stream)
+    throw std::invalid_argument("prefill reference projection contract changed");
+  quantize_fixed<kInputK><<<tokens, 256, 0, stream>>>(
+      bucket->reference_qkvz_packed, bucket->reference_qkvz_sfa, hidden,
+      1.0F);
+  if (bucket->reference_qkvz_gemm.gemm.run(stream) != cutlass::Status::kSuccess)
+    throw std::runtime_error("reference QKVZ projection failed");
+  scale_projection<<<dim3((kQkvzN + 255) / 256, tokens), 256, 0, stream>>>(
+      bucket->reference_qkvz, kQkvzN, kQkvN,
+      impl_->globals.qkv.global_scale, impl_->globals.z.global_scale);
+  quantize_fixed<kInputK><<<tokens, 256, 0, stream>>>(
+      bucket->reference_ba_packed, bucket->reference_ba_sfa, hidden, 1.0F);
+  if (bucket->reference_ba_gemm.gemm.run(stream) != cutlass::Status::kSuccess)
+    throw std::runtime_error("reference BA projection failed");
+  scale_projection<<<dim3((kBaN + 255) / 256, tokens), 256, 0, stream>>>(
+      bucket->reference_ba, kBaN, kBN, impl_->globals.b.global_scale,
+      impl_->globals.a.global_scale);
+  cuda_check(cudaPeekAtLastError(), "launch prefill reference projection");
 }
 
 void CutlassGdnPrefillProjection::launch_output(
@@ -709,6 +802,54 @@ const __nv_bfloat16* CutlassGdnPrefillProjection::output(
     int tokens) const noexcept {
   const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
   return bucket ? bucket->projected : nullptr;
+}
+
+const std::uint8_t* CutlassGdnPrefillProjection::input_packed(
+    int tokens) const noexcept {
+  const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  return bucket ? bucket->input_packed : nullptr;
+}
+
+const std::uint8_t* CutlassGdnPrefillProjection::input_sfa(
+    int tokens) const noexcept {
+  const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  return bucket ? bucket->input_sfa : nullptr;
+}
+
+const std::uint8_t* CutlassGdnPrefillProjection::reference_qkvz_packed(
+    int tokens) const noexcept {
+  const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  return bucket ? bucket->reference_qkvz_packed : nullptr;
+}
+
+const std::uint8_t* CutlassGdnPrefillProjection::reference_qkvz_sfa(
+    int tokens) const noexcept {
+  const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  return bucket ? bucket->reference_qkvz_sfa : nullptr;
+}
+
+const std::uint8_t* CutlassGdnPrefillProjection::reference_ba_packed(
+    int tokens) const noexcept {
+  const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  return bucket ? bucket->reference_ba_packed : nullptr;
+}
+
+const std::uint8_t* CutlassGdnPrefillProjection::reference_ba_sfa(
+    int tokens) const noexcept {
+  const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  return bucket ? bucket->reference_ba_sfa : nullptr;
+}
+
+const __nv_bfloat16* CutlassGdnPrefillProjection::reference_qkvz(
+    int tokens) const noexcept {
+  const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  return bucket ? bucket->reference_qkvz : nullptr;
+}
+
+const __nv_bfloat16* CutlassGdnPrefillProjection::reference_ba(
+    int tokens) const noexcept {
+  const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  return bucket ? bucket->reference_ba : nullptr;
 }
 
 }  // namespace rocket::qwen38::linear_attention

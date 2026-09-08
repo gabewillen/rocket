@@ -138,6 +138,16 @@ std::uint64_t device_hash(const void* data, std::size_t bytes) {
   return hash(host.data(), host.size());
 }
 
+bool device_equal(const void* left, const void* right, std::size_t bytes) {
+  std::vector<std::uint8_t> left_host(bytes);
+  std::vector<std::uint8_t> right_host(bytes);
+  check(cudaMemcpy(left_host.data(), left, bytes, cudaMemcpyDeviceToHost),
+        "copy parity left input");
+  check(cudaMemcpy(right_host.data(), right, bytes, cudaMemcpyDeviceToHost),
+        "copy parity right input");
+  return left_host == right_host;
+}
+
 template <typename Launch>
 std::pair<float, float> capture_measure(cudaStream_t stream, Launch launch) {
   cudaGraph_t graph = nullptr;
@@ -176,7 +186,7 @@ std::pair<float, float> capture_measure(cudaStream_t stream, Launch launch) {
 void run_prefill_projection(int device,
                             rocket::qwen38::linear_attention::GdnWeights weights) {
   using rocket::qwen38::linear_attention::CutlassGdnPrefillProjection;
-  CutlassGdnPrefillProjection projection(device, weights);
+  CutlassGdnPrefillProjection projection(device, weights, true);
   DeviceBlob hidden(8'192ULL * kHidden * 2);
   DeviceBlob normalized(8'192ULL * kHeads * kDim * 2);
   constexpr std::size_t hidden_elements = 8'192ULL * kHidden;
@@ -189,9 +199,26 @@ void run_prefill_projection(int device,
   cudaStream_t stream = nullptr;
   check(cudaStreamCreate(&stream), "create prefill projection stream");
   for (const int tokens : std::array<int, 2>{300, 8'192}) {
+    projection.launch_input_quantize(
+        static_cast<__nv_bfloat16*>(hidden.pointer), tokens, stream);
+    check(cudaStreamSynchronize(stream), "prepare projection phase timing");
+    const auto quantize = capture_measure(stream, [&] {
+      projection.launch_input_quantize(
+          static_cast<__nv_bfloat16*>(hidden.pointer), tokens, stream);
+    });
+    const auto qkvz = capture_measure(stream, [&] {
+      projection.launch_qkvz(tokens, stream);
+    });
+    const auto ba = capture_measure(stream, [&] {
+      projection.launch_ba(tokens, stream);
+    });
     const auto input = capture_measure(stream, [&] {
       projection.launch_input(static_cast<__nv_bfloat16*>(hidden.pointer),
                               tokens, stream);
+    });
+    const auto reference = capture_measure(stream, [&] {
+      projection.launch_reference_input(
+          static_cast<__nv_bfloat16*>(hidden.pointer), tokens, stream);
     });
     const auto output = capture_measure(stream, [&] {
       projection.launch_output(
@@ -203,12 +230,49 @@ void run_prefill_projection(int device,
     const auto output_hash =
         device_hash(projection.output(tokens),
                     static_cast<std::size_t>(tokens) * kOut * 2);
+    projection.launch_input(static_cast<__nv_bfloat16*>(hidden.pointer), tokens,
+                            stream);
+    projection.launch_reference_input(
+        static_cast<__nv_bfloat16*>(hidden.pointer), tokens, stream);
+    check(cudaStreamSynchronize(stream), "complete projection parity paths");
+    const std::size_t packed_bytes =
+        static_cast<std::size_t>(tokens) * kHidden / 2;
+    const std::size_t sfa_bytes =
+        rocket::qwen38::linear_attention::prefill_sfa_bytes(tokens, kHidden);
+    const bool packed_parity =
+        device_equal(projection.input_packed(tokens),
+                     projection.reference_qkvz_packed(tokens), packed_bytes) &&
+        device_equal(projection.input_packed(tokens),
+                     projection.reference_ba_packed(tokens), packed_bytes);
+    const bool sfa_parity =
+        device_equal(projection.input_sfa(tokens),
+                     projection.reference_qkvz_sfa(tokens), sfa_bytes) &&
+        device_equal(projection.input_sfa(tokens),
+                     projection.reference_ba_sfa(tokens), sfa_bytes);
+    const bool qkvz_parity = device_equal(
+        projection.qkvz(tokens), projection.reference_qkvz(tokens),
+        static_cast<std::size_t>(tokens) * 8'192 * 2);
+    const bool ba_parity = device_equal(
+        projection.ba(tokens), projection.reference_ba(tokens),
+        static_cast<std::size_t>(tokens) * 48 * 2);
     std::cout << "prefill_tokens=" << tokens
               << " shared_input_quantizations=1 input_p50_us=" << input.first
               << " input_p95_us=" << input.second
+              << " quantize_once_p50_us=" << quantize.first
+              << " quantize_once_p95_us=" << quantize.second
+              << " qkvz_p50_us=" << qkvz.first
+              << " qkvz_p95_us=" << qkvz.second
+              << " ba_p50_us=" << ba.first
+              << " ba_p95_us=" << ba.second
+              << " two_quant_reference_p50_us=" << reference.first
+              << " two_quant_reference_p95_us=" << reference.second
               << " output_p50_us=" << output.first
               << " output_p95_us=" << output.second
               << " qkvz_hash=" << input_hash << " output_hash=" << output_hash
+              << " packed_parity=" << (packed_parity ? "pass" : "fail")
+              << " sfa_parity=" << (sfa_parity ? "pass" : "fail")
+              << " qkvz_parity=" << (qkvz_parity ? "pass" : "fail")
+              << " ba_parity=" << (ba_parity ? "pass" : "fail")
               << " graph_capture=pass\n";
   }
   cudaStreamDestroy(stream);

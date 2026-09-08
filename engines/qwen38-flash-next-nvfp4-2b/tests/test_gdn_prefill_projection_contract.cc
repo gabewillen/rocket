@@ -44,5 +44,7 @@ int main() {
   check_sfa_bijection(8'192, 3'072);
   check(linear::CutlassGdnPrefillProjection::input_quantizations_per_launch() ==
         1);
+  check(linear::CutlassGdnPrefillProjection::
+            reference_input_quantizations_per_launch() == 2);
   return 0;
 }
