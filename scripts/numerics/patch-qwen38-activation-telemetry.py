@@ -172,15 +172,28 @@ def _rocket_router_cohort(tensor, top_k, channel):
         raise RuntimeError("ROCKET_ROUTER_COHORT is required for router telemetry")
     if cache_barrier and sequences != 16:
         raise RuntimeError("router cache barrier is only valid for c16 telemetry")
-    if sequences == 16 and (
-        cache_barrier != "two-cache-pages-v2" or cache_block_size != 3216
+    if sequences == 16 and not (
+        (cache_barrier == "two-cache-pages-v2" and cache_block_size == 3216)
+        or (cache_barrier == "fresh-prefill-t300-v1" and cache_block_size == 0)
     ):
         raise RuntimeError(
-            "c16 router cohort requires the two-page cache barrier at block size 3216"
+            "c16 router cohort requires an authenticated cache or fresh-prefill barrier"
         )
 
     widths = _rocket_query_widths(rows)
     if any(width > verify_width for width in widths):
+        if cache_barrier == "fresh-prefill-t300-v1":
+            barrier_key = (channel, cohort)
+            if len(widths) != sequences or any(width != 300 for width in widths):
+                raise RuntimeError(
+                    "c16 T300 prefill barrier must contain all 16 fresh requests"
+                )
+            if barrier_key in _ROCKET_ROUTER_PREFILL_BARRIERS:
+                raise RuntimeError(
+                    "c16 T300 prefill barrier may occur exactly once per layer"
+                )
+            _ROCKET_ROUTER_PREFILL_BARRIERS.add(barrier_key)
+            return None
         if cache_barrier == "two-cache-pages-v2":
             raise RuntimeError(
                 "c16 cache barrier violated by post-gate prefill or oversized width"
@@ -197,6 +210,10 @@ def _rocket_router_cohort(tensor, top_k, channel):
         barrier_key = (channel, cohort)
         speculative_rows = sum(width - 1 for width in widths)
         if speculative_rows == 0:
+            if cache_barrier == "fresh-prefill-t300-v1":
+                raise RuntimeError(
+                    "c16 T300 emitted an unexpected target-only call after prefill"
+                )
             if len(widths) != sequences or any(width != 1 for width in widths):
                 raise RuntimeError(
                     "c16 target-only cache prefill must contain all 16 requests"

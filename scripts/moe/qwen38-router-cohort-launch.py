@@ -119,16 +119,16 @@ def build_plan(manifest: dict, home: Path, calibration: Path, port: int, suffix:
     expected_workload = {
         "concurrency": 16,
         "decode": 24,
-        "prefix_tokens": 6304,
-        "divergence_tokens": 128,
-        "expected_cache_block_size": 3216,
-        "expected_prompt_tokens": 6433,
-        "expected_cached_tokens": 6432,
-        "cache_geometry": "two_cache_pages",
+        "prefix_tokens": 300,
+        "divergence_tokens": 0,
+        "expected_cache_block_size": 0,
+        "expected_prompt_tokens": 300,
+        "expected_cached_tokens": 0,
+        "cache_geometry": "no_prefix_pool",
         "pool_with_c1_c8_prompt_distribution": False,
     }
     if workload != expected_workload:
-        raise ValueError("manifest workload differs from the c16 geometry contract")
+        raise ValueError("manifest workload differs from the c16 T300 control contract")
     common_env = {
         "HF_HUB_OFFLINE": "1",
         "HF_HOME": "/root/.cache/huggingface",
@@ -178,6 +178,7 @@ def build_plan(manifest: dict, home: Path, calibration: Path, port: int, suffix:
                 "--divergence-tokens", str(workload["divergence_tokens"]),
                 "--expected-cache-block-size",
                 str(workload["expected_cache_block_size"]),
+                "--workload", "fresh-t300",
             )
         )
         nodes[node] = {"name": name, "rank": rank, "env": env, "binds": binds, "docker_argv": argv}
@@ -264,16 +265,22 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--calibration-root", type=Path, default=Path.home() / "calibration")
     parser.add_argument("--remote", default="192.168.100.11")
-    parser.add_argument("--port", type=int, default=50187)
-    parser.add_argument("--suffix", default="geometry-r7")
+    parser.add_argument("--port", type=int, default=50189)
+    parser.add_argument("--suffix", default="t300-r1")
+    parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
+    if args.preflight_only and args.execute:
+        parser.error("--preflight-only and --execute are mutually exclusive")
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     plan = build_plan(manifest, Path.home(), args.calibration_root, args.port, args.suffix)
-    if not args.execute:
+    if not args.execute and not args.preflight_only:
         print(json.dumps(plan, indent=2, sort_keys=True))
         return
     preflight(plan, manifest, Path.home(), args.calibration_root, args.remote)
+    if args.preflight_only:
+        print(json.dumps({"preflight": "passed", "plan": plan}, sort_keys=True))
+        return
     print(json.dumps({"plan": plan, "handles": execute(plan, args.remote)}, sort_keys=True))
 
 

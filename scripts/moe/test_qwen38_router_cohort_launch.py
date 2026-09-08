@@ -1,8 +1,11 @@
 import copy
 import importlib.util
+import io
 import json
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,7 +22,7 @@ class LaunchContractTests(unittest.TestCase):
         self.manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
         self.plan = MODULE.build_plan(
             self.manifest, Path("/home/tester"), Path("/home/tester/calibration"),
-            50187, "geometry-r7",
+            50189, "t300-r1",
         )
 
     def test_matches_captured_successful_entrypoint_and_bind_contract(self):
@@ -70,27 +73,49 @@ class LaunchContractTests(unittest.TestCase):
         for node, rank in (("head", 0), ("worker", 1)):
             argv = self.plan["nodes"][node]["docker_argv"]
             self.assertIn(f"--node-rank={rank}", argv)
-            self.assertIn("--master-port=50187", argv)
-            self.assertEqual(argv[-11:], [
+            self.assertIn("--master-port=50189", argv)
+            self.assertEqual(argv[-13:], [
                 "/work/qwen38-router-cohort-live.py", "--concurrency", "16",
-                "--decode", "24", "--prefix-tokens", "6304",
-                "--divergence-tokens", "128",
-                "--expected-cache-block-size", "3216",
+                "--decode", "24", "--prefix-tokens", "300",
+                "--divergence-tokens", "0",
+                "--expected-cache-block-size", "0",
+                "--workload", "fresh-t300",
             ])
         self.assertEqual(self.plan["workload"], self.manifest["workload"])
-        self.assertEqual(self.manifest["workload"]["expected_prompt_tokens"], 6433)
-        self.assertEqual(self.manifest["workload"]["expected_cached_tokens"], 6432)
+        self.assertEqual(self.manifest["workload"]["expected_prompt_tokens"], 300)
+        self.assertEqual(self.manifest["workload"]["expected_cached_tokens"], 0)
+
+    def test_preflight_only_is_launch_free(self):
+        output = io.StringIO()
+        argv = [
+            str(LAUNCHER), "--manifest", str(MANIFEST), "--preflight-only",
+        ]
+        with (
+            mock.patch("sys.argv", argv),
+            mock.patch.object(MODULE, "preflight") as preflight,
+            mock.patch.object(MODULE, "execute") as execute,
+            redirect_stdout(output),
+        ):
+            MODULE.main()
+        preflight.assert_called_once()
+        execute.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue())["preflight"], "passed")
+
+    def test_preflight_only_rejects_execute(self):
+        argv = [str(LAUNCHER), "--preflight-only", "--execute"]
+        with mock.patch("sys.argv", argv), self.assertRaises(SystemExit):
+            MODULE.main()
 
     def test_rejects_stale_or_relaxed_geometry_manifest(self):
         broken = copy.deepcopy(self.manifest)
         broken["workload"]["expected_cache_block_size"] = 16
-        with self.assertRaisesRegex(ValueError, "geometry contract"):
+        with self.assertRaisesRegex(ValueError, "T300 control contract"):
             MODULE.build_plan(
                 broken,
                 Path("/home/tester"),
                 Path("/home/tester/calibration"),
-                50187,
-                "geometry-r7",
+                50189,
+                "t300-r1",
             )
 
 

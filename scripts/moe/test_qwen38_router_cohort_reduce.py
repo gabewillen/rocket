@@ -134,10 +134,10 @@ class ReducerTests(unittest.TestCase):
             '"prompt_tokens": len(prompts[0]["prompt_token_ids"])', source
         )
         self.assertIn(
-            '"primed_continuation_tokens": 1 if concurrency == 16 else 0', source
+            '1 if cache_barrier == "two-cache-pages-v2" else 0', source
         )
         self.assertIn(
-            '"pool_with_c1_c8_prompt_distribution": concurrency != 16', source
+            '"pool_with_c1_c8_prompt_distribution": cache_barrier is None', source
         )
         self.assertIn("args.prefix_tokens != 6304", source)
         self.assertNotIn(
@@ -146,14 +146,29 @@ class ReducerTests(unittest.TestCase):
         self.assertIn("args.expected_cache_block_size != 3216", source)
         self.assertIn("prompt_tokens != 6433", source)
         self.assertIn("expected_cached_tokens != 6432", source)
-        self.assertIn('"cache_pages": 2 if concurrency == 16 else None', source)
-        self.assertIn('"two_cache_pages" if concurrency == 16 else None', source)
-        self.assertIn(
-            '"attention_block_size_proof": "all_request_cache_hit_counts"', source
-        )
+        self.assertIn('if cache_barrier == "two-cache-pages-v2"', source)
+        self.assertIn('else "no_prefix_pool"', source)
+        self.assertIn('"all_request_cache_hit_counts"', source)
         self.assertIn('"continuation_is_special_or_stop": False', source)
         self.assertIn('"prime_prompt_tokens": 6433', source)
         self.assertNotIn("+ list(prime_outputs[0].outputs[0].token_ids)", source)
+
+    def test_t300_skips_prefix_pool_and_arms_fresh_prefill_barrier(self):
+        source = LIVE.read_text(encoding="utf-8")
+        self.assertIn('choices=("prefix-cache-6433", "fresh-t300")', source)
+        self.assertIn('fresh-t300 requires prefix_tokens=300 and divergence_tokens=0', source)
+        fresh_branch = source.index('if args.workload == "fresh-t300":')
+        warmup = source.index("warm_outputs = engine.generate(")
+        metadata = source.index("os.environ.update(cohort_metadata)")
+        verifier = source.index("outputs = engine.generate(prompts, sampling")
+        self.assertLess(fresh_branch, warmup)
+        self.assertLess(metadata, verifier)
+        self.assertIn('cache_barrier = "fresh-prefill-t300-v1"', source)
+        self.assertIn('if len(prompt_ids) != 300:', source)
+        self.assertIn('"fresh-t300-c16-k4"', source)
+        self.assertIn('enable_prefix_caching=args.workload != "fresh-t300"', source)
+        self.assertIn('concurrency * 300', source)
+        self.assertIn('"prefix_cache_enabled": cache_barrier != "fresh-prefill-t300-v1"', source)
 
     def test_r6_red_requires_continuation_inside_prime_input(self):
         block_size = 3216

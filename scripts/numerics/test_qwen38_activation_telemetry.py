@@ -133,7 +133,7 @@ os.environ.update({
 try:
     _rocket_router_cohort(torch.zeros((12, 512)), 10, "layer.0.router.gate")
 except RuntimeError as error:
-    assert "requires the two-page cache barrier" in str(error)
+    assert "requires an authenticated cache or fresh-prefill barrier" in str(error)
 else:
     raise AssertionError("c16 telemetry admitted a missing cache barrier")
 os.environ.update({
@@ -190,6 +190,23 @@ record = _rocket_router_cohort(
     torch.zeros((17, 512)), 10, "layer.0.router.gate"
 )
 assert record["request_widths"] == [2] + [1] * 15
+_ROCKET_ROUTER_PREFILL_BARRIERS.clear()
+os.environ.update({
+    "ROCKET_ROUTER_COHORT": "fresh-t300-c16-k4",
+    "ROCKET_ROUTER_CACHE_BARRIER": "fresh-prefill-t300-v1",
+    "ROCKET_ROUTER_CACHE_BLOCK_SIZE": "0",
+})
+metadata.query_start_loc = torch.arange(17, dtype=torch.int32) * 300
+metadata.num_actual_tokens = 4800
+assert _rocket_router_cohort(
+    torch.zeros((4800, 512)), 10, "layer.0.router.gate"
+) is None
+metadata.query_start_loc = torch.arange(17, dtype=torch.int32) * 2
+metadata.num_actual_tokens = 32
+t300_record = _rocket_router_cohort(
+    torch.zeros((32, 512)), 10, "layer.0.router.gate"
+)
+assert t300_record["request_widths"] == [2] * 16
 os.environ.update({
     "ROCKET_ROUTER_COHORT": "contract-c3-k4",
     "ROCKET_ROUTER_SEQUENCES": "3",

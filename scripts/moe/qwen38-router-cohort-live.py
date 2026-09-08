@@ -214,15 +214,24 @@ def _run(state: dict) -> None:
     parser.add_argument("--prefix-tokens", type=int, default=8192)
     parser.add_argument("--divergence-tokens", type=int, default=128)
     parser.add_argument("--expected-cache-block-size", type=int, default=3216)
+    parser.add_argument(
+        "--workload",
+        choices=("prefix-cache-6433", "fresh-t300"),
+        default="prefix-cache-6433",
+    )
     args = parser.parse_args()
     if args.decode < MIN_DECODE:
         parser.error(
             f"--decode must be at least {MIN_DECODE} to guarantee four K4 calls"
         )
-    if args.prefix_tokens < 1024 or args.prefix_tokens > 8192:
-        parser.error("--prefix-tokens must be between 1024 and 8192")
-    if args.divergence_tokens < 50 or args.divergence_tokens > 200:
-        parser.error("--divergence-tokens must be between 50 and 200")
+    if args.workload == "fresh-t300":
+        if args.prefix_tokens != 300 or args.divergence_tokens != 0:
+            parser.error("fresh-t300 requires prefix_tokens=300 and divergence_tokens=0")
+    else:
+        if args.prefix_tokens < 1024 or args.prefix_tokens > 8192:
+            parser.error("--prefix-tokens must be between 1024 and 8192")
+        if args.divergence_tokens < 50 or args.divergence_tokens > 200:
+            parser.error("--divergence-tokens must be between 50 and 200")
     if args.concurrency * args.divergence_tokens > 8192:
         parser.error("fresh cohort prefill exceeds max_num_batched_tokens")
 
@@ -253,22 +262,31 @@ def _run(state: dict) -> None:
         load_format="safetensors",
         safetensors_load_strategy="lazy",
         enable_chunked_prefill=True,
+        enable_prefix_caching=args.workload != "fresh-t300",
         hf_overrides={"text_config": {"ple_embedding_dtype": "float8_e4m3fn"}},
     )
     tokenizer = engine.get_tokenizer()
+    concurrency = args.concurrency
+    if args.workload == "fresh-t300" and concurrency != 16:
+        raise RuntimeError("fresh-t300 is a c16-only control")
     root_material = "Rocket agent session memory about GPU serving and systems. "
-    root_ids = tokenizer.encode(
-        root_material * (args.prefix_tokens // 8 + 2), add_special_tokens=False
-    )[: args.prefix_tokens]
-    if len(root_ids) != args.prefix_tokens:
-        raise RuntimeError("failed to construct the requested root prefix")
-    continuation_token_id = root_ids[0]
-    continuation_token_text = tokenizer.decode([continuation_token_id])
-    if continuation_token_id in set(tokenizer.all_special_ids):
-        raise RuntimeError("c16 continuation token must not be an EOS or stop token")
-    continuation_token_sha256 = hashlib.sha256(
-        json.dumps([continuation_token_id], separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    root_ids = []
+    continuation_token_id = None
+    continuation_token_text = None
+    continuation_token_sha256 = None
+    if args.workload == "prefix-cache-6433":
+        root_ids = tokenizer.encode(
+            root_material * (args.prefix_tokens // 8 + 2), add_special_tokens=False
+        )[: args.prefix_tokens]
+        if len(root_ids) != args.prefix_tokens:
+            raise RuntimeError("failed to construct the requested root prefix")
+        continuation_token_id = root_ids[0]
+        continuation_token_text = tokenizer.decode([continuation_token_id])
+        if continuation_token_id in set(tokenizer.all_special_ids):
+            raise RuntimeError("c16 continuation token must not be an EOS or stop token")
+        continuation_token_sha256 = hashlib.sha256(
+            json.dumps([continuation_token_id], separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
     state.update(
         {
             "continuation_token_id": continuation_token_id,
@@ -276,21 +294,25 @@ def _run(state: dict) -> None:
             "continuation_token_text": continuation_token_text,
         }
     )
-    state["phase"] = "root_warmup"
     warm_sampling = SamplingParams(
         temperature=0.0, max_tokens=1, min_tokens=1, ignore_eos=True
     )
     # Warm the shared long-context root while cohort metadata is wholly absent.
     # Finished prefix-cache blocks remain reusable by every fork in this process.
-    warm_outputs = engine.generate(
-        {"prompt_token_ids": root_ids}, warm_sampling, use_tqdm=False
-    )
-    if len(warm_outputs) != 1 or len(warm_outputs[0].outputs[0].token_ids) != 1:
-        raise RuntimeError("root-prefix warmup did not finish exactly one token")
+    if args.workload == "prefix-cache-6433":
+        state["phase"] = "root_warmup"
+        warm_outputs = engine.generate(
+            {"prompt_token_ids": root_ids}, warm_sampling, use_tqdm=False
+        )
+        if len(warm_outputs) != 1 or len(warm_outputs[0].outputs[0].token_ids) != 1:
+            raise RuntimeError("root-prefix warmup did not finish exactly one token")
 
-    concurrency = args.concurrency
-    cohort = f"forked-prefix-c{concurrency}-k4"
-    if concurrency == 16 and (
+    cohort = (
+        "fresh-t300-c16-k4"
+        if args.workload == "fresh-t300"
+        else f"forked-prefix-c{concurrency}-k4"
+    )
+    if args.workload == "prefix-cache-6433" and concurrency == 16 and (
         args.prefix_tokens != 6304
         or args.divergence_tokens != 128
         or args.expected_cache_block_size != 3216
@@ -301,6 +323,15 @@ def _run(state: dict) -> None:
     prompts = []
     state["phase"] = "prompt_construction"
     for stream in range(concurrency):
+        if args.workload == "fresh-t300":
+            material = (
+                f"Request {stream} independent router compaction control. " * 96
+            )
+            prompt_ids = tokenizer.encode(material, add_special_tokens=False)[:300]
+            if len(prompt_ids) != 300:
+                raise RuntimeError("failed to construct a 300-token fresh prompt")
+            prompts.append({"prompt_token_ids": prompt_ids})
+            continue
         divergence = (
             f" Worker {stream} technical memory systems branch. "
             * (args.divergence_tokens // 6 + 2)
@@ -314,7 +345,10 @@ def _run(state: dict) -> None:
 
     cache_barrier = None
     cached_prompt_tokens = []
-    if concurrency == 16:
+    prime_output_token_ids = []
+    if args.workload == "fresh-t300":
+        cache_barrier = "fresh-prefill-t300-v1"
+    elif concurrency == 16:
         state["phase"] = "cache_prime"
         # Avoid the pinned hybrid-attention c16 failure on interleaved chunked
         # prefill and decode. Prime one complete prompt at a time while router
@@ -341,7 +375,6 @@ def _run(state: dict) -> None:
             ),
             flush=True,
         )
-        prime_output_token_ids = []
         for prompt in measured_prompts:
             prime_outputs = engine.generate(prompt, warm_sampling, use_tqdm=False)
             if (
@@ -406,9 +439,10 @@ def _run(state: dict) -> None:
     }
     if cache_barrier is not None:
         cohort_metadata["ROCKET_ROUTER_CACHE_BARRIER"] = cache_barrier
-        cohort_metadata["ROCKET_ROUTER_CACHE_BLOCK_SIZE"] = str(
-            args.expected_cache_block_size
-        )
+        if cache_barrier == "two-cache-pages-v2":
+            cohort_metadata["ROCKET_ROUTER_CACHE_BLOCK_SIZE"] = str(
+                args.expected_cache_block_size
+            )
     os.environ.update(cohort_metadata)
     state["phase"] = "verifier"
     sampling = SamplingParams(
@@ -435,26 +469,45 @@ def _run(state: dict) -> None:
                     "top_k": 10,
                     "decode": args.decode,
                     "prompt_tokens": len(prompts[0]["prompt_token_ids"]),
-                    "primed_continuation_tokens": 1 if concurrency == 16 else 0,
-                    "pool_with_c1_c8_prompt_distribution": concurrency != 16,
+                    "primed_continuation_tokens": (
+                        1 if cache_barrier == "two-cache-pages-v2" else 0
+                    ),
+                    "pool_with_c1_c8_prompt_distribution": cache_barrier is None,
                     "root_prefix_tokens": args.prefix_tokens,
                     "divergence_tokens": args.divergence_tokens,
                     "fresh_prefill_token_upper_bound": (
-                        concurrency * args.divergence_tokens
+                        concurrency * 300
+                        if cache_barrier == "fresh-prefill-t300-v1"
+                        else concurrency * args.divergence_tokens
                     ),
+                    "prefix_cache_enabled": cache_barrier != "fresh-prefill-t300-v1",
                     "cache_barrier": cache_barrier,
-                    "attention_block_size": args.expected_cache_block_size,
-                    "attention_block_size_proof": "all_request_cache_hit_counts",
-                    "cache_pages": 2 if concurrency == 16 else None,
+                    "attention_block_size": (
+                        args.expected_cache_block_size
+                        if cache_barrier == "two-cache-pages-v2"
+                        else None
+                    ),
+                    "attention_block_size_proof": (
+                        "all_request_cache_hit_counts"
+                        if cache_barrier == "two-cache-pages-v2"
+                        else None
+                    ),
+                    "cache_pages": 2 if cache_barrier == "two-cache-pages-v2" else None,
                     "cache_geometry": (
-                        "two_cache_pages" if concurrency == 16 else None
+                        "two_cache_pages"
+                        if cache_barrier == "two-cache-pages-v2"
+                        else "no_prefix_pool"
+                        if cache_barrier == "fresh-prefill-t300-v1"
+                        else None
                     ),
                     "cached_prompt_tokens": cached_prompt_tokens,
                     "continuation_token_id": continuation_token_id,
                     "continuation_token_sha256": continuation_token_sha256,
                     "continuation_token_text": continuation_token_text,
                     "prime_output_token_ids": (
-                        prime_output_token_ids if concurrency == 16 else []
+                        prime_output_token_ids
+                        if cache_barrier == "two-cache-pages-v2"
+                        else []
                     ),
                 },
                 sort_keys=True,
