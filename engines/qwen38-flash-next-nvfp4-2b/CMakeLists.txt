@@ -129,6 +129,15 @@ target_compile_options(qwen38_native_qsa_graph PRIVATE -Wall -Wextra -Werror)
 set_target_properties(qwen38_native_qsa_graph PROPERTIES
   POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
 
+add_library(qwen38_native_qsa_c_api SHARED
+  src/attention/native_qsa_graph.cc)
+target_include_directories(qwen38_native_qsa_c_api PUBLIC src)
+target_link_libraries(qwen38_native_qsa_c_api PUBLIC
+  qwen38_decode_execution qwen38_qsa_target_preprocess qwen38_cutlass_qkv
+  CUDA::cudart)
+target_compile_options(qwen38_native_qsa_c_api PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38_native_qsa_c_api PROPERTIES LINKER_LANGUAGE CUDA)
+
 add_library(qwen38_layer_pair_reduce SHARED src/decode/pair_reduce_c_api.cc)
 target_include_directories(qwen38_layer_pair_reduce PUBLIC src)
 target_link_libraries(qwen38_layer_pair_reduce PRIVATE qwen38_pair_reduce CUDA::cudart)
@@ -494,6 +503,15 @@ target_link_libraries(qwen38-test-target-full-layer PRIVATE qwen38_decode_execut
 target_compile_options(qwen38-test-target-full-layer PRIVATE -Wall -Wextra -Werror)
 set_target_properties(qwen38-test-target-full-layer PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-target-full-layer-contract COMMAND qwen38-test-target-full-layer)
+
+add_executable(qwen38-test-native-qsa-c-api
+  tests/test_native_qsa_graph_c_api.cc)
+target_link_libraries(qwen38-test-native-qsa-c-api PRIVATE
+  qwen38_native_qsa_c_api)
+target_compile_options(qwen38-test-native-qsa-c-api PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-native-qsa-c-api PROPERTIES LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-native-qsa-c-api-contract
+  COMMAND qwen38-test-native-qsa-c-api)
 
 add_executable(qwen38-test-linear-attention-layer tests/test_linear_attention_layer.cc)
 target_link_libraries(qwen38-test-linear-attention-layer PRIVATE qwen38_decode_execution)

@@ -14,7 +14,7 @@ namespace rocket::qwen38::attention {
 struct TargetQsaPreprocessWeights {
   const __nv_bfloat16* main_q_norm = nullptr;       // [256]
   const __nv_bfloat16* main_k_norm = nullptr;       // [256]
-  const __nv_bfloat16* index_qk = nullptr;          // [320,2560]
+  const __nv_bfloat16* index_qk = nullptr;          // [640,2560], replicated
   const __nv_bfloat16* index_q_norm = nullptr;      // [128]
   const __nv_bfloat16* index_k_norm = nullptr;      // [128]
   const __nv_bfloat16* rope_cos_sin = nullptr;      // [context,64]

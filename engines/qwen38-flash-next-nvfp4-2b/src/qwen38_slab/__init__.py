@@ -11,6 +11,12 @@ from .k0_composition import (
 )
 from .loader import DirectSlabLoader
 from .materialize import materialize
+from .native_qsa import (
+    NativeQsaBindingError,
+    NativeQsaGraphHandle,
+    NativeQsaSlabPointers,
+    bind_slab_pointers,
+)
 from .target_moe import (
     TargetMoeBinding,
     TargetMoeError,
@@ -38,6 +44,9 @@ __all__ = [
     "REQUIRED_K0_PARTICIPANTS",
     "CudaRankSlabLoader",
     "CudaSlabLoadError",
+    "NativeQsaBindingError",
+    "NativeQsaGraphHandle",
+    "NativeQsaSlabPointers",
     "PINNED_CONTRACT",
     "SlabContract",
     "SlabError",
@@ -48,5 +57,6 @@ __all__ = [
     "WholeDecoderColdLoader",
     "WholeDecoderError",
     "WholeDecoderExecutor",
+    "bind_slab_pointers",
     "materialize",
 ]

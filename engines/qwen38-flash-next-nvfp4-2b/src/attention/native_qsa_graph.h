@@ -92,3 +92,22 @@ class NativeQsaFullAttentionGraph final : public decode::FullAttentionGraph {
 };
 
 }  // namespace rocket::qwen38::attention
+
+extern "C" {
+
+int rocket_qwen38_target_qsa_create_c1(
+    int device, int rank, int layer, const char* sidecar_key,
+    const rocket::qwen38::attention::TargetQsaProjectionWeights* projection,
+    const rocket::qwen38::attention::TargetQsaPreprocessWeights* preprocess,
+    const rocket::qwen38::attention::TargetQsaGraphArena* arena,
+    void** handle) noexcept;
+int rocket_qwen38_target_qsa_launch_c1(
+    void* handle, const __nv_bfloat16* block_input,
+    const rocket::qwen38::attention::TargetQsaStateView* state,
+    std::uint64_t generation, int m, cudaStream_t stream) noexcept;
+int rocket_qwen38_target_qsa_projected_output_c1(
+    void* handle, const __nv_bfloat16** output) noexcept;
+void rocket_qwen38_target_qsa_destroy_c1(void* handle) noexcept;
+const char* rocket_qwen38_target_qsa_last_error() noexcept;
+
+}
