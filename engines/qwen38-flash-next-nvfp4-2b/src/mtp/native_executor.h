@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include "attention/qsa_mtp_state_view.h"
 #include "decode/decoder_verifier.h"
 #include "mtp/graph_runtime.h"
 #include "mtp/state_arena.h"
@@ -18,11 +19,15 @@ enum class Phase : std::uint8_t { kInputFusion, kAttention, kAttentionReduce,
   kProposalSample, kCount };
 enum class Outcome : std::uint8_t { kOk, kContractError, kCudaError };
 enum class ExecutorPhase : std::uint8_t { kReady, kDrafted, kFaulted };
-struct GraphKey { int depth; int sequences; };
+// Complete immutable identity for a captured MTP graph. query_tokens is the
+// fixed prefill shape that produced the QSA cache consumed by this graph.
+// Generation is transaction state owned by NativeExecutor, never a cache key.
+struct GraphKey { int depth; int sequences; int query_tokens; };
 constexpr bool allowed_graph_key(GraphKey k) noexcept {
   const bool b = k.sequences == 1 || k.sequences == 2 || k.sequences == 4 ||
                  k.sequences == 8 || k.sequences == 16;
   return k.depth >= 1 && k.depth <= 7 && b &&
+         attention::allowed_mtp_qsa_query_tokens(k.query_tokens) &&
          (k.depth <= 4 || k.sequences <= 4);
 }
 struct PhaseMetric { Phase phase; Outcome outcome; int depth; int sequences;
@@ -35,14 +40,16 @@ class TelemetrySink { public: virtual ~TelemetrySink() = default;
 struct DeviceDraftView { const std::int32_t* verification_tokens = nullptr;
   int depth = 0; int sequences = 0; std::uint64_t generation = 0; };
 
-// Required native QSA/MoE and PairReduce boundary. Methods enqueue only on the
-// caller stream and may write fixed runtime/StateArena storage, never active state.
+// Required native QSA/MoE and PairReduce boundary. Calls are single-writer and
+// enqueue only on the borrowed caller stream. QSA receives a borrowed write
+// view which aliases StateArena for the duration of the call. Implementations
+// may write fixed runtime/StateArena storage, never active accepted state.
 class MtpMiddleStagePort { public: virtual ~MtpMiddleStagePort() = default;
   virtual const std::int32_t* prepare(GraphArenaView, StateArena&, GraphKey,
                                       cudaStream_t) = 0;
   virtual void reduce_input(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
-  virtual void stage_attention(GraphArenaView, PrefixStateView, int, GraphKey,
-                               cudaStream_t) = 0;
+  virtual void stage_attention(GraphArenaView, attention::MtpQsaWriteView, int,
+                               GraphKey, cudaStream_t) = 0;
   virtual void reduce_attention(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
   virtual void stage_moe(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
   virtual void reduce_moe(GraphArenaView, int, GraphKey, cudaStream_t) = 0;

@@ -70,7 +70,11 @@ DeviceDraftView NativeExecutor::draft(std::uint64_t generation) {
       middle_.reduce_input(arena, step, key_, stream_);
       runtime_.launch_input_finish(key_.sequences, stream_);
       check(cudaEventRecord(events_[step][1], stream_), "record input end");
-      middle_.stage_attention(arena, state_.prefix(step), step, key_, stream_);
+      const auto qsa_state = attention::bind_mtp_qsa_write_view(
+          state_.prefix(step),
+          {key_.sequences, key_.depth, key_.query_tokens, step,
+           state_.uses_mrope(), generation, active_generation_ + 1});
+      middle_.stage_attention(arena, qsa_state, step, key_, stream_);
       check(cudaEventRecord(events_[step][2], stream_), "record attention end");
       middle_.reduce_attention(arena, step, key_, stream_);
       check(cudaEventRecord(events_[step][3], stream_), "record attention reduce end");

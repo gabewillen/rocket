@@ -60,6 +60,7 @@ class MtpQsaStateViewError : public std::invalid_argument {
 struct MtpQsaArenaIdentity {
   int sequences;
   int depth;
+  int query_tokens;
   int step;
   bool uses_mrope;
   std::uint64_t generation;
@@ -68,6 +69,11 @@ struct MtpQsaArenaIdentity {
 
 [[nodiscard]] constexpr bool allowed_mtp_qsa_rows(int rows) noexcept {
   return rows == 1 || rows == 2 || rows == 4 || rows == 8 || rows == 16;
+}
+
+[[nodiscard]] constexpr bool allowed_mtp_qsa_query_tokens(
+    int query_tokens) noexcept {
+  return query_tokens == 300 || query_tokens == 8192;
 }
 
 [[nodiscard]] inline MtpQsaWriteView bind_mtp_qsa_write_view(
@@ -98,8 +104,10 @@ struct MtpQsaArenaIdentity {
 [[nodiscard]] inline MtpQsaWriteView bind_mtp_qsa_write_view(
     mtp::PrefixStateView state, MtpQsaArenaIdentity identity) {
   if (!allowed_mtp_qsa_rows(identity.sequences) || identity.depth < 1 ||
-      identity.depth > mtp::kStateMaxDepth || identity.step < 0 ||
-      identity.step >= identity.depth || identity.generation == 0 ||
+      identity.depth > mtp::kStateMaxDepth ||
+      !allowed_mtp_qsa_query_tokens(identity.query_tokens) ||
+      identity.step < 0 || identity.step >= identity.depth ||
+      identity.generation == 0 ||
       identity.generation != identity.expected_generation) {
     throw MtpQsaStateViewError(
         "exact MTP QSA arena identity and generation are required");

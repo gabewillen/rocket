@@ -412,6 +412,15 @@ target_compile_options(qwen38-test-native-mtp-executor PRIVATE
 add_test(NAME qwen38-native-mtp-executor-contract
   COMMAND qwen38-test-native-mtp-executor)
 
+add_executable(qwen38-test-qsa-mtp-state-view
+  tests/test_qsa_mtp_state_view.cc)
+target_include_directories(qwen38-test-qsa-mtp-state-view PRIVATE src)
+target_link_libraries(qwen38-test-qsa-mtp-state-view PRIVATE CUDA::cudart)
+target_compile_options(qwen38-test-qsa-mtp-state-view PRIVATE
+  -Wall -Wextra -Werror)
+add_test(NAME qwen38-qsa-mtp-state-view-contract
+  COMMAND qwen38-test-qsa-mtp-state-view)
+
 add_executable(qwen38-test-mtp-state-arena tests/test_mtp_state_arena.cu)
 target_link_libraries(qwen38-test-mtp-state-arena PRIVATE qwen38_mtp_executor CUDA::cudart)
 add_test(NAME qwen38-mtp-state-arena-contract COMMAND qwen38-test-mtp-state-arena)
