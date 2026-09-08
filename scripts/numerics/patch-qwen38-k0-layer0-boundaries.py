@@ -40,6 +40,11 @@ _ROCKET_K0_BOUNDARY_SEEN = set()
 def _rocket_k0_boundary_save(layer_idx, name, tensor):
     if layer_idx != 0 or os.getenv("ROCKET_QWEN38_K0_BOUNDARY_CAPTURE") != "1":
         return
+    # Startup profiling executes layer 0 with dummy zero inputs before the
+    # authenticated request. The oracle is active only across the target
+    # forward, so this gate excludes every warmup invocation.
+    if _ROCKET_K0_ORACLE is None or not _ROCKET_K0_ORACLE.active_forward:
+        return
     from vllm.distributed import get_tensor_model_parallel_rank
     if get_tensor_model_parallel_rank() != 0:
         return

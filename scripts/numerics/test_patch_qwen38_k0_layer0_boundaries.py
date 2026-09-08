@@ -27,6 +27,7 @@ class BoundaryPatchTest(unittest.TestCase):
             self.assertEqual(patched.count("_rocket_k0_boundary_save(self.layer_idx"), 3)
             self.assertIn("get_tensor_model_parallel_rank() != 0", patched)
             self.assertIn("tensor[:1].detach().contiguous()", patched)
+            self.assertIn("not _ROCKET_K0_ORACLE.active_forward", patched)
 
     def test_source_identity_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
