@@ -463,6 +463,15 @@ target_compile_options(qwen38-test-fp8-routed-experts PRIVATE
 add_test(NAME qwen38-fp8-routed-experts-cpu-contract
   COMMAND qwen38-test-fp8-routed-experts)
 
+add_executable(qwen38-test-fp8-routed-experts-cuda
+  tests/test_fp8_routed_experts.cu)
+target_link_libraries(qwen38-test-fp8-routed-experts-cuda PRIVATE
+  qwen38_route_compaction CUDA::cudart)
+target_compile_options(qwen38-test-fp8-routed-experts-cuda PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>)
+add_test(NAME qwen38-fp8-routed-experts-cuda-contract
+  COMMAND qwen38-test-fp8-routed-experts-cuda)
+
 add_executable(qwen38-test-mtp-state-arena tests/test_mtp_state_arena.cu)
 target_link_libraries(qwen38-test-mtp-state-arena PRIVATE qwen38_mtp_executor CUDA::cudart)
 add_test(NAME qwen38-mtp-state-arena-contract COMMAND qwen38-test-mtp-state-arena)
