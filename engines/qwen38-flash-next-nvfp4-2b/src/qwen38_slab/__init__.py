@@ -15,7 +15,9 @@ from .native_qsa import (
     NativeQsaBindingError,
     NativeQsaGraphHandle,
     NativeQsaSlabPointers,
+    StateView,
     bind_slab_pointers,
+    bind_state_view,
 )
 from .target_moe import (
     TargetMoeBinding,
@@ -47,6 +49,7 @@ __all__ = [
     "NativeQsaBindingError",
     "NativeQsaGraphHandle",
     "NativeQsaSlabPointers",
+    "StateView",
     "PINNED_CONTRACT",
     "SlabContract",
     "SlabError",
@@ -58,5 +61,6 @@ __all__ = [
     "WholeDecoderError",
     "WholeDecoderExecutor",
     "bind_slab_pointers",
+    "bind_state_view",
     "materialize",
 ]

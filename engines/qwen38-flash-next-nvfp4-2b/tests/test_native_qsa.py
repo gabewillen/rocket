@@ -2,7 +2,14 @@
 import unittest
 from pathlib import Path
 
-from qwen38_slab.native_qsa import ARENA_FIELDS, NativeQsaBindingError, bind_slab_pointers
+from qwen38_slab.native_qsa import (
+    ARENA_FIELDS,
+    STATE_POINTER_FIELDS,
+    STATE_DTYPES,
+    NativeQsaBindingError,
+    bind_slab_pointers,
+    bind_state_view,
+)
 from qwen38_slab.qsa_weights import load_qsa_weights
 
 REAL_SLAB = Path(
@@ -30,6 +37,27 @@ class Tensor:
 
 
 class NativeQsaBindingTests(unittest.TestCase):
+    def test_binds_exact_c1_state_generation(self):
+        tensors = {
+            name: Tensor(
+                0x500000000 + index * 0x10000,
+                1,
+                f"torch.{STATE_DTYPES[name]}",
+            )
+            for index, name in enumerate(STATE_POINTER_FIELDS)
+        }
+        state = bind_state_view(
+            tensors, rank=1, layer=47, generation=9, main_blocks=2,
+            compressed_blocks=1, compression_work_items=1,
+        )
+        self.assertEqual((state.rows, state.rank, state.layer), (1, 1, 47))
+        self.assertEqual((state.generation, state.expected_generation), (9, 9))
+        with self.assertRaisesRegex(NativeQsaBindingError, "inventory"):
+            bind_state_view(
+                {}, rank=1, layer=47, generation=9, main_blocks=2,
+                compressed_blocks=1, compression_work_items=1,
+            )
+
     @unittest.skipUnless(REAL_SLAB.is_dir() and SIDECAR.is_dir(), "QSA slabs absent")
     def test_resolves_authenticated_base_and_sidecar_offsets(self):
         descriptor = load_qsa_weights(REAL_SLAB, SIDECAR, 0, 3)
