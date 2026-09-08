@@ -109,6 +109,11 @@ struct TargetK0ExecutionProgress {
   TargetK0LayerBoundaryObserver* boundary_observer = nullptr;
   TargetK0LayerBoundaryEvidence boundary_evidence{};
   std::array<std::uint32_t, 5> oracle_domain_skip_counts{};
+  std::int32_t observed_token = -1;
+  std::int32_t local_winner_token = -1;
+  float local_winner_logit = 0.0F;
+  float global_winner_logit = 0.0F;
+  bool terminal_winner_observed = false;
 };
 
 inline void target_k0_note_oracle_domain_skip(

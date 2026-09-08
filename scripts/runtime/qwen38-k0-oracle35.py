@@ -95,7 +95,11 @@ class NativeRunStatusError(RuntimeError):
                  moe_aot_cuda_failure: int = 0, execution_stage: int = 0,
                  execution_row: int = -1, execution_layer: int = -1,
                  execution_layer_stage: int = 0, gdn_graph_stage: int = 0,
-                 startup_construction_stage: int = 0):
+                 startup_construction_stage: int = 0,
+                 terminal_winner_observed: bool = False,
+                 observed_token: int = -1, local_winner_token: int = -1,
+                 local_winner_logit: float = 0.0,
+                 global_winner_logit: float = 0.0):
         self.stage = NATIVE_STATUS_STAGES.get(status, "unknown")
         self.physical_substage = PHYSICAL_LAYER_SUBSTAGES.get(
             physical_substage, "unknown")
@@ -117,6 +121,11 @@ class NativeRunStatusError(RuntimeError):
         self.startup_construction_stage = STARTUP_CONSTRUCTION_STAGES.get(
             startup_construction_stage, "unknown")
         self.layer_boundary_diagnostics = ()
+        self.terminal_winner_observed = terminal_winner_observed
+        self.observed_token = observed_token
+        self.local_winner_token = local_winner_token
+        self.local_winner_logit = local_winner_logit
+        self.global_winner_logit = global_winner_logit
         super().__init__("native K0 run rejected")
 
 
@@ -161,6 +170,11 @@ class _NativeResult(ctypes.Structure):
         ("layer_boundary_reference_compared", ctypes.c_uint8 * 6),
         ("layer_boundary_reference_exact", ctypes.c_uint8 * 6),
         ("oracle_domain_skip_counts", ctypes.c_uint32 * 5),
+        ("observed_token", ctypes.c_int32),
+        ("local_winner_token", ctypes.c_int32),
+        ("local_winner_logit", ctypes.c_float),
+        ("global_winner_logit", ctypes.c_float),
+        ("terminal_winner_observed", ctypes.c_uint8),
     )
 
 
@@ -308,6 +322,9 @@ def _native_run(args: argparse.Namespace, lease: object,
             result.execution_row, result.execution_layer,
             result.execution_layer_stage, result.gdn_graph_stage,
             result.startup_construction_stage,
+            bool(result.terminal_winner_observed), result.observed_token,
+            result.local_winner_token, result.local_winner_logit,
+            result.global_winner_logit,
         )
         error.layer_boundary_diagnostics = _layer_boundary_diagnostics(result)
         raise error
@@ -372,6 +389,11 @@ def _snapshot(result: _NativeResult) -> dict[str, object]:
             result.startup_construction_stage, "unknown"),
         "layer_boundary_diagnostics": _layer_boundary_diagnostics(result),
         "oracle_domain_skip_counts": list(result.oracle_domain_skip_counts),
+        "terminal_winner_observed": bool(result.terminal_winner_observed),
+        "observed_token": result.observed_token,
+        "local_winner_token": result.local_winner_token,
+        "local_winner_logit": result.local_winner_logit,
+        "global_winner_logit": result.global_winner_logit,
     }
 
 
@@ -439,6 +461,13 @@ def worker(args: argparse.Namespace) -> int:
                 error.startup_construction_stage)
             physical["layer_boundary_diagnostics"] = (
                 error.layer_boundary_diagnostics)
+            physical["terminal_winner_observed"] = (
+                error.terminal_winner_observed)
+            if error.terminal_winner_observed:
+                physical["observed_token"] = error.observed_token
+                physical["local_winner_token"] = error.local_winner_token
+                physical["local_winner_logit"] = error.local_winner_logit
+                physical["global_winner_logit"] = error.global_winner_logit
         print(json.dumps({"schema": SCHEMA, "valid": False, "complete": False,
                           "rank": args.rank, "phase": phase,
                           "failure_class": failure["class"],

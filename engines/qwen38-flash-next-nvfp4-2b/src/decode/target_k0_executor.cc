@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "decode/target_k0_executor.h"
 
+#include <cmath>
 #include <stdexcept>
 
 namespace rocket::qwen38::decode {
@@ -139,9 +140,19 @@ TargetK0ExecutionResult TargetK0Executor::execute_prefill(
         token_io_.finish_prefill(arena_.hidden_a, final_generation, stream_,
                                  progress);
     if (!output.final_hidden_bf16 || !output.local_logits ||
-        output.global_token < 0 ||
-        output.global_token >= 248'320)
+        output.global_token < 0 || output.global_token >= 248'320 ||
+        output.local_winner_token < 0 ||
+        output.local_winner_token >= 248'320 ||
+        !std::isfinite(output.local_winner_logit) ||
+        !std::isfinite(output.global_winner_logit))
       throw std::logic_error("K0 token output changed");
+    if (progress) {
+      progress->observed_token = output.global_token;
+      progress->local_winner_token = output.local_winner_token;
+      progress->local_winner_logit = output.local_winner_logit;
+      progress->global_winner_logit = output.global_winner_logit;
+      progress->terminal_winner_observed = true;
+    }
     target_k0_enter(progress, TargetK0ExecutionStage::kFinalNormComparison,
                     static_cast<int>(prompt_tokens.size() - 1));
     compare_if_compatible(

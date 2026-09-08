@@ -120,11 +120,13 @@ struct NativeTokenIoOwner::Impl {
   Winner* rank_winners = nullptr;
   std::int32_t* global_token = nullptr;
   std::int32_t* terminal_token_host = nullptr;
+  Winner* terminal_winners_host = nullptr;
   std::uint64_t last_embedding_generation = 0;
   std::uint64_t last_finish_generation = 0;
 
   ~Impl() {
     if (head) cublasDestroy(head);
+    cudaFreeHost(terminal_winners_host);
     cudaFreeHost(terminal_token_host);
     cudaFree(global_token);
     cudaFree(rank_winners);
@@ -210,6 +212,9 @@ std::unique_ptr<NativeTokenIoOwner> NativeTokenIoOwner::create(
     check(cudaHostAlloc(&impl->terminal_token_host, sizeof(std::int32_t),
                         cudaHostAllocDefault),
           "allocate terminal token");
+    check(cudaHostAlloc(&impl->terminal_winners_host,
+                        kTpSize * sizeof(Winner), cudaHostAllocDefault),
+          "allocate terminal winners");
     *impl->terminal_token_host = -1;
     check(cudaMemset(impl->zero_block_output, 0, kHidden * sizeof(float)),
           "initialize final block zero");
@@ -339,6 +344,10 @@ decode::TargetK0TokenOutput NativeTokenIoOwner::finish_prefill(
     check(cudaMemcpyAsync(impl_->terminal_token_host, impl_->global_token,
                           sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream),
           "stage terminal token");
+    check(cudaMemcpyAsync(impl_->terminal_winners_host, impl_->rank_winners,
+                          kTpSize * sizeof(Winner), cudaMemcpyDeviceToHost,
+                          stream),
+          "stage terminal winners");
     decode::target_k0_enter_stage(
         progress, decode::TargetK0ExecutionStage::kTerminalFence);
     check(cudaStreamSynchronize(stream), "terminal token fence");
@@ -353,8 +362,20 @@ decode::TargetK0TokenOutput NativeTokenIoOwner::finish_prefill(
             .count());
     impl_->emit("final", pair_reduce::Outcome::kOk, duration,
                 kHidden * sizeof(__nv_bfloat16) +
-                    kLocalVocab * sizeof(float) + sizeof(std::int32_t));
-    return {impl_->final_hidden, impl_->local_logits, token};
+                    kLocalVocab * sizeof(float) + sizeof(std::int32_t) +
+                    kTpSize * sizeof(Winner));
+    const Winner local = impl_->terminal_winners_host[impl_->rank];
+    const Winner global =
+        (impl_->terminal_winners_host[0].value >
+                 impl_->terminal_winners_host[1].value ||
+         (impl_->terminal_winners_host[0].value ==
+              impl_->terminal_winners_host[1].value &&
+          impl_->terminal_winners_host[0].token <
+              impl_->terminal_winners_host[1].token))
+            ? impl_->terminal_winners_host[0]
+            : impl_->terminal_winners_host[1];
+    return {impl_->final_hidden, impl_->local_logits, token, local.token,
+            local.value, global.value};
   } catch (const std::invalid_argument&) {
     impl_->emit("final", pair_reduce::Outcome::kContractError, 0, 0);
     throw;

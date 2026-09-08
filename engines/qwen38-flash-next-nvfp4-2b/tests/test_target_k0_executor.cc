@@ -89,7 +89,7 @@ struct TokenIo final : decode::TargetK0TokenIoPort {
     decode::target_k0_enter_stage(
         progress, decode::TargetK0ExecutionStage::kTerminalFence);
     ++finishes;
-    return {&final_hidden, logits.data(), 248'046};
+    return {&final_hidden, logits.data(), 248'046, 17, 3.5F, 4.5F};
   }
   int waits = 0;
   int embeds = 0;
@@ -126,9 +126,11 @@ struct Comparator final : decode::TargetK0OracleComparator {
   void compare_token(std::int32_t token) override {
     check(token == 248'046);
     ++tokens;
+    if (reject_token) throw std::logic_error("injected token mismatch");
   }
   int boundaries = 0;
   int tokens = 0;
+  bool reject_token = false;
 };
 
 }  // namespace
@@ -183,8 +185,48 @@ int main() {
               decode::TargetK0Boundary::kFinalNorm)] == 1 &&
           progress.oracle_domain_skip_counts[static_cast<std::size_t>(
               decode::TargetK0Boundary::kLocalLogits)] == 1);
+    check(progress.terminal_winner_observed &&
+          progress.observed_token == 248'046 &&
+          progress.local_winner_token == 17 &&
+          progress.local_winner_logit == 3.5F &&
+          progress.global_winner_logit == 4.5F);
     for (const auto& layer : owners)
       check(layer->waits == 1 && layer->rows == 35);
+
+    PhysicalReducer token_rejected_reducer;
+    Sink token_rejected_sink;
+    decode::TargetK0PairReduceSchedule token_rejected_schedule(
+        token_rejected_reducer, token_rejected_sink);
+    std::array<std::unique_ptr<Layer>, decode::kDecoderLayers>
+        token_rejected_owners;
+    std::array<decode::TargetK0LayerPort*, decode::kDecoderLayers>
+        token_rejected_layers{};
+    for (int layer = 0; layer < decode::kDecoderLayers; ++layer) {
+      token_rejected_owners[layer] = std::make_unique<Layer>(
+          layer, token_rejected_schedule.attention_port(layer),
+          token_rejected_schedule.moe_port(layer));
+      token_rejected_layers[layer] = token_rejected_owners[layer].get();
+    }
+    TokenIo token_rejected_io;
+    Comparator token_rejected_comparator;
+    token_rejected_comparator.reject_token = true;
+    decode::TargetK0Executor token_rejected_executor(
+        0, token_rejected_layers, token_rejected_io,
+        token_rejected_schedule, token_rejected_comparator,
+        token_rejected_sink, {hidden_a.data(), hidden_b.data()}, stream);
+    decode::TargetK0ExecutionProgress token_rejected_progress;
+    bool token_rejected = false;
+    try {
+      (void)token_rejected_executor.execute_prefill(
+          1, prompt, "trace", "request", &token_rejected_progress);
+    } catch (const std::logic_error&) {
+      token_rejected = true;
+    }
+    check(token_rejected && token_rejected_progress.terminal_winner_observed &&
+          token_rejected_progress.observed_token == 248'046 &&
+          token_rejected_progress.global_winner_logit == 4.5F &&
+          token_rejected_progress.stage ==
+              decode::TargetK0ExecutionStage::kTokenComparison);
 
     PhysicalReducer failed_reducer;
     Sink failed_sink;

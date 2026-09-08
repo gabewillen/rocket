@@ -36,6 +36,11 @@ struct Qwen38TargetK0Oracle35Result {
   std::uint8_t layer_boundary_reference_compared[6];
   std::uint8_t layer_boundary_reference_exact[6];
   std::uint32_t oracle_domain_skip_counts[5];
+  std::int32_t observed_token;
+  std::int32_t local_winner_token;
+  float local_winner_logit;
+  float global_winner_logit;
+  std::uint8_t terminal_winner_observed;
 };
 
 enum Qwen38TargetK0Oracle35Status : int {

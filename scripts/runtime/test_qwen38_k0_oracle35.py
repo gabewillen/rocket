@@ -232,6 +232,9 @@ class Oracle35LauncherTests(unittest.TestCase):
             "startup_construction_stage",
             "layer_boundary_diagnostics",
             "execution_domain", "oracle_domain_skip_counts",
+            "terminal_winner_observed", "observed_token",
+            "local_winner_token", "local_winner_logit",
+            "global_winner_logit",
         })
         self.assertEqual(module._snapshot(result)["execution_domain"],
                          "packed_decode_rows")
@@ -239,6 +242,18 @@ class Oracle35LauncherTests(unittest.TestCase):
             "oracle_domain_skip_counts"], [0, 0, 0, 0, 0])
         self.assertEqual(module._snapshot(result)[
             "layer_boundary_diagnostics"], ())
+
+    def test_terminal_winner_evidence_is_fixed_and_numeric(self):
+        error = module.NativeRunStatusError(
+            41, execution_stage=15, execution_row=34,
+            terminal_winner_observed=True, observed_token=17,
+            local_winner_token=19, local_winner_logit=2.5,
+            global_winner_logit=3.5)
+        self.assertTrue(error.terminal_winner_observed)
+        self.assertEqual((error.observed_token, error.local_winner_token,
+                          error.local_winner_logit,
+                          error.global_winner_logit),
+                         (17, 19, 2.5, 3.5))
 
     def test_layer_boundary_diagnostics_are_fixed_and_numeric(self):
         result = module._NativeResult()

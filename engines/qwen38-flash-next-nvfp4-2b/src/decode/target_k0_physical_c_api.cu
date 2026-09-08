@@ -110,6 +110,8 @@ extern "C" int qwen38_target_k0_oracle35_run(
   result->physical_layer_index = -1;
   result->execution_row = -1;
   result->execution_layer = -1;
+  result->observed_token = -1;
+  result->local_winner_token = -1;
   std::shared_ptr<decode::TargetK0BoundedTelemetry> telemetry;
   int failure_status = QWEN38_TARGET_K0_VALIDATION;
   decode::TargetK0PhysicalStartupStage startup_stage =
@@ -168,6 +170,12 @@ extern "C" int qwen38_target_k0_oracle35_run(
     std::copy(execution_progress.oracle_domain_skip_counts.begin(),
               execution_progress.oracle_domain_skip_counts.end(),
               result->oracle_domain_skip_counts);
+    result->observed_token = execution_progress.observed_token;
+    result->local_winner_token = execution_progress.local_winner_token;
+    result->local_winner_logit = execution_progress.local_winner_logit;
+    result->global_winner_logit = execution_progress.global_winner_logit;
+    result->terminal_winner_observed =
+        execution_progress.terminal_winner_observed ? 1 : 0;
     if (telemetry) publish(telemetry->snapshot(), *result);
   };
   try {

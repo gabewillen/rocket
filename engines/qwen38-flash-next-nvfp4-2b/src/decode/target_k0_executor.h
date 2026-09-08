@@ -55,6 +55,9 @@ struct TargetK0TokenOutput {
   const __nv_bfloat16* final_hidden_bf16 = nullptr;
   const float* local_logits = nullptr;          // [124160]
   std::int32_t global_token = -1;
+  std::int32_t local_winner_token = -1;
+  float local_winner_logit = 0.0F;
+  float global_winner_logit = 0.0F;
 };
 
 [[nodiscard]] constexpr bool accepted_target_k0_oracle(
