@@ -412,6 +412,17 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
   set_target_properties(qwen38_target_router_shared_c1 PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+
+  add_library(qwen38_target_full_moe_c1 SHARED
+    src/moe/target_full_moe_c1.cc)
+  target_include_directories(qwen38_target_full_moe_c1 PUBLIC src)
+  target_link_libraries(qwen38_target_full_moe_c1 PUBLIC CUDA::cudart PRIVATE
+    qwen38_target_router_shared_c1 qwen38_target_moe_c1
+    qwen38_target_moe_b12x_aot)
+  target_compile_options(qwen38_target_full_moe_c1 PRIVATE
+    -Wall -Wextra -Werror)
+  set_target_properties(qwen38_target_full_moe_c1 PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
 else()
   target_compile_definitions(qwen38_target_moe_b12x_aot PRIVATE
     ROCKET_QWEN38_TARGET_MOE_B12X_AOT=0)
@@ -593,6 +604,15 @@ if(TARGET qwen38_target_router_shared_c1)
     -Wall -Wextra -Werror)
   add_test(NAME qwen38-target-router-shared-c1-cpu-contract
     COMMAND qwen38-test-target-router-shared-c1-contract)
+
+  add_executable(qwen38-test-target-full-moe-c1-contract
+    tests/test_target_full_moe_c1_contract.cc)
+  target_link_libraries(qwen38-test-target-full-moe-c1-contract PRIVATE
+    qwen38_target_full_moe_c1)
+  target_compile_options(qwen38-test-target-full-moe-c1-contract PRIVATE
+    -Wall -Wextra -Werror)
+  add_test(NAME qwen38-target-full-moe-c1-cpu-contract
+    COMMAND qwen38-test-target-full-moe-c1-contract)
 endif()
 
 add_executable(qwen38-test-fp8-routed-experts
