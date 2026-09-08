@@ -119,6 +119,16 @@ target_compile_options(qwen38_decode_execution PRIVATE -Wall -Wextra -Werror)
 # a shared library. Keep the relocation fix local to its owner.
 set_target_properties(qwen38_decode_execution PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(qwen38_native_hyperconnection_adapter STATIC
+  src/hyperconnection/native_adapter.cc)
+target_include_directories(qwen38_native_hyperconnection_adapter PUBLIC src)
+target_link_libraries(qwen38_native_hyperconnection_adapter PUBLIC
+  qwen38_decode_execution qwen38_hyperconnection CUDA::cudart)
+target_compile_options(qwen38_native_hyperconnection_adapter PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_native_hyperconnection_adapter PROPERTIES
+  POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
+
 add_library(qwen38_native_qsa_graph STATIC
   src/attention/native_qsa_graph.cc)
 target_include_directories(qwen38_native_qsa_graph PUBLIC src)
@@ -512,6 +522,17 @@ target_compile_options(qwen38-test-native-qsa-c-api PRIVATE -Wall -Wextra -Werro
 set_target_properties(qwen38-test-native-qsa-c-api PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-native-qsa-c-api-contract
   COMMAND qwen38-test-native-qsa-c-api)
+
+add_executable(qwen38-test-native-hyperconnection-adapter
+  tests/test_native_hyperconnection_adapter.cc)
+target_link_libraries(qwen38-test-native-hyperconnection-adapter PRIVATE
+  qwen38_native_hyperconnection_adapter)
+target_compile_options(qwen38-test-native-hyperconnection-adapter PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-native-hyperconnection-adapter PROPERTIES
+  LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-native-hyperconnection-adapter-contract
+  COMMAND qwen38-test-native-hyperconnection-adapter)
 
 add_executable(qwen38-test-linear-attention-layer tests/test_linear_attention_layer.cc)
 target_link_libraries(qwen38-test-linear-attention-layer PRIVATE qwen38_decode_execution)
