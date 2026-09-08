@@ -302,6 +302,11 @@ target_compile_options(qwen38_layer3_rope_owner PRIVATE
 set_target_properties(qwen38_layer3_rope_owner PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
+# The all-layer binder owns both GDN and QSA bindings. Keep its QSA identity
+# definitions available even when the final consumer is a GDN-only owner.
+target_link_libraries(qwen38_target_layer_native_bindings PUBLIC
+  qwen38_qsa_sidecar_owner qwen38_layer3_rope_owner)
+
 add_executable(qwen38-qsa-sidecar-auth tests/qsa_sidecar_auth.cc)
 target_link_libraries(qwen38-qsa-sidecar-auth PRIVATE
   qwen38_qsa_sidecar_owner)
