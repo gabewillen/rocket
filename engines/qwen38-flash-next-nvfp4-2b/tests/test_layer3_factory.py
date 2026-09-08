@@ -12,6 +12,7 @@ from types import MappingProxyType
 from qwen38_slab.layer3_factory import (
     CtypesNativeTargetSlabLeaseFactory,
     Layer3FactoryError,
+    _accepted_native_descriptor_schema,
     native_target_slab_handoff,
     prepare_layer3_physical_plan,
     native_rank_descriptor,
@@ -67,6 +68,14 @@ class ReadyEvent:
 
 
 class Layer3FactoryTests(unittest.TestCase):
+    def test_native_handoff_accepts_only_layer3_or_all48_descriptor_schema(self):
+        self.assertTrue(_accepted_native_descriptor_schema(
+            "rocket.qwen38.layer3-native-plan.v1"))
+        self.assertTrue(_accepted_native_descriptor_schema(
+            "rocket.qwen38.target-layer-native-descriptor.v1"))
+        self.assertFalse(_accepted_native_descriptor_schema("unknown"))
+        self.assertFalse(_accepted_native_descriptor_schema(None))
+
     @unittest.skipUnless(
         os.environ.get("ROCKET_QWEN38_TARGET_SLAB_OWNER_LIBRARY"),
         "native accepted-loader lease library is unavailable",

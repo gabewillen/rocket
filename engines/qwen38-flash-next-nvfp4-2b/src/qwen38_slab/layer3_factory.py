@@ -32,9 +32,16 @@ TARGET_ARTIFACT = "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f
 INDEXER_SIDECAR = "bdbebd4f45c398f090a41ab98cd3881b969d958d8ae0bc42f3411844d3262edd"
 PLAN_SCHEMA = "rocket.qwen38.layer3-physical-plan.v1"
 NATIVE_PLAN_SCHEMA = "rocket.qwen38.layer3-native-plan.v1"
+TARGET_LAYER_NATIVE_DESCRIPTOR_SCHEMA = (
+    "rocket.qwen38.target-layer-native-descriptor.v1"
+)
 TARGET_MANIFEST_SHA256 = (
     "a44a450d9c0b6fe3df904ad1a78ecee959f28d9f055301195181e986bdc7028b"
 )
+
+
+def _accepted_native_descriptor_schema(value: object) -> bool:
+    return value in (NATIVE_PLAN_SCHEMA, TARGET_LAYER_NATIVE_DESCRIPTOR_SCHEMA)
 ROWS = 35
 HC_WIDTH = 10_240
 HIDDEN = 2_560
@@ -737,7 +744,7 @@ def native_target_slab_handoff(
     if (
         not isinstance(loaded, LoadedRankSlabs)
         or capability is None
-        or descriptor.get("schema") != NATIVE_PLAN_SCHEMA
+        or not _accepted_native_descriptor_schema(descriptor.get("schema"))
         or descriptor.get("artifact_key") != TARGET_ARTIFACT
         or descriptor.get("manifest_sha256") != TARGET_MANIFEST_SHA256
     ):
