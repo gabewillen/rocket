@@ -8,6 +8,12 @@
 
 namespace rocket::qwen38::moe {
 
+class TargetFullMoeConstructionError final : public std::runtime_error {
+ public:
+  TargetFullMoeConstructionError()
+      : std::runtime_error("target full MoE participant contract changed") {}
+};
+
 struct TargetFullMoeC1Weights {
   TargetRouterNvfp4Weights router;
   TargetMoeCompactRuntimeIdentity routed_identity;

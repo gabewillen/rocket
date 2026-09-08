@@ -113,7 +113,7 @@ class Oracle35LauncherTests(unittest.TestCase):
         )
         self.assertEqual(module.NativeRunStatusError(31, 5, 48).physical_layer,
                          -1)
-        self.assertEqual(set(module.GDN_OWNER_SUBSTAGES), set(range(10)))
+        self.assertEqual(set(module.GDN_OWNER_SUBSTAGES), set(range(14)))
         for code, name in module.GDN_OWNER_SUBSTAGES.items():
             self.assertEqual(
                 module.NativeRunStatusError(31, 5, 0, code).gdn_owner_substage,

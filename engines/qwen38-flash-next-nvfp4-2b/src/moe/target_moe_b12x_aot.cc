@@ -36,7 +36,8 @@ bool valid_launch(const TargetMoeB12xLaunch& launch) noexcept {
 
 #if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
 template <class Module>
-bool load_module(Module* module, int device, auto init, auto load) noexcept {
+TargetMoeAotConstructionStage load_module(
+    Module* module, int device, auto init, auto load) noexcept {
   cudaLibrary_t* library = &module->module;
   cudaError_t status = cudaSuccess;
   struct InitArgs {
@@ -44,7 +45,7 @@ bool load_module(Module* module, int device, auto init, auto load) noexcept {
     cudaError_t* status;
   } init_args{&library, &status};
   init(reinterpret_cast<void**>(&init_args));
-  if (status != cudaSuccess) return false;
+  if (status != cudaSuccess) return TargetMoeAotConstructionStage::kModuleData;
   std::int32_t selected_device = device;
   struct LoadArgs {
     cudaLibrary_t** library;
@@ -52,7 +53,8 @@ bool load_module(Module* module, int device, auto init, auto load) noexcept {
     cudaError_t* status;
   } load_args{&library, &selected_device, &status};
   load(reinterpret_cast<void**>(&load_args));
-  return status == cudaSuccess;
+  return status == cudaSuccess ? TargetMoeAotConstructionStage{}
+                               : TargetMoeAotConstructionStage::kModuleLoad;
 }
 #endif
 
@@ -174,14 +176,16 @@ TargetMoeB12xAot::TargetMoeB12xAot(
     : impl_(nullptr) {
   if (diagnose_target_moe_b12x_create(device, identity, weights) !=
       TargetMoeCreateFailure::kNone)
-    throw std::invalid_argument("target MoE B12X identity or weights changed");
+    throw TargetMoeAotConstructionError(
+        TargetMoeAotConstructionStage::kIdentity);
   impl_ = new Impl{device, identity, weights};
-  if (!load_module(&impl_->module, device,
-                   _mlir_qwen38_target_moe_b12x_c1_cuda_init,
-                   _mlir_qwen38_target_moe_b12x_c1_cuda_load_to_device)) {
+  const auto construction_stage = load_module(
+      &impl_->module, device, _mlir_qwen38_target_moe_b12x_c1_cuda_init,
+      _mlir_qwen38_target_moe_b12x_c1_cuda_load_to_device);
+  if (construction_stage != TargetMoeAotConstructionStage{}) {
     delete impl_;
     impl_ = nullptr;
-    throw std::runtime_error("initialize target MoE B12X module failed");
+    throw TargetMoeAotConstructionError(construction_stage);
   }
 }
 

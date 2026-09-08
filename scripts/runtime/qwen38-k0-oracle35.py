@@ -52,6 +52,8 @@ GDN_OWNER_SUBSTAGES = {
     0: "unknown", 1: "lease", 2: "plan_binder", 3: "globals",
     4: "moe_stage", 5: "moe_aot", 6: "storage", 7: "cutlass_graph",
     8: "hyperconnection", 9: "composite",
+    10: "moe_aot_identity", 11: "moe_aot_module_data",
+    12: "moe_aot_module_load", 13: "moe_participant_contract",
 }
 
 

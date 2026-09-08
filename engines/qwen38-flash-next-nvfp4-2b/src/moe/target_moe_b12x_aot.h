@@ -7,10 +7,26 @@
 
 #include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <string_view>
 #include <string>
 
 namespace rocket::qwen38::moe {
+
+enum class TargetMoeAotConstructionStage : std::uint8_t {
+  kIdentity = 1,
+  kModuleData = 2,
+  kModuleLoad = 3,
+};
+
+class TargetMoeAotConstructionError final : public std::runtime_error {
+ public:
+  explicit TargetMoeAotConstructionError(TargetMoeAotConstructionStage stage)
+      : std::runtime_error("target MoE AOT construction failed"), stage_(stage) {}
+  TargetMoeAotConstructionStage stage() const noexcept { return stage_; }
+ private:
+  TargetMoeAotConstructionStage stage_;
+};
 
 inline constexpr int kTargetMoeHidden = 2'560;
 inline constexpr int kTargetMoeLogicalIntermediate = 640;

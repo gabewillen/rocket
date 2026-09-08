@@ -100,7 +100,7 @@ TargetFullMoeC1::TargetFullMoeC1(
           TargetDenseFailure::kNone ||
       diagnose_target_shared_c1(identity, weights.shared, shared_probe) !=
           TargetDenseFailure::kNone)
-    throw std::invalid_argument("target full MoE identity or weights changed");
+    throw TargetFullMoeConstructionError();
   impl_ = new Impl(device, identity, weights);
 }
 

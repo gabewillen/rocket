@@ -24,6 +24,10 @@ enum class TargetGdnOwnerConstructionStage : std::int32_t {
   kCutlassGraph = 7,
   kHyperconnection = 8,
   kComposite = 9,
+  kMoeAotIdentity = 10,
+  kMoeAotModuleData = 11,
+  kMoeAotModuleLoad = 12,
+  kMoeParticipantContract = 13,
 };
 
 struct TargetGdnNativeWeightBindings {

@@ -87,6 +87,22 @@ TargetK0PhysicalLayerOwners::create(
         moe = moe::TargetLayerMoeDeviceOwner::create(
             device, plan, accepted_loader_lease_handle, moe_telemetry,
             stage_telemetry, &moe_stage);
+      } catch (const moe::TargetMoeAotConstructionError& error) {
+        if (progress) {
+          progress->gdn_stage =
+              error.stage() == moe::TargetMoeAotConstructionStage::kIdentity
+                  ? TargetGdnOwnerConstructionStage::kMoeAotIdentity
+                  : (error.stage() ==
+                             moe::TargetMoeAotConstructionStage::kModuleData
+                         ? TargetGdnOwnerConstructionStage::kMoeAotModuleData
+                         : TargetGdnOwnerConstructionStage::kMoeAotModuleLoad);
+        }
+        throw;
+      } catch (const moe::TargetFullMoeConstructionError&) {
+        if (progress)
+          progress->gdn_stage =
+              TargetGdnOwnerConstructionStage::kMoeParticipantContract;
+        throw;
       } catch (...) {
         if (progress) {
           progress->gdn_stage =
