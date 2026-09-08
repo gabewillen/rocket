@@ -483,6 +483,17 @@ set_target_properties(qwen38_gdn_prefill_fused PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+add_library(qwen38_gdn_prefill_owner SHARED
+  src/linear_attention/gdn_prefill_owner.cu)
+target_include_directories(qwen38_gdn_prefill_owner PUBLIC src)
+target_link_libraries(qwen38_gdn_prefill_owner PUBLIC CUDA::cudart)
+target_compile_options(qwen38_gdn_prefill_owner PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+set_target_properties(qwen38_gdn_prefill_owner PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
 set(ROCKET_QWEN38_GDN_B12X_AOT_DIR "" CACHE PATH
   "Directory containing the four generated GDN B12X headers and objects")
 set(ROCKET_QWEN38_CUTE_DSL_RUNTIME "" CACHE FILEPATH
@@ -1459,6 +1470,15 @@ target_compile_options(qwen38-test-gdn-prefill-fused PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>)
 add_test(NAME qwen38-gdn-prefill-fused-contract
   COMMAND qwen38-test-gdn-prefill-fused)
+
+add_executable(qwen38-test-gdn-prefill-owner
+  tests/test_gdn_prefill_owner.cu)
+target_link_libraries(qwen38-test-gdn-prefill-owner PRIVATE
+  qwen38_gdn_prefill_owner CUDA::cudart)
+target_compile_options(qwen38-test-gdn-prefill-owner PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>)
+add_test(NAME qwen38-gdn-prefill-owner-contract
+  COMMAND qwen38-test-gdn-prefill-owner)
 
 add_executable(qwen38-test-gdn-prefill-width4
   tests/test_gdn_prefill_width4.cc)

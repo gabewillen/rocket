@@ -160,6 +160,30 @@ class GdnChunkPrefillTests(unittest.TestCase):
                     bundle, torch_module=types.SimpleNamespace(), backend=Backend()
                 )
 
+    def test_real_tensor_bundle_rejects_backend_identity_mismatch(self):
+        backend = Backend()
+        backend.expected_rank = 1
+        torch = types.SimpleNamespace(
+            bfloat16="bfloat16",
+            float32="float32",
+            int64="int64",
+            frombuffer=lambda payload, *, dtype: Tensor(
+                (len(payload),), dtype, device="cpu", payload=bytes(payload)
+            ),
+            empty=lambda shape, *, dtype, device: Tensor(
+                tuple(shape), dtype, device=device
+            ),
+            tensor=lambda values, *, dtype, device: Tensor(
+                (len(values),), dtype, device=device
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = self._real_tensor_bundle(Path(temporary))
+            with self.assertRaises(GdnChunkPrefillError):
+                execute_authenticated_real_tensor_bundle(
+                    bundle, torch_module=torch, backend=backend
+                )
+
     @staticmethod
     def _real_tensor_bundle(root: Path) -> Path:
         rows = 35
