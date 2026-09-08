@@ -1,0 +1,99 @@
+---
+title: "Native target-slab loading misses the 17.86-second guard"
+description: "Two authenticated 63.21 GB native target-slab loads passed device sampling but exceeded the fixed 17.862785416-second cold-load boundary."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, runtime, memory, telemetry]
+verdict: rejected
+rocket: "#engine-status"
+---
+
+**Question.** Does the fixed native target-slab owner preserve the accepted cold-load boundary?
+
+| setup | value |
+| --- | --- |
+| nodes | gx10-5e36 rank 0 and gx10-2a13 rank 1, GB10, GPU 0, 64 KiB pages |
+| run commit | `b6709eab6a2ccf4aef62f2b1f93ac58741c9802d` |
+| owner commit | `f6137a11273e51a3e792b320a73e9081295f82d0` |
+| failure-telemetry follow-up | `60896df216a48c589e0c7bb0a026d8517ecc183b` (not used for this run) |
+| image | `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| CUTLASS checkout | `e1f584fde116f6b5f8b602dc3a395ab83e408098` |
+| artifact | `a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4` |
+| manifest SHA-256 | `a44a450d9c0b6fe3df904ad1a78ecee959f28d9f055301195181e986bdc7028b` |
+| rank slab | 63,212,748,800 B, 236 authenticated chunks |
+| staging | four pinned slots, 1,074,003,964 B peak request |
+| container limit | 96 GiB memory and swap, network disabled |
+| acceptance boundary | open-to-publish <= 17.862785416 s |
+
+```bash
+# Run once on each node, changing runner, rank, and name as shown.
+docker create \
+  --name rocket-qwen38-target-slab-b6709ea-rank0 \
+  --network none --gpus device=0 \
+  --memory 96g --memory-swap 96g --ulimit memlock=-1:-1 \
+  --entrypoint /runner \
+  --mount type=bind,src=/home/glwillen/Development/rocket-native-target-slab-owner-worktree/engines/qwen38-flash-next-nvfp4-2b/build-target-slab-owner/qwen38-target-slab-load,dst=/runner,readonly \
+  --mount type=bind,src=/home/glwillen/calibration/qwen38-rank-slabs-fc694,dst=/slabs,readonly \
+  sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a \
+  0 0 /slabs/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4
+
+ssh glwillen@192.168.100.11 docker create \
+  --name rocket-qwen38-target-slab-b6709ea-rank1 \
+  --network none --gpus device=0 \
+  --memory 96g --memory-swap 96g --ulimit memlock=-1:-1 \
+  --entrypoint /runner \
+  --mount type=bind,src=/dev/shm/rocket-target-slab-b6709ea/build/qwen38-target-slab-load,dst=/runner,readonly \
+  --mount type=bind,src=/home/glwillen/calibration/qwen38-rank-slabs-fc694,dst=/slabs,readonly \
+  sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a \
+  1 0 /slabs/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4
+
+docker start rocket-qwen38-target-slab-b6709ea-rank0 &
+ssh glwillen@192.168.100.11 docker start rocket-qwen38-target-slab-b6709ea-rank1 &
+wait
+```
+
+| rank | result | container wall | exact open-to-publish | OOM/Xid | identity, event, samples |
+| ---: | --- | ---: | --- | --- | --- |
+| 0 | guard rejected | 40.254062 s | >17.862785416 s | none | passed before guard |
+| 1 | guard rejected | 40.543270 s | >17.862785416 s | none | passed before guard |
+| mean | rejected | 40.398666 s | unavailable | none | 2/2 passed |
+
+| evidence boundary | value |
+| --- | --- |
+| cross-node wall spread | 0.289208 s (0.716%) |
+| run-to-run variance | unavailable, one run per node |
+| container wall | includes launch overhead; excluded from the exact owner timer |
+
+```json
+{"schema":"rocket.qwen38.target-slab-load.v1","valid":false,"complete":false,"failure_class":"contract_or_runtime","telemetry_records":1,"telemetry_overflow":false,"reason":"target slab cold-load regression guard exceeded"}
+```
+
+| artifact | SHA-256 |
+| --- | --- |
+| harness source | `7b336dbb21c10b6f679718ebb15888cc0dc7f7da8bd27ce8b868788e3baf25af` |
+| owner source | `2e909449b0c620c500be402ffffcf10314d2aae1efbb267f64afdd56b1c6bdcf` |
+| generated 472-record contract | `7b25cce6890feca8ef80c2fac4905dcc81419ee7b973e03fe6f4c41da7fbb642` |
+| executable | `1eb3462759f9b2222ec0463c1d177daf54d58dc4c333e33c81b0a7c3e47d71b7` |
+| rank 0 log | `d2a7d012f394e4db94e433029ecac8572a8f67754b3eb4ca989ed57894530ba2` |
+| rank 0 inspect | `29d298857eacf42fb9c804db68c9b78f49b393f1230c1e9a13846d2272618ac0` |
+| rank 1 log | `d2a7d012f394e4db94e433029ecac8572a8f67754b3eb4ca989ed57894530ba2` |
+| rank 1 inspect | `bdef2fc3010ff0fd8196343ebaf2b1183824306dd086751c9b8efe7e26890e48` |
+
+| implementation observation | value |
+| --- | --- |
+| accepted Python loader | four authentication workers and four CUDA streams for the target slab |
+| rejected native owner | four buffers, synchronous read and SHA-256 work, one H2D stream |
+| causal status | unprofiled hypothesis; no root-cause claim |
+| fixed boundary | [17.862785416 s](../2026-09-08-qwen38-local-ext4-cold-first-token/) |
+
+**Verdict.** Rejected for value at the fixed cold-load boundary. The result does not reject the authenticated layout, device publication, or sampled bytes.
+
+**Next.**
+
+- finish the accurate end-to-end token before spending another model-load iteration here
+- profile read, SHA-256, H2D enqueue, and fence time after that token exists
+- test a worker and stream pipeline only if the profile selects it
+
+**Reopen if.**
+
+- CUDA, firmware, storage hardware, or the upstream container image changes
