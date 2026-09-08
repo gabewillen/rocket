@@ -370,3 +370,8 @@ target_compile_options(qwen38-test-gdn-prefill-projection-contract PRIVATE
   -Wall -Wextra -Werror)
 add_test(NAME qwen38-gdn-prefill-projection-cpu-contract
   COMMAND qwen38-test-gdn-prefill-projection-contract)
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME qwen38-gdn-b12x-aot-cpu-contract
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gdn_b12x_aot_contract.py)
