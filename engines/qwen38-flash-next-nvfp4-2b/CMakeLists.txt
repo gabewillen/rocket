@@ -185,10 +185,26 @@ target_compile_options(qwen38_qsa_sidecar_owner PRIVATE
 set_target_properties(qwen38_qsa_sidecar_owner PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
+add_library(qwen38_layer3_rope_owner STATIC
+  src/attention/layer3_rope_owner.cc)
+target_include_directories(qwen38_layer3_rope_owner PUBLIC src)
+target_link_libraries(qwen38_layer3_rope_owner PUBLIC CUDA::cudart)
+target_compile_options(qwen38_layer3_rope_owner PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_layer3_rope_owner PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+
 add_executable(qwen38-qsa-sidecar-auth tests/qsa_sidecar_auth.cc)
 target_link_libraries(qwen38-qsa-sidecar-auth PRIVATE
   qwen38_qsa_sidecar_owner)
 target_compile_options(qwen38-qsa-sidecar-auth PRIVATE
+  -Wall -Wextra -Werror)
+
+add_executable(qwen38-test-layer3-rope-owner
+  tests/test_layer3_rope_owner.cc)
+target_link_libraries(qwen38-test-layer3-rope-owner PRIVATE
+  qwen38_layer3_rope_owner)
+target_compile_options(qwen38-test-layer3-rope-owner PRIVATE
   -Wall -Wextra -Werror)
 
 add_library(qwen38_target_slab_owner STATIC src/model/target_slab_owner.cc)
@@ -598,6 +614,8 @@ target_link_libraries(qwen38-token-output-bench PRIVATE qwen38_token_output)
 
 enable_testing()
 add_test(NAME qwen38-qsa-expand-smoke COMMAND qwen38-qsa-expand-smoke)
+add_test(NAME qwen38-layer3-rope-owner-cpu-contract
+  COMMAND qwen38-test-layer3-rope-owner)
 add_executable(qwen38-test-pair-reduce tests/test_pair_reduce.cu)
 target_link_libraries(qwen38-test-pair-reduce PRIVATE qwen38_pair_reduce)
 target_compile_options(qwen38-test-pair-reduce PRIVATE
@@ -907,6 +925,9 @@ add_test(NAME qwen38-target-moe-n640-materializer-source-contract
 add_test(NAME qwen38-qsa-sidecar-owner-source-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qsa_sidecar_owner_source.py)
+add_test(NAME qwen38-layer3-rope-owner-source-contract
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_layer3_rope_owner_source.py)
 add_test(NAME qwen38-route-compaction-source-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_route_compaction_source.py)
