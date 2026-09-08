@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Focused contract tests for the two-node expanded-calibration launcher."""
 
+import json
 import pathlib
 import socket
 import subprocess
@@ -47,6 +48,47 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn('model_oracle.py:', self.source)
         self.assertIn('ROCKET_QWEN38_K0_EXPECTED_IDS', self.source)
         self.assertIn('"valid": False', self.source)
+
+    def test_remote_prepare_failure_survives_cleanup_and_emits_oracle_failure(self):
+        self.assertIn('run_checked "worker_output_prepare" ssh', self.source)
+        self.assertIn("on_shell_error()", self.source)
+        self.assertIn('exit "$status"', self.source)
+        self.assertIn('write_oracle_failure "$CURRENT_PHASE"', self.source)
+        self.assertIn('"valid": False', self.source)
+        self.assertIn('"complete": False', self.source)
+        lifecycle = self.source[
+            self.source.index('head_log_pid=""'):
+            self.source.index("\ncommand -v docker")
+        ]
+        writer = self.source[
+            self.source.index("write_oracle_failure() {"):
+            self.source.index("\nwhile (($#))")
+        ]
+        with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+            harness = pathlib.Path(directory) / "masked-status-regression.sh"
+            harness.write_text(
+                "set -euo pipefail\n"
+                f"OUTPUT_DIR={directory}\n"
+                "ORACLE_K0=true\nKEEP_RUNNING=false\n"
+                "SSH_TARGET=unused\nHEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n"
+                + writer
+                + lifecycle
+                + '\nrun_checked "worker_output_prepare" bash -c "exit 73"\n'
+            )
+            result = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 73, result.stderr)
+            failure = json.loads((pathlib.Path(directory) / "oracle-failure.json").read_text())
+            self.assertFalse(failure["valid"])
+            self.assertFalse(failure["complete"])
+            self.assertEqual(failure["phase"], "worker_output_prepare")
+
+    def test_oracle_worker_uses_bounded_tmpfs_and_rank0_owns_capture(self):
+        self.assertIn('REMOTE_OUTPUT="/dev/shm/rocket-qwen38-k0-', self.source)
+        self.assertIn('WORKER_SCRATCH_MIN_BYTES=', self.source)
+        self.assertIn('worker tmpfs capacity', self.source)
+        self.assertIn('ROCKET_QWEN38_K0_ORACLE=1', self.source)
+        self.assertIn('if [[ "$node_rank" == 0 ]]', self.source)
+        self.assertIn("find '$REMOTE_OUTPUT' -depth -delete", self.source)
 
     def test_worker_host_cache_is_ext4_and_manifest_matched_fail_closed(self):
         self.assertIn('[[ "$WORKER_HF_CACHE" == /* ]]', self.source)
@@ -95,7 +137,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn('head_benchmark_since=$(date --iso-8601=seconds)', self.source)
         self.assertIn('--not-before "$head_benchmark_since"', self.source)
         production = self.source[
-            self.source.index('if [[ "$PRODUCTION" == true ]]', self.source.index("trap cleanup")):
+            self.source.index('if [[ "$PRODUCTION" == true ]]', self.source.index("trap on_shell_exit EXIT")):
             self.source.index("# Move past the health-check second")
         ]
         self.assertIn('> "$OUTPUT_DIR/mtp-runtime-evidence.json"', production)
@@ -294,7 +336,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         ]
         production = self.source[
             self.source.index('if [[ "$PRODUCTION" == true ]]; then', self.source.index("write_launch_script() {")):
-            self.source.index('\nscp -q "$OUTPUT_DIR/launch-worker.sh"')
+            self.source.index('\nrun_checked "worker_launcher_transfer" scp')
         ]
         with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
             root = pathlib.Path(directory)

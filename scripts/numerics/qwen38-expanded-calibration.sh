@@ -102,8 +102,15 @@ EOF
 }
 
 fail() {
+    write_oracle_failure "${CURRENT_PHASE:-launcher}" "$*"
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+write_oracle_failure() {
+    local phase=${1:-launcher} reason=${2:-unknown}
     if [[ "${ORACLE_K0:-false}" == true && -n "${OUTPUT_DIR:-}" && -d "${OUTPUT_DIR:-}" ]]; then
-        python3 - "$OUTPUT_DIR/oracle-failure.json" "$*" <<'PY' || true
+        python3 - "$OUTPUT_DIR/oracle-failure.json" "$phase" "$reason" <<'PY' || true
 import json
 import pathlib
 import sys
@@ -116,16 +123,14 @@ record = {
     "schema": "rocket.qwen38.k0-target-oracle-failure.v1",
     "valid": False,
     "complete": False,
-    "phase": "launcher",
-    "reason": sys.argv[2][:1024],
+    "phase": sys.argv[2][:128],
+    "reason": sys.argv[3][:1024],
     "identity": identity,
     "completed": sorted(item.name for item in capture.glob("*.bin"))[:51] if capture.is_dir() else [],
 }
 path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 PY
     fi
-    printf 'ERROR: %s\n' "$*" >&2
-    exit 1
 }
 
 while (($#)); do
@@ -190,6 +195,8 @@ fi
 [[ "$MTP_DEPTH" != 0 || "$ORACLE_K0" == true ]] || fail "K0 is only available through --oracle-k0"
 [[ "$ORACLE_K0" != true || "$PRODUCTION" != true ]] || fail "--oracle-k0 and --production are mutually exclusive"
 [[ "$ORACLE_K0" != true || -n "$NVFP4_ARTIFACT_DIR" ]] || fail "--oracle-k0 requires the accepted --nvfp4-artifact-dir"
+[[ "$ORACLE_K0" != true || "$KEEP_RUNNING" != true ]] || fail "--oracle-k0 requires exact cleanup and rejects --keep-running"
+[[ "$ORACLE_K0" != true || -n "$WORKER_HF_CACHE" ]] || fail "--oracle-k0 requires --worker-hf-cache for the read-only rank1 source mount"
 # The pinned Qwen path reuses its one MTP layer. Its GDN and PLE cache shapes add
 # num_speculative_tokens to their convolution history, while the model weights,
 # model revision, and persistent recurrent-state shapes remain unchanged. K7's
@@ -298,6 +305,67 @@ ARTIFACT_DIR="$OUTPUT_DIR/artifacts"
 LOG_DIR="$OUTPUT_DIR/logs"
 WORK_DIR="$OUTPUT_DIR/work"
 SSH_TARGET="${WORKER_USER}@${WORKER_IP}"
+
+head_log_pid=""
+worker_log_pid=""
+head_workload_log_pid=""
+worker_workload_log_pid=""
+hardware_monitor_pid=""
+head_container_started=false
+worker_container_started=false
+worker_scratch_created=false
+REMOTE_OUTPUT=""
+CURRENT_PHASE="cpu_preflight"
+
+cleanup() {
+    local status=${1:-0}
+    set +e
+    [[ -n "$head_log_pid" ]] && kill "$head_log_pid" >/dev/null 2>&1
+    [[ -n "$worker_log_pid" ]] && kill "$worker_log_pid" >/dev/null 2>&1
+    [[ -n "$head_workload_log_pid" ]] && kill "$head_workload_log_pid" >/dev/null 2>&1
+    [[ -n "$worker_workload_log_pid" ]] && kill "$worker_workload_log_pid" >/dev/null 2>&1
+    [[ -n "$hardware_monitor_pid" ]] && kill "$hardware_monitor_pid" >/dev/null 2>&1
+    [[ -n "$hardware_monitor_pid" ]] && wait "$hardware_monitor_pid" 2>/dev/null
+    if [[ "$KEEP_RUNNING" != true ]]; then
+        [[ "$head_container_started" == true ]] && docker rm -f "$HEAD_CONTAINER" >/dev/null 2>&1
+        if [[ "$worker_container_started" == true ]]; then
+            ssh -o BatchMode=yes "$SSH_TARGET" \
+                "docker rm -f '$WORKER_CONTAINER' >/dev/null 2>&1" >/dev/null 2>&1
+        fi
+    fi
+    if [[ "$worker_scratch_created" == true ]]; then
+        ssh -o BatchMode=yes "$SSH_TARGET" \
+            "case '$REMOTE_OUTPUT' in /dev/shm/rocket-qwen38-k0-*) find '$REMOTE_OUTPUT' -depth -delete ;; *) exit 91 ;; esac" \
+            >/dev/null 2>&1
+    fi
+    return "$status"
+}
+
+on_shell_error() {
+    local status=$?
+    trap - ERR EXIT INT TERM
+    write_oracle_failure "$CURRENT_PHASE" "command failed with status $status"
+    cleanup "$status"
+    exit "$status"
+}
+
+on_shell_exit() {
+    local status=$?
+    trap - ERR EXIT INT TERM
+    cleanup "$status"
+    exit "$status"
+}
+
+run_checked() {
+    CURRENT_PHASE=$1
+    shift
+    "$@"
+}
+
+set -E
+trap on_shell_error ERR
+trap on_shell_exit EXIT
+trap 'exit 130' INT TERM
 
 command -v docker >/dev/null || fail "docker is required"
 command -v python3 >/dev/null || fail "python3 is required"
@@ -541,7 +609,9 @@ fi
 # the selected patched metadata, then mount that view once as read-only.
 if [[ "$WORKER_CACHE_KIND" == host_ext4 ]]; then
     HEAD_RUNTIME_CACHE_MOUNT="$WORK_DIR/hf-cache-view"
-    WORKER_RUNTIME_CACHE_MOUNT="$OUTPUT_DIR/work/hf-cache-view"
+    if [[ "$ORACLE_K0" != true ]]; then
+        WORKER_RUNTIME_CACHE_MOUNT="$OUTPUT_DIR/work/hf-cache-view"
+    fi
     head_cache_device=$(stat -c %d "$HF_CACHE")
     head_output_device=$(stat -c %d "$WORK_DIR")
     [[ "$head_cache_device" == "$head_output_device" ]] || \
@@ -596,10 +666,37 @@ check_port_available "0.0.0.0" "$API_PORT" || \
     fail "head API port is unavailable: 0.0.0.0:$API_PORT"
 
 REMOTE_OUTPUT="$OUTPUT_DIR"
-ssh -o BatchMode=yes "$SSH_TARGET" \
+if [[ "$ORACLE_K0" == true ]]; then
+    scratch_key=$(printf '%s\n%s\n' "$(git -C "$REPO_ROOT" rev-parse HEAD)" "$OUTPUT_DIR" | sha256sum | cut -c1-20)
+    REMOTE_OUTPUT="/dev/shm/rocket-qwen38-k0-$scratch_key"
+    [[ "$REMOTE_OUTPUT" =~ ^/dev/shm/rocket-qwen38-k0-[0-9a-f]{20}$ ]] || \
+        fail "worker scratch identity is unsafe"
+    overlay_bytes=$(stat -c %s "$NVFP4_ARTIFACT_DIR/$NVFP4_OVERLAY_FILE")
+    artifact_bytes=$(du -sb "$ARTIFACT_DIR" | cut -f1)
+    WORKER_SCRATCH_MIN_BYTES=$((overlay_bytes + artifact_bytes + 134217728))
+    worker_tmpfs_available=$(ssh -o BatchMode=yes "$SSH_TARGET" \
+        "df -B1 --output=avail /dev/shm | tail -1 | tr -d ' '")
+    [[ "$worker_tmpfs_available" =~ ^[0-9]+$ && "$worker_tmpfs_available" -ge "$WORKER_SCRATCH_MIN_BYTES" ]] || \
+        fail "worker tmpfs capacity ${worker_tmpfs_available:-unknown} is below required $WORKER_SCRATCH_MIN_BYTES bytes"
+    WORKER_RUNTIME_CACHE_MOUNT="$REMOTE_OUTPUT/work/hf-cache-view"
+    worker_scratch_created=true
+    python3 - "$OUTPUT_DIR/run.json" "$REMOTE_OUTPUT" "$WORKER_RUNTIME_CACHE_MOUNT" "$WORKER_SCRATCH_MIN_BYTES" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+record = json.loads(path.read_text())
+record["worker_oracle_scratch"] = sys.argv[2]
+record["worker_runtime_cache_path"] = sys.argv[3]
+record["worker_scratch_min_bytes"] = int(sys.argv[4])
+path.write_text(json.dumps(record, sort_keys=True) + "\n")
+PY
+fi
+run_checked "worker_output_prepare" ssh -o BatchMode=yes "$SSH_TARGET" \
     "mkdir -p '$REMOTE_OUTPUT/artifacts' '$REMOTE_OUTPUT/logs' '$REMOTE_OUTPUT/work'"
-scp -q "$ARTIFACT_DIR"/* "$SSH_TARGET:$REMOTE_OUTPUT/artifacts/"
-ssh -o BatchMode=yes "$SSH_TARGET" \
+run_checked "worker_artifact_transfer" scp -q "$ARTIFACT_DIR"/* "$SSH_TARGET:$REMOTE_OUTPUT/artifacts/"
+run_checked "worker_artifact_verify" ssh -o BatchMode=yes "$SSH_TARGET" \
     "cd '$REMOTE_OUTPUT/artifacts' && sha256sum --check SHA256SUMS"
 
 write_launch_script() {
@@ -631,6 +728,9 @@ write_launch_script() {
   -e ROCKET_QWEN38_K0_IDENTITY=$(printf '%q' "$ORACLE_IDENTITY") \\
   -e ROCKET_QWEN38_K0_ORACLE_DIR=/rocket/oracle-root/capture \\
   -v $(printf '%q' "$OUTPUT_DIR"):/rocket/oracle-root \\"
+        else
+            oracle_options="
+  -v $(printf '%q' "$WORKER_HF_CACHE"):/rocket/source-hf:ro \\"
         fi
     fi
     cat > "$destination" <<EOF
@@ -703,19 +803,19 @@ fi
 REMOTE_NVFP4_ARTIFACT=""
 if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
     REMOTE_NVFP4_ARTIFACT="$REMOTE_OUTPUT/nvfp4-artifact"
-    ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p '$REMOTE_NVFP4_ARTIFACT'"
+    run_checked "worker_overlay_prepare" ssh -o BatchMode=yes "$SSH_TARGET" "mkdir -p '$REMOTE_NVFP4_ARTIFACT'"
     (
         cd "$NVFP4_ARTIFACT_DIR"
         sha256sum manifest.json hf_quant_config.json "$NVFP4_OVERLAY_FILE" \
             > "$WORK_DIR/nvfp4-artifact-SHA256SUMS"
     )
-    scp -q "$NVFP4_ARTIFACT_DIR/manifest.json" "$NVFP4_ARTIFACT_DIR/hf_quant_config.json" \
+    run_checked "worker_overlay_transfer" scp -q "$NVFP4_ARTIFACT_DIR/manifest.json" "$NVFP4_ARTIFACT_DIR/hf_quant_config.json" \
         "$NVFP4_ARTIFACT_DIR/$NVFP4_OVERLAY_FILE" \
         "$WORK_DIR/nvfp4-artifact-SHA256SUMS" \
         "$SSH_TARGET:$REMOTE_NVFP4_ARTIFACT/"
-    ssh -o BatchMode=yes "$SSH_TARGET" \
+    run_checked "worker_overlay_verify" ssh -o BatchMode=yes "$SSH_TARGET" \
         "cd '$REMOTE_NVFP4_ARTIFACT' && sha256sum --check nvfp4-artifact-SHA256SUMS"
-    ssh -o BatchMode=yes "$SSH_TARGET" \
+    run_checked "worker_overlay_preflight" ssh -o BatchMode=yes "$SSH_TARGET" \
         "docker run --rm \
         -v '$WORKER_CACHE_MOUNT:/root/.cache/huggingface:ro' \
         -v '$REMOTE_NVFP4_ARTIFACT:/rocket/qwen38-linear-nvfp4:ro' \
@@ -724,7 +824,7 @@ if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
         -e ROCKET_QWEN38_NVFP4_QUANT_CONFIG=/rocket/qwen38-linear-nvfp4/hf_quant_config.json \
         --entrypoint /usr/bin/python3 '$IMAGE_TAG' -c \
         \"import glob; from vllm.model_executor.model_loader.weight_utils import _rocket_qwen38_nvfp4_overlay_preflight as check; files=glob.glob('/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/*.safetensors'); result=check(sorted(files), 'lazy'); assert len(result['selected']) == $NVFP4_EXPECTED_COUNT; print('validated worker NVFP4 overlay: $NVFP4_EXPECTED_COUNT tensors')\""
-    ssh -o BatchMode=yes "$SSH_TARGET" \
+    run_checked "worker_overlay_semantics" ssh -o BatchMode=yes "$SSH_TARGET" \
         "docker run --rm \
         -v '$REMOTE_OUTPUT/artifacts/modelopt_patched.py:$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro' \
         -v '$REMOTE_NVFP4_ARTIFACT/hf_quant_config.json:/work/hf_quant_config.json:ro' \
@@ -740,14 +840,20 @@ if [[ "$WORKER_CACHE_KIND" == host_ext4 ]]; then
     printf -v remote_view_q '%q' "$WORKER_RUNTIME_CACHE_MOUNT"
     printf -v remote_model_q '%q' "$WORKER_HF_CACHE/hub/$MODEL_CACHE_NAME"
     printf -v remote_view_snapshot_q '%q' "$WORKER_RUNTIME_CACHE_MOUNT/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION"
-    worker_cache_device=$(ssh -o BatchMode=yes "$SSH_TARGET" "stat -c %d $worker_cache_q")
-    worker_output_device=$(ssh -o BatchMode=yes "$SSH_TARGET" "stat -c %d $remote_work_q")
-    [[ "$worker_cache_device" == "$worker_output_device" ]] || \
-        fail "worker immutable cache view must share the checkpoint ext4 filesystem"
-    ssh -o BatchMode=yes "$SSH_TARGET" \
-        "mkdir -p $remote_view_q/hub && cp -al $remote_model_q $remote_view_q/hub/ && rm $remote_view_snapshot_q/config.json $remote_view_snapshot_q/hf_quant_config.json"
-    if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
+    if [[ "$ORACLE_K0" == true ]]; then
+        printf -v remote_source_snapshot_q '%q' "/rocket/source-hf/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION"
+        run_checked "worker_cache_view" ssh -o BatchMode=yes "$SSH_TARGET" \
+            "mkdir -p $remote_view_snapshot_q && for source in $worker_snapshot_q/*; do name=\${source##*/}; case \"\$name\" in config.json|hf_quant_config.json) continue ;; esac; ln -s $remote_source_snapshot_q/\"\$name\" $remote_view_snapshot_q/\"\$name\"; done"
+    else
+        worker_cache_device=$(ssh -o BatchMode=yes "$SSH_TARGET" "stat -c %d $worker_cache_q")
+        worker_output_device=$(ssh -o BatchMode=yes "$SSH_TARGET" "stat -c %d $remote_work_q")
+        [[ "$worker_cache_device" == "$worker_output_device" ]] || \
+            fail "worker immutable cache view must share the checkpoint ext4 filesystem"
         ssh -o BatchMode=yes "$SSH_TARGET" \
+            "mkdir -p $remote_view_q/hub && cp -al $remote_model_q $remote_view_q/hub/ && rm $remote_view_snapshot_q/config.json $remote_view_snapshot_q/hf_quant_config.json"
+    fi
+    if [[ -n "$NVFP4_ARTIFACT_DIR" ]]; then
+        run_checked "worker_cache_metadata" ssh -o BatchMode=yes "$SSH_TARGET" \
             "cp '$REMOTE_OUTPUT/artifacts/config_nvfp4_patched.json' $remote_view_snapshot_q/config.json && cp '$REMOTE_NVFP4_ARTIFACT/hf_quant_config.json' $remote_view_snapshot_q/hf_quant_config.json"
     elif [[ -n "$FP8_ARTIFACT_DIR" ]]; then
         ssh -o BatchMode=yes "$SSH_TARGET" \
@@ -756,8 +862,13 @@ if [[ "$WORKER_CACHE_KIND" == host_ext4 ]]; then
         ssh -o BatchMode=yes "$SSH_TARGET" \
             "cp '$REMOTE_OUTPUT/artifacts/config_patched.json' $remote_view_snapshot_q/config.json && cp '$REMOTE_OUTPUT/artifacts/hf_quant_config_patched.json' $remote_view_snapshot_q/hf_quant_config.json"
     fi
-    resolved_worker_shards=$(ssh -o BatchMode=yes "$SSH_TARGET" \
-        "find -L $remote_view_snapshot_q -maxdepth 1 -name '*.safetensors' -type f | wc -l")
+    if [[ "$ORACLE_K0" == true ]]; then
+        resolved_worker_shards=$(ssh -o BatchMode=yes "$SSH_TARGET" \
+            "find $remote_view_snapshot_q -maxdepth 1 -name '*.safetensors' -type l | wc -l")
+    else
+        resolved_worker_shards=$(ssh -o BatchMode=yes "$SSH_TARGET" \
+            "find -L $remote_view_snapshot_q -maxdepth 1 -name '*.safetensors' -type f | wc -l")
+    fi
     [[ "$resolved_worker_shards" == 11 ]] || \
         fail "worker immutable cache view has unresolved checkpoint shards"
 fi
@@ -793,36 +904,18 @@ if [[ "${ORACLE_K0:-false}" == true ]]; then
             "$launch_script"
     done
 fi
-scp -q "$OUTPUT_DIR/launch-worker.sh" "$SSH_TARGET:$REMOTE_OUTPUT/launch-worker.sh"
+run_checked "worker_launcher_transfer" scp -q "$OUTPUT_DIR/launch-worker.sh" "$SSH_TARGET:$REMOTE_OUTPUT/launch-worker.sh"
 
 if [[ "$LAUNCH" != true ]]; then
     printf 'Two-node preflight complete. Re-run with a new empty --output-dir and --launch to execute.\n'
     exit 0
 fi
 
-head_log_pid=""
-worker_log_pid=""
-head_workload_log_pid=""
-worker_workload_log_pid=""
-hardware_monitor_pid=""
-cleanup() {
-    [[ -n "$head_log_pid" ]] && kill "$head_log_pid" >/dev/null 2>&1 || true
-    [[ -n "$worker_log_pid" ]] && kill "$worker_log_pid" >/dev/null 2>&1 || true
-    [[ -n "$head_workload_log_pid" ]] && kill "$head_workload_log_pid" >/dev/null 2>&1 || true
-    [[ -n "$worker_workload_log_pid" ]] && kill "$worker_workload_log_pid" >/dev/null 2>&1 || true
-    [[ -n "$hardware_monitor_pid" ]] && kill "$hardware_monitor_pid" >/dev/null 2>&1 || true
-    [[ -n "$hardware_monitor_pid" ]] && wait "$hardware_monitor_pid" 2>/dev/null || true
-    if [[ "$KEEP_RUNNING" != true ]]; then
-        docker rm -f "$HEAD_CONTAINER" >/dev/null 2>&1 || true
-        ssh -o BatchMode=yes "$SSH_TARGET" \
-            "docker rm -f '$WORKER_CONTAINER' >/dev/null 2>&1 || true" || true
-    fi
-}
-trap cleanup EXIT INT TERM
-
-ssh -o BatchMode=yes "$SSH_TARGET" "bash '$REMOTE_OUTPUT/launch-worker.sh'"
+run_checked "worker_launch" ssh -o BatchMode=yes "$SSH_TARGET" "bash '$REMOTE_OUTPUT/launch-worker.sh'"
+worker_container_started=true
 sleep 15
-bash "$OUTPUT_DIR/launch-head.sh"
+run_checked "head_launch" bash "$OUTPUT_DIR/launch-head.sh"
+head_container_started=true
 docker logs --timestamps -f "$HEAD_CONTAINER" >"$LOG_DIR/head.log" 2>&1 &
 head_log_pid=$!
 ssh -o BatchMode=yes "$SSH_TARGET" \
@@ -830,6 +923,7 @@ ssh -o BatchMode=yes "$SSH_TARGET" \
 worker_log_pid=$!
 
 deadline=$((SECONDS + STARTUP_TIMEOUT_SECONDS))
+CURRENT_PHASE="startup_health"
 until curl -fsS "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; do
     ((SECONDS < deadline)) || fail \
         "server did not become healthy within ${STARTUP_TIMEOUT_SECONDS} seconds (startup timeout budget exhausted)"
@@ -842,6 +936,7 @@ until curl -fsS "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; do
 done
 
 if [[ "${ORACLE_K0:-false}" == true ]]; then
+    CURRENT_PHASE="oracle_request"
     if ! python3 "$REPO_ROOT/scripts/runtime/qwen38-k0-oracle.py" invoke \
         --endpoint "http://127.0.0.1:$API_PORT" \
         --request "$OUTPUT_DIR/oracle-request.json" \
@@ -849,6 +944,7 @@ if [[ "${ORACLE_K0:-false}" == true ]]; then
         --arm "$OUTPUT_DIR/ARMED"; then
         fail "oracle request invocation failed"
     fi
+    CURRENT_PHASE="oracle_validation"
     if ! python3 "$REPO_ROOT/scripts/runtime/qwen38-k0-oracle.py" validate \
         --request "$OUTPUT_DIR/oracle-request.json" \
         --capture-dir "$OUTPUT_DIR/capture" \
