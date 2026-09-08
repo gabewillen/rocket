@@ -157,6 +157,32 @@ target_compile_options(qwen38_target_k0_layer_owner_inventory PRIVATE
 set_target_properties(qwen38_target_k0_layer_owner_inventory PROPERTIES
   POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
 
+add_library(qwen38_target_k0_startup STATIC
+  src/decode/target_k0_startup.cc)
+target_include_directories(qwen38_target_k0_startup PUBLIC src)
+target_link_libraries(qwen38_target_k0_startup PUBLIC
+  qwen38_target_k0_layer_owner_inventory
+  qwen38_target_k0_oracle_comparator qwen38_native_token_io)
+target_compile_options(qwen38_target_k0_startup PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_k0_startup PROPERTIES
+  POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
+
+add_executable(qwen38-target-k0-startup
+  src/decode/target_k0_startup_cli.cc)
+target_link_libraries(qwen38-target-k0-startup PRIVATE qwen38_native_token_io)
+target_compile_options(qwen38-target-k0-startup PRIVATE
+  -Wall -Wextra -Werror)
+
+add_executable(qwen38-test-target-k0-startup
+  tests/test_target_k0_startup.cc)
+target_link_libraries(qwen38-test-target-k0-startup PRIVATE
+  qwen38_target_k0_startup)
+target_compile_options(qwen38-test-target-k0-startup PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-k0-startup PROPERTIES
+  LINKER_LANGUAGE CUDA)
+
 add_library(qwen38_target_layer3_native_plan STATIC
   src/decode/target_layer3_native_plan.cc)
 target_include_directories(qwen38_target_layer3_native_plan PUBLIC src)
@@ -978,6 +1004,8 @@ target_compile_options(qwen38-test-token-io-roots PRIVATE
 set_target_properties(qwen38-test-token-io-roots PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-token-io-roots-rejection-contract
   COMMAND qwen38-test-token-io-roots)
+add_test(NAME qwen38-target-k0-startup-rejection-contract
+  COMMAND qwen38-test-target-k0-startup)
 set(ROCKET_QWEN38_TOKENIZER_ROOT
   "/home/glwillen/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47"
   CACHE PATH "Pinned Qwen3.8 tokenizer root")
@@ -989,6 +1017,14 @@ if(EXISTS "${ROCKET_QWEN38_TOKENIZER_ROOT}/tokenizer.json" AND
   add_test(NAME qwen38-token-io-roots-authenticated-contract
     COMMAND qwen38-test-token-io-roots
       "${ROCKET_QWEN38_TOKENIZER_ROOT}" "${ROCKET_QWEN38_K0_ORACLE_ROOT}")
+  add_test(NAME qwen38-target-k0-startup-authenticated-contract
+    COMMAND qwen38-test-target-k0-startup
+      "${ROCKET_QWEN38_TOKENIZER_ROOT}" "${ROCKET_QWEN38_K0_ORACLE_ROOT}")
+  add_test(NAME qwen38-target-k0-startup-incomplete-contract
+    COMMAND qwen38-target-k0-startup --tokenizer
+      "${ROCKET_QWEN38_TOKENIZER_ROOT}" --oracle "${ROCKET_QWEN38_K0_ORACLE_ROOT}")
+  set_tests_properties(qwen38-target-k0-startup-incomplete-contract
+    PROPERTIES WILL_FAIL TRUE)
 endif()
 target_compile_options(qwen38-test-token-output PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
