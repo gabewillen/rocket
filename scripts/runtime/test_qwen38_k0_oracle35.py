@@ -95,6 +95,30 @@ class Oracle35LauncherTests(unittest.TestCase):
             path.write_bytes(b"x" * 32)
             self.assertEqual(module._secret(path), b"x" * 32)
 
+    def test_nested_slab_cause_is_bounded_and_published(self):
+        inner = module.SlabError("private artifact path")
+        outer = module.CudaSlabLoadError("outer loader wrapper")
+        outer.__cause__ = inner
+        chain = module._typed_cause_chain(outer, "load")
+        self.assertEqual(chain, (
+            {"class": "slab_load", "stage": "accepted_loader"},
+            {"class": "slab_contract", "stage": "accepted_loader_contract"},
+        ))
+        self.assertNotIn("private", json.dumps(chain))
+
+        class Counter:
+            def __init__(self): self.records = []
+            def add(self, value, attributes):
+                self.records.append((value, attributes))
+
+        counter = Counter()
+        module._emit_failure(counter, 1, "load", chain[-1])
+        self.assertEqual(counter.records, [(1, {
+            "rank": 1, "phase": "load", "outcome": "failure",
+            "failure.class": "slab_contract",
+            "failure.stage": "accepted_loader_contract",
+        })])
+
     def test_supervisor_timeout_is_bounded(self):
         args = argparse.Namespace(
             worker=False, timeout_seconds=60, rank=0, device_index=0,

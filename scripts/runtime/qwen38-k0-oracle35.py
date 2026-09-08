@@ -18,9 +18,14 @@ ENGINE = ROOT / "engines/qwen38-flash-next-nvfp4-2b"
 sys.path.insert(0, str(ENGINE / "src"))
 
 from qwen38_slab.contract import canonical_bytes  # noqa: E402
-from qwen38_slab.cuda_slab_loader import CudaRankSlabLoader  # noqa: E402
+from qwen38_slab.contract import SlabError  # noqa: E402
+from qwen38_slab.cuda_slab_loader import (  # noqa: E402
+    CudaRankSlabLoader, CudaSlabCleanupIncompleteError, CudaSlabLoadError,
+    CudaSlabPublicationError,
+)
 from qwen38_slab.layer3_factory import (  # noqa: E402
-    CtypesNativeTargetSlabLeaseFactory, native_target_slab_handoff,
+    CtypesNativeTargetSlabLeaseFactory, Layer3FactoryError,
+    NativeTargetSlabFinalizeError, native_target_slab_handoff,
 )
 from qwen38_slab.target_layer_descriptor import (  # noqa: E402
     authenticate_descriptor_identity, descriptor_identity,
@@ -61,6 +66,49 @@ def _secret(path: Path) -> bytes:
     if len(value) != 32:
         raise ValueError("bootstrap secret extent changed")
     return value
+
+
+def _typed_cause_chain(error: BaseException, phase: str) -> tuple[dict[str, str], ...]:
+    """Return at most four bounded failure classifications, never messages."""
+
+    chain = []
+    current: BaseException | None = error
+    while current is not None and len(chain) < 4:
+        if isinstance(current, CudaSlabPublicationError):
+            kind, stage = "slab_publication", "python_publish"
+        elif isinstance(current, CudaSlabCleanupIncompleteError):
+            kind, stage = "slab_cleanup", "cuda_cleanup"
+        elif isinstance(current, CudaSlabLoadError):
+            kind, stage = "slab_load", "accepted_loader"
+        elif isinstance(current, SlabError):
+            kind, stage = "slab_contract", "accepted_loader_contract"
+        elif isinstance(current, NativeTargetSlabFinalizeError):
+            kind, stage = "native_finalize", current.stage
+        elif isinstance(current, Layer3FactoryError):
+            kind, stage = "layer_factory", "native_finalize"
+        elif isinstance(current, OSError):
+            kind, stage = "io", "artifact_io"
+        elif isinstance(current, TimeoutError):
+            kind, stage = "timeout", "supervisor"
+        elif isinstance(current, (ValueError, TypeError)):
+            kind, stage = "contract", phase
+        elif isinstance(current, RuntimeError):
+            kind, stage = "runtime", phase
+        else:
+            kind, stage = "unknown", phase
+        chain.append({"class": kind, "stage": stage})
+        current = current.__cause__
+    return tuple(chain)
+
+
+def _emit_failure(counter: object, rank: int, phase: str,
+                  terminal: dict[str, str]) -> None:
+    try:
+        counter.add(1, {"rank": rank, "phase": phase, "outcome": "failure",
+                        "failure.class": terminal["class"],
+                        "failure.stage": terminal["stage"]})
+    except BaseException:
+        pass
 
 
 def _native_symbols(library: Path) -> CtypesNativeTargetSlabLeaseFactory:
@@ -193,14 +241,14 @@ def worker(args: argparse.Namespace) -> int:
                           **evidence}, sort_keys=True), flush=True)
         return 0
     except BaseException as error:
-        try:
-            terminal.add(1, {"rank": args.rank, "phase": phase,
-                             "outcome": "failure"})
-        except BaseException:
-            pass
+        cause_chain = _typed_cause_chain(error, phase)
+        failure = cause_chain[-1]
+        _emit_failure(terminal, args.rank, phase, failure)
         print(json.dumps({"schema": SCHEMA, "valid": False, "complete": False,
                           "rank": args.rank, "phase": phase,
-                          "failure_class": type(error).__name__[:64],
+                          "failure_class": failure["class"],
+                          "failure_stage": failure["stage"],
+                          "cause_chain": cause_chain,
                           "elapsed_ns": time.perf_counter_ns() - started},
                          sort_keys=True), flush=True)
         return 1
