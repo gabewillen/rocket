@@ -292,6 +292,25 @@ set_target_properties(qwen38_token_output PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+add_library(qwen38_route_compaction_contract STATIC
+  src/moe/route_compaction.cc)
+target_include_directories(qwen38_route_compaction_contract PUBLIC src)
+target_link_libraries(qwen38_route_compaction_contract PUBLIC CUDA::cudart)
+target_compile_options(qwen38_route_compaction_contract PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_route_compaction_contract PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+
+add_library(qwen38_route_compaction STATIC src/moe/route_compaction.cu)
+target_include_directories(qwen38_route_compaction PUBLIC src)
+target_link_libraries(qwen38_route_compaction PUBLIC
+  qwen38_route_compaction_contract CUDA::cudart)
+target_compile_options(qwen38_route_compaction PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+set_target_properties(qwen38_route_compaction PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON)
+
 add_library(qwen38_mtp_executor STATIC
   src/mtp/graph_runtime.cu
   src/mtp/input_fusion.cu
@@ -423,6 +442,14 @@ target_compile_options(qwen38-test-qsa-mtp-state-view PRIVATE
 add_test(NAME qwen38-qsa-mtp-state-view-contract
   COMMAND qwen38-test-qsa-mtp-state-view)
 
+add_executable(qwen38-test-route-compaction tests/test_route_compaction.cc)
+target_link_libraries(qwen38-test-route-compaction PRIVATE
+  qwen38_route_compaction_contract)
+target_compile_options(qwen38-test-route-compaction PRIVATE
+  -Wall -Wextra -Werror)
+add_test(NAME qwen38-route-compaction-cpu-contract
+  COMMAND qwen38-test-route-compaction)
+
 add_executable(qwen38-test-mtp-state-arena tests/test_mtp_state_arena.cu)
 target_link_libraries(qwen38-test-mtp-state-arena PRIVATE qwen38_mtp_executor CUDA::cudart)
 add_test(NAME qwen38-mtp-state-arena-contract COMMAND qwen38-test-mtp-state-arena)
@@ -474,6 +501,9 @@ add_test(NAME qwen38-gdn-prefill-projection-cpu-contract
   COMMAND qwen38-test-gdn-prefill-projection-contract)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME qwen38-route-compaction-source-contract
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_route_compaction_source.py)
 add_test(NAME qwen38-gdn-b12x-aot-cpu-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gdn_b12x_aot_contract.py)
