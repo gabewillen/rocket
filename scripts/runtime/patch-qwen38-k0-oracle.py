@@ -26,8 +26,23 @@ class _RocketK0Oracle:
         self.output.mkdir(parents=True, exist_ok=False)
         self.expected_ids = json.loads(os.environ["ROCKET_QWEN38_K0_EXPECTED_IDS"])
         self.identity = json.loads(os.environ["ROCKET_QWEN38_K0_IDENTITY"])
+        arm = json.loads((self.output.parent / "ARMED").read_text())
+        if set(arm) != {"schema", "request_sha256", "generation_index"}:
+            raise RuntimeError("oracle arm schema differs")
+        if arm["schema"] != "rocket.qwen38.k0-target-oracle-arm.v1":
+            raise RuntimeError("oracle arm schema differs")
+        if arm["request_sha256"] != self.identity.get("request_sha256"):
+            raise RuntimeError("oracle request identity differs")
+        if arm["generation_index"] != 0:
+            raise RuntimeError("oracle generation identity differs")
+        self.request_sha256 = arm["request_sha256"]
+        self.generation_index = arm["generation_index"]
         self.artifacts = []
-        self.started = False
+        self.artifact_by_name = {}
+        self.expected_forward_names = ["embedding", *[f"layer.{i:02d}" for i in range(48)], "final_norm"]
+        self.consumed_tokens = 0
+        self.active_forward = False
+        self.forward_names = []
         self.complete = False
 
     def fail(self, phase, error):
@@ -45,39 +60,78 @@ class _RocketK0Oracle:
         os.replace(temporary, self.output / "failure.json")
         print("ROCKET_QWEN38_K0_ORACLE_FAILURE\t" + json.dumps(record, sort_keys=True), flush=True)
 
-    def save(self, name, tensor):
-        if any(item["name"] == name for item in self.artifacts):
-            raise RuntimeError(f"duplicate oracle artifact: {name}")
+    def append(self, name, tensor):
         value = tensor.detach().contiguous()
         payload = value.view(torch.uint8).cpu().numpy().tobytes()
         filename = name.replace(".", "-") + ".bin"
-        temporary = self.output / ("." + filename + ".tmp")
-        temporary.write_bytes(payload)
-        os.replace(temporary, self.output / filename)
-        self.artifacts.append({
-            "name": name,
-            "file": filename,
-            "dtype": str(value.dtype).removeprefix("torch."),
-            "shape": list(value.shape),
-            "strides": list(value.stride()),
-            "numel": value.numel(),
-            "bytes": len(payload),
-            "sha256": hashlib.sha256(payload).hexdigest(),
-        })
+        path = self.output / filename
+        previous = self.artifact_by_name.get(name)
+        if previous is None:
+            temporary = self.output / ("." + filename + ".tmp")
+            temporary.write_bytes(payload)
+            os.replace(temporary, path)
+            item = {
+                "name": name,
+                "file": filename,
+                "dtype": str(value.dtype).removeprefix("torch."),
+                "shape": list(value.shape),
+                "strides": list(value.stride()),
+                "numel": value.numel(),
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+            self.artifacts.append(item)
+            self.artifact_by_name[name] = item
+            return
+        if previous["dtype"] != str(value.dtype).removeprefix("torch.") or previous["shape"][1:] != list(value.shape)[1:] or list(value.stride())[-1:] != [1]:
+            raise RuntimeError(f"oracle chunk layout differs: {name}")
+        with path.open("ab") as stream:
+            stream.write(payload)
+        previous["shape"][0] += value.shape[0]
+        previous["strides"] = [previous["shape"][1], 1]
+        previous["numel"] += value.numel()
+        previous["bytes"] += len(payload)
+        previous["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def save(self, name, tensor):
+        if not self.active_forward:
+            raise RuntimeError(f"oracle {name} arrived before authenticated request begin")
+        if self.complete:
+            raise RuntimeError(f"oracle {name} arrived after exactly-once consumption")
+        index = len(self.forward_names)
+        expected = self.expected_forward_names[index] if index < len(self.expected_forward_names) else None
+        if name != expected:
+            raise RuntimeError(f"oracle forward artifact order differs: expected {expected}, got {name}")
+        self.append(name, tensor)
+        self.forward_names.append(name)
 
     def begin(self, input_ids, embedding):
-        if self.started or self.complete:
-            raise RuntimeError("oracle expected exactly one target forward")
+        if self.complete:
+            raise RuntimeError("oracle received a second generation after exactly-once consumption")
+        if self.active_forward or self.consumed_tokens == len(self.expected_ids):
+            raise RuntimeError("oracle previous authenticated forward is missing logits")
         actual = input_ids.detach().cpu().tolist()
-        if actual != self.expected_ids:
-            raise RuntimeError(f"input token IDs differ: expected {self.expected_ids}, got {actual}")
-        self.started = True
+        expected = self.expected_ids[self.consumed_tokens:self.consumed_tokens + len(actual)]
+        if not actual or actual != expected:
+            raise RuntimeError(f"input token IDs differ at offset {self.consumed_tokens}: expected {expected}, got {actual}")
+        if embedding.ndim != 2 or embedding.shape[0] != len(actual):
+            raise RuntimeError("oracle embedding extent differs from authenticated request")
+        self.active_forward = True
+        self.forward_names = []
+        self.consumed_tokens += len(actual)
         self.save("embedding", embedding)
 
     def finish(self, logits):
-        if not self.started or self.complete:
+        if not self.active_forward or self.complete:
             raise RuntimeError("oracle logits arrived outside the one target forward")
-        self.save("logits", logits)
+        if self.forward_names != self.expected_forward_names:
+            raise RuntimeError(f"oracle forward ended before all boundaries: {self.forward_names}")
+        self.active_forward = False
+        if self.consumed_tokens < len(self.expected_ids):
+            return
+        if logits.ndim != 2 or logits.shape[0] != 1:
+            raise RuntimeError("oracle logits generation extent differs")
+        self.append("logits", logits)
         last = logits[-1].detach().float()
         values, indices = torch.topk(last, min(20, last.numel()), sorted=True)
         manifest = {
@@ -85,6 +139,8 @@ class _RocketK0Oracle:
             "valid": True,
             "complete": True,
             "identity": self.identity,
+            "request_sha256": self.request_sha256,
+            "generation_index": self.generation_index,
             "input_token_ids": self.expected_ids,
             "artifacts": self.artifacts,
             "top_k": [
@@ -171,11 +227,11 @@ def patch(path: Path) -> None:
     source = replace_once(source, CLASS_ANCHOR, HELPER + CLASS_ANCHOR, "class decorator")
     source = replace_once(
         source,
-        "                hidden_states = self.embed_input_ids(input_ids)\n            hidden_states = hidden_states.repeat(1, self.config.hc_count)\n",
-        "                hidden_states = self.embed_input_ids(input_ids)\n"
-        "                _rocket_k0_guard(\"embedding\", lambda oracle: oracle.begin(input_ids, hidden_states))\n"
-        "            hidden_states = hidden_states.repeat(1, self.config.hc_count)\n",
-        "embedding",
+        "        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:\n            return inputs_embeds\n",
+        "        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:\n"
+        "            _rocket_k0_guard(\"embedding\", lambda oracle: oracle.begin(input_ids, inputs_embeds))\n"
+        "            return inputs_embeds\n",
+        "external embedding lifecycle",
     )
     source = replace_once(
         source,

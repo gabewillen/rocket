@@ -62,7 +62,11 @@ def invoke(endpoint: str, request_path: Path, output: Path, arm: Path) -> None:
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    arm.write_text("one target request\n")
+    arm.write_text(json.dumps({
+        "schema": "rocket.qwen38.k0-target-oracle-arm.v1",
+        "request_sha256": sha256(request_path),
+        "generation_index": 0,
+    }, sort_keys=True) + "\n")
     with urllib.request.urlopen(request, timeout=600) as response:
         payload = json.load(response)
     output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -80,6 +84,14 @@ def validate(request_path: Path, capture_dir: Path, response_path: Path, output:
         raise SystemExit("oracle manifest is invalid or incomplete")
     if manifest.get("input_token_ids") != request.get("input_token_ids"):
         raise SystemExit("oracle input token IDs mismatch")
+    request_sha256 = sha256(request_path)
+    if manifest.get("request_sha256") != request_sha256:
+        raise SystemExit("oracle request identity mismatch")
+    if manifest.get("generation_index") != 0:
+        raise SystemExit("oracle generation identity mismatch")
+    identity = manifest.get("identity")
+    if not isinstance(identity, dict) or identity.get("request_sha256") != request_sha256 or identity.get("generation_index") != 0:
+        raise SystemExit("oracle manifest identity mismatch")
     expected_names = ["embedding", *[f"layer.{i:02d}" for i in range(48)], "final_norm", "logits"]
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or [item.get("name") for item in artifacts] != expected_names:
@@ -135,7 +147,7 @@ def validate(request_path: Path, capture_dir: Path, response_path: Path, output:
         "top_k": manifest["top_k"],
         "capture_manifest_sha256": sha256(manifest_path),
         "response_sha256": sha256(response_path),
-        "identity": manifest["identity"],
+        "identity": identity,
     }
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 

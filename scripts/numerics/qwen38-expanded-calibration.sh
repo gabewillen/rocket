@@ -603,10 +603,11 @@ if [[ "${ORACLE_K0:-false}" == true ]]; then
         --model-dir "/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION" \
         --output /rocket/output/oracle-request.json
     ORACLE_EXPECTED_IDS=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["input_token_ids"],separators=(",",":")))' "$OUTPUT_DIR/oracle-request.json")
+    oracle_request_sha=$(sha256sum "$OUTPUT_DIR/oracle-request.json" | cut -d' ' -f1)
     nvfp4_manifest_sha=$(sha256sum "$NVFP4_ARTIFACT_DIR/manifest.json" | cut -d' ' -f1)
     nvfp4_payload_sha=$(sha256sum "$NVFP4_ARTIFACT_DIR/$NVFP4_OVERLAY_FILE" | cut -d' ' -f1)
     nvfp4_quant_sha=$(sha256sum "$NVFP4_ARTIFACT_DIR/hf_quant_config.json" | cut -d' ' -f1)
-    ORACLE_IDENTITY=$(python3 -c 'import json,sys; print(json.dumps({"image_id":sys.argv[1],"image_repo_digest":sys.argv[2],"model":sys.argv[3],"model_revision":sys.argv[4],"mia_commit":sys.argv[5],"overlay_manifest_sha256":sys.argv[6],"overlay_payload_sha256":sys.argv[7],"overlay_quant_config_sha256":sys.argv[8],"speculation":"disabled","tensor_parallel_size":2,"node_count":2},sort_keys=True,separators=(",",":")))' "$IMAGE_ID" "$IMAGE_REPO_DIGEST" "$MODEL_ID" "$MODEL_REVISION" "$MIA_COMMIT" "$nvfp4_manifest_sha" "$nvfp4_payload_sha" "$nvfp4_quant_sha")
+    ORACLE_IDENTITY=$(python3 -c 'import json,sys; print(json.dumps({"image_id":sys.argv[1],"image_repo_digest":sys.argv[2],"model":sys.argv[3],"model_revision":sys.argv[4],"mia_commit":sys.argv[5],"overlay_manifest_sha256":sys.argv[6],"overlay_payload_sha256":sys.argv[7],"overlay_quant_config_sha256":sys.argv[8],"request_sha256":sys.argv[9],"generation_index":0,"speculation":"disabled","tensor_parallel_size":2,"node_count":2},sort_keys=True,separators=(",",":")))' "$IMAGE_ID" "$IMAGE_REPO_DIGEST" "$MODEL_ID" "$MODEL_REVISION" "$MIA_COMMIT" "$nvfp4_manifest_sha" "$nvfp4_payload_sha" "$nvfp4_quant_sha" "$oracle_request_sha")
     python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]),indent=2,sort_keys=True))' \
         "$ORACLE_IDENTITY" > "$OUTPUT_DIR/oracle-identity.json"
     docker run --rm --entrypoint /usr/bin/python3 "$IMAGE_TAG" -c \
