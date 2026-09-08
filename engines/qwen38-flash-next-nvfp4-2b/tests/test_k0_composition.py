@@ -106,6 +106,20 @@ class K0CompositionContractTests(unittest.TestCase):
         participants = _complete_participants()
         root = K0CompositionRoot(participants, _Tracer())
         self.assertEqual(tuple(root.binding.participants), REQUIRED_K0_PARTICIPANTS)
+        self.assertEqual(len(root.binding.layer_plan), 96)
+        self.assertEqual(
+            (root.binding.layer_plan[3].rank, root.binding.layer_plan[3].layer,
+             root.binding.layer_plan[3].kind),
+            (0, 3, AttentionKind.QSA),
+        )
+        self.assertIs(
+            root.binding.layer_plan[3].attention,
+            root.binding.participants["rank0.qsa.layer3"],
+        )
+        self.assertEqual(
+            (root.binding.layer_plan[-1].rank, root.binding.layer_plan[-1].layer),
+            (1, 47),
+        )
         participants.pop("tokenizer")
         self.assertIn("tokenizer", root.binding.participants)
         with self.assertRaises(TypeError):

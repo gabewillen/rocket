@@ -6,6 +6,7 @@ from .k0_composition import (
     K0CompositionBinding,
     K0CompositionError,
     K0CompositionRoot,
+    K0LayerBinding,
     K0_DOMAIN,
     REQUIRED_K0_PARTICIPANTS,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "K0CompositionBinding",
     "K0CompositionError",
     "K0CompositionRoot",
+    "K0LayerBinding",
     "K0_DOMAIN",
     "Layer3QsaStorage",
     "Layer3RuntimeError",

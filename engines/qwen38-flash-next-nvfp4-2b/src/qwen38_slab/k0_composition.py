@@ -89,6 +89,20 @@ class K0CompositionBinding:
     """Immutable, complete participant table for a later TP2 launch root."""
 
     participants: Mapping[str, object]
+    layer_plan: tuple["K0LayerBinding", ...]
+
+
+@dataclass(frozen=True)
+class K0LayerBinding:
+    """One real rank-local layer slot and its two TP2 reduction points."""
+
+    rank: int
+    layer: int
+    kind: AttentionKind
+    attention: object
+    moe: object
+    attention_pair_reduce: object
+    moe_pair_reduce: object
 
 
 class K0CompositionRoot:
@@ -118,7 +132,10 @@ class K0CompositionRoot:
                 raise
             span.set_attribute("outcome", "success")
             span.set_attribute("missing.bucket", "0")
-        self._binding = K0CompositionBinding(MappingProxyType(owned))
+        immutable = MappingProxyType(owned)
+        self._binding = K0CompositionBinding(
+            immutable, self._layer_plan(immutable)
+        )
 
     @property
     def binding(self) -> K0CompositionBinding:
@@ -179,6 +196,27 @@ class K0CompositionRoot:
                 )
         return owned
 
+    @staticmethod
+    def _layer_plan(participants: Mapping[str, object]) -> tuple[K0LayerBinding, ...]:
+        plan = []
+        for rank in (0, 1):
+            for layer, kind in LAYER_TOPOLOGY.items():
+                prefix = f"rank{rank}"
+                plan.append(K0LayerBinding(
+                    rank=rank,
+                    layer=layer,
+                    kind=kind,
+                    attention=participants[f"{prefix}.{kind.value}.layer{layer}"],
+                    moe=participants[f"{prefix}.moe.layer{layer}"],
+                    attention_pair_reduce=participants[
+                        f"{prefix}.pair_reduce.attention.layer{layer}"
+                    ],
+                    moe_pair_reduce=participants[
+                        f"{prefix}.pair_reduce.moe.layer{layer}"
+                    ],
+                ))
+        return tuple(plan)
+
 
 def _required_method(name: str) -> str:
     if name == "tokenizer":
@@ -201,6 +239,7 @@ def _required_method(name: str) -> str:
 __all__ = [
     "K0CompositionBinding",
     "K0CompositionError",
+    "K0LayerBinding",
     "K0CompositionRoot",
     "K0_DOMAIN",
     "REQUIRED_K0_PARTICIPANTS",
