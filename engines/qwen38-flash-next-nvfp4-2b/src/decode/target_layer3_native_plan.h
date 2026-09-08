@@ -15,6 +15,11 @@ struct TargetLayer3NativeExtent {
   std::uint64_t offset_bytes;
   std::uint64_t length_bytes;
   std::string storage;
+  std::string dtype;
+  std::string layout;
+  std::string abi;
+  std::vector<std::uint64_t> shape;
+  std::vector<std::uint64_t> strides;
 };
 
 struct TargetLayer3NativePlan {

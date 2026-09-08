@@ -11,6 +11,7 @@
 namespace decode = rocket::qwen38::decode;
 namespace attention = rocket::qwen38::attention;
 namespace model = rocket::qwen38::model;
+namespace moe = rocket::qwen38::moe;
 namespace pair_reduce = rocket::qwen38::pair_reduce;
 
 struct Sink final : pair_reduce::OtelStageSink {
@@ -68,7 +69,14 @@ int main(int argc, char** argv) {
         binding.rope_ready_event != rope.ready ||
         !binding.attention_hyperconnection.norm ||
         !binding.mlp_hyperconnection.norm || !binding.router.packed_e2m1 ||
-        !binding.shared.gate || sink.spans != 1 || sink.metrics != 1 ||
+        !binding.shared.gate ||
+        !binding.routed_source.front().up_packed ||
+        !binding.routed_source.front().gate_packed ||
+        !binding.routed_source.front().down_packed ||
+        !binding.routed_source.back().up_packed ||
+        !binding.routed_source.back().gate_packed ||
+        !binding.routed_source.back().down_packed ||
+        sink.spans != 1 || sink.metrics != 1 ||
         sink.outcome != pair_reduce::Outcome::kOk)
       throw std::logic_error("native binding publication changed");
 
@@ -197,7 +205,23 @@ int main(int argc, char** argv) {
       throw std::logic_error("unpublished RoPE view unexpectedly bound");
     } catch (const std::invalid_argument&) {
     }
-    if (sink.spans != 16 || sink.metrics != 16 ||
+    bad_plan = plan;
+    for (auto& item : bad_plan.extents) {
+      if (item.name ==
+          "model.language_model.layers.3.mlp.experts." +
+              std::to_string(rank * moe::kTargetMoeLocalExperts) +
+              ".up_proj.weight") {
+        item.layout = "wrong";
+        break;
+      }
+    }
+    try {
+      (void)decode::bind_target_layer3_native_weights(
+          bad_plan, slab, sidecar, rope_identity, rope, probe, sink);
+      throw std::logic_error("routed extent layout unexpectedly bound");
+    } catch (const std::invalid_argument&) {
+    }
+    if (sink.spans != 17 || sink.metrics != 17 ||
         sink.outcome != pair_reduce::Outcome::kContractError)
       throw std::logic_error("binding failure telemetry changed");
     std::printf("rank=%d extents=%zu native_weight_binding=1\n", rank,

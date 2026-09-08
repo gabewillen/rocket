@@ -8,6 +8,7 @@
 #include "hyperconnection/hyperconnection.h"
 #include "model/target_slab_owner.h"
 #include "moe/target_router_shared_c1.h"
+#include "moe/target_moe_n640_device_stage.h"
 
 namespace rocket::qwen38::decode {
 
@@ -21,6 +22,8 @@ struct TargetLayer3NativeWeightBindings {
   hyperconnection::Weights mlp_hyperconnection;
   moe::TargetRouterNvfp4Weights router;
   moe::TargetSharedBf16Weights shared;
+  std::array<moe::TargetMoeN640DeviceExpert,
+             moe::kTargetMoeLocalExperts> routed_source;
 };
 
 class TargetLayer3ReadyEventProbe {

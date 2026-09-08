@@ -479,7 +479,10 @@ TargetLayer3NativePlan load_target_layer3_native_plan(
       fail("extent field inventory changed");
     TargetLayer3NativeExtent extent{
         string_field(item, "name"), uint_field(item, "offset_bytes"),
-        uint_field(item, "length_bytes"), string_field(item, "storage")};
+        uint_field(item, "length_bytes"), string_field(item, "storage"),
+        string_field(item, "dtype"), string_field(item, "layout"),
+        string_field(item, "abi"), dimensions(item, "shape"),
+        dimensions(item, "strides")};
     if (!names.insert(extent.name).second || extent.length_bytes == 0 ||
         extent.offset_bytes % 256 != 0)
       fail("extent name, length, or alignment changed");
