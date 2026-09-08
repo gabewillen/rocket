@@ -392,8 +392,20 @@ void NativeTargetK0OracleComparator::observe(
   evidence.elements[index] = static_cast<std::uint32_t>(elements);
   evidence.zero_counts[index] = zero_count;
   evidence.nonfinite_counts[index] = nonfinite_count;
-  if (boundary == TargetK0LayerBoundary::kHyperconnectionCombineMix &&
+  if (boundary == TargetK0LayerBoundary::kAttentionReduction &&
       impl_->layer0_boundaries) {
+    const auto rounded = round_target_layer0_attention_to_bf16(
+        static_cast<const float*>(impl_->observed), elements);
+    const auto comparison = compare_target_layer0_boundary_bytes(
+        (*impl_->layer0_boundaries)[0], rounded.data(), rounded.size());
+    evidence.reference_compared[index] = 1;
+    evidence.reference_exact[index] = comparison.exact ? 1 : 0;
+    evidence.reference_mismatch_counts[index] =
+        static_cast<std::uint32_t>(comparison.mismatch_count);
+    evidence.reference_first_mismatches[index] =
+        static_cast<std::uint32_t>(comparison.first_mismatch);
+  } else if (boundary == TargetK0LayerBoundary::kHyperconnectionCombineMix &&
+             impl_->layer0_boundaries) {
     const auto comparison = compare_target_layer0_boundary_bytes(
         (*impl_->layer0_boundaries)[1], bytes, observed_bytes);
     evidence.reference_compared[index] = 1;

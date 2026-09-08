@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstring>
 #include <fcntl.h>
 #include <stdexcept>
 #include <string_view>
@@ -124,6 +126,20 @@ TargetLayer0BoundaryEvidence compare_target_layer0_boundary_bytes(
   }
   result.exact = result.mismatch_count == 0 &&
                  result.observed_sha256 == expected.sha256;
+  return result;
+}
+
+std::vector<std::uint8_t> round_target_layer0_attention_to_bf16(
+    const float* observed, std::size_t elements) {
+  if (!observed || elements != 2'560)
+    throw std::invalid_argument("layer0 attention observation extent changed");
+  std::vector<std::uint8_t> result(elements * sizeof(std::uint16_t));
+  for (std::size_t i = 0; i < elements; ++i) {
+    const std::uint32_t bits = std::bit_cast<std::uint32_t>(observed[i]);
+    const auto rounded = static_cast<std::uint16_t>(
+        (bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16);
+    std::memcpy(result.data() + i * sizeof(rounded), &rounded, sizeof(rounded));
+  }
   return result;
 }
 

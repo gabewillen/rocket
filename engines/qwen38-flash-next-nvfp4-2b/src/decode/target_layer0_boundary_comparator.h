@@ -41,6 +41,12 @@ TargetLayer0BoundaryEvidence compare_target_layer0_boundary_bytes(
     const TargetLayer0BoundaryReference& expected,
     const std::uint8_t* observed, std::size_t bytes);
 
+// Debug-only materialization of vLLM's post-collective BF16 boundary from
+// Rocket's FP32 PairReduce output. The conversion is IEEE round-to-nearest,
+// ties-to-even and has a fixed 2 * elements output extent.
+std::vector<std::uint8_t> round_target_layer0_attention_to_bf16(
+    const float* observed, std::size_t elements);
+
 // Debug-only synchronous D2H comparator. It is not graph captured and does
 // not participate in serving publication. Calls must arrive once in attention,
 // HC, MoE order for the first layer-0 row.
