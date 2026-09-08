@@ -81,11 +81,14 @@ __global__ void causal_conv_update(
   history[kQkvWidth + dim] = __float2bfloat16(x2);
   history[2 * kQkvWidth + dim] = __float2bfloat16(x3);
   const std::size_t w = static_cast<std::size_t>(dim) * kConvKernel;
-  float value = x0 * __bfloat162float(weight[w]) +
-                x1 * __bfloat162float(weight[w + 1]) +
-                x2 * __bfloat162float(weight[w + 2]) +
-                x3 * __bfloat162float(weight[w + 3]);
-  value *= 1.0F / (1.0F + __expf(-value));
+  const float inputs[kConvKernel] = {x0, x1, x2, x3};
+  float value = 0.0F;
+#pragma unroll
+  for (int index = 0; index < kConvKernel; ++index) {
+    value += inputs[index] * __bfloat162float(weight[w + index]);
+  }
+  // Match causal-conv1d's CUDA kernel: accurate expf and a final division.
+  value = value / (1.0F + expf(-value));
   mixed_qkv[row * kQkvWidth + dim] = __float2bfloat16(value);
 }
 
@@ -106,11 +109,13 @@ __global__ void causal_conv_verify(
     const float x3 = __bfloat162float(
         qkvz[static_cast<std::size_t>(row) * (kQkvWidth + kGateWidth) + dim]);
     const std::size_t w = static_cast<std::size_t>(dim) * kConvKernel;
-    float value = x0 * __bfloat162float(weight[w]) +
-                  x1 * __bfloat162float(weight[w + 1]) +
-                  x2 * __bfloat162float(weight[w + 2]) +
-                  x3 * __bfloat162float(weight[w + 3]);
-    value *= 1.0F / (1.0F + __expf(-value));
+    const float inputs[kConvKernel] = {x0, x1, x2, x3};
+    float value = 0.0F;
+#pragma unroll
+    for (int index = 0; index < kConvKernel; ++index) {
+      value += inputs[index] * __bfloat162float(weight[w + index]);
+    }
+    value = value / (1.0F + expf(-value));
     // Reuse the graph-owned mixed buffer as the post-convolution QKV rows.
     const_cast<__nv_bfloat16*>(qkvz)[
         static_cast<std::size_t>(row) * (kQkvWidth + kGateWidth) + dim] =

@@ -126,6 +126,15 @@ class LinearAttentionSlabTests(unittest.TestCase):
         )
         self.assertEqual(source.count("recurrent_beta(ba["), 2)
 
+    def test_causal_conv_matches_pinned_accumulation_and_silu(self):
+        source = (
+            Path(__file__).parents[1] / "src" / "linear_attention" / "gdn_core.cu"
+        ).read_text()
+        conv = source[source.index("__global__ void causal_conv_update") :]
+        self.assertEqual(source.count("value = value / (1.0F + expf(-value));"), 2)
+        self.assertIn("value += inputs[index] *", conv)
+        self.assertNotIn("value *= 1.0F / (1.0F + __expf(-value))", conv)
+
     def test_gdn_debug_capture_is_layer0_once_and_bounded(self):
         source = (
             Path(__file__).parents[1] / "src" / "linear_attention" / "gdn_cutlass.cu"
@@ -136,7 +145,9 @@ class LinearAttentionSlabTests(unittest.TestCase):
         self.assertIn("bytes > kMaxDebugBytes", body)
         launch = source[source.index("void CutlassGdnGraph::launch(") :]
         self.assertLess(launch.index('"qkvz"'), launch.index('"ba"'))
-        self.assertLess(launch.index('"ba"'), launch.index('"core"'))
+        self.assertLess(launch.index('"ba"'), launch.index('"conv"'))
+        self.assertLess(launch.index('"conv"'), launch.index('"recurrent"'))
+        self.assertLess(launch.index('"recurrent"'), launch.index('"core"'))
         self.assertLess(launch.index('"core"'), launch.index('"projected"'))
 
     def test_decode_projection_uses_authenticated_input_scale_before_bf16(self):
