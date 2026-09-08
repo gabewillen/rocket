@@ -139,6 +139,18 @@ class LinearAttentionSlabTests(unittest.TestCase):
         self.assertLess(launch.index('"ba"'), launch.index('"core"'))
         self.assertLess(launch.index('"core"'), launch.index('"projected"'))
 
+    def test_decode_projection_uses_authenticated_input_scale_before_bf16(self):
+        source = (
+            Path(__file__).parents[1] / "src" / "linear_attention" / "gdn_cutlass.cu"
+        ).read_text()
+        launch = source[source.index("void CutlassGdnGraph::launch(") :]
+        self.assertIn("gdn_quantizer_scale(impl_->input_global_scale)", launch)
+        self.assertIn("gdn_quantizer_scale(impl_->output_global_scale)", launch)
+        for family in ("qkv_gemms", "z_gemms", "b_gemms", "a_gemms"):
+            self.assertIn(f"impl_->{family}[bucket].gemm.run(stream)", launch)
+        before_verifier = launch[: launch.index("void CutlassGdnGraph::launch_verifier(")]
+        self.assertNotIn("scale_projection<<<", before_verifier)
+
 
 if __name__ == "__main__":
     unittest.main()

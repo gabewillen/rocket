@@ -112,6 +112,9 @@ TargetGdnNativeWeightBindings resolve(
         address<std::uint8_t>(base, extent(
             plan, std::string(root) + ".weight_scale", scale_bytes,
             "F8_E4M3", "cutlass_sm121_sfb", kNvfp4Abi, scale_shape)),
+        address<float>(base, extent(
+            plan, std::string(root) + ".input_scale", 4, "F32",
+            "scalar", kNvfp4Abi, {1})),
         global};
   };
   const auto native_bf16 = [&](std::string_view suffix, std::uint64_t bytes,

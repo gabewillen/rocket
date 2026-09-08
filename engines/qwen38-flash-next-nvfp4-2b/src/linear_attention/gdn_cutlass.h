@@ -16,6 +16,7 @@ namespace rocket::qwen38::linear_attention {
 struct Nvfp4Matrix {
   const std::uint8_t* weight;
   const std::uint8_t* scale;
+  const float* input_scale;
   float global_scale;
 };
 
@@ -30,6 +31,16 @@ struct GdnWeights {
   const __nv_bfloat16* dt_bias;
   const __nv_bfloat16* norm;
 };
+
+[[nodiscard]] constexpr float gdn_quantizer_scale(
+    float input_global_scale) noexcept {
+  return 1.0F / input_global_scale;
+}
+
+[[nodiscard]] constexpr float gdn_projection_alpha(
+    float input_global_scale, float weight_global_scale) noexcept {
+  return input_global_scale * weight_global_scale;
+}
 
 [[nodiscard]] constexpr bool allowed_prefill_tokens(int tokens) noexcept {
   return tokens == 300 || tokens == 8'192;
@@ -179,13 +190,16 @@ extern "C" {
 int qwen38_gdn_graph_create(
     int device, int rank, int layer,
     const std::uint8_t* qkv_weight, const std::uint8_t* qkv_scale,
-    float qkv_global, const std::uint8_t* z_weight,
-    const std::uint8_t* z_scale, float z_global,
+    const float* qkv_input_scale, float qkv_global,
+    const std::uint8_t* z_weight, const std::uint8_t* z_scale,
+    const float* z_input_scale, float z_global,
     const std::uint8_t* b_weight, const std::uint8_t* b_scale,
-    float b_global, const std::uint8_t* a_weight,
-    const std::uint8_t* a_scale, float a_global,
+    const float* b_input_scale, float b_global,
+    const std::uint8_t* a_weight, const std::uint8_t* a_scale,
+    const float* a_input_scale, float a_global,
     const std::uint8_t* output_weight, const std::uint8_t* output_scale,
-    float output_global, const __nv_bfloat16* conv,
+    const float* output_input_scale, float output_global,
+    const __nv_bfloat16* conv,
     const __nv_bfloat16* a_log, const __nv_bfloat16* dt_bias,
     const __nv_bfloat16* norm, void** graph);
 int qwen38_gdn_graph_launch(

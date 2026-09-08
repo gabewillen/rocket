@@ -34,19 +34,24 @@ constexpr Extent kDt{1'297'776'896, 48};
 constexpr Extent kAWeight{1'297'777'152, 30'720};
 constexpr Extent kAScale{1'297'807'872, 20'480};
 constexpr Extent kAGlobal{1'297'828'352, 4};
+constexpr Extent kAInputScale{1'297'828'608, 4};
 constexpr Extent kBWeight{1'297'828'864, 30'720};
 constexpr Extent kBScale{1'297'859'584, 20'480};
 constexpr Extent kBGlobal{1'297'880'064, 4};
+constexpr Extent kBInputScale{1'297'880'320, 4};
 constexpr Extent kQWeight{1'297'880'576, 6'553'600};
 constexpr Extent kQScale{1'304'434'176, 819'200};
 constexpr Extent kQGlobal{1'305'253'376, 4};
+constexpr Extent kQInputScale{1'305'253'632, 4};
 constexpr Extent kZWeight{1'305'253'888, 3'932'160};
 constexpr Extent kZScale{1'309'186'048, 491'520};
 constexpr Extent kZGlobal{1'309'677'568, 4};
+constexpr Extent kZInputScale{1'309'677'824, 4};
 constexpr Extent kNorm{1'309'678'080, 256};
 constexpr Extent kOWeight{1'309'678'336, 3'932'160};
 constexpr Extent kOScale{1'313'610'496, 491'520};
 constexpr Extent kOGlobal{1'314'102'016, 4};
+constexpr Extent kOInputScale{1'314'102'272, 4};
 
 void check(cudaError_t status, const char* operation) {
   if (status != cudaSuccess) {
@@ -328,11 +333,15 @@ int main(int argc, char** argv) try {
   DeviceBlob bw(kBWeight.bytes), bs(kBScale.bytes), aw(kAWeight.bytes), as(kAScale.bytes);
   DeviceBlob ow(kOWeight.bytes), os(kOScale.bytes), conv(kConv.bytes), alog(kALog.bytes);
   DeviceBlob dt(kDt.bytes), norm(kNorm.bytes);
+  DeviceBlob qis(4), zis(4), bis(4), ais(4), ois(4);
   load_blob(fd, kQWeight, qw); load_blob(fd, kQScale, qs);
   load_blob(fd, kZWeight, zw); load_blob(fd, kZScale, zs);
   load_blob(fd, kBWeight, bw); load_blob(fd, kBScale, bs);
   load_blob(fd, kAWeight, aw); load_blob(fd, kAScale, as);
   load_blob(fd, kOWeight, ow); load_blob(fd, kOScale, os);
+  load_blob(fd, kQInputScale, qis); load_blob(fd, kZInputScale, zis);
+  load_blob(fd, kBInputScale, bis); load_blob(fd, kAInputScale, ais);
+  load_blob(fd, kOInputScale, ois);
   load_blob(fd, kConv, conv); load_blob(fd, kALog, alog);
   load_blob(fd, kDt, dt); load_blob(fd, kNorm, norm);
   const float qg = load_scalar(fd, kQGlobal), zg = load_scalar(fd, kZGlobal);
@@ -342,15 +351,15 @@ int main(int argc, char** argv) try {
 
   const rocket::qwen38::linear_attention::GdnWeights weights{
       {static_cast<std::uint8_t*>(qw.pointer),
-       static_cast<std::uint8_t*>(qs.pointer), qg},
+       static_cast<std::uint8_t*>(qs.pointer), static_cast<float*>(qis.pointer), qg},
       {static_cast<std::uint8_t*>(zw.pointer),
-       static_cast<std::uint8_t*>(zs.pointer), zg},
+       static_cast<std::uint8_t*>(zs.pointer), static_cast<float*>(zis.pointer), zg},
       {static_cast<std::uint8_t*>(bw.pointer),
-       static_cast<std::uint8_t*>(bs.pointer), bg},
+       static_cast<std::uint8_t*>(bs.pointer), static_cast<float*>(bis.pointer), bg},
       {static_cast<std::uint8_t*>(aw.pointer),
-       static_cast<std::uint8_t*>(as.pointer), ag},
+       static_cast<std::uint8_t*>(as.pointer), static_cast<float*>(ais.pointer), ag},
       {static_cast<std::uint8_t*>(ow.pointer),
-       static_cast<std::uint8_t*>(os.pointer), og},
+       static_cast<std::uint8_t*>(os.pointer), static_cast<float*>(ois.pointer), og},
       static_cast<__nv_bfloat16*>(conv.pointer),
       static_cast<__nv_bfloat16*>(alog.pointer),
       static_cast<__nv_bfloat16*>(dt.pointer),
@@ -372,11 +381,11 @@ int main(int argc, char** argv) try {
 
   void* graph = nullptr;
   if (qwen38_gdn_graph_create(
-          device, 0, 0, static_cast<std::uint8_t*>(qw.pointer), static_cast<std::uint8_t*>(qs.pointer), qg,
-          static_cast<std::uint8_t*>(zw.pointer), static_cast<std::uint8_t*>(zs.pointer), zg,
-          static_cast<std::uint8_t*>(bw.pointer), static_cast<std::uint8_t*>(bs.pointer), bg,
-          static_cast<std::uint8_t*>(aw.pointer), static_cast<std::uint8_t*>(as.pointer), ag,
-          static_cast<std::uint8_t*>(ow.pointer), static_cast<std::uint8_t*>(os.pointer), og,
+          device, 0, 0, static_cast<std::uint8_t*>(qw.pointer), static_cast<std::uint8_t*>(qs.pointer), static_cast<float*>(qis.pointer), qg,
+          static_cast<std::uint8_t*>(zw.pointer), static_cast<std::uint8_t*>(zs.pointer), static_cast<float*>(zis.pointer), zg,
+          static_cast<std::uint8_t*>(bw.pointer), static_cast<std::uint8_t*>(bs.pointer), static_cast<float*>(bis.pointer), bg,
+          static_cast<std::uint8_t*>(aw.pointer), static_cast<std::uint8_t*>(as.pointer), static_cast<float*>(ais.pointer), ag,
+          static_cast<std::uint8_t*>(ow.pointer), static_cast<std::uint8_t*>(os.pointer), static_cast<float*>(ois.pointer), og,
           static_cast<__nv_bfloat16*>(conv.pointer), static_cast<__nv_bfloat16*>(alog.pointer),
           static_cast<__nv_bfloat16*>(dt.pointer), static_cast<__nv_bfloat16*>(norm.pointer), &graph)) {
     throw std::runtime_error(qwen38_gdn_graph_last_error());

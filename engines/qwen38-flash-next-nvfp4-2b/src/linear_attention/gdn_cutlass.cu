@@ -51,6 +51,7 @@ constexpr int kAN = 24;
 constexpr int kBaN = kBN + kAN;
 constexpr int kOutputK = 3'072;
 constexpr int kOutputN = 2'560;
+// Retained only by the unchanged prefill reference/control path.
 constexpr float kOutputActivationGlobal = 1.0F / 256.0F;
 constexpr int kInputSfaBytes = 128 * ((kInputK / 16 + 3) / 4) * 4;
 constexpr int kOutputSfaBytes = 128 * ((kOutputK / 16 + 3) / 4) * 4;
@@ -319,6 +320,18 @@ __global__ void scale_projection(__nv_bfloat16* output, int n,
   output[index] = __float2bfloat16(__bfloat162float(output[index]) * scale);
 }
 
+__global__ void assemble_projection(__nv_bfloat16* destination,
+                                    int destination_width,
+                                    const __nv_bfloat16* source,
+                                    int source_width, int destination_offset) {
+  const int column = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = blockIdx.y;
+  if (column < source_width) {
+    destination[row * destination_width + destination_offset + column] =
+        source[row * source_width + column];
+  }
+}
+
 struct FixedGemm {
   cutlass::DeviceAllocation<std::uint8_t> owned_workspace;
   Gemm gemm;
@@ -327,7 +340,7 @@ struct FixedGemm {
   static typename Gemm::Arguments arguments(
       int m, int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
       const std::uint8_t* b, const std::uint8_t* sfb,
-      __nv_bfloat16* output) {
+      __nv_bfloat16* output, float alpha) {
     StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
     StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
     StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
@@ -338,15 +351,15 @@ struct FixedGemm {
              reinterpret_cast<const ElementInput*>(b), sb,
              reinterpret_cast<const ElementSF*>(sfa), la,
              reinterpret_cast<const ElementSF*>(sfb), lb},
-            {{1.0F, 0.0F}, nullptr, sd, reinterpret_cast<ElementD*>(output),
+            {{alpha, 0.0F}, nullptr, sd, reinterpret_cast<ElementD*>(output),
              sd}};
   }
 
   static std::size_t workspace_size(
       int m, int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
       const std::uint8_t* b, const std::uint8_t* sfb,
-      __nv_bfloat16* output) {
-    const auto args = arguments(m, n, k, a, sfa, b, sfb, output);
+      __nv_bfloat16* output, float alpha) {
+    const auto args = arguments(m, n, k, a, sfa, b, sfb, output, alpha);
     if (Gemm{}.can_implement(args) != cutlass::Status::kSuccess) {
       throw std::runtime_error("CUTLASS fixed GDN shape is unsupported");
     }
@@ -355,8 +368,9 @@ struct FixedGemm {
 
   void init(int m, int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
             const std::uint8_t* b, const std::uint8_t* sfb,
-            __nv_bfloat16* output, void* shared_workspace = nullptr) {
-    auto args = arguments(m, n, k, a, sfa, b, sfb, output);
+            __nv_bfloat16* output, float alpha,
+            void* shared_workspace = nullptr) {
+    auto args = arguments(m, n, k, a, sfa, b, sfb, output, alpha);
     if (gemm.can_implement(args) != cutlass::Status::kSuccess) {
       throw std::runtime_error("CUTLASS fixed GDN shape is unsupported");
     }
@@ -393,17 +407,24 @@ struct CutlassGdnGraph::Impl {
   GdnWeights globals;
   std::uint8_t *input_packed = nullptr, *input_sfa = nullptr;
   std::uint8_t *qkvz_weight = nullptr, *qkvz_scale = nullptr;
-  std::uint8_t *ba_weight = nullptr, *ba_scale = nullptr;
+  std::uint8_t *ba_weight = nullptr, *b_scale = nullptr, *a_scale = nullptr;
   std::uint8_t *output_packed = nullptr, *output_sfa = nullptr;
   std::uint8_t *output_weight = nullptr, *output_scale = nullptr;
+  __nv_bfloat16 *qkv = nullptr, *z = nullptr, *b = nullptr, *a = nullptr;
   __nv_bfloat16 *qkvz = nullptr, *ba = nullptr, *projected = nullptr;
   cutlass::DeviceAllocation<std::uint8_t> decode_workspace;
-  std::array<FixedGemm, kMBucketCount> qkvz_gemms, ba_gemms, output_gemms;
+  std::array<FixedGemm, kMBucketCount> qkv_gemms, z_gemms, b_gemms,
+      a_gemms, output_gemms;
   std::uint8_t *verify_input_packed = nullptr, *verify_input_sfa = nullptr;
   std::uint8_t *verify_output_packed = nullptr, *verify_output_sfa = nullptr;
-  __nv_bfloat16 *verify_qkvz = nullptr, *verify_ba = nullptr,
+  __nv_bfloat16 *verify_qkv = nullptr, *verify_z = nullptr,
+                 *verify_b = nullptr, *verify_a = nullptr,
+                 *verify_qkvz = nullptr, *verify_ba = nullptr,
                  *verify_projected = nullptr;
-  FixedGemm verify_qkvz_gemm, verify_ba_gemm, verify_output_gemm;
+  FixedGemm verify_qkv_gemm, verify_z_gemm, verify_b_gemm, verify_a_gemm,
+      verify_output_gemm;
+  float input_global_scale = 0.0F;
+  float output_global_scale = 0.0F;
   std::unique_ptr<CorePlan> core;
   std::array<bool, 4> debug_dumped{};
 
@@ -435,12 +456,14 @@ struct CutlassGdnGraph::Impl {
   ~Impl() {
     cudaSetDevice(device);
     cudaFree(verify_projected); cudaFree(verify_ba); cudaFree(verify_qkvz);
+    cudaFree(verify_a); cudaFree(verify_b); cudaFree(verify_z); cudaFree(verify_qkv);
     cudaFree(verify_output_sfa); cudaFree(verify_output_packed);
     cudaFree(verify_input_sfa); cudaFree(verify_input_packed);
     cudaFree(projected); cudaFree(ba); cudaFree(qkvz);
+    cudaFree(a); cudaFree(b); cudaFree(z); cudaFree(qkv);
     cudaFree(output_scale); cudaFree(output_weight);
     cudaFree(output_sfa); cudaFree(output_packed);
-    cudaFree(ba_scale); cudaFree(ba_weight);
+    cudaFree(a_scale); cudaFree(b_scale); cudaFree(ba_weight);
     cudaFree(qkvz_scale); cudaFree(qkvz_weight);
     cudaFree(input_sfa); cudaFree(input_packed);
   }
@@ -458,14 +481,33 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
     throw std::invalid_argument("authenticated GDN weight pointers are required");
   }
   for (const auto& matrix : matrices) {
-    if (!matrix.weight || !matrix.scale || !std::isfinite(matrix.global_scale) ||
-        matrix.global_scale <= 0.0F) {
+    if (!matrix.weight || !matrix.scale || !matrix.input_scale ||
+        !std::isfinite(matrix.global_scale) || matrix.global_scale <= 0.0F) {
       delete impl_; impl_ = nullptr;
       throw std::invalid_argument("authenticated NVFP4 GDN matrix is invalid");
     }
   }
   try {
     cuda_check(cudaSetDevice(device), "cudaSetDevice");
+    std::array<float, 5> input_scales{};
+    for (std::size_t index = 0; index < input_scales.size(); ++index) {
+      cuda_check(cudaMemcpy(&input_scales[index], matrices[index].input_scale,
+                            sizeof(float), cudaMemcpyDeviceToHost),
+                 "copy authenticated GDN input scale");
+      if (!std::isfinite(input_scales[index]) || input_scales[index] <= 0.0F) {
+        throw std::invalid_argument("authenticated GDN input scale is invalid");
+      }
+    }
+    if (input_scales[0] != input_scales[1] ||
+        input_scales[0] != input_scales[2] ||
+        input_scales[0] != input_scales[3]) {
+      throw std::invalid_argument(
+          "shared GDN input quantization scale identity changed");
+    }
+    // vLLM quantizes with the reciprocal scalar, while the CUTLASS epilogue
+    // restores input_global_scale * weight_global_scale before BF16 rounding.
+    impl_->input_global_scale = input_scales[0];
+    impl_->output_global_scale = input_scales[4];
     cuda_check(cudaMalloc(&impl_->input_packed, kM * kInputK / 2), "malloc input A");
     cuda_check(cudaMalloc(&impl_->input_sfa, kInputSfaBytes), "malloc input SFA");
     cuda_check(cudaMalloc(&impl_->qkvz_weight,
@@ -477,7 +519,8 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
     cuda_check(cudaMalloc(&impl_->ba_weight,
                           static_cast<std::size_t>(kBaN) * kInputK / 2),
                "malloc BA B");
-    cuda_check(cudaMalloc(&impl_->ba_scale, kBaSfbBytes), "malloc BA SFB");
+    cuda_check(cudaMalloc(&impl_->b_scale, kBaSfbBytes), "malloc B SFB");
+    cuda_check(cudaMalloc(&impl_->a_scale, kBaSfbBytes), "malloc A SFB");
     cuda_check(cudaMalloc(&impl_->output_packed, kM * kOutputK / 2),
                "malloc output A");
     cuda_check(cudaMalloc(&impl_->output_sfa, kOutputSfaBytes),
@@ -491,9 +534,21 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
     cuda_check(cudaMalloc(&impl_->qkvz,
                           static_cast<std::size_t>(kM) * kQkvzN * 2),
                "malloc QKVZ output");
+    cuda_check(cudaMalloc(&impl_->qkv,
+                          static_cast<std::size_t>(kM) * kQkvN * 2),
+               "malloc QKV output");
+    cuda_check(cudaMalloc(&impl_->z,
+                          static_cast<std::size_t>(kM) * kZN * 2),
+               "malloc Z output");
     cuda_check(cudaMalloc(&impl_->ba,
                           static_cast<std::size_t>(kM) * kBaN * 2),
                "malloc BA output");
+    cuda_check(cudaMalloc(&impl_->b,
+                          static_cast<std::size_t>(kM) * kBN * 2),
+               "malloc B output");
+    cuda_check(cudaMalloc(&impl_->a,
+                          static_cast<std::size_t>(kM) * kAN * 2),
+               "malloc A output");
     cuda_check(cudaMalloc(&impl_->projected,
                           static_cast<std::size_t>(kM) * kOutputN * 2),
                "malloc projected output");
@@ -511,10 +566,23 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
                           static_cast<std::size_t>(kMaxVerifierRows) *
                               kQkvzN * 2),
                "malloc verifier QKVZ output");
+    cuda_check(cudaMalloc(&impl_->verify_qkv,
+                          static_cast<std::size_t>(kMaxVerifierRows) *
+                              kQkvN * 2),
+               "malloc verifier QKV output");
+    cuda_check(cudaMalloc(&impl_->verify_z,
+                          static_cast<std::size_t>(kMaxVerifierRows) * kZN * 2),
+               "malloc verifier Z output");
     cuda_check(cudaMalloc(&impl_->verify_ba,
                           static_cast<std::size_t>(kMaxVerifierRows) * kBaN *
                               2),
                "malloc verifier BA output");
+    cuda_check(cudaMalloc(&impl_->verify_b,
+                          static_cast<std::size_t>(kMaxVerifierRows) * kBN * 2),
+               "malloc verifier B output");
+    cuda_check(cudaMalloc(&impl_->verify_a,
+                          static_cast<std::size_t>(kMaxVerifierRows) * kAN * 2),
+               "malloc verifier A output");
     cuda_check(cudaMalloc(&impl_->verify_projected,
                           static_cast<std::size_t>(kMaxVerifierRows) *
                               kOutputN * 2),
@@ -531,9 +599,8 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
     const std::size_t ba_w = static_cast<std::size_t>(kBN) * kInputK / 2;
     copy(impl_->ba_weight, weights.b.weight, ba_w, "copy B weight");
     copy(impl_->ba_weight + ba_w, weights.a.weight, ba_w, "copy A weight");
-    fuse_ba_scales<<<dim3((kInputK / 16 + 255) / 256, kBaN), 256>>>(
-        weights.b.scale, weights.a.scale, impl_->ba_scale);
-    cuda_check(cudaGetLastError(), "fuse BA scale layout");
+    copy(impl_->b_scale, weights.b.scale, kBaSfbBytes, "copy B scale");
+    copy(impl_->a_scale, weights.a.scale, kBaSfbBytes, "copy A scale");
     copy(impl_->output_weight, weights.output.weight,
          static_cast<std::size_t>(kOutputN) * kOutputK / 2,
          "copy output weight");
@@ -548,38 +615,82 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
       decode_workspace_bytes = std::max(
           decode_workspace_bytes,
           FixedGemm::workspace_size(
-              rows, kQkvzN, kInputK, impl_->input_packed, impl_->input_sfa,
-              impl_->qkvz_weight, impl_->qkvz_scale, impl_->qkvz));
+              rows, kQkvN, kInputK, impl_->input_packed, impl_->input_sfa,
+              impl_->qkvz_weight, impl_->qkvz_scale, impl_->qkv,
+              gdn_projection_alpha(impl_->input_global_scale,
+                                   weights.qkv.global_scale)));
+    decode_workspace_bytes = std::max(
+        decode_workspace_bytes,
+          FixedGemm::workspace_size(
+              rows, kZN, kInputK, impl_->input_packed, impl_->input_sfa,
+              impl_->qkvz_weight + qkv_w, impl_->qkvz_scale + qkv_s,
+              impl_->z,
+              gdn_projection_alpha(impl_->input_global_scale,
+                                   weights.z.global_scale)));
       decode_workspace_bytes = std::max(
           decode_workspace_bytes,
           FixedGemm::workspace_size(
-              rows, kBaN, kInputK, impl_->input_packed, impl_->input_sfa,
-              impl_->ba_weight, impl_->ba_scale, impl_->ba));
+              rows, kBN, kInputK, impl_->input_packed, impl_->input_sfa,
+              impl_->ba_weight, impl_->b_scale, impl_->b,
+              gdn_projection_alpha(impl_->input_global_scale,
+                                   weights.b.global_scale)));
+      decode_workspace_bytes = std::max(
+          decode_workspace_bytes,
+          FixedGemm::workspace_size(
+              rows, kAN, kInputK, impl_->input_packed, impl_->input_sfa,
+              impl_->ba_weight + ba_w, impl_->a_scale, impl_->a,
+              gdn_projection_alpha(impl_->input_global_scale,
+                                   weights.a.global_scale)));
       decode_workspace_bytes = std::max(
           decode_workspace_bytes,
           FixedGemm::workspace_size(
               rows, kOutputN, kOutputK, impl_->output_packed,
               impl_->output_sfa, impl_->output_weight, impl_->output_scale,
-              impl_->projected));
+              impl_->projected,
+              gdn_projection_alpha(impl_->output_global_scale,
+                                   weights.output.global_scale)));
     }
     impl_->decode_workspace.reset(decode_workspace_bytes);
     for (std::size_t bucket = 0; bucket < kMBucketCount; ++bucket) {
       const int rows = gdn_bucket_rows(static_cast<int>(bucket));
-      impl_->qkvz_gemms[bucket].init(
-          rows, kQkvzN, kInputK, impl_->input_packed, impl_->input_sfa,
-          impl_->qkvz_weight, impl_->qkvz_scale, impl_->qkvz,
+      impl_->qkv_gemms[bucket].init(
+          rows, kQkvN, kInputK, impl_->input_packed, impl_->input_sfa,
+          impl_->qkvz_weight, impl_->qkvz_scale, impl_->qkv,
+          gdn_projection_alpha(impl_->input_global_scale,
+                               weights.qkv.global_scale),
           impl_->decode_workspace.get());
-      impl_->ba_gemms[bucket].init(
-          rows, kBaN, kInputK, impl_->input_packed, impl_->input_sfa,
-          impl_->ba_weight, impl_->ba_scale, impl_->ba,
+      impl_->z_gemms[bucket].init(
+          rows, kZN, kInputK, impl_->input_packed, impl_->input_sfa,
+          impl_->qkvz_weight + qkv_w, impl_->qkvz_scale + qkv_s,
+          impl_->z,
+          gdn_projection_alpha(impl_->input_global_scale,
+                               weights.z.global_scale),
+          impl_->decode_workspace.get());
+      impl_->b_gemms[bucket].init(
+          rows, kBN, kInputK, impl_->input_packed, impl_->input_sfa,
+          impl_->ba_weight, impl_->b_scale, impl_->b,
+          gdn_projection_alpha(impl_->input_global_scale,
+                               weights.b.global_scale),
+          impl_->decode_workspace.get());
+      impl_->a_gemms[bucket].init(
+          rows, kAN, kInputK, impl_->input_packed, impl_->input_sfa,
+          impl_->ba_weight + ba_w, impl_->a_scale, impl_->a,
+          gdn_projection_alpha(impl_->input_global_scale,
+                               weights.a.global_scale),
           impl_->decode_workspace.get());
       impl_->output_gemms[bucket].init(
           rows, kOutputN, kOutputK, impl_->output_packed, impl_->output_sfa,
           impl_->output_weight, impl_->output_scale, impl_->projected,
+          gdn_projection_alpha(impl_->output_global_scale,
+                               weights.output.global_scale),
           impl_->decode_workspace.get());
-      if (impl_->qkvz_gemms[bucket].bound_workspace !=
+      if (impl_->qkv_gemms[bucket].bound_workspace !=
               impl_->decode_workspace.get() ||
-          impl_->ba_gemms[bucket].bound_workspace !=
+          impl_->z_gemms[bucket].bound_workspace !=
+              impl_->decode_workspace.get() ||
+          impl_->b_gemms[bucket].bound_workspace !=
+              impl_->decode_workspace.get() ||
+          impl_->a_gemms[bucket].bound_workspace !=
               impl_->decode_workspace.get() ||
           impl_->output_gemms[bucket].bound_workspace !=
               impl_->decode_workspace.get()) {
@@ -588,18 +699,36 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
     }
     impl_->core = std::make_unique<CorePlan>(
         device, weights.conv, weights.a_log, weights.dt_bias, weights.norm);
-    impl_->verify_qkvz_gemm.init(
-        kMaxVerifierRows, kQkvzN, kInputK, impl_->verify_input_packed,
+    impl_->verify_qkv_gemm.init(
+        kMaxVerifierRows, kQkvN, kInputK, impl_->verify_input_packed,
         impl_->verify_input_sfa, impl_->qkvz_weight, impl_->qkvz_scale,
-        impl_->verify_qkvz);
-    impl_->verify_ba_gemm.init(
-        kMaxVerifierRows, kBaN, kInputK, impl_->verify_input_packed,
-        impl_->verify_input_sfa, impl_->ba_weight, impl_->ba_scale,
-        impl_->verify_ba);
+        impl_->verify_qkv,
+        gdn_projection_alpha(impl_->input_global_scale,
+                             weights.qkv.global_scale));
+    impl_->verify_z_gemm.init(
+        kMaxVerifierRows, kZN, kInputK, impl_->verify_input_packed,
+        impl_->verify_input_sfa, impl_->qkvz_weight + qkv_w,
+        impl_->qkvz_scale + qkv_s, impl_->verify_z,
+        gdn_projection_alpha(impl_->input_global_scale,
+                             weights.z.global_scale));
+    impl_->verify_b_gemm.init(
+        kMaxVerifierRows, kBN, kInputK, impl_->verify_input_packed,
+        impl_->verify_input_sfa, impl_->ba_weight, impl_->b_scale,
+        impl_->verify_b,
+        gdn_projection_alpha(impl_->input_global_scale,
+                             weights.b.global_scale));
+    impl_->verify_a_gemm.init(
+        kMaxVerifierRows, kAN, kInputK, impl_->verify_input_packed,
+        impl_->verify_input_sfa, impl_->ba_weight + ba_w, impl_->a_scale,
+        impl_->verify_a,
+        gdn_projection_alpha(impl_->input_global_scale,
+                             weights.a.global_scale));
     impl_->verify_output_gemm.init(
         kMaxVerifierRows, kOutputN, kOutputK, impl_->verify_output_packed,
         impl_->verify_output_sfa, impl_->output_weight, impl_->output_scale,
-        impl_->verify_projected);
+        impl_->verify_projected,
+        gdn_projection_alpha(impl_->output_global_scale,
+                             weights.output.global_scale));
   } catch (...) {
     delete impl_; impl_ = nullptr;
     throw;
@@ -644,33 +773,46 @@ void CutlassGdnGraph::launch(
   decode::target_k0_enter_gdn_graph(
       progress, decode::TargetK0GdnGraphStage::kInputQuantize);
   quantize_fixed<kInputK><<<m, 256, 0, stream>>>(
-      impl_->input_packed, impl_->input_sfa, block_input, 1.0F);
+      impl_->input_packed, impl_->input_sfa, block_input,
+      gdn_quantizer_scale(impl_->input_global_scale));
   cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN input quantization");
   decode::target_k0_enter_gdn_graph(
       progress, decode::TargetK0GdnGraphStage::kQkvProjection);
   const auto bucket = static_cast<std::size_t>(gdn_bucket_index(m));
-  const auto qkv_status = impl_->qkvz_gemms[bucket].gemm.run(stream);
+  const auto qkv_status = impl_->qkv_gemms[bucket].gemm.run(stream);
   cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN QKV projection launch");
-  auto ba_status = cutlass::Status::kSuccess;
+  auto z_status = cutlass::Status::kSuccess;
+  auto b_status = cutlass::Status::kSuccess;
+  auto a_status = cutlass::Status::kSuccess;
   if (qkv_status == cutlass::Status::kSuccess) {
+    z_status = impl_->z_gemms[bucket].gemm.run(stream);
+    cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN Z projection launch");
+  }
+  if (z_status == cutlass::Status::kSuccess) {
     decode::target_k0_enter_gdn_graph(
         progress, decode::TargetK0GdnGraphStage::kBaProjection);
-    ba_status = impl_->ba_gemms[bucket].gemm.run(stream);
-    cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN BA projection launch");
+    b_status = impl_->b_gemms[bucket].gemm.run(stream);
+    cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN B projection launch");
+  }
+  if (b_status == cutlass::Status::kSuccess) {
+    a_status = impl_->a_gemms[bucket].gemm.run(stream);
+    cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN A projection launch");
   }
   if (qkv_status != cutlass::Status::kSuccess ||
-      ba_status != cutlass::Status::kSuccess) {
+      z_status != cutlass::Status::kSuccess ||
+      b_status != cutlass::Status::kSuccess ||
+      a_status != cutlass::Status::kSuccess) {
     throw std::runtime_error("fixed Qwen GDN input projection failed");
   }
-  decode::target_k0_enter_gdn_graph(
-      progress, decode::TargetK0GdnGraphStage::kInputScale);
-  scale_projection<<<dim3((kQkvzN + 255) / 256, m), 256, 0, stream>>>(
-      impl_->qkvz, kQkvzN, kQkvN, impl_->globals.qkv.global_scale,
-      impl_->globals.z.global_scale);
-  scale_projection<<<dim3((kBaN + 255) / 256, m), 256, 0, stream>>>(
-      impl_->ba, kBaN, kBN, impl_->globals.b.global_scale,
-      impl_->globals.a.global_scale);
-  cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN input scale launch");
+  assemble_projection<<<dim3((kQkvN + 255) / 256, m), 256, 0, stream>>>(
+      impl_->qkvz, kQkvzN, impl_->qkv, kQkvN, 0);
+  assemble_projection<<<dim3((kZN + 255) / 256, m), 256, 0, stream>>>(
+      impl_->qkvz, kQkvzN, impl_->z, kZN, kQkvN);
+  assemble_projection<<<dim3((kBN + 255) / 256, m), 256, 0, stream>>>(
+      impl_->ba, kBaN, impl_->b, kBN, 0);
+  assemble_projection<<<dim3((kAN + 255) / 256, m), 256, 0, stream>>>(
+      impl_->ba, kBaN, impl_->a, kAN, kBN);
+  cuda_check(cudaPeekAtLastError(), "assemble fixed Qwen GDN projections");
   impl_->debug_dump(0, "qkvz", impl_->qkvz,
                     static_cast<std::size_t>(m) * kQkvzN * 2, stream);
   impl_->debug_dump(1, "ba", impl_->ba,
@@ -689,7 +831,7 @@ void CutlassGdnGraph::launch(
       progress, decode::TargetK0GdnGraphStage::kOutputQuantize);
   quantize_fixed<kOutputK><<<m, 256, 0, stream>>>(
       impl_->output_packed, impl_->output_sfa, impl_->core->output(),
-      kOutputActivationGlobal);
+      gdn_quantizer_scale(impl_->output_global_scale));
   cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN output quantization");
   decode::target_k0_enter_gdn_graph(
       progress, decode::TargetK0GdnGraphStage::kOutputProjection);
@@ -698,12 +840,6 @@ void CutlassGdnGraph::launch(
     throw std::runtime_error("fixed Qwen GDN output projection failed");
   }
   cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN output projection launch");
-  decode::target_k0_enter_gdn_graph(
-      progress, decode::TargetK0GdnGraphStage::kOutputScale);
-  scale_projection<<<dim3((kOutputN + 255) / 256, m), 256, 0, stream>>>(
-      impl_->projected, kOutputN, kOutputN,
-      impl_->globals.output.global_scale * kOutputActivationGlobal,
-      impl_->globals.output.global_scale * kOutputActivationGlobal);
   impl_->debug_dump(3, "projected", impl_->projected,
                     static_cast<std::size_t>(m) * kOutputN * 2, stream);
   decode::target_k0_enter_gdn_graph(progress,
@@ -731,34 +867,36 @@ void CutlassGdnGraph::launch_verifier(
   // The input owner zeroes the inactive tail. One M128 projection is cheaper
   // than verify_width M16 projections and leaves causal order to the core.
   quantize_fixed<kInputK><<<kMaxVerifierRows, 256, 0, stream>>>(
-      impl_->verify_input_packed, impl_->verify_input_sfa, input, 1.0F);
-  if (impl_->verify_qkvz_gemm.gemm.run(stream) != cutlass::Status::kSuccess ||
-      impl_->verify_ba_gemm.gemm.run(stream) != cutlass::Status::kSuccess) {
+      impl_->verify_input_packed, impl_->verify_input_sfa, input,
+      gdn_quantizer_scale(impl_->input_global_scale));
+  if (impl_->verify_qkv_gemm.gemm.run(stream) != cutlass::Status::kSuccess ||
+      impl_->verify_z_gemm.gemm.run(stream) != cutlass::Status::kSuccess ||
+      impl_->verify_b_gemm.gemm.run(stream) != cutlass::Status::kSuccess ||
+      impl_->verify_a_gemm.gemm.run(stream) != cutlass::Status::kSuccess) {
     throw std::runtime_error("fixed Qwen GDN verifier input projection failed");
   }
-  scale_projection<<<dim3((kQkvzN + 255) / 256, kMaxVerifierRows), 256, 0,
-                     stream>>>(
-      impl_->verify_qkvz, kQkvzN, kQkvN, impl_->globals.qkv.global_scale,
-      impl_->globals.z.global_scale);
-  scale_projection<<<dim3((kBaN + 255) / 256, kMaxVerifierRows), 256, 0,
-                     stream>>>(
-      impl_->verify_ba, kBaN, kBN, impl_->globals.b.global_scale,
-      impl_->globals.a.global_scale);
+  assemble_projection<<<dim3((kQkvN + 255) / 256, kMaxVerifierRows), 256, 0,
+                         stream>>>(impl_->verify_qkvz, kQkvzN,
+                                   impl_->verify_qkv, kQkvN, 0);
+  assemble_projection<<<dim3((kZN + 255) / 256, kMaxVerifierRows), 256, 0,
+                         stream>>>(impl_->verify_qkvz, kQkvzN,
+                                   impl_->verify_z, kZN, kQkvN);
+  assemble_projection<<<dim3((kBN + 255) / 256, kMaxVerifierRows), 256, 0,
+                         stream>>>(impl_->verify_ba, kBaN, impl_->verify_b,
+                                   kBN, 0);
+  assemble_projection<<<dim3((kAN + 255) / 256, kMaxVerifierRows), 256, 0,
+                         stream>>>(impl_->verify_ba, kBaN, impl_->verify_a,
+                                   kAN, kBN);
   impl_->core->launch_verifier(
       impl_->verify_qkvz, impl_->verify_ba, dense_conv_state,
       dense_recurrent_state, prefix_conv_state, prefix_recurrent_state,
       sequences, verify_width, stream);
   quantize_fixed<kOutputK><<<kMaxVerifierRows, 256, 0, stream>>>(
       impl_->verify_output_packed, impl_->verify_output_sfa,
-      impl_->core->output(), kOutputActivationGlobal);
+      impl_->core->output(), gdn_quantizer_scale(impl_->output_global_scale));
   if (impl_->verify_output_gemm.gemm.run(stream) != cutlass::Status::kSuccess) {
     throw std::runtime_error("fixed Qwen GDN verifier output projection failed");
   }
-  scale_projection<<<dim3((kOutputN + 255) / 256, kMaxVerifierRows), 256, 0,
-                     stream>>>(
-      impl_->verify_projected, kOutputN, kOutputN,
-      impl_->globals.output.global_scale * kOutputActivationGlobal,
-      impl_->globals.output.global_scale * kOutputActivationGlobal);
   cuda_check(cudaGetLastError(), "fixed Qwen GDN verifier launch");
 }
 
@@ -995,7 +1133,7 @@ CutlassGdnPrefillProjection::CutlassGdnPrefillProjection(int device,
       bucket->output_gemm.init(tokens, kOutputN, kOutputK,
                                bucket->output_packed, bucket->output_sfa,
                                impl_->output_weight, impl_->output_scale,
-                               bucket->projected);
+                               bucket->projected, 1.0F);
       if (enable_reference) {
         cuda_check(cudaMalloc(&bucket->reference_qkvz_packed,
                               static_cast<std::size_t>(tokens) * kInputK / 2),
@@ -1018,11 +1156,11 @@ CutlassGdnPrefillProjection::CutlassGdnPrefillProjection(int device,
         bucket->reference_qkvz_gemm.init(
             tokens, kQkvzN, kInputK, bucket->reference_qkvz_packed,
             bucket->reference_qkvz_sfa, impl_->qkvz_weight,
-            impl_->qkvz_scale, bucket->reference_qkvz);
+            impl_->qkvz_scale, bucket->reference_qkvz, 1.0F);
         bucket->reference_ba_gemm.init(
             tokens, kBaN, kInputK, bucket->reference_ba_packed,
             bucket->reference_ba_sfa, impl_->ba_weight, impl_->ba_scale,
-            bucket->reference_ba);
+            bucket->reference_ba, 1.0F);
       }
       impl_->buckets[index] = std::move(bucket);
     }
@@ -1226,13 +1364,16 @@ int graph_wrap(F&& fn) noexcept {
 extern "C" int qwen38_gdn_graph_create(
     int device, int rank, int layer,
     const std::uint8_t* qkv_weight, const std::uint8_t* qkv_scale,
-    float qkv_global, const std::uint8_t* z_weight,
-    const std::uint8_t* z_scale, float z_global,
+    const float* qkv_input_scale, float qkv_global,
+    const std::uint8_t* z_weight, const std::uint8_t* z_scale,
+    const float* z_input_scale, float z_global,
     const std::uint8_t* b_weight, const std::uint8_t* b_scale,
-    float b_global, const std::uint8_t* a_weight,
-    const std::uint8_t* a_scale, float a_global,
+    const float* b_input_scale, float b_global,
+    const std::uint8_t* a_weight, const std::uint8_t* a_scale,
+    const float* a_input_scale, float a_global,
     const std::uint8_t* output_weight, const std::uint8_t* output_scale,
-    float output_global, const __nv_bfloat16* conv,
+    const float* output_input_scale, float output_global,
+    const __nv_bfloat16* conv,
     const __nv_bfloat16* a_log, const __nv_bfloat16* dt_bias,
     const __nv_bfloat16* norm, void** graph) {
   return graph_wrap([&] {
@@ -1240,11 +1381,11 @@ extern "C" int qwen38_gdn_graph_create(
     *graph = nullptr;
     using namespace rocket::qwen38::linear_attention;
     *graph = new CutlassGdnGraph(
-        device, rank, layer, {{qkv_weight, qkv_scale, qkv_global},
-                 {z_weight, z_scale, z_global},
-                 {b_weight, b_scale, b_global},
-                 {a_weight, a_scale, a_global},
-                 {output_weight, output_scale, output_global},
+        device, rank, layer, {{qkv_weight, qkv_scale, qkv_input_scale, qkv_global},
+                 {z_weight, z_scale, z_input_scale, z_global},
+                 {b_weight, b_scale, b_input_scale, b_global},
+                 {a_weight, a_scale, a_input_scale, a_global},
+                 {output_weight, output_scale, output_input_scale, output_global},
                  conv, a_log, dt_bias, norm});
   });
 }

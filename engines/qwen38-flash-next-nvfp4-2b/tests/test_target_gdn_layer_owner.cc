@@ -32,6 +32,19 @@ int main() {
   static_assert(linear::gdn_bucket_rows(-1) == 0);
   static_assert(linear::gdn_bucket_rows(5) == 0);
   static_assert(linear::CutlassGdnGraph::decode_workspace_count() == 1);
+  static_assert(linear::gdn_quantizer_scale(0.001331147737801075F) > 751.0F);
+  static_assert(linear::gdn_quantizer_scale(0.001331147737801075F) < 752.0F);
+  static_assert(
+      linear::gdn_projection_alpha(0.001331147737801075F,
+                                   0.0003022693563F) > 4.02e-7F);
+  static_assert(
+      linear::gdn_projection_alpha(0.001331147737801075F,
+                                   0.0003022693563F) < 4.03e-7F);
+  static_assert(
+      linear::gdn_projection_alpha(0.001331147737801075F,
+                                   0.0003022693563F) !=
+      linear::gdn_projection_alpha(0.001331147737801075F,
+                                   0.0002615792328F));
 
   void* storage = nullptr;
   if (posix_memalign(&storage, 256, decode::kTargetGdnOwnerStorageBytes) != 0)
