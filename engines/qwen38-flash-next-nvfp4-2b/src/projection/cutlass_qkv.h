@@ -124,4 +124,15 @@ int qwen38_target_qsa_projection_output_c1(void* plan, void** output_bf16,
                                           std::size_t* elements);
 int qwen38_target_qsa_projection_destroy_c1(void* plan);
 
+// External-BF16-cache sparse attention. Scratch extents are
+// partial_output[32,1,12,256], partial_lse[32,1,12], output[12,256].
+int qwen38_target_qsa_attention_c1(
+    const void* query_bf16, const void* main_key_cache_bf16,
+    const void* main_value_cache_bf16,
+    const std::int32_t* selected_tokens,
+    const std::int32_t* main_block_table,
+    const std::int32_t* token_to_request, float* partial_output,
+    float* partial_lse, void* attention_output_bf16, int main_blocks,
+    cudaStream_t stream);
+
 }

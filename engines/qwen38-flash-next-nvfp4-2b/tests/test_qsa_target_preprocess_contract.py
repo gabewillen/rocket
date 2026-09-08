@@ -45,6 +45,16 @@ class TargetQsaPreprocessSourceTests(unittest.TestCase):
         self.assertNotIn("cudaDeviceSynchronize", replay)
         self.assertNotIn("cudaStreamSynchronize", replay)
 
+    def test_c1_attention_reads_external_bf16_pages(self):
+        source = (ENGINE / "src/projection/cutlass_qkv.cu").read_text()
+        launch = source.split('extern "C" int qwen38_target_qsa_attention_c1', 1)[1]
+        self.assertIn("kTargetMainPageSize = 1600", launch)
+        self.assertIn("qsa_sparse_splitk_block16<<<dim3(1", launch)
+        self.assertIn("main_block_table", launch)
+        self.assertNotIn("cudaMalloc", launch)
+        self.assertNotIn("cudaMemcpy", launch)
+        self.assertNotIn("cudaDeviceSynchronize", launch)
+
 
 if __name__ == "__main__":
     unittest.main()

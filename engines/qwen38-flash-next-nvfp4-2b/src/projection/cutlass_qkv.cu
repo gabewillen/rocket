@@ -655,13 +655,15 @@ __global__ void qsa_sparse_splitk_control(
 // probabilities, and retain FP32 online-softmax state between the four tiles
 // in each 32-way split. The scalar kernel above remains the control.
 __global__ void qsa_sparse_splitk_block16(
-    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ keys,
     const __nv_bfloat16* __restrict__ values,
     const std::int32_t* __restrict__ logical_indices,
     const std::int32_t* __restrict__ block_table,
     const std::int32_t* __restrict__ token_to_request,
-    float* __restrict__ partial_output, float* __restrict__ partial_lse) {
+    float* __restrict__ partial_output, float* __restrict__ partial_lse,
+    int query_stride, int page_size, int table_pages, int physical_blocks,
+    int row_capacity) {
   using namespace nvcuda;
   __shared__ __align__(16) __nv_bfloat16 query_tile[16 * kAttentionDim];
   __shared__ __align__(16) __nv_bfloat16 key_tile[16 * kAttentionDim];
@@ -681,7 +683,8 @@ __global__ void qsa_sparse_splitk_block16(
     const int head = index / kAttentionDim;
     const int dim = index % kAttentionDim;
     query_tile[index] = head < kAttentionHeads
-                            ? qkv[row * kN + head * kAttentionDim + dim]
+                            ? query[row * query_stride +
+                                    head * kAttentionDim + dim]
                             : __float2bfloat16(0.0f);
     accumulator[index] = 0.0f;
   }
@@ -702,13 +705,13 @@ __global__ void qsa_sparse_splitk_block16(
                               : -1;
       int physical = -1;
       if (request >= 0 && request < kM && logical >= 0) {
-        const int logical_page = logical / kQsaPageSize;
-        if (logical_page < kQsaPages * kCompressRatio)
+        const int logical_page = logical / page_size;
+        if (logical_page < table_pages)
           physical = block_table[
-              request * (kQsaPages * kCompressRatio) + logical_page];
+              request * table_pages + logical_page];
       }
       valid_tokens[tid] =
-          physical >= 0 && physical < kQsaPages * kCompressRatio ? logical : -1;
+          physical >= 0 && physical < physical_blocks ? logical : -1;
       scores[tid] = static_cast<float>(physical);
     }
     __syncthreads();
@@ -718,8 +721,8 @@ __global__ void qsa_sparse_splitk_block16(
       const int logical = valid_tokens[token];
       const int physical = static_cast<int>(scores[token]);
       const std::size_t cache =
-          (static_cast<std::size_t>(max(physical, 0)) * kQsaPageSize +
-           max(logical, 0) % kQsaPageSize) * kAttentionDim + dim;
+          (static_cast<std::size_t>(max(physical, 0)) * page_size +
+           max(logical, 0) % page_size) * kAttentionDim + dim;
       key_tile[index] = logical >= 0 ? keys[cache] : __float2bfloat16(0.0f);
       value_tile[index] = logical >= 0 ? values[cache] : __float2bfloat16(0.0f);
     }
@@ -802,32 +805,36 @@ __global__ void qsa_sparse_splitk_block16(
     const int dim = index % kAttentionDim;
     const float norm = normalizers[head];
     partial_output[
-        ((split * kM + row) * kAttentionHeads + head) * kAttentionDim + dim] =
+        ((split * row_capacity + row) * kAttentionHeads + head) *
+            kAttentionDim + dim] =
         norm > 0.0f ? accumulator[head * kAttentionDim + dim] / norm : 0.0f;
   }
   if (tid < kAttentionHeads) {
     const float norm = normalizers[tid];
-    partial_lse[(split * kM + row) * kAttentionHeads + tid] =
+    partial_lse[(split * row_capacity + row) * kAttentionHeads + tid] =
         norm > 0.0f ? maxima[tid] + logf(norm) : -INFINITY;
   }
 }
 
 __global__ void qsa_merge_splitk(const float* partial_output,
                                  const float* partial_lse,
-                                 __nv_bfloat16* output) {
+                                 __nv_bfloat16* output, int row_capacity) {
   const int row = blockIdx.x;
   const int head = blockIdx.y;
   const int dim = threadIdx.x;
   float maximum = -INFINITY;
   for (int split = 0; split < kAttentionSplits; ++split)
-    maximum = fmaxf(maximum, partial_lse[(split * kM + row) * kAttentionHeads + head]);
+    maximum = fmaxf(maximum, partial_lse[
+        (split * row_capacity + row) * kAttentionHeads + head]);
   float total = 0.0f, value = 0.0f;
   for (int split = 0; split < kAttentionSplits; ++split) {
-    const float lse = partial_lse[(split * kM + row) * kAttentionHeads + head];
+    const float lse = partial_lse[
+        (split * row_capacity + row) * kAttentionHeads + head];
     const float weight = isfinite(lse) ? expf(lse - maximum) : 0.0f;
     total += weight;
     value += weight * partial_output[
-        ((split * kM + row) * kAttentionHeads + head) * kAttentionDim + dim];
+        ((split * row_capacity + row) * kAttentionHeads + head) *
+            kAttentionDim + dim];
   }
   output[(row * kAttentionHeads + head) * kAttentionDim + dim] =
       __float2bfloat16(total > 0.0f ? value / total : 0.0f);
@@ -1279,10 +1286,11 @@ extern "C" int qwen38_qsa_sparse_attention(
   qsa_sparse_splitk_block16<<<dim3(kM, kAttentionSplits), 512, 0, stream>>>(
       qkv, plan->attention_keys, plan->attention_values, plan->output,
       plan->attention_table, token_to_request, plan->partial_output,
-      plan->partial_lse);
+      plan->partial_lse, kN, kQsaPageSize, kQsaPages * kCompressRatio,
+      kQsaPages * kCompressRatio, kM);
   if (!cuda_ok(cudaGetLastError(), "QSA BLOCK_N=16 sparse split-K")) return 1;
   qsa_merge_splitk<<<dim3(kM, kAttentionHeads), kAttentionDim, 0, stream>>>(
-      plan->partial_output, plan->partial_lse, plan->attention_output);
+      plan->partial_output, plan->partial_lse, plan->attention_output, kM);
   return cuda_ok(cudaGetLastError(), "merge QSA sparse split-K") ? 0 : 1;
 }
 
@@ -1306,7 +1314,7 @@ extern "C" int qwen38_qsa_sparse_attention_control(
       plan->partial_lse);
   if (!cuda_ok(cudaGetLastError(), "control QSA sparse split-K")) return 1;
   qsa_merge_splitk<<<dim3(kM, kAttentionHeads), kAttentionDim, 0, stream>>>(
-      plan->partial_output, plan->partial_lse, plan->attention_output);
+      plan->partial_output, plan->partial_lse, plan->attention_output, kM);
   return cuda_ok(cudaGetLastError(), "merge control QSA sparse split-K") ? 0 : 1;
 }
 
@@ -1511,4 +1519,34 @@ extern "C" int qwen38_target_qsa_projection_output_c1(
 extern "C" int qwen38_target_qsa_projection_destroy_c1(void* opaque) {
   delete static_cast<TargetQsaProjectionPlan*>(opaque);
   return 0;
+}
+
+extern "C" int qwen38_target_qsa_attention_c1(
+    const void* query, const void* main_keys, const void* main_values,
+    const std::int32_t* selected_tokens,
+    const std::int32_t* main_block_table,
+    const std::int32_t* token_to_request, float* partial_output,
+    float* partial_lse, void* attention_output, int main_blocks,
+    cudaStream_t stream) {
+  last_error.clear();
+  if (!query || !main_keys || !main_values || !selected_tokens ||
+      !main_block_table || !token_to_request || !partial_output ||
+      !partial_lse || !attention_output || main_blocks <= 0 || !stream) {
+    last_error = "invalid caller-owned c1 target QSA attention bindings";
+    return 1;
+  }
+  constexpr int kTargetMainPageSize = 1600;
+  constexpr int kTargetMainTablePages = 164;
+  qsa_sparse_splitk_block16<<<dim3(1, kAttentionSplits), 512, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_bfloat16*>(main_keys),
+      static_cast<const __nv_bfloat16*>(main_values), selected_tokens,
+      main_block_table, token_to_request, partial_output, partial_lse,
+      kOutputK, kTargetMainPageSize, kTargetMainTablePages, main_blocks, 1);
+  if (!cuda_ok(cudaGetLastError(), "target c1 QSA BLOCK_N=16 attention"))
+    return 1;
+  qsa_merge_splitk<<<dim3(1, kAttentionHeads), kAttentionDim, 0, stream>>>(
+      partial_output, partial_lse,
+      static_cast<__nv_bfloat16*>(attention_output), 1);
+  return cuda_ok(cudaGetLastError(), "target c1 QSA split merge") ? 0 : 1;
 }
