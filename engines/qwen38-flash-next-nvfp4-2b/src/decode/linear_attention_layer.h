@@ -62,6 +62,10 @@ class LinearAttentionHyperConnection {
       const __nv_bfloat16* injection, __nv_bfloat16* updated_hidden,
       __nv_bfloat16* next_block_input, __nv_bfloat16* next_injection, int m,
       cudaStream_t stream) = 0;
+  virtual void combine(const __nv_bfloat16* hidden, const float* block_output,
+                       const __nv_bfloat16* injection,
+                       __nv_bfloat16* updated_hidden, int m,
+                       cudaStream_t stream) = 0;
   virtual void synchronize(cudaStream_t stream) = 0;
 };
 

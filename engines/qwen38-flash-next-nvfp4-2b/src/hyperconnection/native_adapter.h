@@ -2,6 +2,7 @@
 #pragma once
 
 #include "decode/full_attention_layer.h"
+#include "decode/linear_attention_layer.h"
 #include "hyperconnection/hyperconnection.h"
 
 namespace rocket::qwen38::hyperconnection {
@@ -10,7 +11,8 @@ namespace rocket::qwen38::hyperconnection {
 // borrowed-stream interface. Plan creation and weight copies occur before
 // graph capture. Every execution method only enqueues fixed-buffer work.
 class NativeFullAttentionHyperConnection final
-    : public decode::FullAttentionHyperConnection {
+    : public decode::FullAttentionHyperConnection,
+      public decode::LinearAttentionHyperConnection {
  public:
   explicit NativeFullAttentionHyperConnection(Plan& plan) noexcept
       : plan_(plan) {}

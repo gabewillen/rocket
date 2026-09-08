@@ -118,6 +118,16 @@ class HyperConnection final : public decode::LinearAttentionHyperConnection {
     calls.push_back("combine_and_mix");
     ordered.push_back("combine_and_mix");
   }
+  void combine(const __nv_bfloat16* hidden, const float* block_output,
+               const __nv_bfloat16* injection,
+               __nv_bfloat16* updated_hidden, int m,
+               cudaStream_t stream) override {
+    check(hidden && block_output && injection && updated_hidden && m == 4 &&
+              stream,
+          "linear HC combine drift");
+    calls.push_back("combine");
+    ordered.push_back("combine");
+  }
   void synchronize(cudaStream_t stream) override {
     check(stream != nullptr, "linear HC completion stream drift");
     calls.push_back("synchronize");

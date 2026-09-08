@@ -139,6 +139,7 @@ add_library(qwen38_decode_execution STATIC
   src/decode/target_k0_pair_reduce.cc
   src/decode/target_k0_executor.cc
   src/decode/linear_attention_layer.cc
+  src/decode/target_gdn_layer.cc
 )
 target_include_directories(qwen38_decode_execution PUBLIC src)
 target_link_libraries(qwen38_decode_execution PUBLIC qwen38_pair_reduce CUDA::cudart)
@@ -966,6 +967,12 @@ target_link_libraries(qwen38-test-linear-attention-layer PRIVATE qwen38_decode_e
 target_compile_options(qwen38-test-linear-attention-layer PRIVATE -Wall -Wextra -Werror)
 set_target_properties(qwen38-test-linear-attention-layer PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-linear-attention-layer-contract COMMAND qwen38-test-linear-attention-layer)
+
+add_executable(qwen38-test-target-gdn-layer tests/test_target_gdn_layer.cc)
+target_link_libraries(qwen38-test-target-gdn-layer PRIVATE qwen38_decode_execution)
+target_compile_options(qwen38-test-target-gdn-layer PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-gdn-layer PROPERTIES LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-target-gdn-layer-cpu-contract COMMAND qwen38-test-target-gdn-layer)
 
 add_executable(qwen38-test-decoder-verifier tests/test_decoder_verifier.cc)
 target_link_libraries(qwen38-test-decoder-verifier PRIVATE
