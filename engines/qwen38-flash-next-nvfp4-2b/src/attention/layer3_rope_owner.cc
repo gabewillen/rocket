@@ -100,7 +100,8 @@ Layer3RopeDeviceOwner::~Layer3RopeDeviceOwner() {
 }
 
 Layer3RopeView Layer3RopeDeviceOwner::view() const noexcept {
-  return {cos_sin_, ready_, kLayer3RopeRows, kLayer3RopeColumns,
+  return {cos_sin_, ready_, kLayer3RopePayloadSha256, kLayer3RopeRows,
+          kLayer3RopeColumns,
           kLayer3RopeColumns};
 }
 

@@ -231,7 +231,8 @@ add_library(qwen38_target_layer3_native_bindings STATIC
 target_include_directories(qwen38_target_layer3_native_bindings PUBLIC src)
 target_link_libraries(qwen38_target_layer3_native_bindings PUBLIC
   qwen38_target_layer3_native_plan qwen38_target_slab_owner
-  qwen38_qsa_sidecar_owner qwen38_decode_execution CUDA::cudart)
+  qwen38_qsa_sidecar_owner qwen38_layer3_rope_owner
+  qwen38_decode_execution CUDA::cudart)
 target_compile_options(qwen38_target_layer3_native_bindings PRIVATE
   -Wall -Wextra -Werror)
 set_target_properties(qwen38_target_layer3_native_bindings PROPERTIES

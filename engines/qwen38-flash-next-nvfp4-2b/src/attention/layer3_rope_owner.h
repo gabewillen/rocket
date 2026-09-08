@@ -47,6 +47,7 @@ struct Layer3RopeIdentity {
 struct Layer3RopeView {
   const __nv_bfloat16* cos_sin = nullptr;
   cudaEvent_t ready = nullptr;
+  std::string_view payload_sha256;
   int rows = 0;
   int columns = 0;
   int row_stride = 0;

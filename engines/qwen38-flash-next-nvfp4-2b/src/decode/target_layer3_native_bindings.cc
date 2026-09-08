@@ -2,6 +2,7 @@
 #include "decode/target_layer3_native_bindings.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <limits>
 #include <set>
@@ -88,7 +89,8 @@ TargetLayer3NativeWeightBindings bind_target_layer3_native_weights(
     const TargetLayer3NativePlan& plan,
     const model::TargetSlabPublication& slab,
     const attention::QsaSidecarPublication& sidecar,
-    const __nv_bfloat16* rope_cos_sin,
+    const attention::Layer3RopeIdentity& rope_identity,
+    const attention::Layer3RopeView& rope,
     TargetLayer3ReadyEventProbe& ready_event_probe,
     pair_reduce::OtelStageSink& telemetry) {
   try {
@@ -96,6 +98,7 @@ TargetLayer3NativeWeightBindings bind_target_layer3_native_weights(
     validate_plan_storage(plan);
     const auto expected_sidecar =
         attention::layer3_qsa_sidecar_identity(plan.rank);
+    const auto expected_rope = attention::layer3_rope_identity(plan.rank);
     if ((plan.rank != 0 && plan.rank != 1) || plan.layer != 3 ||
         plan.peer_rank != 1 - plan.rank ||
         !slab.device_base || !slab.ready_event ||
@@ -117,7 +120,21 @@ TargetLayer3NativeWeightBindings bind_target_layer3_native_weights(
         sidecar.identity.payload_sha256 != expected_sidecar.payload_sha256 ||
         sidecar.identity.layer3_sha256 != expected_sidecar.layer3_sha256 ||
         sidecar.identity.rank != plan.rank || sidecar.identity.layer != 3 ||
-        !rope_cos_sin)
+        rope_identity.checkpoint_revision !=
+            expected_rope.checkpoint_revision ||
+        rope_identity.config_sha256 != expected_rope.config_sha256 ||
+        rope_identity.vllm_revision != expected_rope.vllm_revision ||
+        rope_identity.rank != plan.rank || rope_identity.layer != 3 ||
+        rope_identity.first_position != 0 ||
+        rope_identity.rows != attention::kLayer3RopeRows ||
+        rope_identity.rotary_dim != attention::kLayer3RopeColumns ||
+        std::bit_cast<std::uint32_t>(rope_identity.rope_theta) !=
+        std::bit_cast<std::uint32_t>(attention::kLayer3RopeTheta) ||
+        rope_identity.uses_mrope || !rope.cos_sin || !rope.ready ||
+        rope.payload_sha256 != attention::kLayer3RopePayloadSha256 ||
+        rope.rows != attention::kLayer3RopeRows ||
+        rope.columns != attention::kLayer3RopeColumns ||
+        rope.row_stride != attention::kLayer3RopeColumns)
       fail("publication identity changed");
 
     const auto target = [&](std::string_view name, std::uint64_t bytes) {
@@ -150,7 +167,7 @@ TargetLayer3NativeWeightBindings bind_target_layer3_native_weights(
             target("self_attn.indexer.q_layernorm.weight", 256)),
         address<__nv_bfloat16>(target_base,
             target("self_attn.indexer.k_layernorm.weight", 256)),
-        rope_cos_sin};
+        rope.cos_sin};
     const auto hyper = [&](std::string_view family) {
       const std::string prefix = std::string(family) + "_hyper_connection.";
       return hyperconnection::Weights{
@@ -178,8 +195,8 @@ TargetLayer3NativeWeightBindings bind_target_layer3_native_weights(
         address<__nv_bfloat16>(target_base,
             target("mlp.shared_expert_gate.weight", 5'120))};
     TargetLayer3NativeWeightBindings result{
-        qsa_projection, qsa_preprocess, hyper("attn"), hyper("mlp"),
-        router, shared};
+        qsa_projection, qsa_preprocess, rope.ready, hyper("attn"),
+        hyper("mlp"), router, shared};
     emit(telemetry, plan.rank, pair_reduce::Outcome::kOk);
     return result;
   } catch (...) {

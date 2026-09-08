@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "attention/layer3_rope_owner.h"
 #include "attention/native_qsa_graph.h"
 #include "attention/qsa_sidecar_owner.h"
 #include "decode/target_layer3_native_plan.h"
@@ -13,6 +14,9 @@ namespace rocket::qwen38::decode {
 struct TargetLayer3NativeWeightBindings {
   attention::TargetQsaProjectionWeights qsa_projection;
   attention::TargetQsaPreprocessWeights qsa_preprocess;
+  // Borrowed from Layer3RopeDeviceOwner. The composition owner must enqueue a
+  // stream wait on this event before capturing or launching QSA.
+  cudaEvent_t rope_ready_event = nullptr;
   hyperconnection::Weights attention_hyperconnection;
   hyperconnection::Weights mlp_hyperconnection;
   moe::TargetRouterNvfp4Weights router;
@@ -44,7 +48,8 @@ TargetLayer3NativeWeightBindings bind_target_layer3_native_weights(
     const TargetLayer3NativePlan& plan,
     const model::TargetSlabPublication& slab,
     const attention::QsaSidecarPublication& sidecar,
-    const __nv_bfloat16* rope_cos_sin,
+    const attention::Layer3RopeIdentity& rope_identity,
+    const attention::Layer3RopeView& rope,
     TargetLayer3ReadyEventProbe& ready_event_probe,
     pair_reduce::OtelStageSink& telemetry);
 

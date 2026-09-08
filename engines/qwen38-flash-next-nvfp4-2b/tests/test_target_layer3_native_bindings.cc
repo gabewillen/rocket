@@ -52,13 +52,20 @@ int main(int argc, char** argv) {
     attention::QsaSidecarPublication sidecar{
         reinterpret_cast<const std::uint8_t*>(0x200000000000ULL),
         attention::kQsaSidecarBytes, rank, sidecar_identity};
+    auto rope_identity = attention::layer3_rope_identity(rank);
+    attention::Layer3RopeView rope{
+        reinterpret_cast<const __nv_bfloat16*>(0x300000000000ULL),
+        reinterpret_cast<cudaEvent_t>(0x2000ULL),
+        attention::kLayer3RopePayloadSha256,
+        attention::kLayer3RopeRows, attention::kLayer3RopeColumns,
+        attention::kLayer3RopeColumns};
     Sink sink;
     ReadyProbe probe;
     const auto binding = decode::bind_target_layer3_native_weights(
-        plan, slab, sidecar,
-        reinterpret_cast<const __nv_bfloat16*>(0x300000000000ULL), probe, sink);
+        plan, slab, sidecar, rope_identity, rope, probe, sink);
     if (!binding.qsa_projection.q_weight ||
         !binding.qsa_preprocess.index_qk ||
+        binding.rope_ready_event != rope.ready ||
         !binding.attention_hyperconnection.norm ||
         !binding.mlp_hyperconnection.norm || !binding.router.packed_e2m1 ||
         !binding.shared.gate || sink.spans != 1 || sink.metrics != 1 ||
@@ -70,9 +77,7 @@ int main(int argc, char** argv) {
                             const char* label) {
       try {
         (void)decode::bind_target_layer3_native_weights(
-            plan, slab_value, sidecar_value,
-            reinterpret_cast<const __nv_bfloat16*>(0x300000000000ULL), probe,
-            sink);
+            plan, slab_value, sidecar_value, rope_identity, rope, probe, sink);
         throw std::logic_error(std::string(label) + " unexpectedly bound");
       } catch (const std::invalid_argument&) {
       }
@@ -102,9 +107,7 @@ int main(int argc, char** argv) {
     }
     try {
       (void)decode::bind_target_layer3_native_weights(
-          bad_plan, slab, sidecar,
-          reinterpret_cast<const __nv_bfloat16*>(0x300000000000ULL), probe,
-          sink);
+          bad_plan, slab, sidecar, rope_identity, rope, probe, sink);
       throw std::logic_error("in-memory offset mutation unexpectedly bound");
     } catch (const std::invalid_argument&) {
     }
@@ -121,9 +124,7 @@ int main(int argc, char** argv) {
     std::swap(k_weight->offset_bytes, v_weight->offset_bytes);
     try {
       (void)decode::bind_target_layer3_native_weights(
-          bad_plan, slab, sidecar,
-          reinterpret_cast<const __nv_bfloat16*>(0x300000000000ULL), probe,
-          sink);
+          bad_plan, slab, sidecar, rope_identity, rope, probe, sink);
       throw std::logic_error("equal-size offset swap unexpectedly bound");
     } catch (const std::invalid_argument&) {
     }
@@ -132,9 +133,7 @@ int main(int argc, char** argv) {
               bad_plan.qsa_projection_globals[1]);
     try {
       (void)decode::bind_target_layer3_native_weights(
-          bad_plan, slab, sidecar,
-          reinterpret_cast<const __nv_bfloat16*>(0x300000000000ULL), probe,
-          sink);
+          bad_plan, slab, sidecar, rope_identity, rope, probe, sink);
       throw std::logic_error("projection scalar swap unexpectedly bound");
     } catch (const std::invalid_argument&) {
     }
@@ -144,9 +143,7 @@ int main(int argc, char** argv) {
     bad_slab.artifact_key = "evil";
     try {
       (void)decode::bind_target_layer3_native_weights(
-          bad_plan, bad_slab, sidecar,
-          reinterpret_cast<const __nv_bfloat16*>(0x300000000000ULL), probe,
-          sink);
+          bad_plan, bad_slab, sidecar, rope_identity, rope, probe, sink);
       throw std::logic_error("artifact co-mutation unexpectedly bound");
     } catch (const std::invalid_argument&) {
     }
@@ -156,13 +153,51 @@ int main(int argc, char** argv) {
     bad_slab.layout_sha256 = "evil";
     try {
       (void)decode::bind_target_layer3_native_weights(
-          bad_plan, bad_slab, sidecar,
-          reinterpret_cast<const __nv_bfloat16*>(0x300000000000ULL), probe,
-          sink);
+          bad_plan, bad_slab, sidecar, rope_identity, rope, probe, sink);
       throw std::logic_error("layout co-mutation unexpectedly bound");
     } catch (const std::invalid_argument&) {
     }
-    if (sink.spans != 11 || sink.metrics != 11 ||
+    auto bad_rope_identity = rope_identity;
+    bad_rope_identity.first_position = 35;
+    try {
+      (void)decode::bind_target_layer3_native_weights(
+          plan, slab, sidecar, bad_rope_identity, rope, probe, sink);
+      throw std::logic_error("decode RoPE identity unexpectedly bound");
+    } catch (const std::invalid_argument&) {
+    }
+    bad_rope_identity = rope_identity;
+    bad_rope_identity.uses_mrope = true;
+    try {
+      (void)decode::bind_target_layer3_native_weights(
+          plan, slab, sidecar, bad_rope_identity, rope, probe, sink);
+      throw std::logic_error("mRoPE identity unexpectedly bound");
+    } catch (const std::invalid_argument&) {
+    }
+    auto bad_rope = rope;
+    bad_rope.rows = 34;
+    try {
+      (void)decode::bind_target_layer3_native_weights(
+          plan, slab, sidecar, rope_identity, bad_rope, probe, sink);
+      throw std::logic_error("short RoPE view unexpectedly bound");
+    } catch (const std::invalid_argument&) {
+    }
+    bad_rope = rope;
+    bad_rope.payload_sha256 = "wrong";
+    try {
+      (void)decode::bind_target_layer3_native_weights(
+          plan, slab, sidecar, rope_identity, bad_rope, probe, sink);
+      throw std::logic_error("wrong RoPE payload unexpectedly bound");
+    } catch (const std::invalid_argument&) {
+    }
+    bad_rope = rope;
+    bad_rope.ready = nullptr;
+    try {
+      (void)decode::bind_target_layer3_native_weights(
+          plan, slab, sidecar, rope_identity, bad_rope, probe, sink);
+      throw std::logic_error("unpublished RoPE view unexpectedly bound");
+    } catch (const std::invalid_argument&) {
+    }
+    if (sink.spans != 16 || sink.metrics != 16 ||
         sink.outcome != pair_reduce::Outcome::kContractError)
       throw std::logic_error("binding failure telemetry changed");
     std::printf("rank=%d extents=%zu native_weight_binding=1\n", rank,
