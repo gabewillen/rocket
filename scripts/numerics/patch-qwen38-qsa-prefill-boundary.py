@@ -96,7 +96,28 @@ def _rocket_capture_qsa_prefill_boundary(owner, positions, query, key, value,
         ).contiguous()
     values["k_scale"] = owner._k_scale.detach().to(torch.float32).reshape(1).clone()
     values["v_scale"] = owner._v_scale.detach().to(torch.float32).reshape(1).clone()
-    names = (*names, "k_scale", "v_scale")
+    raw_state_slots = torch.unique(
+        values["raw_slots"][values["raw_slots"] >= 0], sorted=True
+    )
+    compressed_state_slots = torch.unique(
+        values["compressed_slots"][values["compressed_slots"] >= 0], sorted=True
+    )
+    raw_cache = owner.indexer.raw_key_cache.kv_cache.reshape(
+        -1, 1, owner.indexer.raw_key_cache.kv_cache.shape[-1]
+    )
+    compressed_cache = owner.indexer.compressed_key_cache.kv_cache.reshape(
+        -1, 1, owner.indexer.index_head_dim
+    )
+    values["raw_state_slots"] = raw_state_slots
+    values["raw_state"] = raw_cache.index_select(0, raw_state_slots).contiguous()
+    values["compressed_state_slots"] = compressed_state_slots
+    values["compressed_state"] = compressed_cache.index_select(
+        0, compressed_state_slots
+    ).contiguous()
+    names = (
+        *names, "k_scale", "v_scale", "raw_state_slots", "raw_state",
+        "compressed_state_slots", "compressed_state",
+    )
     expected = {
         "query": ((35, 12, 256), torch.bfloat16),
         "key": ((35, 1, 256), torch.bfloat16),
@@ -111,6 +132,10 @@ def _rocket_capture_qsa_prefill_boundary(owner, positions, query, key, value,
         "written_value": ((35, 1, 256), owner.kv_cache.dtype),
         "k_scale": ((1,), torch.float32),
         "v_scale": ((1,), torch.float32),
+        "raw_state_slots": ((4,), torch.int64),
+        "raw_state": ((4, 1, 140), torch.bfloat16),
+        "compressed_state_slots": ((8,), torch.int64),
+        "compressed_state": ((8, 1, 128), compressed_cache.dtype),
     }
     if any(tuple(values[name].shape) != shape or values[name].dtype != dtype
            for name, (shape, dtype) in expected.items()):
@@ -130,7 +155,7 @@ def _rocket_capture_qsa_prefill_boundary(owner, positions, query, key, value,
                         "shape": list(tensor.shape), "bytes": len(data),
                         "sha256": hashlib.sha256(data).hexdigest()})
     manifest = {
-        "schema": "rocket.qwen38.qsa-prefill-boundary.v1",
+        "schema": "rocket.qwen38.qsa-prefill-boundary.v2",
         "oracle_manifest_sha256":
             "05ea3af1c4694a9c035ce2fe9ce006acc58881df0fe86771b1846f4bd8e5f48b",
         "implementation": "vllm:8e685d198:qwen38-qsa-prefill",

@@ -363,6 +363,28 @@ set_target_properties(qwen38-test-target-k0-qsa-state-owner PROPERTIES
 add_test(NAME qwen38-target-k0-qsa-state-owner-cpu-contract
   COMMAND qwen38-test-target-k0-qsa-state-owner)
 
+add_library(qwen38_qsa_m35_state_seed SHARED
+  src/attention/qsa_m35_state_seed.cu)
+target_include_directories(qwen38_qsa_m35_state_seed PUBLIC src)
+target_link_libraries(qwen38_qsa_m35_state_seed PUBLIC CUDA::cudart)
+target_compile_options(qwen38_qsa_m35_state_seed PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+set_target_properties(qwen38_qsa_m35_state_seed PROPERTIES
+  CUDA_ARCHITECTURES "121"
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON)
+
+add_executable(qwen38-test-qsa-m35-state-seed
+  tests/test_qsa_m35_state_seed.cc)
+target_link_libraries(qwen38-test-qsa-m35-state-seed PRIVATE
+  qwen38_qsa_m35_state_seed)
+target_compile_options(qwen38-test-qsa-m35-state-seed PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-qsa-m35-state-seed PROPERTIES
+  LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-qsa-m35-state-seed-cpu-contract
+  COMMAND qwen38-test-qsa-m35-state-seed)
+
 add_library(qwen38_target_slab_owner SHARED src/model/target_slab_owner.cc)
 target_include_directories(qwen38_target_slab_owner PUBLIC src)
 target_link_libraries(qwen38_target_slab_owner PUBLIC

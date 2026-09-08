@@ -16,7 +16,16 @@ class TestQsaPrefillBoundaryPatcher(unittest.TestCase):
         self.assertIn("main_key.index_select(0, main_slots)", source)
         self.assertIn('values["k_scale"] = owner._k_scale', source)
         self.assertIn('"written_key": ((35, 1, 256), owner.kv_cache.dtype)', source)
-        self.assertIn('"schema": "rocket.qwen38.qsa-prefill-boundary.v1"', source)
+        self.assertIn('"schema": "rocket.qwen38.qsa-prefill-boundary.v2"', source)
+        self.assertIn('"raw_state": ((4, 1, 140), torch.bfloat16)', source)
+        self.assertIn('"compressed_state_slots": ((8,), torch.int64)', source)
+        self.assertIn("raw_cache.index_select(0, raw_state_slots)", source)
+        self.assertIn(
+            "compressed_cache.index_select(\n        0, compressed_state_slots",
+            source,
+        )
+        self.assertIn("compressed_cache.dtype", source)
+        self.assertNotIn("owner.indexer.indexer_dtype", source)
         self.assertIn('"generation_index": 0', source)
         self.assertIn("hashlib.sha256(canonical).hexdigest()", source)
         self.assertNotIn('"source_sha256": PINNED_SOURCE_SHA256', source)
