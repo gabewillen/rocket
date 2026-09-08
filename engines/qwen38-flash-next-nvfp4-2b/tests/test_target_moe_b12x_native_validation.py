@@ -39,6 +39,13 @@ class TargetMoeB12xNativeValidationContract(unittest.TestCase):
         self.assertNotIn("torch.zeros(1, 2560", source)
         self.assertNotIn("synthetic", source.lower())
 
+    def test_static_native_alpha_matches_pinned_wrapper_fold(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("folded_w1_alpha", source)
+        self.assertIn("views.w1_alpha * source_weights.input_scale", source)
+        self.assertIn("pointer(folded_w1_alpha)", source)
+        self.assertNotIn("pointer(views.w1_alpha)", source)
+
     def test_result_dimensions_are_bounded(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         for forbidden in ("global_ids.tolist", "routing_weights.tolist", "data_ptr()}"):

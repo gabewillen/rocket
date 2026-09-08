@@ -32,7 +32,11 @@ struct TargetMoeB12xWeights {
   const std::uint8_t* down_packed;
   const std::uint8_t* down_scale;
   const float* input_global_scale;
-  const float* w1_alpha;
+  // Pinned FlashInfer folds input_global_scale into w1_alpha once before it
+  // creates the static weight views. This plane must carry that folded value;
+  // input_global_scale remains separate because activation quantization also
+  // consumes it.
+  const float* folded_w1_alpha;
   const float* w2_alpha;
   const float* down_input_scale;
 };
@@ -75,7 +79,7 @@ enum class TargetMoeCreateFailure : std::uint8_t {
   kDownPacked,
   kDownScale,
   kInputGlobalScale,
-  kW1Alpha,
+  kFoldedW1Alpha,
   kW2Alpha,
   kDownInputScale,
 };
