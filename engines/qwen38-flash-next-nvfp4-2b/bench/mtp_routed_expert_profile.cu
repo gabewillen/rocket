@@ -503,14 +503,20 @@ int main(int argc, char** argv) try {
   const int device = argc > 1 ? std::atoi(argv[1]) : 0;
   const int warmup = argc > 2 ? std::atoi(argv[2]) : 20;
   const int samples = argc > 3 ? std::atoi(argv[3]) : 100;
-  if (device < 0 || warmup < 1 || samples < 2)
-    throw std::invalid_argument("usage: profile [device] [warmup>=1] [samples>=2]");
+  const std::string selected_case = argc > 4 ? argv[4] : "all";
+  if (device < 0 || warmup < 1 || samples < 2 || argc > 5 ||
+      (selected_case != "all" && selected_case != "c8-k7-r1" &&
+       selected_case != "c16-k7-r1")) {
+    throw std::invalid_argument(
+        "usage: profile [device] [warmup>=1] [samples>=2] "
+        "[all|c8-k7-r1|c16-k7-r1]");
+  }
   check(cudaSetDevice(device), "cudaSetDevice");
   cudaDeviceProp properties{};
   check(cudaGetDeviceProperties(&properties, device), "cudaGetDeviceProperties");
-  std::printf("META\tdevice=%d\tname=%s\tcc=%d.%d\twarmup=%d\tsamples=%d\tplain_kernel_launches=6\tcubin_launches=4\n",
+  std::printf("META\tdevice=%d\tname=%s\tcc=%d.%d\twarmup=%d\tsamples=%d\tcase=%s\tplain_kernel_launches=6\tcubin_launches=4\n",
               device, properties.name, properties.major, properties.minor,
-              warmup, samples);
+              warmup, samples, selected_case.c_str());
   std::printf("FIELDS\trank\tconcurrency\tdraft_depth\trows\towner_routes\tactive_experts\tstage\tp50_ms\tp95_ms\tmean_ms\tstddev_ms\tcv\tmin_ms\twarmup\tsamples\tgraph_nodes\tactive_weight_bytes\troute_expanded_weight_bytes\tcapacity_control\n");
 
   cudaStream_t stream = nullptr;
@@ -519,10 +525,24 @@ int main(int argc, char** argv) try {
   FixedBuffers buffers(arena);
   moe::Fp8RoutedExperts rank0(device, 0);
   moe::Fp8RoutedExperts rank1(device, 1);
+  int matched_workloads = 0;
   for (const auto& workload : workloads()) {
+    if (selected_case == "c8-k7-r1" &&
+        !(workload.concurrency == 8 && workload.draft_depth == 7 &&
+          workload.rank == 1 && !workload.capacity_control)) {
+      continue;
+    }
+    if (selected_case == "c16-k7-r1" &&
+        !(workload.concurrency == 16 && workload.draft_depth == 7 &&
+          workload.rank == 1 && workload.capacity_control)) {
+      continue;
+    }
+    ++matched_workloads;
     run_workload(workload, buffers, stream,
                  workload.rank == 0 ? rank0 : rank1, warmup, samples);
   }
+  if (selected_case != "all" && matched_workloads != 1)
+    throw std::runtime_error("selected profile case did not match exactly once");
   check(cudaStreamDestroy(stream), "cudaStreamDestroy");
   return 0;
 } catch (const std::exception& error) {
