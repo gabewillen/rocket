@@ -177,6 +177,24 @@ target_compile_options(qwen38_target_layer3_oracle_comparator PRIVATE
 set_target_properties(qwen38_target_layer3_oracle_comparator PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
+add_library(qwen38_target_k0_oracle_comparator STATIC
+  src/decode/target_k0_oracle_comparator.cc)
+target_include_directories(qwen38_target_k0_oracle_comparator PUBLIC src)
+target_link_libraries(qwen38_target_k0_oracle_comparator PUBLIC
+  qwen38_decode_execution qwen38_target_layer3_oracle_comparator
+  rocket_qwen38_openssl3_crypto rocket_qwen38_jsonc CUDA::cudart)
+target_compile_options(qwen38_target_k0_oracle_comparator PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_k0_oracle_comparator PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+
+add_executable(qwen38-target-k0-oracle-auth
+  tests/target_k0_oracle_auth.cc)
+target_link_libraries(qwen38-target-k0-oracle-auth PRIVATE
+  qwen38_target_k0_oracle_comparator)
+target_compile_options(qwen38-target-k0-oracle-auth PRIVATE
+  -Wall -Wextra -Werror)
+
 add_executable(qwen38-target-layer3-oracle-auth
   tests/target_layer3_oracle_auth.cc)
 target_link_libraries(qwen38-target-layer3-oracle-auth PRIVATE
@@ -705,12 +723,17 @@ target_link_libraries(qwen38-token-output-bench PRIVATE qwen38_token_output)
 enable_testing()
 add_test(NAME qwen38-target-layer3-oracle-cpu-contract
   COMMAND qwen38-target-layer3-oracle-auth)
+add_test(NAME qwen38-target-k0-oracle-cpu-contract
+  COMMAND qwen38-target-k0-oracle-auth)
 set(ROCKET_QWEN38_LAYER3_ORACLE_CAPTURE
   "/home/glwillen/calibration/qwen38-k0-oracle-a1794d5-01/capture"
   CACHE PATH "Authenticated layer-3 K0 oracle capture")
 if(EXISTS "${ROCKET_QWEN38_LAYER3_ORACLE_CAPTURE}/manifest.json")
   add_test(NAME qwen38-target-layer3-oracle-authenticated-contract
     COMMAND qwen38-target-layer3-oracle-auth
+      "${ROCKET_QWEN38_LAYER3_ORACLE_CAPTURE}")
+  add_test(NAME qwen38-target-k0-oracle-authenticated-contract
+    COMMAND qwen38-target-k0-oracle-auth
       "${ROCKET_QWEN38_LAYER3_ORACLE_CAPTURE}")
 endif()
 add_test(NAME qwen38-qsa-expand-smoke COMMAND qwen38-qsa-expand-smoke)
