@@ -46,4 +46,7 @@ struct TargetLayerNativePlan {
 void validate_target_layer_native_plan_binding(
     const TargetLayerNativePlan& plan);
 
+TargetLayerNativePlan load_target_layer_native_plan(
+    const std::filesystem::path& path);
+
 }  // namespace rocket::qwen38::decode

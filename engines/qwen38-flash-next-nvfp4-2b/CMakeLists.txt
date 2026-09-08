@@ -171,7 +171,7 @@ add_library(qwen38_target_layer_native_plan STATIC
   src/decode/target_layer_native_plan.cc)
 target_include_directories(qwen38_target_layer_native_plan PUBLIC src)
 target_link_libraries(qwen38_target_layer_native_plan PUBLIC
-  rocket_qwen38_openssl3_crypto qwen38_decode_execution)
+  rocket_qwen38_openssl3_crypto rocket_qwen38_jsonc qwen38_decode_execution)
 target_compile_options(qwen38_target_layer_native_plan PRIVATE
   -Wall -Wextra -Werror)
 set_target_properties(qwen38_target_layer_native_plan PROPERTIES
@@ -865,6 +865,15 @@ target_link_libraries(qwen38-test-target-layer3-native-plan PRIVATE
   qwen38_target_layer3_native_plan)
 target_compile_options(qwen38-test-target-layer3-native-plan PRIVATE
   -Wall -Wextra -Werror)
+
+add_executable(qwen38-test-target-layer-native-plan
+  tests/test_target_layer_native_plan.cc)
+target_link_libraries(qwen38-test-target-layer-native-plan PRIVATE
+  qwen38_target_layer_native_plan)
+target_compile_options(qwen38-test-target-layer-native-plan PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-layer-native-plan PROPERTIES
+  LINKER_LANGUAGE CUDA)
 
 add_executable(qwen38-test-target-layer3-native-bindings
   tests/test_target_layer3_native_bindings.cc)
