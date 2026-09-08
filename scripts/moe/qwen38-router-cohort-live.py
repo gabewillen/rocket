@@ -133,12 +133,16 @@ def main() -> None:
             "ROCKET_ROUTER_RUN\t"
             + json.dumps(
                 {
-                    "schema": "rocket.qwen38.router-cohort-run.v2",
+                    "schema": "rocket.qwen38.router-cohort-run.v3",
+                    "telemetry_schema": "rocket.qwen38.activation-telemetry.v4",
                     "captured_at": datetime.now(timezone.utc).isoformat(),
                     "model": MODEL,
                     "revision": REVISION,
                     "concurrency": concurrency,
                     "verify_width": VERIFY_WIDTH,
+                    "request_width_source": (
+                        "vllm.forward_context.attn_metadata.query_start_loc"
+                    ),
                     "top_k": 10,
                     "decode": args.decode,
                     "root_prefix_tokens": args.prefix_tokens,

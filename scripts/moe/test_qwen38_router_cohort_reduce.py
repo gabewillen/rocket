@@ -19,108 +19,206 @@ assert LIVE_SPEC.loader is not None
 LIVE_SPEC.loader.exec_module(LIVE_MODULE)
 
 
+def router_record(rank, layer, cohort_call, widths, *, cohort_sequences=None):
+    offset = rank * MODULE.LOCAL_EXPERTS
+    rows = sum(widths)
+    row_offsets = [0]
+    route_rows = []
+    for sequence, width in enumerate(widths):
+        start = row_offsets[-1]
+        row_offsets.append(start + width)
+        for position in range(width):
+            route_rows.append(
+                {
+                    "row": start + position,
+                    "sequence": sequence,
+                    "position": position,
+                    "position_kind": "target" if position == 0 else "speculative",
+                    "expert_ids": list(range(offset, offset + 10)),
+                    "weights": [0.1] * 10,
+                }
+            )
+    return {
+        "schema": MODULE.SCHEMA,
+        "channel": f"layer.{layer}.router.topk.output",
+        "call": 17 + cohort_call,
+        "cohort": f"forked-prefix-c{cohort_sequences or len(widths)}-k4",
+        "rank": rank,
+        "cohort_sequences": cohort_sequences or len(widths),
+        "sequences": len(widths),
+        "verify_width": 5,
+        "request_widths": widths,
+        "row_offsets": row_offsets,
+        "route_top_k": 10,
+        "route_layout": "sequence_major",
+        "cohort_call": cohort_call,
+        "selected_expert_count": rows * 10,
+        "top_experts": [
+            {"expert_id": expert_id, "selections": rows}
+            for expert_id in range(offset, offset + 10)
+        ],
+        "route_rows": route_rows,
+    }
+
+
+def write_logs(directory, call_widths, *, ranks=(0, 1), layers=48):
+    paths = []
+    for rank in ranks:
+        path = Path(directory) / f"rank{rank}.log"
+        lines = []
+        for layer in range(layers):
+            for cohort_call, widths in enumerate(call_widths, 1):
+                record = router_record(
+                    rank,
+                    layer,
+                    cohort_call,
+                    widths,
+                    cohort_sequences=max(len(item) for item in call_widths),
+                )
+                lines.append("ROCKET_NVFP4_TELEMETRY\t" + json.dumps(record))
+        path.write_text("\n".join(lines), encoding="utf-8")
+        paths.append(path)
+    return paths
+
+
 class ReducerTests(unittest.TestCase):
-    def test_driver_runs_one_cohort_and_publishes_metadata_after_engine_init(self):
-        source = LIVE.read_text()
+    def test_driver_publishes_metadata_only_after_initialization(self):
+        source = LIVE.read_text(encoding="utf-8")
         engine = source.index("engine = LLM(")
         warmup = source.index("warm_outputs = engine.generate(")
         metadata = source.index('"ROCKET_ROUTER_RANK": str(rank)')
-        cohort = source.index('"ROCKET_ROUTER_COHORT": cohort')
         self.assertLess(engine, metadata)
         self.assertLess(warmup, metadata)
-        self.assertLess(engine, cohort)
         self.assertNotIn("os.environ.update(", source[:engine])
         self.assertIn('"--concurrency", type=int, required=True', source)
         self.assertNotIn("for concurrency in CONCURRENCY", source)
         self.assertIn("args.concurrency * args.divergence_tokens > 8192", source)
+        self.assertIn(
+            '"telemetry_schema": "rocket.qwen38.activation-telemetry.v4"', source
+        )
+        self.assertIn('"vllm.forward_context.attn_metadata.query_start_loc"', source)
 
     def test_decode_exceeds_observed_c2_three_call_terminal_by_full_iteration(self):
         self.assertEqual(LIVE_MODULE.VERIFY_WIDTH, 5)
         self.assertEqual(LIVE_MODULE.CAPTURE_CALLS, 4)
         self.assertEqual(LIVE_MODULE.OBSERVED_THREE_CALL_TERMINAL_TOKENS, 17)
-        self.assertEqual(LIVE_MODULE.CONSERVATIVE_ITERATION_MARGIN, 6)
-        self.assertEqual(LIVE_MODULE.MIN_DECODE, 17 + 6 + 1)
         self.assertEqual(LIVE_MODULE.MIN_DECODE, 24)
 
     def test_exact_target_and_speculative_rank_unions(self):
         with tempfile.TemporaryDirectory() as directory:
-            paths = []
-            for rank in (0, 1):
-                path = Path(directory) / f"rank{rank}.log"
-                lines = []
-                for layer in range(48):
-                    for cohort_call in range(1, 5):
-                        offset = rank * 256
-                        record = {
-                            "schema": "rocket.qwen38.activation-telemetry.v3",
-                            "channel": f"layer.{layer}.router.topk.output",
-                            "cohort": "c1-k4",
-                            "rank": rank,
-                            "sequences": 1,
-                            "verify_width": 5,
-                            "route_top_k": 10,
-                            "cohort_call": cohort_call,
-                            "selected_expert_count": 50,
-                            "route_rows": [],
-                        }
-                        for row in range(5):
-                            record["route_rows"].append(
-                                {
-                                    "row": row,
-                                    "sequence": 0,
-                                    "position": row,
-                                    "position_kind": "target" if row == 0 else "speculative",
-                                    "expert_ids": list(range(offset, offset + 10)),
-                                    "weights": [0.1] * 10,
-                                }
-                            )
-                        lines.append("prefix ROCKET_NVFP4_TELEMETRY\t" + json.dumps(record))
-                path.write_text("\n".join(lines))
-                paths.append(path)
-            result = MODULE.reduce(paths)
+            result = MODULE.reduce(write_logs(directory, [[5]] * 4))
         self.assertEqual(len(result["cases"]), 2)
-        case = result["cases"][0]
-        sample = case["layers"][0]["samples"][0]
+        sample = result["cases"][0]["layers"][0]["samples"][0]
+        self.assertEqual(sample["request_widths"], [5])
+        self.assertEqual(sample["row_offsets"], [0, 5])
         self.assertEqual(sample["target_unique_local_experts"], 10)
         self.assertEqual(sample["speculative_unique_local_experts"], 10)
         self.assertEqual(sample["union_unique_local_experts"], 10)
         self.assertEqual(sample["local_routes"], 50)
         self.assertEqual(sample["routed_slab_bytes"], MODULE.routed_slab_bytes(10))
 
-    def test_incomplete_four_call_layer_is_terminal(self):
+    def test_mixed_request_widths_use_actual_boundaries_and_rows(self):
+        call_widths = [
+            [5, 3, 1, 4],
+            [2, 5, 4, 1],
+            [1, 1, 5, 2],
+            [4, 2, 3, 5],
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            result = MODULE.reduce(write_logs(directory, call_widths))
+        self.assertEqual(result["schema"], MODULE.SUMMARY_SCHEMA)
+        samples = result["cases"][0]["layers"][0]["samples"]
+        self.assertEqual(samples[0]["request_widths"], [5, 3, 1, 4])
+        self.assertEqual(samples[0]["row_offsets"], [0, 5, 8, 9, 13])
+        self.assertEqual(samples[0]["route_rows"], 13)
+        self.assertEqual(samples[0]["target_rows"], 4)
+        self.assertEqual(samples[0]["speculative_rows"], 9)
+        self.assertEqual(samples[0]["local_routes"], 130)
+
+    def test_c8_decode24_variable_calls_close_preserved_red(self):
+        call_widths = [
+            [5, 5, 5, 5, 5, 5, 5, 5],
+            [5, 5, 5, 5, 5, 4, 3, 2],
+            [5, 4, 4, 3, 2, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            result = MODULE.reduce(write_logs(directory, call_widths))
+        samples = result["cases"][0]["layers"][0]["samples"]
+        self.assertEqual(
+            [sample["route_rows"] for sample in samples], [40, 34, 21, 8]
+        )
+        self.assertEqual(
+            [sample["cohort_call"] for sample in samples], [1, 2, 3, 4]
+        )
+
+    def test_c8_two_exact_calls_remains_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = write_logs(directory, [[5] * 8] * 2)
+            with self.assertRaisesRegex(ValueError, "calls 1..4"):
+                MODULE.reduce(paths)
+
+    def test_missing_rank_is_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = write_logs(directory, [[5]] * 4, ranks=(0,))
+            with self.assertRaisesRegex(ValueError, "authenticate ranks 0 and 1"):
+                MODULE.reduce(paths)
+
+    def test_invalid_variable_width_boundary_is_terminal(self):
+        record = router_record(0, 0, 1, [5, 2, 1])
+        record["row_offsets"] = [0, 5, 6, 8]
+        with self.assertRaisesRegex(ValueError, "row offsets"):
+            MODULE.validate_record(record)
+
+    def test_invalid_top_expert_counts_are_terminal(self):
+        record = router_record(0, 0, 1, [5, 2, 1])
+        record["top_experts"][0]["selections"] -= 1
+        with self.assertRaisesRegex(ValueError, "top expert count"):
+            MODULE.validate_record(record)
+
+    def test_malformed_router_json_is_terminal(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rank0.log"
-            lines = []
-            for layer in range(48):
-                record = {
-                    "schema": "rocket.qwen38.activation-telemetry.v3",
-                    "channel": f"layer.{layer}.router.topk.output",
-                    "cohort": "c1-k4",
-                    "rank": 0,
-                    "sequences": 1,
-                    "verify_width": 5,
-                    "route_top_k": 10,
-                    "cohort_call": 1,
-                    "selected_expert_count": 50,
-                    "route_rows": [],
-                }
-                for row in range(5):
-                    record["route_rows"].append(
-                        {
-                            "row": row,
-                            "sequence": 0,
-                            "position": row,
-                            "position_kind": (
-                                "target" if row == 0 else "speculative"
-                            ),
-                            "expert_ids": list(range(10)),
-                            "weights": [0.1] * 10,
-                        }
-                    )
-                lines.append("ROCKET_NVFP4_TELEMETRY\t" + json.dumps(record))
-            path.write_text("\n".join(lines))
-            with self.assertRaisesRegex(ValueError, "calls 1..4"):
+            path.write_text(
+                "ROCKET_NVFP4_TELEMETRY\t{bad}\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "invalid router telemetry JSON"):
                 MODULE.reduce([path])
+
+    def test_non_monotonic_raw_calls_are_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = write_logs(directory, [[5]] * 4)
+            lines = paths[0].read_text(encoding="utf-8").splitlines()
+            second = json.loads(lines[1].split("\t", 1)[1])
+            second["call"] = 18
+            lines[1] = "ROCKET_NVFP4_TELEMETRY\t" + json.dumps(second)
+            paths[0].write_text("\n".join(lines), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "raw call ids are not monotonic"):
+                MODULE.reduce(paths)
+
+    def test_width_schedule_mismatch_between_ranks_is_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = write_logs(directory, [[5, 3]] * 4)
+            lines = paths[1].read_text(encoding="utf-8").splitlines()
+            first = json.loads(lines[0].split("\t", 1)[1])
+            first["request_widths"] = [4, 4]
+            first["row_offsets"] = [0, 4, 8]
+            for row in first["route_rows"]:
+                if row["row"] == 4:
+                    row["sequence"] = 1
+                    row["position"] = 0
+                    row["position_kind"] = "target"
+                elif row["row"] < 4:
+                    row["sequence"] = 0
+                    row["position"] = row["row"]
+                else:
+                    row["sequence"] = 1
+                    row["position"] = row["row"] - 4
+                    row["position_kind"] = "speculative"
+            lines[0] = "ROCKET_NVFP4_TELEMETRY\t" + json.dumps(first)
+            paths[1].write_text("\n".join(lines), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "schedule changed"):
+                MODULE.reduce(paths)
 
 
 if __name__ == "__main__":

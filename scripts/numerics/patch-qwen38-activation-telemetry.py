@@ -9,7 +9,7 @@ IMPORT_PATCH = "from itertools import islice\nimport json\nimport os\n\nimport t
 CLASS_ANCHOR = "class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):\n"
 HELPER = r'''_ROCKET_CALIBRATION_MAXIMA = {}
 _ROCKET_TELEMETRY_CALLS = {}
-_ROCKET_TELEMETRY_SCHEMA = "rocket.qwen38.activation-telemetry.v3"
+_ROCKET_TELEMETRY_SCHEMA = "rocket.qwen38.activation-telemetry.v4"
 
 
 def _rocket_install_linear_load_trace():
@@ -98,6 +98,44 @@ def _rocket_summary(value):
     }
 
 
+def _rocket_query_widths(rows):
+    from vllm.forward_context import get_forward_context
+
+    context = get_forward_context()
+    metadata = context.attn_metadata
+    pending = list(metadata) if isinstance(metadata, (list, tuple)) else [metadata]
+    candidates = set()
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(value.values())
+            continue
+        if isinstance(value, (list, tuple)):
+            pending.extend(value)
+            continue
+        offsets = getattr(value, "query_start_loc", None)
+        actual = getattr(value, "num_actual_tokens", None)
+        if not isinstance(offsets, torch.Tensor) or actual != rows:
+            continue
+        boundaries = tuple(int(item) for item in offsets.detach().cpu().tolist())
+        if (
+            len(boundaries) < 2
+            or boundaries[0] != 0
+            or boundaries[-1] != rows
+            or any(right <= left for left, right in zip(boundaries, boundaries[1:]))
+        ):
+            continue
+        candidates.add(
+            tuple(right - left for left, right in zip(boundaries, boundaries[1:]))
+        )
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"router cohort query widths are missing or ambiguous for {rows} rows"
+        )
+    widths = next(iter(candidates))
+    return widths
+
+
 def _rocket_router_cohort(tensor, top_k):
     expected_top_k = 10
     if top_k != expected_top_k:
@@ -116,14 +154,25 @@ def _rocket_router_cohort(tensor, top_k):
         raise RuntimeError(
             "router cohort sequences and verify_width must both be positive"
         )
-    if sequences * verify_width != rows:
-        return None
     rank = int(rank_text or "-1")
     if rank not in (0, 1):
         raise RuntimeError(f"router cohort rank must be 0 or 1, got {rank}")
     if not cohort:
         raise RuntimeError("ROCKET_ROUTER_COHORT is required for router telemetry")
 
+    widths = _rocket_query_widths(rows)
+    if any(width > verify_width for width in widths):
+        # Cohort prefill and mixed prefill/decode batches are outside the
+        # verifier workload. Their scheduler-owned widths remain larger than
+        # target plus the configured speculative width.
+        return None
+    if len(widths) > sequences:
+        raise RuntimeError(
+            f"router cohort scheduled {len(widths)} requests above c{sequences}"
+        )
+    row_offsets = [0]
+    for width in widths:
+        row_offsets.append(row_offsets[-1] + width)
     logits = tensor.detach().float()
     probabilities = torch.softmax(logits, dim=-1)
     weights, selected = torch.topk(probabilities, top_k, dim=-1)
@@ -131,25 +180,29 @@ def _rocket_router_cohort(tensor, top_k):
     selected_rows = selected.cpu().tolist()
     weight_rows = weights.cpu().tolist()
     route_rows = []
-    for row, (expert_ids, route_weights) in enumerate(
-        zip(selected_rows, weight_rows)
-    ):
-        position = row % verify_width
-        route_rows.append(
-            {
-                "row": row,
-                "sequence": row // verify_width,
-                "position": position,
-                "position_kind": "target" if position == 0 else "speculative",
-                "expert_ids": [int(expert_id) for expert_id in expert_ids],
-                "weights": [float(weight) for weight in route_weights],
-            }
-        )
+    for sequence, (start, width) in enumerate(zip(row_offsets, widths)):
+        for position in range(width):
+            row = start + position
+            route_rows.append(
+                {
+                    "row": row,
+                    "sequence": sequence,
+                    "position": position,
+                    "position_kind": (
+                        "target" if position == 0 else "speculative"
+                    ),
+                    "expert_ids": [int(item) for item in selected_rows[row]],
+                    "weights": [float(item) for item in weight_rows[row]],
+                }
+            )
     return {
         "cohort": cohort,
         "rank": rank,
-        "sequences": sequences,
+        "cohort_sequences": sequences,
+        "sequences": len(widths),
         "verify_width": verify_width,
+        "request_widths": list(widths),
+        "row_offsets": row_offsets,
         "route_top_k": top_k,
         "route_layout": "sequence_major",
         "route_rows": route_rows,
@@ -164,8 +217,7 @@ def _rocket_emit(name, kind, value, *, output_index=None, top_k=None):
         max(1, int(os.getenv("ROCKET_NVFP4_MAX_EMISSIONS", "4"))),
     )
     # Non-router channels emit at calls 1, 2, 4, ... and then stop. Router
-    # cohorts instead retain the first bounded set of exact-shape verifier
-    # calls, skipping prefill and draft-only forwards.
+    # cohorts retain the first bounded set of scheduler-width verifier calls.
     if top_k is None and (count & (count - 1) or count.bit_length() > max_emissions):
         return
     tensor = _rocket_tensor(value, output_index)
@@ -193,7 +245,11 @@ def _rocket_emit(name, kind, value, *, output_index=None, top_k=None):
         if cohort_count > router_limit:
             return
         selected = torch.tensor(
-            [expert_id for row in router_cohort["route_rows"] for expert_id in row["expert_ids"]],
+            [
+                expert_id
+                for row in router_cohort["route_rows"]
+                for expert_id in row["expert_ids"]
+            ],
             dtype=torch.int64,
             device=tensor.device,
         )
@@ -343,13 +399,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model_py", type=Path)
     args = parser.parse_args()
-    source = args.model_py.read_text()
+    source = args.model_py.read_text(encoding="utf-8")
     if "ROCKET_NVFP4_TELEMETRY" in source:
         raise SystemExit("already patched")
     source = replace_once(source, IMPORT_ANCHOR, IMPORT_PATCH, "import")
     source = replace_once(source, CLASS_ANCHOR, HELPER + CLASS_ANCHOR, "class")
     source = replace_once(source, INIT_ANCHOR, INIT_PATCH, "initialization")
-    args.model_py.write_text(source)
+    args.model_py.write_text(source, encoding="utf-8")
 
 
 if __name__ == "__main__":

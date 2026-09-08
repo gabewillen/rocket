@@ -44,7 +44,7 @@ class PatchTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             patched = model_py.read_text()
-        self.assertIn('rocket.qwen38.activation-telemetry.v3', patched)
+        self.assertIn('rocket.qwen38.activation-telemetry.v4', patched)
         self.assertIn('ROCKET_QWEN38_LINEAR_LOAD', patched)
         self.assertIn('getattr(value, "shard_id", None)', patched)
         self.assertIn('type(self.quant_method).__name__', patched)
@@ -57,7 +57,7 @@ class PatchTests(unittest.TestCase):
         self.assertIn("chunk_gated_delta_rule", patched)
         compile(patched, "model.py", "exec")
 
-    def test_pinned_config_drives_full_top10_router_cohort_without_backend_top_k(self):
+    def test_pinned_config_drives_variable_width_top10_router_cohort(self):
         patch_spec = importlib.util.spec_from_file_location("telemetry_patcher", PATCHER)
         patcher = importlib.util.module_from_spec(patch_spec)
         assert patch_spec.loader is not None
@@ -71,9 +71,19 @@ class PatchTests(unittest.TestCase):
 import json
 import os
 import sys
+import types
 import torch
 ''' + patcher.HELPER + r'''
 config = json.load(open(sys.argv[1]))["text_config"]
+forward_context_module = types.ModuleType("vllm.forward_context")
+metadata = type("Metadata", (), {
+    "query_start_loc": torch.tensor([0, 5, 8, 9], dtype=torch.int32),
+    "num_actual_tokens": 9,
+})()
+forward_context_module.get_forward_context = lambda: type(
+    "Context", (), {"attn_metadata": {"layer.0": metadata}}
+)()
+sys.modules["vllm.forward_context"] = forward_context_module
 class Gate:
     def register_forward_pre_hook(self, _hook): pass
     def register_forward_hook(self, hook): self.hook = hook
@@ -96,13 +106,18 @@ else:
 os.environ.pop("ROCKET_ROUTER_COHORT")
 os.environ.update({
     "ROCKET_NVFP4_CALIBRATE": "1",
-    "ROCKET_ROUTER_COHORT": "contract-c2-k0",
+    "ROCKET_ROUTER_COHORT": "contract-c3-k4",
     "ROCKET_ROUTER_RANK": "0",
-    "ROCKET_ROUTER_SEQUENCES": "2",
-    "ROCKET_ROUTER_VERIFY_WIDTH": "1",
+    "ROCKET_ROUTER_SEQUENCES": "3",
+    "ROCKET_ROUTER_VERIFY_WIDTH": "5",
 })
+metadata.query_start_loc = torch.tensor([0, 6, 12], dtype=torch.int32)
+metadata.num_actual_tokens = 12
+assert _rocket_router_cohort(torch.zeros((12, 512)), 10) is None
+metadata.query_start_loc = torch.tensor([0, 5, 8, 9], dtype=torch.int32)
+metadata.num_actual_tokens = 9
 _rocket_install_activation_telemetry(model)
-gate.hook(None, (), torch.arange(1024).reshape(2, 512))
+gate.hook(None, (), torch.arange(4608).reshape(9, 512))
 '''
         with tempfile.TemporaryDirectory() as directory:
             harness_path = Path(directory) / "contract.py"
@@ -119,14 +134,20 @@ gate.hook(None, (), torch.arange(1024).reshape(2, 512))
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout.split("\t", 1)[1])
-        self.assertEqual(payload["schema"], "rocket.qwen38.activation-telemetry.v3")
+        self.assertEqual(payload["schema"], "rocket.qwen38.activation-telemetry.v4")
         self.assertEqual(payload["route_top_k"], 10)
-        self.assertEqual(payload["selected_expert_count"], 20)
+        self.assertEqual(payload["selected_expert_count"], 90)
         self.assertEqual(payload["cohort_call"], 1)
-        self.assertEqual(len(payload["route_rows"]), 2)
-        self.assertEqual([len(row["expert_ids"]) for row in payload["route_rows"]], [10, 10])
+        self.assertEqual(payload["request_widths"], [5, 3, 1])
+        self.assertEqual(payload["row_offsets"], [0, 5, 8, 9])
+        self.assertEqual(len(payload["route_rows"]), 9)
+        self.assertEqual(
+            [len(row["expert_ids"]) for row in payload["route_rows"]], [10] * 9
+        )
         self.assertEqual(payload["route_rows"][0]["position_kind"], "target")
-        self.assertEqual(payload["cohort"], "contract-c2-k0")
+        self.assertEqual(payload["route_rows"][5]["position_kind"], "target")
+        self.assertEqual(payload["route_rows"][8]["position_kind"], "target")
+        self.assertEqual(payload["cohort"], "contract-c3-k4")
 
     def test_refuses_source_drift(self):
         with tempfile.TemporaryDirectory() as directory:
