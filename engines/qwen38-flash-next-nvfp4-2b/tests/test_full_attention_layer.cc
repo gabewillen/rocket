@@ -118,15 +118,33 @@ rocket::qwen38::attention::TargetQsaStateView state_view(int rank, int layer,
   static __nv_bfloat16 bf16{};
   static std::int64_t i64{};
   static std::int32_t i32{};
-  return {&bf16, &bf16, &bf16, &bf16,
-          &i64,  &i32,  &i32,  &i32,
-          &i32,  &i32,  &i32,  &i32,
-          &i32,  &i32,  &i32,  &i32,
-          1,     1,     1,     1,
-          rank,  layer,  false,
-          rocket::qwen38::attention::TargetQsaServingDtype::kBfloat16,
-          rocket::qwen38::attention::TargetQsaServingDtype::kBfloat16,
-          generation, generation};
+  return {.main_key_cache = &bf16,
+          .main_value_cache = &bf16,
+          .raw_key_cache = &bf16,
+          .compressed_key_cache = &bf16,
+          .positions = &i64,
+          .main_slot_mapping = &i32,
+          .main_block_table = &i32,
+          .raw_slot_mapping = &i32,
+          .raw_block_table = &i32,
+          .compressed_slot_mapping = &i32,
+          .compressed_block_table = &i32,
+          .query_start_locations = &i32,
+          .logical_positions = &i64,
+          .sequence_lengths = &i32,
+          .token_to_request = &i32,
+          .compression_work = &i32,
+          .main_blocks = 1,
+          .compressed_blocks = 1,
+          .compression_work_items = 1,
+          .rows = 1,
+          .rank = rank,
+          .layer = layer,
+          .uses_mrope = false,
+          .main_kv_dtype = rocket::qwen38::attention::TargetQsaServingDtype::kBfloat16,
+          .side_cache_dtype = rocket::qwen38::attention::TargetQsaServingDtype::kBfloat16,
+          .generation = generation,
+          .expected_generation = generation};
 }
 
 int main() {

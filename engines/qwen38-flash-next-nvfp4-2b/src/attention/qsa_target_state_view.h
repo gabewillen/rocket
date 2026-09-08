@@ -38,7 +38,7 @@ struct TargetQsaStateView {
   const std::int32_t* compressed_slot_mapping = nullptr;
   const std::int32_t* compressed_block_table = nullptr;
   const std::int32_t* query_start_locations = nullptr;
-  const std::int32_t* logical_positions = nullptr;
+  const std::int64_t* logical_positions = nullptr;
   const std::int32_t* sequence_lengths = nullptr;
   const std::int32_t* token_to_request = nullptr;
   const std::int32_t* compression_work = nullptr;

@@ -79,6 +79,17 @@ target_include_directories(qwen38-qsa-expand-smoke PRIVATE src)
 target_link_libraries(qwen38-qsa-expand-smoke PRIVATE qwen38_cutlass_qkv CUDA::cudart)
 set_target_properties(qwen38-qsa-expand-smoke PROPERTIES CUDA_ARCHITECTURES "121")
 
+add_library(qwen38_qsa_target_preprocess STATIC
+  src/attention/qsa_target_preprocess.cu)
+target_include_directories(qwen38_qsa_target_preprocess PUBLIC src)
+target_link_libraries(qwen38_qsa_target_preprocess PUBLIC CUDA::cudart)
+target_compile_options(qwen38_qsa_target_preprocess PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+set_target_properties(qwen38_qsa_target_preprocess PROPERTIES
+  CUDA_ARCHITECTURES "121"
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON)
+
 add_library(qwen38_pair_reduce STATIC
   src/pair_reduce/pair_reduce.cu
   src/pair_reduce/rdma.cc
