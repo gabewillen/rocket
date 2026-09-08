@@ -31,6 +31,10 @@ struct Qwen38TargetK0Oracle35Result {
   std::uint32_t layer_boundary_elements[6];
   std::uint32_t layer_boundary_zero_counts[6];
   std::uint32_t layer_boundary_nonfinite_counts[6];
+  std::uint32_t layer_boundary_reference_mismatch_counts[6];
+  std::uint32_t layer_boundary_reference_first_mismatches[6];
+  std::uint8_t layer_boundary_reference_compared[6];
+  std::uint8_t layer_boundary_reference_exact[6];
 };
 
 enum Qwen38TargetK0Oracle35Status : int {

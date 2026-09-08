@@ -265,6 +265,7 @@ add_library(qwen38_target_k0_oracle_comparator STATIC
 target_include_directories(qwen38_target_k0_oracle_comparator PUBLIC src)
 target_link_libraries(qwen38_target_k0_oracle_comparator PUBLIC
   qwen38_decode_execution qwen38_target_layer3_oracle_comparator
+  qwen38_target_layer0_boundary_comparator
   rocket_qwen38_openssl3_crypto rocket_qwen38_jsonc CUDA::cudart)
 target_compile_options(qwen38_target_k0_oracle_comparator PRIVATE
   -Wall -Wextra -Werror)

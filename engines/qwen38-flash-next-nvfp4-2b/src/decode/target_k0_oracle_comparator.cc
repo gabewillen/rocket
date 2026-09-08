@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "decode/target_k0_oracle_comparator.h"
+#include "decode/target_layer0_boundary_comparator.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -165,6 +168,8 @@ struct NativeTargetK0OracleComparator::Impl {
   std::string manifest;
   std::vector<std::int32_t> tokens;
   std::array<Artifact, 51> artifacts{};
+  std::optional<std::array<TargetLayer0BoundaryReference, 3>>
+      layer0_boundaries;
   std::int32_t greedy_token = -1;
   void* observed = nullptr;
   cudaEvent_t ready = nullptr;
@@ -212,6 +217,13 @@ NativeTargetK0OracleComparator::NativeTargetK0OracleComparator(
   try {
     if (rank != 0 && rank != 1)
       throw std::invalid_argument("K0 oracle rank changed");
+    if (const char* layer0_directory =
+            std::getenv("ROCKET_QWEN38_K0_LAYER0_BOUNDARY_DIR")) {
+      if (!*layer0_directory)
+        throw std::invalid_argument("K0 layer0 boundary directory changed");
+      impl_->layer0_boundaries = authenticate_target_layer0_boundary_references(
+          std::filesystem::path(layer0_directory));
+    }
     auto manifest_bytes = read_file(capture / "manifest.json", 1 << 20);
     impl_->manifest = sha256(manifest_bytes);
     if (impl_->manifest != kTargetK0OracleManifestSha256)
@@ -380,6 +392,17 @@ void NativeTargetK0OracleComparator::observe(
   evidence.elements[index] = static_cast<std::uint32_t>(elements);
   evidence.zero_counts[index] = zero_count;
   evidence.nonfinite_counts[index] = nonfinite_count;
+  if (boundary == TargetK0LayerBoundary::kHyperconnectionCombineMix &&
+      impl_->layer0_boundaries) {
+    const auto comparison = compare_target_layer0_boundary_bytes(
+        (*impl_->layer0_boundaries)[1], bytes, observed_bytes);
+    evidence.reference_compared[index] = 1;
+    evidence.reference_exact[index] = comparison.exact ? 1 : 0;
+    evidence.reference_mismatch_counts[index] =
+        static_cast<std::uint32_t>(comparison.mismatch_count);
+    evidence.reference_first_mismatches[index] =
+        static_cast<std::uint32_t>(comparison.first_mismatch);
+  }
   impl_->emit_boundary(boundary, pair_reduce::Outcome::kOk, observed_bytes);
 }
 std::int32_t NativeTargetK0OracleComparator::expected_input_token(int row) const {

@@ -82,6 +82,12 @@ struct TargetK0LayerBoundaryEvidence {
   std::array<std::uint32_t, kTargetK0LayerBoundaryCount> elements{};
   std::array<std::uint32_t, kTargetK0LayerBoundaryCount> zero_counts{};
   std::array<std::uint32_t, kTargetK0LayerBoundaryCount> nonfinite_counts{};
+  std::array<std::uint32_t, kTargetK0LayerBoundaryCount>
+      reference_mismatch_counts{};
+  std::array<std::uint32_t, kTargetK0LayerBoundaryCount>
+      reference_first_mismatches{};
+  std::array<std::uint8_t, kTargetK0LayerBoundaryCount> reference_compared{};
+  std::array<std::uint8_t, kTargetK0LayerBoundaryCount> reference_exact{};
 };
 
 class TargetK0LayerBoundaryObserver {

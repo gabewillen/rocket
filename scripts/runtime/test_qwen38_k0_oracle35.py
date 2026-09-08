@@ -244,6 +244,8 @@ class Oracle35LauncherTests(unittest.TestCase):
         self.assertEqual(module._layer_boundary_diagnostics(result), ({
             "boundary": "attention_reduction", "hash": 7,
             "elements": 2560, "zero_count": 3, "nonfinite_count": 0,
+            "reference_compared": False, "reference_exact": False,
+            "reference_mismatch_count": 0, "reference_first_mismatch": 0,
         },))
         self.assertEqual(len(module.LAYER_BOUNDARY_NAMES), 6)
 

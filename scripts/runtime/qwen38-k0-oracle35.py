@@ -156,6 +156,10 @@ class _NativeResult(ctypes.Structure):
         ("layer_boundary_elements", ctypes.c_uint32 * 6),
         ("layer_boundary_zero_counts", ctypes.c_uint32 * 6),
         ("layer_boundary_nonfinite_counts", ctypes.c_uint32 * 6),
+        ("layer_boundary_reference_mismatch_counts", ctypes.c_uint32 * 6),
+        ("layer_boundary_reference_first_mismatches", ctypes.c_uint32 * 6),
+        ("layer_boundary_reference_compared", ctypes.c_uint8 * 6),
+        ("layer_boundary_reference_exact", ctypes.c_uint8 * 6),
     )
 
 
@@ -321,7 +325,15 @@ def _layer_boundary_diagnostics(result: _NativeResult) -> tuple[dict[str, int | 
                   "elements": int(result.layer_boundary_elements[index]),
                   "zero_count": int(result.layer_boundary_zero_counts[index]),
                   "nonfinite_count": int(
-                      result.layer_boundary_nonfinite_counts[index])}
+                      result.layer_boundary_nonfinite_counts[index]),
+                  "reference_compared": bool(
+                      result.layer_boundary_reference_compared[index]),
+                  "reference_exact": bool(
+                      result.layer_boundary_reference_exact[index]),
+                  "reference_mismatch_count": int(
+                      result.layer_boundary_reference_mismatch_counts[index]),
+                  "reference_first_mismatch": int(
+                      result.layer_boundary_reference_first_mismatches[index])}
                  for index, name in enumerate(LAYER_BOUNDARY_NAMES)
                  if result.layer_boundary_elements[index])
 

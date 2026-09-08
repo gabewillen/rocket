@@ -151,6 +151,20 @@ extern "C" int qwen38_target_k0_oracle35_run(
     std::copy(execution_progress.boundary_evidence.nonfinite_counts.begin(),
               execution_progress.boundary_evidence.nonfinite_counts.end(),
               result->layer_boundary_nonfinite_counts);
+    std::copy(
+        execution_progress.boundary_evidence.reference_mismatch_counts.begin(),
+        execution_progress.boundary_evidence.reference_mismatch_counts.end(),
+        result->layer_boundary_reference_mismatch_counts);
+    std::copy(
+        execution_progress.boundary_evidence.reference_first_mismatches.begin(),
+        execution_progress.boundary_evidence.reference_first_mismatches.end(),
+        result->layer_boundary_reference_first_mismatches);
+    std::copy(execution_progress.boundary_evidence.reference_compared.begin(),
+              execution_progress.boundary_evidence.reference_compared.end(),
+              result->layer_boundary_reference_compared);
+    std::copy(execution_progress.boundary_evidence.reference_exact.begin(),
+              execution_progress.boundary_evidence.reference_exact.end(),
+              result->layer_boundary_reference_exact);
     if (telemetry) publish(telemetry->snapshot(), *result);
   };
   try {
