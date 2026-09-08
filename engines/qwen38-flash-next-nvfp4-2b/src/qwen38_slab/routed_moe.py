@@ -121,6 +121,7 @@ class OwnerLocalMoeSlab:
     slab_bytes: int
     layout_sha256: str
     chunk_sha256: tuple[str, ...]
+    router: tuple[MoeExtent, ...]
     routed: tuple[MoeExtent, ...]
     shared: tuple[MoeExtent, ...]
 
@@ -514,6 +515,30 @@ _SHARED_CONTRACT = {
     "shared_expert_gate.weight": (HIDDEN * 2, (1, HIDDEN)),
 }
 
+_ROUTER_CONTRACT = {
+    "gate.weight": (
+        GLOBAL_EXPERTS * HIDDEN // 2,
+        (GLOBAL_EXPERTS, HIDDEN // 2),
+        "U8",
+        "packed_e2m1_row_major",
+        MODEL_NVFP4_ABI,
+    ),
+    "gate.weight_scale": (
+        GLOBAL_EXPERTS * HIDDEN // 16,
+        (GLOBAL_EXPERTS * HIDDEN // 16,),
+        "F8_E4M3",
+        "cutlass_sm121_sfb",
+        MODEL_NVFP4_ABI,
+    ),
+    "gate.weight_scale_2": (
+        4,
+        (1,),
+        "F32",
+        "scalar",
+        MODEL_NVFP4_ABI,
+    ),
+}
+
 
 def load_owner_local_moe(artifact: Path, rank: int, layer: int) -> OwnerLocalMoeSlab:
     """Authenticate every routed and shared extent for one frozen layer."""
@@ -555,6 +580,10 @@ def load_owner_local_moe(artifact: Path, rank: int, layer: int) -> OwnerLocalMoe
         raise RoutedMoeGraphError("target slab entries are duplicate or invalid")
     first = rank * LOCAL_EXPERTS
     prefix = f"model.language_model.layers.{layer}.mlp"
+    router = tuple(
+        _validated_extent(entries, prefix, suffix, contract)
+        for suffix, contract in _ROUTER_CONTRACT.items()
+    )
     routed: list[MoeExtent] = []
     for expert in range(first, first + LOCAL_EXPERTS):
         for projection in ("gate_proj", "up_proj", "down_proj"):
@@ -569,7 +598,7 @@ def load_owner_local_moe(artifact: Path, rank: int, layer: int) -> OwnerLocalMoe
         )
         for suffix, (length, shape) in _SHARED_CONTRACT.items()
     )
-    selected = tuple(routed) + shared
+    selected = router + tuple(routed) + shared
     layout_sha = hashlib.sha256(
         canonical_bytes([
             {"name": x.name, "offset": x.offset, "length": x.length,
@@ -613,7 +642,7 @@ def load_owner_local_moe(artifact: Path, rank: int, layer: int) -> OwnerLocalMoe
     return OwnerLocalMoeSlab(
         MOE_SCHEMA, claimed, PINNED_CONTRACT.revision, rank, layer, first,
         first + LOCAL_EXPERTS - 1, slab_path, slab_bytes, layout_sha,
-        tuple(item[2] for item in touched), tuple(routed), shared,
+        tuple(item[2] for item in touched), router, tuple(routed), shared,
     )
 
 
@@ -662,14 +691,18 @@ class RoutedMoeGraph:
             or not _sha256(slab.layout_sha256)
             or not slab.chunk_sha256
             or any(not _sha256(value) for value in slab.chunk_sha256)
+            or len(slab.router) != len(_ROUTER_CONTRACT)
             or len(slab.routed) != LOCAL_EXPERTS * 3 * 4
             or len(slab.shared) != len(_SHARED_CONTRACT)
             or any(
                 not extent.name.startswith(
                     f"model.language_model.layers.{slab.layer}.mlp."
                 )
-                for extent in (*slab.routed, *slab.shared)
+                for extent in (*slab.router, *slab.routed, *slab.shared)
             )
+            or any(extent.abi != MODEL_NVFP4_ABI for extent in slab.router)
+            or any(extent.abi != MODEL_NVFP4_ABI for extent in slab.routed)
+            or any(extent.abi != _NATIVE_ABI for extent in slab.shared)
         ):
             raise RoutedMoeGraphError("authenticated owner-local MoE slab changed")
         if backend is None or tracer is None:
