@@ -169,6 +169,20 @@ target_link_libraries(qwen38-qsa-sidecar-auth PRIVATE
 target_compile_options(qwen38-qsa-sidecar-auth PRIVATE
   -Wall -Wextra -Werror)
 
+add_library(qwen38_target_slab_owner STATIC src/model/target_slab_owner.cc)
+target_include_directories(qwen38_target_slab_owner PUBLIC src)
+target_link_libraries(qwen38_target_slab_owner PUBLIC
+  CUDA::cudart rocket_qwen38_openssl3_crypto)
+target_compile_options(qwen38_target_slab_owner PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_slab_owner PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+
+add_executable(qwen38-target-slab-auth tests/target_slab_auth.cc)
+target_link_libraries(qwen38-target-slab-auth PRIVATE qwen38_target_slab_owner)
+target_compile_options(qwen38-target-slab-auth PRIVATE
+  -Wall -Wextra -Werror)
+
 add_library(qwen38_native_hyperconnection_adapter STATIC
   src/hyperconnection/native_adapter.cc)
 target_include_directories(qwen38_native_hyperconnection_adapter PUBLIC src)
