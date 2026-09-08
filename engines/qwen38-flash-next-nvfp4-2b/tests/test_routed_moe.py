@@ -63,10 +63,18 @@ class Backend:
 
 def descriptor(rank=0, layer=0):
     prefix = f"model.language_model.layers.{layer}.mlp"
+    router = tuple(
+        MoeExtent(
+            f"{prefix}.gate.{leaf}", 800_000 + leaf * 256, 256,
+            (1,), "U8", "layout", "modelopt_nvfp4_group16_cutlass_sm121_sfb",
+        )
+        for leaf in range(3)
+    )
     routed = tuple(
         MoeExtent(
             f"{prefix}.experts.{rank * LOCAL_EXPERTS + expert}.p{part}.x{leaf}",
-            (expert * 12 + part * 4 + leaf) * 256, 256, (1,), "U8", "layout", "abi",
+            (expert * 12 + part * 4 + leaf) * 256, 256, (1,), "U8", "layout",
+            "modelopt_nvfp4_group16_cutlass_sm121_sfb",
         )
         for expert in range(LOCAL_EXPERTS)
         for part in range(3)
@@ -80,7 +88,7 @@ def descriptor(rank=0, layer=0):
     return OwnerLocalMoeSlab(
         MOE_SCHEMA, SLAB_ARTIFACT_KEY, PINNED_CONTRACT.revision, rank, layer,
         rank * LOCAL_EXPERTS, rank * LOCAL_EXPERTS + LOCAL_EXPERTS - 1,
-        Path("rank.slab"), 1, "a" * 64, ("b" * 64,), routed, shared,
+        Path("rank.slab"), 1, "a" * 64, ("b" * 64,), router, routed, shared,
     )
 
 
@@ -135,6 +143,22 @@ class RoutedMoeGraphTests(unittest.TestCase):
         self.assertEqual(graph.identity[2], 47)
         with self.assertRaisesRegex(RoutedMoeGraphError, "authenticated"):
             RoutedMoeGraph(replace(descriptor(layer=0), layer=47), backend, tracer)
+
+    def test_target_router_and_routed_are_nvfp4_while_shared_stays_native(self):
+        slab = descriptor(rank=1, layer=47)
+        self.assertEqual(len(slab.router), 3)
+        self.assertTrue(all("nvfp4" in extent.abi for extent in slab.router))
+        self.assertTrue(all("nvfp4" in extent.abi for extent in slab.routed))
+        self.assertTrue(all(extent.abi == "native" for extent in slab.shared))
+        with self.assertRaisesRegex(RoutedMoeGraphError, "authenticated"):
+            RoutedMoeGraph(
+                replace(
+                    slab,
+                    router=(replace(slab.router[0], abi="native"), *slab.router[1:]),
+                ),
+                Backend(),
+                Tracer(),
+            )
 
     def test_rank_local_launch_returns_bf16_and_emits_bounded_dimensions(self):
         backend, tracer = Backend(), Tracer()
