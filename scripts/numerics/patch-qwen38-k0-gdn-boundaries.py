@@ -95,6 +95,16 @@ def _rocket_k0_gdn_save(prefix, name, tensor):
     gdn = replace_once(gdn, "logger = init_logger(__name__)\n", helper + "\nlogger = init_logger(__name__)\n")
     gdn = replace_once(
         gdn,
+        "        use_fused_gdn_decode = (\n"
+        "            self.enable_fused_gdn_decode\n",
+        "        # The fused decode op returns before the bounded intermediate hooks.\n"
+        "        # Select the pinned unfused reference only for the authenticated capture.\n"
+        "        use_fused_gdn_decode = (\n"
+        "            os.getenv('ROCKET_QWEN38_K0_GDN_CAPTURE_ACTIVE') != '1'\n"
+        "            and self.enable_fused_gdn_decode\n",
+    )
+    gdn = replace_once(
+        gdn,
         "        # ============================================================\n"
         "        # Part 2: Core Attention (Custom Op)\n",
         "        _rocket_k0_gdn_save(\n"

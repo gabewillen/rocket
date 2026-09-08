@@ -11,6 +11,8 @@ class TestGdnBoundaryPatcher(unittest.TestCase):
         self.assertEqual(source.count('"core": 3072'), 1)
         self.assertEqual(source.count('"normalized": 3072'), 1)
         self.assertIn("GDN_CAPTURE_ACTIVE", source)
+        self.assertIn("Select the pinned unfused reference only", source)
+        self.assertIn("!= '1'", source)
         self.assertIn("tensor[:1].detach().contiguous()", source)
         self.assertIn("name in _ROCKET_K0_GDN_SEEN", source)
 
