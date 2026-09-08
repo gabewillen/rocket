@@ -21,8 +21,14 @@ ROUTER_METADATA = (
 )
 VERIFY_WIDTH = 5
 CAPTURE_CALLS = 4
-EARLY_TERMINAL_TOKENS = 1 + (CAPTURE_CALLS - 1) * VERIFY_WIDTH
-MIN_DECODE = EARLY_TERMINAL_TOKENS + 1
+# The pinned runtime completed c2 at 17 output tokens with only three exact
+# width-5 verifier calls. Add a full K4 accepted-plus-bonus iteration and one
+# token beyond that observed boundary before claiming four captured calls.
+OBSERVED_THREE_CALL_TERMINAL_TOKENS = 17
+CONSERVATIVE_ITERATION_MARGIN = VERIFY_WIDTH + 1
+MIN_DECODE = (
+    OBSERVED_THREE_CALL_TERMINAL_TOKENS + CONSERVATIVE_ITERATION_MARGIN + 1
+)
 
 
 def main() -> None:

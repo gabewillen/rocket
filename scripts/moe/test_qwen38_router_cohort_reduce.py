@@ -34,12 +34,13 @@ class ReducerTests(unittest.TestCase):
         self.assertNotIn("for concurrency in CONCURRENCY", source)
         self.assertIn("args.concurrency * args.divergence_tokens > 8192", source)
 
-    def test_decode_exceeds_base_plus_three_fully_accepted_k4_steps(self):
+    def test_decode_exceeds_observed_c2_three_call_terminal_by_full_iteration(self):
         self.assertEqual(LIVE_MODULE.VERIFY_WIDTH, 5)
         self.assertEqual(LIVE_MODULE.CAPTURE_CALLS, 4)
-        self.assertEqual(LIVE_MODULE.EARLY_TERMINAL_TOKENS, 1 + 3 * 5)
-        self.assertEqual(LIVE_MODULE.EARLY_TERMINAL_TOKENS, 16)
-        self.assertEqual(LIVE_MODULE.MIN_DECODE, 17)
+        self.assertEqual(LIVE_MODULE.OBSERVED_THREE_CALL_TERMINAL_TOKENS, 17)
+        self.assertEqual(LIVE_MODULE.CONSERVATIVE_ITERATION_MARGIN, 6)
+        self.assertEqual(LIVE_MODULE.MIN_DECODE, 17 + 6 + 1)
+        self.assertEqual(LIVE_MODULE.MIN_DECODE, 24)
 
     def test_exact_target_and_speculative_rank_unions(self):
         with tempfile.TemporaryDirectory() as directory:
