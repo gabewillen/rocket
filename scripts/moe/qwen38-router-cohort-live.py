@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -31,6 +32,16 @@ CONSERVATIVE_ITERATION_MARGIN = VERIFY_WIDTH + 1
 MIN_DECODE = (
     OBSERVED_THREE_CALL_TERMINAL_TOKENS + CONSERVATIVE_ITERATION_MARGIN + 1
 )
+
+
+def _publishable_cache_tokens(
+    num_computed_tokens: int,
+    block_size: int,
+    num_reprefillable_tokens: int = 1,
+) -> int:
+    """Model pinned vLLM's finalized-token cache publication boundary."""
+    finalized = max(0, num_computed_tokens - num_reprefillable_tokens)
+    return finalized // block_size * block_size
 
 
 def main() -> None:
@@ -89,6 +100,13 @@ def main() -> None:
     )[: args.prefix_tokens]
     if len(root_ids) != args.prefix_tokens:
         raise RuntimeError("failed to construct the requested root prefix")
+    continuation_token_id = root_ids[0]
+    continuation_token_text = tokenizer.decode([continuation_token_id])
+    if continuation_token_id in set(tokenizer.all_special_ids):
+        raise RuntimeError("c16 continuation token must not be an EOS or stop token")
+    continuation_token_sha256 = hashlib.sha256(
+        json.dumps([continuation_token_id], separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     warm_sampling = SamplingParams(
         temperature=0.0, max_tokens=1, min_tokens=1, ignore_eos=True
     )
@@ -130,24 +148,36 @@ def main() -> None:
         # prefill and decode. Prime one complete prompt at a time while router
         # metadata is absent, then prove concurrent lookups hit each maximal
         # scheduler-owned prefix before opening the measured gate.
-        measured_prompts = []
-        for prompt in prompts:
+        measured_prompts = [
+            {
+                "prompt_token_ids": list(prompt["prompt_token_ids"])
+                + [continuation_token_id]
+            }
+            for prompt in prompts
+        ]
+        print(
+            "ROCKET_ROUTER_CACHE_PRIME_SETUP\t"
+            + json.dumps(
+                {
+                    "continuation_token_id": continuation_token_id,
+                    "continuation_token_sha256": continuation_token_sha256,
+                    "continuation_token_text": continuation_token_text,
+                    "continuation_is_special_or_stop": False,
+                    "prime_prompt_tokens": 6433,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        prime_output_token_ids = []
+        for prompt in measured_prompts:
             prime_outputs = engine.generate(prompt, warm_sampling, use_tqdm=False)
             if (
                 len(prime_outputs) != 1
                 or len(prime_outputs[0].outputs[0].token_ids) != 1
             ):
                 raise RuntimeError("c16 full-prompt cache prime did not finish")
-            # vLLM intentionally caps a new request's prefix-cache hit at
-            # prompt_tokens - 1 so it can recompute logits. Append the sampled
-            # continuation to make that cap land exactly after the complete
-            # original prompt, leaving one target token for cached prefill.
-            measured_prompts.append(
-                {
-                    "prompt_token_ids": prompt["prompt_token_ids"]
-                    + list(prime_outputs[0].outputs[0].token_ids)
-                }
-            )
+            prime_output_token_ids.append(prime_outputs[0].outputs[0].token_ids[0])
         prompts = measured_prompts
         barrier_outputs = engine.generate(prompts, warm_sampling, use_tqdm=False)
         cached_prompt_tokens = [
@@ -246,6 +276,12 @@ def main() -> None:
                         "two_cache_pages" if concurrency == 16 else None
                     ),
                     "cached_prompt_tokens": cached_prompt_tokens,
+                    "continuation_token_id": continuation_token_id,
+                    "continuation_token_sha256": continuation_token_sha256,
+                    "continuation_token_text": continuation_token_text,
+                    "prime_output_token_ids": (
+                        prime_output_token_ids if concurrency == 16 else []
+                    ),
                 },
                 sort_keys=True,
             ),

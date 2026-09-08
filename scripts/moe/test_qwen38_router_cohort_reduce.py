@@ -101,23 +101,25 @@ class ReducerTests(unittest.TestCase):
     def test_c16_primes_complete_prompts_and_proves_cache_before_gate(self):
         source = LIVE.read_text(encoding="utf-8")
         prompts = source.index("prompts = []")
-        sequential_prime = source.index("for prompt in prompts:")
+        continuation = source.index("measured_prompts = [")
+        sequential_prime = source.index("for prompt in measured_prompts:")
         concurrent_barrier = source.index(
             "barrier_outputs = engine.generate(prompts, warm_sampling"
         )
         observable_counts = source.index('"ROCKET_ROUTER_CACHE_BARRIER\\t"')
-        continuation = source.index("prompts = measured_prompts")
+        measured_prompts = source.index("prompts = measured_prompts")
         cached_check = source.index("output.num_cached_tokens != expected_cached_tokens")
         metadata = source.index("os.environ.update(cohort_metadata)")
-        measured = source.index("outputs = engine.generate(prompts, sampling")
+        verifier = source.index("outputs = engine.generate(prompts, sampling")
         self.assertLess(prompts, sequential_prime)
-        self.assertLess(sequential_prime, continuation)
-        self.assertLess(continuation, concurrent_barrier)
+        self.assertLess(continuation, sequential_prime)
+        self.assertLess(sequential_prime, measured_prompts)
+        self.assertLess(measured_prompts, concurrent_barrier)
         self.assertLess(sequential_prime, concurrent_barrier)
         self.assertLess(concurrent_barrier, cached_check)
         self.assertLess(observable_counts, cached_check)
         self.assertLess(cached_check, metadata)
-        self.assertLess(metadata, measured)
+        self.assertLess(metadata, verifier)
         self.assertIn('if concurrency == 16:', source)
         self.assertIn(
             'cache_barrier = "two-cache-pages-v2"', source
@@ -146,6 +148,18 @@ class ReducerTests(unittest.TestCase):
         self.assertIn('"two_cache_pages" if concurrency == 16 else None', source)
         self.assertIn(
             '"attention_block_size_proof": "all_request_cache_hit_counts"', source
+        )
+        self.assertIn('"continuation_is_special_or_stop": False', source)
+        self.assertIn('"prime_prompt_tokens": 6433', source)
+        self.assertNotIn("+ list(prime_outputs[0].outputs[0].token_ids)", source)
+
+    def test_r6_red_requires_continuation_inside_prime_input(self):
+        block_size = 3216
+        self.assertEqual(
+            LIVE_MODULE._publishable_cache_tokens(6432, block_size), 3216
+        )
+        self.assertEqual(
+            LIVE_MODULE._publishable_cache_tokens(6433, block_size), 6432
         )
 
     def test_decode_exceeds_observed_c2_three_call_terminal_by_full_iteration(self):

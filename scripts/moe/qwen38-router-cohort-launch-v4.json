@@ -16,7 +16,7 @@
   },
   "driver": {
     "path": "qwen38-router-cohort-v4-c16-20260908-01/qwen38-router-cohort-live-geometry-v1.py",
-    "sha256": "2b9dea304a3977692b2ac0d9174002f00fe9844df4bb475a3998d7d9d82f9e1c"
+    "sha256": "aa6f41db8751f2fc917ad7f66305962a986df36123e0dd62b6249dedcab52891"
   },
   "model_telemetry": {
     "path": "qwen38-router-cohort-v4-c16-20260908-01/artifacts/model_telemetry-geometry-v1.py",
