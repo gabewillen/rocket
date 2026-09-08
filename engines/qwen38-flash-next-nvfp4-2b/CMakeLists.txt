@@ -1480,6 +1480,11 @@ add_test(NAME qwen38-gdn-prefill-projection-cpu-contract
   COMMAND qwen38-test-gdn-prefill-projection-contract)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME qwen38-gdn-chunk-prefill-adapter-cpu-contract
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gdn_chunk_prefill.py)
+set_tests_properties(qwen38-gdn-chunk-prefill-adapter-cpu-contract
+  PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src")
 add_test(NAME qwen38-target-k0-physical-layer-owners-source-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_target_k0_physical_layer_owners_source.py)
