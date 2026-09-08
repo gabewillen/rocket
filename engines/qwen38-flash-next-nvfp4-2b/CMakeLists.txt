@@ -110,6 +110,7 @@ add_library(qwen38_decode_execution STATIC
   src/decode/execution.cc
   src/decode/full_attention_layer.cc
   src/decode/target_full_layer.cc
+  src/decode/target_layer3_prefill.cc
   src/decode/linear_attention_layer.cc
 )
 target_include_directories(qwen38_decode_execution PUBLIC src)
@@ -546,6 +547,17 @@ target_link_libraries(qwen38-test-target-full-layer PRIVATE qwen38_decode_execut
 target_compile_options(qwen38-test-target-full-layer PRIVATE -Wall -Wextra -Werror)
 set_target_properties(qwen38-test-target-full-layer PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-target-full-layer-contract COMMAND qwen38-test-target-full-layer)
+
+add_executable(qwen38-test-target-layer3-prefill
+  tests/test_target_layer3_prefill.cc)
+target_link_libraries(qwen38-test-target-layer3-prefill PRIVATE
+  qwen38_decode_execution)
+target_compile_options(qwen38-test-target-layer3-prefill PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-layer3-prefill PROPERTIES
+  LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-target-layer3-prefill-contract
+  COMMAND qwen38-test-target-layer3-prefill)
 
 add_executable(qwen38-test-native-qsa-c-api
   tests/test_native_qsa_graph_c_api.cc)

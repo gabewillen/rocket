@@ -42,6 +42,9 @@ class TargetFullLayer final {
                   FullAttentionHyperConnection& hyperconnection,
                   pair_reduce::OtelStageSink& telemetry);
 
+  int rank() const noexcept { return rank_; }
+  int layer() const noexcept { return 3; }
+
   TargetFullLayerResult execute(
       std::uint64_t generation, const attention::TargetQsaStateView& qsa_state,
       const __nv_bfloat16* materialized_pre_layer,
