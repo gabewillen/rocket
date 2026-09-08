@@ -1,0 +1,50 @@
+{
+  "schema": "rocket.qwen38.target-moe.compact-aot.v1",
+  "target_artifact_key": "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4",
+  "source_abi": "modelopt_nvfp4_group16_cutlass_sm121_sfb",
+  "transform_abi": "rocket.qwen38.target-moe.device-stage.v1",
+  "route_remap_abi": "route_position_iota10_unique_positive_remote_zero_v1",
+  "shape": {
+    "tokens": 1,
+    "hidden": 2560,
+    "logical_intermediate": 640,
+    "physical_intermediate": 768,
+    "top_k": 10,
+    "weight_experts": 10,
+    "state_experts": 11,
+    "max_rows": 10
+  },
+  "planes": [
+    {"name": "w13_packed", "dtype": "uint8", "shape": [10, 1536, 1280], "bytes": 19660800},
+    {"name": "w13_scale", "dtype": "e4m3_sfb", "shape": [10, 1536, 160], "bytes": 2457600},
+    {"name": "down_packed", "dtype": "uint8", "shape": [10, 2560, 384], "bytes": 9830400},
+    {"name": "down_scale", "dtype": "e4m3_sfb", "shape": [10, 2560, 48], "bytes": 1228800},
+    {"name": "input_global_scale", "dtype": "float32", "shape": [10], "bytes": 40},
+    {"name": "folded_w1_alpha", "dtype": "float32", "shape": [10], "bytes": 40},
+    {"name": "w2_alpha", "dtype": "float32", "shape": [10], "bytes": 40},
+    {"name": "down_input_scale", "dtype": "float32", "shape": [10], "bytes": 40}
+  ],
+  "control": [
+    {"name": "compact_expert_ids", "dtype": "int32", "shape": [10], "bytes": 40},
+    {"name": "compact_routing_weights", "dtype": "float32", "shape": [10], "bytes": 40},
+    {"name": "source_expert_ids", "dtype": "int32", "shape": [10], "bytes": 40},
+    {"name": "active_experts", "dtype": "int32", "shape": [1], "bytes": 4},
+    {"name": "generation", "dtype": "uint64", "shape": [1], "bytes": 8},
+    {"name": "outcome", "dtype": "int32", "shape": [1], "bytes": 4}
+  ],
+  "fc1_physical_rows": ["up[0:640]", "zero[640:768]", "gate[768:1408]", "zero[1408:1536]"],
+  "ranks": [
+    {
+      "rank": 0,
+      "descriptor_sha256": "a596da067a2a4a498c661929872c6ee81ec6c6a1f448b90edfd3d8986fad64d5",
+      "binding_inventory_sha256": "0f88201c81e6ace3991969dc397fca345773b7a28f317e08a6727c7903ee30c5",
+      "publication_layout_sha256": "4f03ccc90c9020ff2e87f044867f2ac9896ac20c0d97c85055beef0b125ce6d6"
+    },
+    {
+      "rank": 1,
+      "descriptor_sha256": "1983df9eebd04977fe7889e69bc8c6ef5a170297b743e9f21d015aa7770c5f71",
+      "binding_inventory_sha256": "5d6a7b322e1a78059f7abea9d9b6a20a1e7c76263713b5e6dff940d9247e3d93",
+      "publication_layout_sha256": "afd718cf00b6fffa61336ac53e744209750b1c9bd0399622f73cf99cb81de2e9"
+    }
+  ]
+}

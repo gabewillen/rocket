@@ -548,7 +548,8 @@ set_target_properties(qwen38_target_moe_b12x_aot PROPERTIES
 if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
   if(NOT EXISTS "${ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR}/target_moe_b12x_c1.h" OR
      NOT EXISTS "${ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR}/target_moe_b12x_c1.o" OR
-     NOT EXISTS "${ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR}/target_moe_artifact_key.h")
+     NOT EXISTS "${ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR}/target_moe_artifact_key.h" OR
+     NOT EXISTS "${ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR}/target_moe_compact_config.h")
     message(FATAL_ERROR "Incomplete target MoE B12X AOT fixed-c1 export")
   endif()
   if(NOT EXISTS "${ROCKET_QWEN38_CUTE_DSL_RUNTIME}")

@@ -17,15 +17,20 @@ from pathlib import Path
 
 PINNED_FLASHINFER_COMMIT = "91bda04c66f7cb851e1ab3b78b9fecea644b9844"
 PINNED_DISPATCH_SHA256 = (
-    "61cb17593721d1bacc04c9a4dcc52238d3d99c531f3c6ae01c3d33971448a942"
+    "c518e65d6bfd7f08db1e5261e20795fd020e82e681699729171bc2fd5331239a"
 )
 PINNED_KERNEL_SHA256 = (
-    "6dbd27625bc059c1246b3ef8445312e84ac76a8f1825ae3fb518f27919d8af64"
-)
-PINNED_TVM_FFI_OBJECT_SHA256 = (
-    "8cc49bdb4163b07338818bb7db482aea812d91cc1cbf3ef1eeecf0ee2756fef4"
+    "c7b6f24b94d7939cc0eb917ab15cef4c34f3dc12bf75e15fc9dc316ee7327f3f"
 )
 ARTIFACT_KEY_HEADER = "target_moe_artifact_key.h"
+COMPACT_CONFIG_HEADER = "target_moe_compact_config.h"
+COMPACT_CONFIG_SCHEMA = "rocket.qwen38.target-moe.compact-aot.v1"
+SOURCE_ABI = "modelopt_nvfp4_group16_cutlass_sm121_sfb"
+TRANSFORM_ABI = "rocket.qwen38.target-moe.device-stage.v1"
+ROUTE_REMAP_ABI = "route_position_iota10_unique_positive_remote_zero_v1"
+PINNED_COMPACT_CONFIG_SHA256 = (
+    "4d7c327c6363b0e0dc200f80df1ae3b7ec85c574f64811d595cbd6e945ff1d39"
+)
 
 
 @dataclass(frozen=True)
@@ -36,8 +41,8 @@ class Plan:
     physical_intermediate: int = 768
     top_k: int = 10
     max_rows: int = 10
-    local_experts: int = 256
-    state_experts: int = 257
+    weight_experts: int = 10
+    state_experts: int = 11
     tile_m: int = 64
     tile_n: int = 128
     max_active_clusters: int = 20
@@ -48,6 +53,41 @@ class Plan:
 
 PLAN = Plan()
 
+EXPECTED_SHAPE = {
+    "tokens": 1,
+    "hidden": 2560,
+    "logical_intermediate": 640,
+    "physical_intermediate": 768,
+    "top_k": 10,
+    "weight_experts": 10,
+    "state_experts": 11,
+    "max_rows": 10,
+}
+EXPECTED_PLANES = [
+    {"name": "w13_packed", "dtype": "uint8", "shape": [10, 1536, 1280], "bytes": 19_660_800},
+    {"name": "w13_scale", "dtype": "e4m3_sfb", "shape": [10, 1536, 160], "bytes": 2_457_600},
+    {"name": "down_packed", "dtype": "uint8", "shape": [10, 2560, 384], "bytes": 9_830_400},
+    {"name": "down_scale", "dtype": "e4m3_sfb", "shape": [10, 2560, 48], "bytes": 1_228_800},
+    {"name": "input_global_scale", "dtype": "float32", "shape": [10], "bytes": 40},
+    {"name": "folded_w1_alpha", "dtype": "float32", "shape": [10], "bytes": 40},
+    {"name": "w2_alpha", "dtype": "float32", "shape": [10], "bytes": 40},
+    {"name": "down_input_scale", "dtype": "float32", "shape": [10], "bytes": 40},
+]
+EXPECTED_CONTROL = [
+    {"name": "compact_expert_ids", "dtype": "int32", "shape": [10], "bytes": 40},
+    {"name": "compact_routing_weights", "dtype": "float32", "shape": [10], "bytes": 40},
+    {"name": "source_expert_ids", "dtype": "int32", "shape": [10], "bytes": 40},
+    {"name": "active_experts", "dtype": "int32", "shape": [1], "bytes": 4},
+    {"name": "generation", "dtype": "uint64", "shape": [1], "bytes": 8},
+    {"name": "outcome", "dtype": "int32", "shape": [1], "bytes": 4},
+]
+EXPECTED_FC1_ROWS = [
+    "up[0:640]",
+    "zero[640:768]",
+    "gate[768:1408]",
+    "zero[1408:1536]",
+]
+
 
 def digest(path: Path) -> str:
     value = hashlib.sha256()
@@ -55,6 +95,117 @@ def digest(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             value.update(chunk)
     return value.hexdigest()
+
+
+def canonical_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _valid_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(ch in "0123456789abcdef" for ch in value)
+    )
+
+
+def authenticate_compact_config(path: Path, artifact_key: str) -> dict[str, object]:
+    """Load the closed E10 stage/consumer contract or reject before codegen."""
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("compact target MoE config is unavailable") from exc
+    if not isinstance(config, dict) or set(config) != {
+        "schema", "target_artifact_key", "source_abi", "transform_abi",
+        "route_remap_abi", "shape", "planes", "control", "fc1_physical_rows",
+        "ranks",
+    }:
+        raise RuntimeError("compact target MoE config schema changed")
+    if (
+        config["schema"] != COMPACT_CONFIG_SCHEMA
+        or config["target_artifact_key"] != artifact_key
+        or config["source_abi"] != SOURCE_ABI
+        or config["transform_abi"] != TRANSFORM_ABI
+        or config["route_remap_abi"] != ROUTE_REMAP_ABI
+        or config["shape"] != EXPECTED_SHAPE
+        or config["planes"] != EXPECTED_PLANES
+        or config["control"] != EXPECTED_CONTROL
+        or config["fc1_physical_rows"] != EXPECTED_FC1_ROWS
+    ):
+        raise RuntimeError("compact target MoE shape or layout changed")
+    ranks = config["ranks"]
+    if not isinstance(ranks, list) or len(ranks) != 2:
+        raise RuntimeError("compact target MoE rank identities changed")
+    for expected_rank, rank in enumerate(ranks):
+        if (
+            not isinstance(rank, dict)
+            or set(rank) != {
+                "rank", "descriptor_sha256", "binding_inventory_sha256",
+                "publication_layout_sha256",
+            }
+            or rank["rank"] != expected_rank
+            or not all(
+                _valid_sha256(rank[field])
+                for field in (
+                    "descriptor_sha256", "binding_inventory_sha256",
+                    "publication_layout_sha256",
+                )
+            )
+        ):
+            raise RuntimeError("compact target MoE rank identities changed")
+    if canonical_digest(config) != PINNED_COMPACT_CONFIG_SHA256:
+        raise RuntimeError("compact target MoE config identity changed")
+    return config
+
+
+def compact_layout_identity(config: dict[str, object]) -> str:
+    return canonical_digest({
+        "shape": config["shape"],
+        "planes": config["planes"],
+        "control": config["control"],
+        "fc1_physical_rows": config["fc1_physical_rows"],
+        "route_remap_abi": config["route_remap_abi"],
+    })
+
+
+def emit_compact_config_header(
+    output_dir: Path, config: dict[str, object]
+) -> tuple[Path, str]:
+    config_sha256 = canonical_digest(config)
+    layout_sha256 = compact_layout_identity(config)
+    ranks = config["ranks"]
+    assert isinstance(ranks, list)
+    values = {
+        "Config": config_sha256,
+        "Layout": layout_sha256,
+        "SourceAbi": canonical_digest(SOURCE_ABI),
+        "TransformAbi": canonical_digest(TRANSFORM_ABI),
+        "RouteRemapAbi": canonical_digest(ROUTE_REMAP_ABI),
+        "Rank0Descriptor": ranks[0]["descriptor_sha256"],
+        "Rank1Descriptor": ranks[1]["descriptor_sha256"],
+        "Rank0BindingInventory": ranks[0]["binding_inventory_sha256"],
+        "Rank1BindingInventory": ranks[1]["binding_inventory_sha256"],
+        "Rank0PublicationLayout": ranks[0]["publication_layout_sha256"],
+        "Rank1PublicationLayout": ranks[1]["publication_layout_sha256"],
+    }
+    declarations = "".join(
+        f'inline constexpr char kRocketQwen38TargetMoeCompact{name}Sha256[] = "{value}";\n'
+        for name, value in values.items()
+    )
+    path = output_dir / COMPACT_CONFIG_HEADER
+    path.write_text(
+        "// Generated from the authenticated compact E10 stage contract.\n"
+        "#pragma once\n"
+        "inline constexpr int kRocketQwen38TargetMoeWeightExperts = 10;\n"
+        "inline constexpr int kRocketQwen38TargetMoeStateExperts = 11;\n"
+        "inline constexpr int kRocketQwen38TargetMoeMaxRows = 10;\n"
+        "inline constexpr int kRocketQwen38TargetMoePhysicalIntermediate = 768;\n"
+        + declarations,
+        encoding="utf-8",
+    )
+    return path, config_sha256
 
 
 def authenticate_exported_abi(header: Path, object_file: Path) -> None:
@@ -181,24 +332,24 @@ def export(output_dir: Path, arch: str) -> dict[str, str]:
     scalar_i32 = lambda: tensor(cutlass.Int32, (1,), assumed_align=4)
     w13 = tensor(
         cutlass.Float4E2M1FN,
-        (2 * p.physical_intermediate, p.hidden, p.local_experts),
+        (2 * p.physical_intermediate, p.hidden, p.weight_experts),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
     down = tensor(
         cutlass.Float4E2M1FN,
-        (p.hidden, p.physical_intermediate, p.local_experts),
+        (p.hidden, p.physical_intermediate, p.weight_experts),
         stride_order=(1, 0, 2),
         assumed_align=16,
     )
     row_counts = tensor(cutlass.Int32, (p.state_experts,), assumed_align=4)
     weight_expert_ids = tensor(cutlass.Int32, (p.state_experts,), assumed_align=4)
-    global_to_local = tensor(cutlass.Int32, (p.local_experts,), assumed_align=4)
+    global_to_local = tensor(cutlass.Int32, (p.weight_experts,), assumed_align=4)
     virt_scratch = tensor(
-        cutlass.Int32, (p.local_experts * 2 + 8,), assumed_align=4
+        cutlass.Int32, (p.weight_experts * 2 + 8,), assumed_align=4
     )
     expert_f32 = lambda: tensor(
-        cutlass.Float32, (p.local_experts,), assumed_align=16
+        cutlass.Float32, (p.weight_experts,), assumed_align=16
     )
     output_tensor = tensor(
         cutlass.BFloat16,
@@ -268,6 +419,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path)
     parser.add_argument("--artifact-manifest", type=Path)
+    parser.add_argument("--compact-config", type=Path)
     parser.add_argument("--arch", default="sm_121a")
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--identity-only", action="store_true")
@@ -278,7 +430,6 @@ def main() -> None:
         "commit": PINNED_FLASHINFER_COMMIT,
         "dispatch_sha256": PINNED_DISPATCH_SHA256,
         "kernel_sha256": PINNED_KERNEL_SHA256,
-        "measured_tvm_ffi_object_sha256": PINNED_TVM_FFI_OBJECT_SHA256,
         "plan": asdict(PLAN),
         "stream": "explicit_borrowed_cu_stream",
     }
@@ -290,9 +441,18 @@ def main() -> None:
     if args.artifact_manifest is None:
         parser.error("--artifact-manifest is required for an authenticated export")
     artifact_key = authenticate_artifact_manifest(args.artifact_manifest)
+    if args.compact_config is None:
+        parser.error("--compact-config is required for an authenticated E10 export")
+    compact_config = authenticate_compact_config(args.compact_config, artifact_key)
     identity_header = emit_artifact_key_header(args.output, artifact_key)
+    config_header, compact_config_sha256 = emit_compact_config_header(
+        args.output, compact_config
+    )
     manifest["artifact_key"] = artifact_key
     manifest["artifact_key_header_sha256"] = digest(identity_header)
+    manifest["compact_config_sha256"] = compact_config_sha256
+    manifest["compact_layout_sha256"] = compact_layout_identity(compact_config)
+    manifest["compact_config_header_sha256"] = digest(config_header)
     if args.identity_only:
         print(json.dumps(manifest, sort_keys=True))
         return

@@ -8,13 +8,11 @@
 #if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
 #include "target_moe_b12x_c1.h"
 #include "target_moe_artifact_key.h"
+#include "target_moe_compact_config.h"
 #endif
 
 namespace rocket::qwen38::moe {
 namespace {
-
-#if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
-#endif
 
 bool valid_launch(const TargetMoeB12xLaunch& launch) noexcept {
   const auto& w = launch.workspace;
@@ -83,6 +81,11 @@ TargetMoeCreateFailure diagnose_target_moe_b12x_create(
     const TargetMoeB12xWeights& weights) noexcept {
   if (device < 0) return TargetMoeCreateFailure::kDevice;
 #if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
+  static_assert(kTargetMoeWeightExperts == kRocketQwen38TargetMoeWeightExperts);
+  static_assert(kTargetMoeStateExperts == kRocketQwen38TargetMoeStateExperts);
+  static_assert(kTargetMoeMaxRows == kRocketQwen38TargetMoeMaxRows);
+  static_assert(kTargetMoePhysicalIntermediate ==
+                kRocketQwen38TargetMoePhysicalIntermediate);
   std::array<std::uint8_t, 32> artifact_sha256{};
   if (!parse_target_moe_artifact_key(target_moe_artifact_key_ascii(),
                                      &artifact_sha256) ||
