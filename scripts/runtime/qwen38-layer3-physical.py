@@ -32,12 +32,17 @@ def main() -> int:
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--indexer-sidecar", type=Path, required=True)
     parser.add_argument("--oracle-capture", type=Path, required=True)
+    parser.add_argument("--bootstrap-host", required=True)
+    parser.add_argument("--bootstrap-port", type=int, required=True)
+    parser.add_argument("--timeout-ms", type=int, default=120_000)
     parser.add_argument("--preflight-only", action="store_true", required=True)
     args = parser.parse_args()
     try:
         plan = prepare_layer3_physical_plan(
             artifact=args.artifact, indexer_sidecar=args.indexer_sidecar,
             oracle_capture=args.oracle_capture, tracer=_Tracer(),
+            bootstrap_host=args.bootstrap_host,
+            bootstrap_port=args.bootstrap_port, timeout_ms=args.timeout_ms,
         )
     except Exception as exc:
         print(json.dumps({

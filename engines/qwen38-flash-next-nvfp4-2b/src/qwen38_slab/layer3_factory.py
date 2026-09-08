@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 from dataclasses import dataclass
@@ -50,6 +51,19 @@ class Layer3RankPlan:
 
 
 @dataclass(frozen=True)
+class Layer3PairReducePlan:
+    rank: int
+    peer_rank: int
+    bootstrap_host: str
+    bootstrap_port: int
+    timeout_ms: int
+    session_sha256: str
+    rails: tuple[str, str]
+    gid_index: int
+    calls: int
+
+
+@dataclass(frozen=True)
 class Layer3PhysicalPlan:
     schema: str
     oracle_manifest_sha256: str
@@ -60,6 +74,7 @@ class Layer3PhysicalPlan:
     compare_row: int
     replicated_hc_shape: tuple[int, int]
     ranks: tuple[Layer3RankPlan, Layer3RankPlan]
+    pair_reduce: tuple[Layer3PairReducePlan, Layer3PairReducePlan]
 
 
 def _sha256(path: Path) -> str:
@@ -187,13 +202,27 @@ def _hyperconnection_layout(artifact: Path, rank: int) -> str:
 
 def prepare_layer3_physical_plan(
     *, artifact: Path, indexer_sidecar: Path, oracle_capture: Path,
-    tracer: object,
+    tracer: object, bootstrap_host: str = "192.168.100.10",
+    bootstrap_port: int = 18839, timeout_ms: int = 120_000,
 ) -> Layer3PhysicalPlan:
     if tracer is None or not callable(getattr(tracer, "start_as_current_span", None)):
         raise Layer3FactoryError("layer-3 factory requires OpenTelemetry")
     with tracer.start_as_current_span("rocket.qwen38.layer3_factory.prepare") as span:
         span.set_attribute("phase", "prepare")
         try:
+            try:
+                ipaddress.IPv4Address(bootstrap_host)
+            except (ipaddress.AddressValueError, TypeError) as exc:
+                raise Layer3FactoryError("layer-3 bootstrap IPv4 changed") from exc
+            if (
+                isinstance(bootstrap_port, bool)
+                or not isinstance(bootstrap_port, int)
+                or not 1 <= bootstrap_port <= 65_535
+                or isinstance(timeout_ms, bool)
+                or not isinstance(timeout_ms, int)
+                or not 100 <= timeout_ms <= 120_000
+            ):
+                raise Layer3FactoryError("layer-3 PairReduce bounds changed")
             before, after, tokens = _oracle(oracle_capture)
             if artifact.name != TARGET_ARTIFACT or indexer_sidecar.name != INDEXER_SIDECAR:
                 raise Layer3FactoryError("layer-3 slab or sidecar key changed")
@@ -213,9 +242,19 @@ def prepare_layer3_physical_plan(
             raise
         span.set_attribute("outcome", "success")
         span.set_attribute("failure.class", "none")
+    pair_reduce = tuple(
+        Layer3PairReducePlan(
+            rank=rank, peer_rank=1 - rank, bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port, timeout_ms=timeout_ms,
+            session_sha256=ORACLE_MANIFEST_SHA256,
+            rails=("rocep1s0f1", "roceP2p1s0f1"), gid_index=3,
+            calls=2 * ROWS,
+        )
+        for rank in (0, 1)
+    )
     return Layer3PhysicalPlan(
         PLAN_SCHEMA, ORACLE_MANIFEST_SHA256, before, after, tokens,
-        tuple(range(ROWS)), ROWS - 1, (ROWS, HC_WIDTH), ranks,
+        tuple(range(ROWS)), ROWS - 1, (ROWS, HC_WIDTH), ranks, pair_reduce,
     )
 
 
@@ -232,9 +271,19 @@ def public_plan(plan: Layer3PhysicalPlan) -> Mapping[str, object]:
         "ranks": [item.rank for item in plan.ranks],
         "layer": LAYER,
         "generation": 0,
+        "pair_reduce": {
+            "bootstrap_host": plan.pair_reduce[0].bootstrap_host,
+            "bootstrap_port": plan.pair_reduce[0].bootstrap_port,
+            "timeout_ms": plan.pair_reduce[0].timeout_ms,
+            "session_sha256": plan.pair_reduce[0].session_sha256,
+            "rails": list(plan.pair_reduce[0].rails),
+            "gid_index": plan.pair_reduce[0].gid_index,
+            "calls_per_rank": plan.pair_reduce[0].calls,
+            "schedule": "35x(attention_m1,moe_m1)",
+        },
         "next": "materialize_cuda_graph",
     })
 
 
-__all__ = ["Layer3FactoryError", "Layer3PhysicalPlan", "Layer3RankPlan",
+__all__ = ["Layer3FactoryError", "Layer3PairReducePlan", "Layer3PhysicalPlan", "Layer3RankPlan",
            "prepare_layer3_physical_plan", "public_plan"]

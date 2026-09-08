@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -10,6 +11,8 @@
 #include "pair_reduce/transport.h"
 
 namespace rocket::qwen38::pair_reduce {
+
+inline constexpr std::uint32_t kRdmaBootstrapSchema = 3;
 
 class RdmaError final : public std::runtime_error {
  public:
@@ -24,11 +27,30 @@ struct RdmaConfig {
   int gid_index = 3;
   std::size_t rail_split_bytes = 65'536;
   std::uint32_t operation_timeout_ms = 120'000;
+  // Exact invocation identity exchanged during bootstrap. A zero value keeps
+  // the generic PairReduce tools available; production composition owners
+  // require a nonzero authenticated digest.
+  std::array<std::uint8_t, 32> session_sha256{};
 };
 
 constexpr bool valid_operation_timeout_ms(std::uint32_t timeout_ms) noexcept {
   return timeout_ms >= 100 && timeout_ms <= 120'000;
 }
+
+struct RdmaPeerBootstrapIdentity {
+  std::uint32_t schema;
+  std::uint32_t rank;
+  std::uint32_t world_size;
+  std::uint32_t rails;
+  std::uint32_t page_bytes;
+  std::uint32_t operation_timeout_ms;
+  std::array<std::uint8_t, 32> session_sha256;
+};
+
+// Pure validator used at the live wire boundary and by deterministic tests.
+// Throws RdmaError before any peer QP metadata is accepted.
+void validate_peer_bootstrap_identity(
+    const RdmaConfig& local, const RdmaPeerBootstrapIdentity& peer);
 
 // Fixed two-rank, two-rail RC transport. Registered regions must match in size
 // and registration order across ranks. Payload writes are unsignaled. A

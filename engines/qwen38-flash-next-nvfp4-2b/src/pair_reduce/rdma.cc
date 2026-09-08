@@ -25,7 +25,6 @@ constexpr int kRails = 2;
 constexpr std::size_t kDoorStride = 64;
 constexpr std::size_t kReadyOffset = 0;
 constexpr std::size_t kConsumedOffset = sizeof(std::uint64_t);
-constexpr std::uint32_t kBootstrapSchema = 2;
 constexpr std::array<std::string_view, kRails> kDevices{"rocep1s0f1", "roceP2p1s0f1"};
 
 [[noreturn]] void fail(const std::string& reason) {
@@ -139,7 +138,9 @@ struct RailWire {
   std::uint32_t reserved;
   std::uint64_t door_address;
   std::uint8_t gid[16];
+  std::uint8_t session_sha256[32];
 };
+static_assert(sizeof(RailWire) == 96);
 
 struct RegionWire {
   std::uint64_t address;
@@ -148,6 +149,18 @@ struct RegionWire {
 };
 
 }  // namespace
+
+void validate_peer_bootstrap_identity(
+    const RdmaConfig& local, const RdmaPeerBootstrapIdentity& peer) {
+  if (peer.schema != kRdmaBootstrapSchema ||
+      peer.rank != static_cast<std::uint32_t>(1 - local.rank) ||
+      peer.world_size != 2 || peer.rails != kRails ||
+      peer.page_bytes != 65'536 ||
+      peer.operation_timeout_ms != local.operation_timeout_ms)
+    fail("peer bootstrap topology or page contract drift");
+  if (peer.session_sha256 != local.session_sha256)
+    fail("peer bootstrap session identity drift");
+}
 
 struct RdmaTransport::Impl {
   struct Rail {
@@ -255,7 +268,7 @@ RdmaTransport::RdmaTransport(const RdmaConfig& config) : impl_(new Impl(config))
       fail("RoCE GID query failed on " + rail.name);
 
     auto& wire = local[static_cast<std::size_t>(index)];
-    wire.schema = kBootstrapSchema;
+    wire.schema = kRdmaBootstrapSchema;
     wire.rank = static_cast<std::uint32_t>(config.rank);
     wire.world_size = 2;
     wire.rails = kRails;
@@ -266,6 +279,8 @@ RdmaTransport::RdmaTransport(const RdmaConfig& config) : impl_(new Impl(config))
     wire.operation_timeout_ms = config.operation_timeout_ms;
     wire.door_address = reinterpret_cast<std::uint64_t>(impl_->door);
     std::memcpy(wire.gid, gid.raw, sizeof(wire.gid));
+    std::memcpy(wire.session_sha256, config.session_sha256.data(),
+                config.session_sha256.size());
   }
 
   impl_->socket = config.rank == 0 ? listen_once(config.bootstrap_port)
@@ -277,10 +292,12 @@ RdmaTransport::RdmaTransport(const RdmaConfig& config) : impl_(new Impl(config))
   for (int index = 0; index < kRails; ++index) {
     auto& rail = impl_->rails[static_cast<std::size_t>(index)];
     const auto& remote = peer[static_cast<std::size_t>(index)];
-    if (remote.schema != kBootstrapSchema || remote.rank != static_cast<std::uint32_t>(1 - config.rank) ||
-        remote.world_size != 2 || remote.rails != kRails || remote.page_bytes != 65'536 ||
-        remote.operation_timeout_ms != config.operation_timeout_ms)
-      fail("peer bootstrap topology or page contract drift");
+    RdmaPeerBootstrapIdentity identity{
+        remote.schema, remote.rank, remote.world_size, remote.rails,
+        remote.page_bytes, remote.operation_timeout_ms, {}};
+    std::memcpy(identity.session_sha256.data(), remote.session_sha256,
+                identity.session_sha256.size());
+    validate_peer_bootstrap_identity(config, identity);
     rail.peer_door_address = remote.door_address;
     rail.peer_door_rkey = remote.door_rkey;
 

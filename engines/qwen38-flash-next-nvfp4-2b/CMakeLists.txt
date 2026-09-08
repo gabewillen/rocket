@@ -123,6 +123,7 @@ add_library(qwen38_decode_execution STATIC
   src/decode/full_attention_layer.cc
   src/decode/target_full_layer.cc
   src/decode/target_layer3_prefill.cc
+  src/decode/target_layer3_pair_reduce.cc
   src/decode/linear_attention_layer.cc
 )
 target_include_directories(qwen38_decode_execution PUBLIC src)
@@ -567,6 +568,16 @@ target_compile_options(qwen38-test-pair-reduce PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
 )
 add_test(NAME qwen38-pair-reduce-contract COMMAND qwen38-test-pair-reduce)
+add_executable(qwen38-test-rdma-bootstrap-identity
+  tests/test_rdma_bootstrap_identity.cc)
+target_link_libraries(qwen38-test-rdma-bootstrap-identity PRIVATE
+  qwen38_pair_reduce)
+target_compile_options(qwen38-test-rdma-bootstrap-identity PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-rdma-bootstrap-identity PROPERTIES
+  LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-rdma-bootstrap-identity-contract
+  COMMAND qwen38-test-rdma-bootstrap-identity)
 add_test(NAME qwen38-pair-reduce-reject-timeout
   COMMAND qwen38-pair-reduce-bench --rank 0 --timeout-ms 99)
 set_tests_properties(qwen38-pair-reduce-reject-timeout PROPERTIES WILL_FAIL TRUE)
@@ -606,6 +617,17 @@ set_target_properties(qwen38-test-target-layer3-prefill PROPERTIES
   LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-target-layer3-prefill-contract
   COMMAND qwen38-test-target-layer3-prefill)
+
+add_executable(qwen38-test-target-layer3-pair-reduce
+  tests/test_target_layer3_pair_reduce.cc)
+target_link_libraries(qwen38-test-target-layer3-pair-reduce PRIVATE
+  qwen38_decode_execution)
+target_compile_options(qwen38-test-target-layer3-pair-reduce PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-layer3-pair-reduce PROPERTIES
+  LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-target-layer3-pair-reduce-contract
+  COMMAND qwen38-test-target-layer3-pair-reduce)
 
 add_executable(qwen38-test-target-layer3-generation
   tests/test_target_layer3_generation.cc)

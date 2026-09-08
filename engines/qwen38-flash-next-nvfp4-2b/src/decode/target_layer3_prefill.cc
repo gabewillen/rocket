@@ -24,13 +24,15 @@ TargetFullLayerResult NativeTargetLayer3RowPort::execute_row(
 TargetLayer3Prefill::TargetLayer3Prefill(
     int rank, TargetLayer3RowPort& rows,
     TargetLayer3GenerationOwner& generations,
+    TargetLayer3ReductionGeneration& reductions,
     TargetLayer3Comparator& comparator,
     pair_reduce::OtelStageSink& telemetry)
     : rank_(rank), rows_(rows), generations_(generations),
-      comparator_(comparator), telemetry_(telemetry) {
+      reductions_(reductions), comparator_(comparator), telemetry_(telemetry) {
   if ((rank != 0 && rank != 1) || rows.rank() != rank || rows.layer() != 3 ||
       !rows.authenticated() || generations.rank() != rank ||
       generations.layer() != 3 || !generations.authenticated() ||
+      reductions.rank() != rank || !reductions.authenticated() ||
       !comparator.authenticated()) {
     const int diagnostic_rank = (rank_ == 0 || rank_ == 1) ? rank_ : -1;
     telemetry_.emit_span_and_log({
@@ -68,6 +70,7 @@ const __nv_bfloat16* TargetLayer3Prefill::execute(
           state.expected_generation != generation)
         throw std::logic_error("layer-3 generation owner changed");
       generations_.enqueue_prepare(row, generation, stream);
+      reductions_.begin_row(row, generation);
       const auto result = rows_.execute_row(
           generation, state, replicated_layer02 + row * kHcWidth, b,
           replicated_layer03 + row * kHcWidth, stream);
@@ -76,6 +79,8 @@ const __nv_bfloat16* TargetLayer3Prefill::execute(
           result.post_layer != replicated_layer03 + row * kHcWidth)
         throw std::logic_error("layer-3 row publication changed");
     }
+    if (!reductions_.complete())
+      throw std::logic_error("layer-3 PairReduce publication incomplete");
     const auto* last =
         replicated_layer03 + (kTargetLayer3OracleRows - 1) * kHcWidth;
     if (!comparator_.compare_row34(last, stream))

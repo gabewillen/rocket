@@ -60,6 +60,18 @@ struct Comparator final : decode::TargetLayer3Comparator {
   bool accept = true;
 };
 
+struct Reductions final : decode::TargetLayer3ReductionGeneration {
+  int rank() const noexcept override { return 1; }
+  bool authenticated() const noexcept override { return true; }
+  void begin_row(int row, std::uint64_t generation) override {
+    if (row != calls || generation != static_cast<std::uint64_t>(row + 1))
+      throw std::runtime_error("reduction generation changed");
+    ++calls;
+  }
+  bool complete() const noexcept override { return calls == 35; }
+  int calls = 0;
+};
+
 struct Telemetry final : pr::OtelStageSink {
   void emit_span_and_log(const pr::SpanRecord& point) noexcept override {
     ++calls;
@@ -81,10 +93,11 @@ struct Telemetry final : pr::OtelStageSink {
 int main() {
   Generations generations;
   Rows rows;
+  Reductions reductions;
   Comparator comparator;
   Telemetry telemetry;
   decode::TargetLayer3Prefill prefill(
-      1, rows, generations, comparator, telemetry);
+      1, rows, generations, reductions, comparator, telemetry);
   std::array<__nv_bfloat16, 35 * 4 * 2560> before{};
   std::array<__nv_bfloat16, 35 * 4 * 2560> after{};
   __nv_bfloat16 bf16{};
@@ -94,7 +107,8 @@ int main() {
   const auto* result = prefill.execute(
       before.data(), after.data(), buffers,
       reinterpret_cast<cudaStream_t>(0x10));
-  if (generations.views != 35 || generations.calls != 35 || rows.calls != 35 ||
+  if (generations.views != 35 || generations.calls != 35 ||
+      reductions.calls != 35 || rows.calls != 35 ||
       result != after.data() + 34 * 4 * 2560 || comparator.observed != result ||
       telemetry.calls != 1 || telemetry.metrics != 1 ||
       telemetry.last != pr::Outcome::kOk ||
@@ -111,11 +125,13 @@ int main() {
 
   Generations mismatch_generations;
   Rows mismatch_rows;
+  Reductions mismatch_reductions;
   Comparator mismatch;
   mismatch.accept = false;
   Telemetry mismatch_telemetry;
   decode::TargetLayer3Prefill rejected(
-      1, mismatch_rows, mismatch_generations, mismatch, mismatch_telemetry);
+      1, mismatch_rows, mismatch_generations, mismatch_reductions, mismatch,
+      mismatch_telemetry);
   try {
     rejected.execute(before.data(), after.data(), buffers,
                      reinterpret_cast<cudaStream_t>(0x10));
@@ -127,12 +143,13 @@ int main() {
     return 5;
   Generations invalid_generations;
   Rows invalid_rows;
+  Reductions invalid_reductions;
   Comparator invalid_comparator;
   Telemetry invalid_telemetry;
   try {
     decode::TargetLayer3Prefill invalid(
         123456, invalid_rows, invalid_generations,
-        invalid_comparator, invalid_telemetry);
+        invalid_reductions, invalid_comparator, invalid_telemetry);
     return 6;
   } catch (const std::invalid_argument&) {
   }

@@ -67,6 +67,9 @@ class Layer3FactoryTests(unittest.TestCase):
         self.assertEqual(record["replicated_hc_shape"], [35, 10240])
         self.assertEqual(record["replay"], "sequential_rows_0_34")
         self.assertEqual(record["compare_row"], 34)
+        self.assertEqual(record["pair_reduce"]["calls_per_rank"], 70)
+        self.assertEqual(record["pair_reduce"]["session_sha256"],
+                         "05ea3af1c4694a9c035ce2fe9ce006acc58881df0fe86771b1846f4bd8e5f48b")
         self.assertEqual(tuple(item.rank for item in plan.ranks), (0, 1))
         self.assertEqual(tracer.spans[-1].attributes, {
             "phase": "prepare", "outcome": "success",
