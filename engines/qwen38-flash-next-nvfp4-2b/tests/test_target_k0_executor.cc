@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "decode/target_k0_executor.h"
+#include "decode/target_k0_startup_progress.h"
 
 #include <array>
 #include <cstdio>
@@ -126,6 +127,14 @@ struct Comparator final : decode::TargetK0OracleComparator {
 
 int main() {
   try {
+    decode::TargetK0StartupConstructionStage startup_progress{};
+    decode::target_k0_enter_startup_construction(
+        &startup_progress,
+        decode::TargetK0StartupConstructionStage::
+            kExecutorOwnershipValidation);
+    check(startup_progress ==
+          decode::TargetK0StartupConstructionStage::
+              kExecutorOwnershipValidation);
     PhysicalReducer reducer;
     Sink sink;
     decode::TargetK0PairReduceSchedule reductions(reducer, sink);

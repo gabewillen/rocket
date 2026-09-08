@@ -27,12 +27,19 @@ std::unique_ptr<TargetK0StartupOwner> TargetK0StartupOwner::create(
     std::unique_ptr<TargetK0PhysicalLayers> layers,
     pair_reduce::OtelStageSink& telemetry,
     output::TokenIoArtifactRoots tokenizer, TargetK0ExecutorArena arena,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    TargetK0StartupConstructionStage* construction_progress) {
+  target_k0_enter_startup_construction(
+      construction_progress,
+      TargetK0StartupConstructionStage::kDependencyValidation);
   if ((rank != 0 && rank != 1) || !reductions || !comparator || !token_io ||
       !layers || layers->rank() != rank || !layers->authenticated() ||
       token_io->rank() != rank || !token_io->authenticated() ||
       comparator->rank() != rank || !comparator->authenticated())
     throw std::invalid_argument("K0 startup dependencies are incomplete");
+  target_k0_enter_startup_construction(
+      construction_progress,
+      TargetK0StartupConstructionStage::kTokenizerReauthentication);
   tokenizer = output::authenticate_token_io_artifact_roots(
       tokenizer.tokenizer, tokenizer.oracle_capture);
   auto owner = std::unique_ptr<TargetK0StartupOwner>(new TargetK0StartupOwner);
@@ -41,10 +48,16 @@ std::unique_ptr<TargetK0StartupOwner> TargetK0StartupOwner::create(
   owner->token_io_ = std::move(token_io);
   owner->tokenizer_ = std::move(tokenizer);
   owner->layers_ = std::move(layers);
+  target_k0_enter_startup_construction(
+      construction_progress,
+      TargetK0StartupConstructionStage::kExecutorOwnershipValidation);
   owner->executor_ = std::make_unique<TargetK0Executor>(
       rank, owner->layers_->inventory().ports(), *owner->token_io_,
       owner->reductions_->schedule(), *owner->comparator_, telemetry, arena,
       stream);
+  target_k0_enter_startup_construction(
+      construction_progress,
+      TargetK0StartupConstructionStage::kFinalPublication);
   return owner;
 }
 

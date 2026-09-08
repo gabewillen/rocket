@@ -7,6 +7,7 @@
 
 #include "decode/target_k0_physical_layers.h"
 #include "decode/target_k0_oracle_comparator.h"
+#include "decode/target_k0_startup_progress.h"
 #include "output/native_token_io.h"
 
 namespace rocket::qwen38::decode {
@@ -31,7 +32,8 @@ class TargetK0StartupOwner final {
       std::unique_ptr<TargetK0PhysicalLayers> layers,
       pair_reduce::OtelStageSink& telemetry,
       output::TokenIoArtifactRoots tokenizer,
-      TargetK0ExecutorArena arena, cudaStream_t stream);
+      TargetK0ExecutorArena arena, cudaStream_t stream,
+      TargetK0StartupConstructionStage* construction_progress = nullptr);
 
   TargetK0GeneratedToken execute_prefill(
       std::uint64_t first_generation,

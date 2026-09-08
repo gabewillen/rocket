@@ -26,6 +26,7 @@ struct Qwen38TargetK0Oracle35Result {
   std::int32_t execution_layer;
   std::int32_t execution_layer_stage;
   std::int32_t gdn_graph_stage;
+  std::int32_t startup_construction_stage;
 };
 
 enum Qwen38TargetK0Oracle35Status : int {

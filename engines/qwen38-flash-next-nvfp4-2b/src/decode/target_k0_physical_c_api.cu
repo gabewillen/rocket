@@ -116,6 +116,8 @@ extern "C" int qwen38_target_k0_oracle35_run(
       decode::TargetK0PhysicalStartupStage::kValidation;
   decode::TargetK0PhysicalLayerConstructionProgress layer_progress;
   decode::TargetK0ExecutionProgress execution_progress;
+  decode::TargetK0StartupConstructionStage construction_progress =
+      decode::TargetK0StartupConstructionStage::kNone;
   const auto resolved_status = [&]() noexcept {
     return failure_status < 0 ? status_for(startup_stage) : failure_status;
   };
@@ -135,6 +137,8 @@ extern "C" int qwen38_target_k0_oracle35_run(
         static_cast<std::int32_t>(execution_progress.layer_stage);
     result->gdn_graph_stage =
         static_cast<std::int32_t>(execution_progress.gdn_graph_stage);
+    result->startup_construction_stage =
+        static_cast<std::int32_t>(construction_progress);
     if (telemetry) publish(telemetry->snapshot(), *result);
   };
   try {
@@ -187,7 +191,7 @@ extern "C" int qwen38_target_k0_oracle35_run(
     failure_status = -1;  // Startup owner reports its exact construction stage.
     auto owner = decode::TargetK0PhysicalStartupOwner::create(
         std::move(config), std::move(winner), telemetry, telemetry, telemetry,
-        telemetry, &startup_stage, &layer_progress);
+        telemetry, &startup_stage, &layer_progress, &construction_progress);
     failure_status = QWEN38_TARGET_K0_PROMPT_EXECUTION;
     const auto generated = owner->execute_oracle35(
         1, "k0-oracle35", "oracle-05ea3af", &execution_progress);

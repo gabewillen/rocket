@@ -146,6 +146,7 @@ class Oracle35LauncherTests(unittest.TestCase):
         self.assertEqual(set(module.EXECUTION_STAGES), set(range(17)))
         self.assertEqual(set(module.LAYER_EXECUTION_STAGES), set(range(10)))
         self.assertEqual(set(module.GDN_GRAPH_STAGES), set(range(11)))
+        self.assertEqual(set(module.STARTUP_CONSTRUCTION_STAGES), set(range(6)))
         error = module.NativeRunStatusError(
             41, execution_stage=7, execution_row=34, execution_layer=47,
             execution_layer_stage=8, gdn_graph_stage=9)
@@ -162,6 +163,14 @@ class Oracle35LauncherTests(unittest.TestCase):
                           unknown.execution_layer_stage,
                           unknown.gdn_graph_stage),
                          ("unknown", -1, -1, "unknown", "unknown"))
+        startup = module.NativeRunStatusError(
+            32, startup_construction_stage=4)
+        self.assertEqual(startup.startup_construction_stage,
+                         "executor_ownership_validation")
+        self.assertEqual(
+            module.NativeRunStatusError(
+                32, startup_construction_stage=99).startup_construction_stage,
+            "unknown")
 
     def test_nested_slab_cause_is_bounded_and_published(self):
         inner = module.SlabError("private artifact path")
@@ -220,6 +229,7 @@ class Oracle35LauncherTests(unittest.TestCase):
             "execution_stage", "execution_row", "execution_layer",
             "execution_layer_stage",
             "gdn_graph_stage",
+            "startup_construction_stage",
         })
 
 

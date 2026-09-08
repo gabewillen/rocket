@@ -11,6 +11,7 @@
 #include <string_view>
 
 #include "decode/target_k0_executor.h"
+#include "decode/target_k0_startup_progress.h"
 #include "model/target_slab_owner.h"
 #include "mtp/graph_runtime.h"
 #include "pair_reduce/pair_reduce.h"
@@ -58,7 +59,9 @@ class NativeTokenIoOwner final : public decode::TargetK0TokenIoPort {
       pair_reduce::Transport& embedding_transport,
       mtp::WinnerExchangePort& winner_exchange,
       pair_reduce::OtelStageSink& telemetry,
-      TokenIoArtifactRoots roots);
+      TokenIoArtifactRoots roots,
+      decode::TargetK0StartupConstructionStage* construction_progress =
+          nullptr);
   ~NativeTokenIoOwner();
   NativeTokenIoOwner(const NativeTokenIoOwner&) = delete;
   NativeTokenIoOwner& operator=(const NativeTokenIoOwner&) = delete;

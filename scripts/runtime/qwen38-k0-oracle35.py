@@ -81,6 +81,12 @@ GDN_GRAPH_STAGES = {
     6: "output_quantize", 7: "output_projection", 8: "output_scale",
     9: "launch_check", 10: "output_publication",
 }
+STARTUP_CONSTRUCTION_STAGES = {
+    0: "none", 1: "dependency_validation",
+    2: "token_io_pair_reduce_registration",
+    3: "tokenizer_reauthentication",
+    4: "executor_ownership_validation", 5: "final_publication",
+}
 
 
 class NativeRunStatusError(RuntimeError):
@@ -88,7 +94,8 @@ class NativeRunStatusError(RuntimeError):
                  physical_layer: int = -1, gdn_owner_substage: int = 0,
                  moe_aot_cuda_failure: int = 0, execution_stage: int = 0,
                  execution_row: int = -1, execution_layer: int = -1,
-                 execution_layer_stage: int = 0, gdn_graph_stage: int = 0):
+                 execution_layer_stage: int = 0, gdn_graph_stage: int = 0,
+                 startup_construction_stage: int = 0):
         self.stage = NATIVE_STATUS_STAGES.get(status, "unknown")
         self.physical_substage = PHYSICAL_LAYER_SUBSTAGES.get(
             physical_substage, "unknown")
@@ -107,6 +114,8 @@ class NativeRunStatusError(RuntimeError):
         self.execution_layer_stage = LAYER_EXECUTION_STAGES.get(
             execution_layer_stage, "unknown")
         self.gdn_graph_stage = GDN_GRAPH_STAGES.get(gdn_graph_stage, "unknown")
+        self.startup_construction_stage = STARTUP_CONSTRUCTION_STAGES.get(
+            startup_construction_stage, "unknown")
         super().__init__("native K0 run rejected")
 
 
@@ -141,6 +150,7 @@ class _NativeResult(ctypes.Structure):
         ("execution_layer", ctypes.c_int32),
         ("execution_layer_stage", ctypes.c_int32),
         ("gdn_graph_stage", ctypes.c_int32),
+        ("startup_construction_stage", ctypes.c_int32),
     )
 
 
@@ -206,6 +216,8 @@ def _emit_failure(counter: object, rank: int, phase: str,
             attributes["failure.execution_layer_stage"] = (
                 error.execution_layer_stage)
             attributes["failure.gdn_graph_stage"] = error.gdn_graph_stage
+            attributes["failure.startup_construction_stage"] = (
+                error.startup_construction_stage)
         counter.add(1, attributes)
     except BaseException:
         pass
@@ -285,6 +297,7 @@ def _native_run(args: argparse.Namespace, lease: object,
             result.moe_aot_cuda_failure, result.execution_stage,
             result.execution_row, result.execution_layer,
             result.execution_layer_stage, result.gdn_graph_stage,
+            result.startup_construction_stage,
         )
     return result
 
@@ -317,6 +330,8 @@ def _snapshot(result: _NativeResult) -> dict[str, object]:
             result.execution_layer_stage, "unknown"),
         "gdn_graph_stage": GDN_GRAPH_STAGES.get(result.gdn_graph_stage,
                                                  "unknown"),
+        "startup_construction_stage": STARTUP_CONSTRUCTION_STAGES.get(
+            result.startup_construction_stage, "unknown"),
     }
 
 
@@ -380,6 +395,8 @@ def worker(args: argparse.Namespace) -> int:
                 physical["execution_layer"] = error.execution_layer
             physical["execution_layer_stage"] = error.execution_layer_stage
             physical["gdn_graph_stage"] = error.gdn_graph_stage
+            physical["startup_construction_stage"] = (
+                error.startup_construction_stage)
         print(json.dumps({"schema": SCHEMA, "valid": False, "complete": False,
                           "rank": args.rank, "phase": phase,
                           "failure_class": failure["class"],

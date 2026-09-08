@@ -157,7 +157,8 @@ std::unique_ptr<NativeTokenIoOwner> NativeTokenIoOwner::create(
     int device, int rank, void* accepted_loader_lease_handle,
     pair_reduce::Transport& embedding_transport,
     mtp::WinnerExchangePort& winner_exchange,
-    pair_reduce::OtelStageSink& telemetry, TokenIoArtifactRoots roots) {
+    pair_reduce::OtelStageSink& telemetry, TokenIoArtifactRoots roots,
+    decode::TargetK0StartupConstructionStage* construction_progress) {
   const auto started = Clock::now();
   auto impl = std::make_unique<Impl>();
   impl->device = device;
@@ -179,6 +180,10 @@ std::unique_ptr<NativeTokenIoOwner> NativeTokenIoOwner::create(
       throw std::invalid_argument("K0 embedding transport identity changed");
     impl->roots = authenticated_roots;
     impl->winner_exchange = &winner_exchange;
+    decode::target_k0_enter_startup_construction(
+        construction_progress,
+        decode::TargetK0StartupConstructionStage::
+            kTokenIoPairReduceRegistration);
     impl->embedding_reduce = std::make_unique<pair_reduce::PairReduce>(
         embedding_transport, telemetry);
     const auto& publication = impl->slab->publication();
