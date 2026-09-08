@@ -1,0 +1,144 @@
+---
+title: "Pinned vLLM K0 oracle captures all 51 Qwen3.8 boundaries"
+description: "The fixed 35-token coding prompt produced a complete lossless target-model oracle after the capture state was extended across two chunked forwards."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, numerics, runtime, baseline]
+verdict: accepted
+rocket: "#numerics"
+---
+
+**Question.** Can the pinned vLLM target produce a complete, authenticated K0 reference artifact for later Rocket parity checks?
+
+| setup | value |
+| --- | --- |
+| nodes | `gx10-5e36` and `gx10-2a13` |
+| kernel | `6.17.13-rocket64k`, 64 KiB |
+| tested commit | `a1794d50beec7a2b5276ca1fde7ecf45cabb6d18` |
+| vLLM image | `vllm/vllm-openai:qwen38-flash-next` |
+| image ID | `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| image digest | `vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8` |
+| vLLM runtime | `v0.1.dev20073+g8e685d198` |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| model source overlay | Mia `c2325b22602b51a5faf55fc2bebccc34f3f80b9f` |
+| NVFP4 overlay manifest | `9fb50176ccfc8a916e33e85152be54e8aca60b174a92298fa0b82ff06051929b` |
+| NVFP4 overlay payload | `57c5f07d518d302349c1f0f6f8ae75276ae9de602a8b6faadce4faf98a198d6f` |
+| NVFP4 quant config | `085c9a625bd271d1252b1298862fb7f898c14af558eb9968e5f1a0bcf908ad9b` |
+| execution | TP2, EP, K0, eager, chunked prefill, greedy, seed 0 |
+
+```bash
+cd /home/glwillen/Development/rocket-whole-decoder-worktree &&
+test "$(git rev-parse HEAD)" = a1794d50beec7a2b5276ca1fde7ecf45cabb6d18 &&
+test ! -e /home/glwillen/calibration/qwen38-k0-oracle-a1794d5-01 &&
+scripts/numerics/qwen38-expanded-calibration.sh \
+  --output-dir /home/glwillen/calibration/qwen38-k0-oracle-a1794d5-01 \
+  --oracle-k0 \
+  --launch \
+  --mia-source /home/glwillen/Development/Qwen3.8-Flash-Next-Dual-DGX-Sparks \
+  --nvfp4-artifact-dir /home/glwillen/calibration/qwen38-all-eligible-nvfp4-artifacts/23d2c39e9c2cf36a832cb1750f6542fa46f11f1befe195d80c082051a5a772b4 \
+  --worker-hf-cache /home/glwillen/.cache/huggingface \
+  --gpu-memory-utilization 0.60
+```
+
+| request | value |
+| --- | --- |
+| prompt | fixed coding prompt below |
+| token count | 35 |
+| token IDs | `7734,264,12654,709,1510,284,36951,1393,25,514,8,1411,1744,63,421,13081,24959,3559,220,17,321,5533,8818,12436,685,310,279,9057,3578,13,3301,1132,279,709,13` |
+| request SHA-256 | `8e9240e72b84c5682989486e6010b99b030d08d2308d58a7c26da32ded02646b` |
+| forward chunks | 32 tokens, then 3 tokens |
+| repetitions | one; cross-run artifact hash variance unmeasured |
+
+```text
+Write a Python function `is_prime(n: int) -> bool` that handles integers below 2 and uses trial division up to the square root. Return only the function.
+```
+
+| lifecycle | result |
+| --- | --- |
+| `fd12c3400c976c10258c161adae9eabe0d9d8d80` | rejected: the inner embedding hook was skipped because vLLM supplied `inputs_embeds`; logits rejected the unauthenticated forward |
+| outer failure SHA-256 | `7b1b726221f5d2154fddbf287d4e29ca2303d46903a9c86f2eb45fc28928fa00` |
+| capture failure SHA-256 | `5ccd073d8741fea4ec1c9a9e7a74bf99f9b9443cf351d3e13fe00e1c7c0bbfad` |
+| `a1794d50beec7a2b5276ca1fde7ecf45cabb6d18` | accepted: outer embedding authenticated the request, ordered tensors accumulated across both forwards, and final logits consumed generation 0 once |
+
+| artifact | shape | dtype | bytes | SHA-256 |
+| --- | --- | --- | ---: | --- |
+| embedding | `[35, 2560]` | bfloat16 | 179200 | `c358d186071a8c428c4d281f3f5dbabcf3b0c0f9fe915fd39b59636da52f9be1` |
+| layer.00 | `[35, 10240]` | bfloat16 | 716800 | `ec445d6e1ce0cc9c80539dfdca817ff5257ee4d2207a8401edb044c690dce1eb` |
+| layer.01 | `[35, 10240]` | bfloat16 | 716800 | `3c945e24ebb993b7594ffdb0bc957e9bd7f6f2b1e8a813d94c54f6e3f2d36aed` |
+| layer.02 | `[35, 10240]` | bfloat16 | 716800 | `6503eeeb3c70c9c1c163aca08dcdb4e1df7ca997699f2f20946265a72069d2fe` |
+| layer.03 | `[35, 10240]` | bfloat16 | 716800 | `aa2d2a1454f0654ea2082d12e7e3284cad9304a7ede124303f99c52bbf9cddbe` |
+| layer.04 | `[35, 10240]` | bfloat16 | 716800 | `23e9976183b2bcf9d1b182c8df65195d81db69ecf496a2c1ab697ef05e4175dc` |
+| layer.05 | `[35, 10240]` | bfloat16 | 716800 | `b65f60a0ce2d619381ca95051e257c50a2c54f3701d04b520b56d688564cbdd8` |
+| layer.06 | `[35, 10240]` | bfloat16 | 716800 | `c1e65ea42cf629b0f5e1f540ab04c5007f6c954a8aec12a2db02c7eb655cb693` |
+| layer.07 | `[35, 10240]` | bfloat16 | 716800 | `d810f27d120ffd5e9f559eab66804f72c3bbb0879fc36c3872d3b764bc317466` |
+| layer.08 | `[35, 10240]` | bfloat16 | 716800 | `0ee78527278daef3f19524bbc4a90396a37e2b1aa462596e5d63d0e5e4329e91` |
+| layer.09 | `[35, 10240]` | bfloat16 | 716800 | `6a9cbc143a2d84ee27c7ed265899eb853693a053f440c7ff0665b87c07cf451d` |
+| layer.10 | `[35, 10240]` | bfloat16 | 716800 | `b6771ad4d1480c5d15a7b1188447466739c462f46833ed1a4ecfa123ce3159b1` |
+| layer.11 | `[35, 10240]` | bfloat16 | 716800 | `a7459013116b6450ae296f6e8abe3a5fa3cb908737837ee2a70d95373b2d8698` |
+| layer.12 | `[35, 10240]` | bfloat16 | 716800 | `2e063f7ae6c8e7959f3a524500d983f36b2e168e1b7332fcce40ed085b726d42` |
+| layer.13 | `[35, 10240]` | bfloat16 | 716800 | `5c8941306d71d507610679e484d495fd95d76478a61fe9f9071e59c0d47c0311` |
+| layer.14 | `[35, 10240]` | bfloat16 | 716800 | `e0f41ef6911e9ee77c2b9a1aabcef6be4d0cdd8ab9cc88a85626b2f935a14631` |
+| layer.15 | `[35, 10240]` | bfloat16 | 716800 | `31b8e4d6edc19fb2d138954c13e1082aa6b8285a1a94f3d233a41e5203bd68af` |
+| layer.16 | `[35, 10240]` | bfloat16 | 716800 | `ccaffe02b6f4a72d9741b32adcef0a85f87a7c02662fdcc49165ca2a4e9ffe81` |
+| layer.17 | `[35, 10240]` | bfloat16 | 716800 | `ab05ca0e8df461036d8de3ac6256de47309afc9dc5bc695867a0bcb09b3841e8` |
+| layer.18 | `[35, 10240]` | bfloat16 | 716800 | `6d69eb3c6179b58a0f6dd9bcc540242ae1fc1fe5ade8ec2bb11dd6d219905364` |
+| layer.19 | `[35, 10240]` | bfloat16 | 716800 | `5244a345c0cca9c724c8449a7ffa4f3bd895e269e9e149029aafde7c26c2b28b` |
+| layer.20 | `[35, 10240]` | bfloat16 | 716800 | `5b3724d4fb3c0ffaefe8272882cbfe67603661d04f52c4c967a557844aef49b1` |
+| layer.21 | `[35, 10240]` | bfloat16 | 716800 | `4e3d4e9c331ccf534dbb699981e47fad12a44464cefe8b020c97457596ff44d7` |
+| layer.22 | `[35, 10240]` | bfloat16 | 716800 | `31ddc21eff847d271142909c119398bab45f3297c6378ae66ea56a150eb3b5b1` |
+| layer.23 | `[35, 10240]` | bfloat16 | 716800 | `430ea73f2ad0cf6b90d9f9624e83e255a228240a27a4805e513456cca832cf31` |
+| layer.24 | `[35, 10240]` | bfloat16 | 716800 | `2ea8a8eaf11cdfb99e44e3cb18bea9c0865361c0b2e7adf0dbc08b9feffc11c5` |
+| layer.25 | `[35, 10240]` | bfloat16 | 716800 | `a7853448adc3f3c3c3c1f9faf7a4421559b86473c5518fdafb297b51d03011fd` |
+| layer.26 | `[35, 10240]` | bfloat16 | 716800 | `d13bd07e0e51b51ad18c42a5d0b4feed61027ffbd5b24bb62cf23e963906abc8` |
+| layer.27 | `[35, 10240]` | bfloat16 | 716800 | `6154321e2d3306ab73740953ff70870192721dd6c150f7888fc5deae00b9223b` |
+| layer.28 | `[35, 10240]` | bfloat16 | 716800 | `37bb8be3c604553cdbbe481faff58009fe4ed30ad300b8ca78a530d863ae4944` |
+| layer.29 | `[35, 10240]` | bfloat16 | 716800 | `d3bde996eec0c1582ce3115ebe84ebc7ec88965f9f2a7a8c0d3bbabda689cb69` |
+| layer.30 | `[35, 10240]` | bfloat16 | 716800 | `532753493a2375f4ad0c86fd50c2d3be9bc661d6b304d789a218702034458fe2` |
+| layer.31 | `[35, 10240]` | bfloat16 | 716800 | `3b436d452d41ae4a746335fc33ce861cb21af07ff277338615141f41f3c0d64b` |
+| layer.32 | `[35, 10240]` | bfloat16 | 716800 | `df30cd05ac99c41bd4b77dc7acb7ea6a94e9e366cc72c3aa4cc503ec73f97e55` |
+| layer.33 | `[35, 10240]` | bfloat16 | 716800 | `3ccba0065d52f4ca3b313899656cb45525a870650b2f29696177b518107e4ac7` |
+| layer.34 | `[35, 10240]` | bfloat16 | 716800 | `082bb8403cdfa9e62f8ee42391c36d6d19ac72ffa28a2a8be6094dc07846f5bd` |
+| layer.35 | `[35, 10240]` | bfloat16 | 716800 | `e72aab8b17dee36690063ea68233b5bbc7ed128696992cca2060e23b22fe473a` |
+| layer.36 | `[35, 10240]` | bfloat16 | 716800 | `c98b5a942637906bd334670c9ef7a9adf7f93c0abbc0b58f67c4533676f94b1d` |
+| layer.37 | `[35, 10240]` | bfloat16 | 716800 | `dc3d4c745f4ed5a2316e35f06a5a978362c73fbcef7651a5968fd7b5d05b96db` |
+| layer.38 | `[35, 10240]` | bfloat16 | 716800 | `5cce00124b647daf6ec8b47740d48d90f1ae2af0a036049d17f5f803facf24af` |
+| layer.39 | `[35, 10240]` | bfloat16 | 716800 | `37f7606c536b650c5349121c8c5b9536a4d45d386cb6889cae6a0e5b79c4469c` |
+| layer.40 | `[35, 10240]` | bfloat16 | 716800 | `db3004270ec3459b6ac0dc1be8d2ece6cb0f9f66254b169296d4e39dcdb85b2d` |
+| layer.41 | `[35, 10240]` | bfloat16 | 716800 | `5c4a87fd546ceee197a028cb140e7ba9552b9af82dc877f115fa98fa5960397e` |
+| layer.42 | `[35, 10240]` | bfloat16 | 716800 | `7d131637186d63fc0eac9edd23c602ead34a870783fe6db69adc36066c4de7ef` |
+| layer.43 | `[35, 10240]` | bfloat16 | 716800 | `6065da4686de41214776344cdc05cd72a83064cd9c69a725fb4a27a486f27bb3` |
+| layer.44 | `[35, 10240]` | bfloat16 | 716800 | `c8299380752f632b3471c1f778b769b2c5a73985dbdccdffc255612a1c2c4dcd` |
+| layer.45 | `[35, 10240]` | bfloat16 | 716800 | `a65787e4f527753b3b1d45aa161d1ff500e22321679a2d684263811b322afdfe` |
+| layer.46 | `[35, 10240]` | bfloat16 | 716800 | `2522e9e481d5e87624e3bfb2a85ffbf02e7be17c8885306c6bf0947a8759b1ff` |
+| layer.47 | `[35, 10240]` | bfloat16 | 716800 | `40fb8be363118c63262e38d9d94f91e6cd24102d72149acca054446719f61f3b` |
+| final_norm | `[35, 2560]` | bfloat16 | 179200 | `0a562c4b0b435443894c95ce8993280f921c9da19eade55ad7da23f549fb01df` |
+| logits | `[1, 248320]` | bfloat16 | 496640 | `e31515cfcd98b1fed61f90ae287c9cf97c7a2a52e3fcf8feef956910ff4dc9ab` |
+
+| result | value |
+| --- | --- |
+| artifact count | 51 / 51 |
+| capture manifest SHA-256 | `05ea3af1c4694a9c035ce2fe9ce006acc58881df0fe86771b1846f4bd8e5f48b` |
+| oracle result SHA-256 | `9044036d008b9c083fd3eef7adf711b13caf0a084c040bcdc342fda52434f302` |
+| response SHA-256 | `a712ea657109f42e1faf68a5a066d9b3988a87ead34421ea23f2180d625f3340` |
+| greedy token | `248046` |
+| greedy logit | 16.125 BF16 |
+| detokenized output | empty string for token `248046` |
+| top-20 | captured in descending logit order |
+| rank argv | head expected = actual; worker expected = local = remote |
+| cleanup | both containers absent, both compute tables empty, rank1 scratch absent |
+
+```text
+ROCKET_QWEN38_K0_ORACLE_COMPLETE {"artifact_count": 51, "greedy_token_id": 248046, "schema": "rocket.qwen38.k0-target-oracle.v1"}
+K0 target oracle complete: /home/glwillen/calibration/qwen38-k0-oracle-a1794d5-01
+```
+
+**Verdict.** Accepted for reference-oracle artifact completeness. This was one deterministic request, cross-run hash variance remains unmeasured, performance variance was outside scope, and no Rocket accuracy claim follows from this result.
+
+**Next.**
+
+- Run Rocket on the same 35 token IDs.
+- Compare every Rocket boundary against these 51 lossless artifacts before profiling generation.
+
+**Reopen if.**
+
+- Rebuild the oracle when upstream vLLM changes the Qwen3.8 embedding, chunked-forward, or logits lifecycle, or when NVIDIA publishes a different checkpoint revision or container image.
