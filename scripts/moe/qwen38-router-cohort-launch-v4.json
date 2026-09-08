@@ -1,0 +1,62 @@
+{
+  "schema": "rocket.qwen38.router-cohort-launch.v1",
+  "image": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
+  "entrypoint": "python3",
+  "run_label": "d9643b0",
+  "driver": {
+    "path": "qwen38-router-cohort-v4-c16-20260908-01/qwen38-router-cohort-live-d9643b0.py",
+    "sha256": "15e687447d835356d90326b626bbfb7aa90dbd30399d2866f95f8d058559345c"
+  },
+  "model_telemetry": {
+    "path": "qwen38-router-cohort-v4-c16-20260908-01/artifacts/model_telemetry-barrier.py",
+    "sha256": "7cd73aef5facc31c62835d67c2f3cf30f1a84b3862d07f3ee7e1fed699f76542"
+  },
+  "common_artifacts": {
+    "config": {"path": "qwen38-router-cohort-k4-20260907-01/artifacts/config_nvfp4_patched.json", "sha256": "bbdb01bd22e7e92564097c60c6a4ff0a1826694067080863e6b4a9130a450685"},
+    "modelopt": {"path": "qwen38-router-cohort-k4-20260907-01/artifacts/modelopt_patched.py", "sha256": "6b1a1eb03c66dd51e239001be551f60ec1115681b1804e28d732c19b87b75228"},
+    "ple": {"path": "qwen38-router-cohort-k4-20260907-01/artifacts/ple_layer_patched.py", "sha256": "fae9fd5242748e8cdb314445a25ad628a0ce335cf26f794623f8679497a65186"},
+    "qsa_nvidia": {"path": "qwen38-router-cohort-k4-20260907-01/artifacts/qsa_nvidia_patched.py", "sha256": "ee5de40742ad48a6064ea24b99a285ff69c47d57bbb170f57c4eef71567a1df3"},
+    "qsa_ops": {"path": "qwen38-router-cohort-k4-20260907-01/artifacts/qsa_ops_patched.py", "sha256": "0669d6334f58a624c89c15f3e46c90f28e59b0b913507101dec1c5765e3c3b12"},
+    "weight_utils": {"path": "qwen38-router-cohort-k4-20260907-01/artifacts/weight_utils_64k.py", "sha256": "cc9c1cfd8e8d556207d8c1d6e1e3b26aa06861e817351da2564f96a793da1d20"}
+  },
+  "nodes": {
+    "head": {
+      "host_ip": "192.168.100.10",
+      "hf_cache": "${HOME}/.cache/huggingface",
+      "overlay": {"path": "qwen38-linear-nvfp4-artifacts/64539e4a5a4b533aa143d20e055ae73ebd10b21f05dbd422847a9be30e56c4e5", "manifest_sha256": "e8431f631774cabe72bed5c2a582dc404fae811485276c37d4e1431bd1ecb117", "quant_sha256": "1d938f08167b53b66d12399ff37155d458ff74f9efbde08d52d5dde0415963f4"},
+      "bind_destination_order": [
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/weight_utils.py",
+        "/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/model.py",
+        "/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py",
+        "/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/qsa.py",
+        "/root/.cache/vllm",
+        "/work/qwen38-router-cohort-live.py",
+        "/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py",
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/modelopt.py",
+        "/root/.cache/huggingface",
+        "/root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47/config.json",
+        "/root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47/hf_quant_config.json",
+        "/rocket/qwen38-linear-nvfp4"
+      ]
+    },
+    "worker": {
+      "host_ip": "192.168.100.11",
+      "hf_cache": "vllm-fn-hf",
+      "overlay": {"path": "qwen38-linear-nvfp4-live-20260907-04/nvfp4-artifact", "manifest_sha256": "e8431f631774cabe72bed5c2a582dc404fae811485276c37d4e1431bd1ecb117", "quant_sha256": "1d938f08167b53b66d12399ff37155d458ff74f9efbde08d52d5dde0415963f4"},
+      "bind_destination_order": [
+        "/rocket/qwen38-linear-nvfp4",
+        "/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py",
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/modelopt.py",
+        "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/weight_utils.py",
+        "/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py",
+        "/root/.cache/huggingface",
+        "/root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47/config.json",
+        "/root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47/hf_quant_config.json",
+        "/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/model.py",
+        "/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/qsa.py",
+        "/root/.cache/vllm",
+        "/work/qwen38-router-cohort-live.py"
+      ]
+    }
+  }
+}
