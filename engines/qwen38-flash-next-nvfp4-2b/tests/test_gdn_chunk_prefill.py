@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import sys
+import hashlib
 import types
 import unittest
 import inspect
+import json
+import sys
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from qwen38_slab.gdn_chunk_prefill import (
@@ -15,15 +19,17 @@ from qwen38_slab.gdn_chunk_prefill import (
     GdnChunkPrefillError,
     GdnChunkPrefillTensors,
     ORACLE_MANIFEST_SHA256,
-    execute_authenticated_sm121a_chunk_prefill,
+    REAL_TENSOR_BUNDLE_SCHEMA,
+    execute_authenticated_real_tensor_bundle,
 )
 
 
 class Tensor:
-    def __init__(self, shape, dtype, device="cuda:0"):
+    def __init__(self, shape, dtype, device="cuda:0", payload=b"tensor"):
         self.shape = shape
         self.dtype = dtype
         self.device = device
+        self.payload = payload
 
     def is_contiguous(self):
         return True
@@ -37,11 +43,22 @@ class Tensor:
     def view(self, _dtype):
         return self
 
+    def clone(self):
+        return Tensor(self.shape, self.dtype, self.device, self.payload)
+
+    def reshape(self, shape):
+        self.shape = tuple(shape)
+        return self
+
+    def to(self, device):
+        self.device = device
+        return self
+
     def cpu(self):
         return self
 
     def numpy(self):
-        return types.SimpleNamespace(tobytes=lambda: repr(self.shape).encode())
+        return types.SimpleNamespace(tobytes=lambda: self.payload)
 
 
 def tensors(rows=35):
@@ -94,7 +111,7 @@ class Backend:
 
 
 class GdnChunkPrefillTests(unittest.TestCase):
-    def test_executable_boundary_owns_tensors_and_runs_supported_backend(self):
+    def test_real_tensor_bundle_owns_tensors_and_runs_supported_backend(self):
         allocations = []
         torch = types.SimpleNamespace(
             bfloat16="bfloat16",
@@ -112,41 +129,85 @@ class GdnChunkPrefillTests(unittest.TestCase):
             allocations.append(value)
             return value
 
-        torch.full = allocate
-        torch.zeros = allocate
         torch.empty = allocate
         torch.tensor = lambda values, *, dtype, device: allocate(
             (len(values),), dtype=dtype, device=device
         )
-        backend = Backend()
-        result = execute_authenticated_sm121a_chunk_prefill(
-            rank=0,
-            layer=0,
-            rows=35,
-            oracle_manifest_sha256=ORACLE_MANIFEST_SHA256,
-            torch_module=torch,
-            backend=backend,
+        torch.frombuffer = lambda payload, *, dtype: Tensor(
+            (len(payload),), dtype, device="cpu", payload=bytes(payload)
         )
+        backend = Backend()
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = self._real_tensor_bundle(Path(temporary))
+            result = execute_authenticated_real_tensor_bundle(
+                bundle, torch_module=torch, backend=backend
+            )
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["implementation"], FLASHINFER_GDN_CHUNK_IDENTITY)
         self.assertEqual(result["telemetry"]["execution.domain"], "chunk_prefill")
         self.assertEqual(allocations[-1], ("sync", 0))
         self.assertEqual(len(backend.calls), 1)
-        source = inspect.getsource(execute_authenticated_sm121a_chunk_prefill)
+        source = inspect.getsource(execute_authenticated_real_tensor_bundle)
         self.assertNotIn("data_ptr", source)
         self.assertNotIn("ctypes", source)
 
-    def test_executable_boundary_rejects_identity_before_allocation(self):
-        torch = types.SimpleNamespace()
-        with self.assertRaises(GdnChunkPrefillError):
-            execute_authenticated_sm121a_chunk_prefill(
-                rank=0,
-                layer=0,
-                rows=35,
-                oracle_manifest_sha256="0" * 64,
-                torch_module=torch,
-                backend=Backend(),
+    def test_real_tensor_bundle_rejects_payload_and_identity_mutations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = self._real_tensor_bundle(Path(temporary))
+            (bundle / "q.bin").write_bytes(b"bad")
+            with self.assertRaises(GdnChunkPrefillError):
+                execute_authenticated_real_tensor_bundle(
+                    bundle, torch_module=types.SimpleNamespace(), backend=Backend()
+                )
+
+    @staticmethod
+    def _real_tensor_bundle(root: Path) -> Path:
+        rows = 35
+        layouts = {
+            "q": ("bfloat16", (rows, 8, 128), 2),
+            "k": ("bfloat16", (rows, 8, 128), 2),
+            "v": ("bfloat16", (rows, 24, 128), 2),
+            "log_decay": ("float32", (rows, 24), 4),
+            "beta": ("float32", (rows, 24), 4),
+            "initial_state": ("float32", (1, 24, 128, 128), 4),
+        }
+        entries = []
+        payloads = {}
+        for index, (name, (dtype, shape, width)) in enumerate(layouts.items(), 1):
+            size = width
+            for extent in shape:
+                size *= extent
+            payload = bytes([index]) * size
+            payloads[f"{name}.bin"] = payload
+            entries.append(
+                {
+                    "name": name,
+                    "file": f"{name}.bin",
+                    "dtype": dtype,
+                    "shape": list(shape),
+                    "bytes": size,
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
             )
+        manifest = {
+            "schema": REAL_TENSOR_BUNDLE_SCHEMA,
+            "oracle_manifest_sha256": ORACLE_MANIFEST_SHA256,
+            "implementation": FLASHINFER_GDN_CHUNK_IDENTITY,
+            "rank": 0,
+            "layer": 0,
+            "rows": rows,
+            "tensors": entries,
+        }
+        key = hashlib.sha256(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        manifest["artifact_key"] = key
+        bundle = root / key
+        bundle.mkdir()
+        for filename, payload in payloads.items():
+            (bundle / filename).write_bytes(payload)
+        (bundle / "manifest.json").write_text(json.dumps(manifest))
+        return bundle
 
     def test_authenticated_oracle35_call_publishes_exact_owned_outputs(self):
         backend, tracer = Backend(), Tracer()

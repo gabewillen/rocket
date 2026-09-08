@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 PINNED_VLLM_COMMIT = "8e685d198"
@@ -29,6 +30,7 @@ KEY_HEADS = 8
 VALUE_HEADS = 24
 HEAD_DIM = 128
 ATTENTION_SCALE = HEAD_DIM**-0.5
+REAL_TENSOR_BUNDLE_SCHEMA = "rocket.qwen38.gdn-prefill-tensors.v1"
 
 
 class GdnChunkPrefillError(RuntimeError):
@@ -249,69 +251,137 @@ def _tensor_sha256(tensor: object, torch_module: object) -> str:
     return hashlib.sha256(detached.cpu().numpy().tobytes()).hexdigest()
 
 
-def execute_authenticated_sm121a_chunk_prefill(
+_REAL_TENSOR_LAYOUTS = {
+    "q": ("bfloat16", lambda rows: (rows, KEY_HEADS, HEAD_DIM)),
+    "k": ("bfloat16", lambda rows: (rows, KEY_HEADS, HEAD_DIM)),
+    "v": ("bfloat16", lambda rows: (rows, VALUE_HEADS, HEAD_DIM)),
+    "log_decay": ("float32", lambda rows: (rows, VALUE_HEADS)),
+    "beta": ("float32", lambda rows: (rows, VALUE_HEADS)),
+    "initial_state": (
+        "float32",
+        lambda _rows: (1, VALUE_HEADS, HEAD_DIM, HEAD_DIM),
+    ),
+}
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def load_authenticated_real_tensor_bundle(
+    bundle: Path, torch_module: object
+) -> tuple[int, int, GdnChunkPrefillTensors]:
+    """Load a content-addressed real-model tensor bundle onto CUDA device 0."""
+    try:
+        manifest = json.loads((bundle / "manifest.json").read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GdnChunkPrefillError("GDN prefill tensor bundle unavailable") from exc
+    if not isinstance(manifest, dict):
+        raise GdnChunkPrefillError("GDN prefill tensor manifest changed")
+    digest_input = dict(manifest)
+    artifact_key = digest_input.pop("artifact_key", None)
+    observed_key = hashlib.sha256(_canonical_json(digest_input)).hexdigest()
+    rank, layer, rows = (
+        manifest.get("rank"),
+        manifest.get("layer"),
+        manifest.get("rows"),
+    )
+    if (
+        artifact_key != observed_key
+        or bundle.name != observed_key
+        or manifest.get("schema") != REAL_TENSOR_BUNDLE_SCHEMA
+        or manifest.get("oracle_manifest_sha256") != ORACLE_MANIFEST_SHA256
+        or manifest.get("implementation") != FLASHINFER_GDN_CHUNK_IDENTITY
+        or isinstance(rank, bool)
+        or rank not in (0, 1)
+        or isinstance(layer, bool)
+        or not isinstance(layer, int)
+        or not 0 <= layer < 48
+        or layer % 4 == 3
+        or isinstance(rows, bool)
+        or rows not in ORACLE_PREFILL_ROWS
+        or not isinstance(manifest.get("tensors"), list)
+    ):
+        raise GdnChunkPrefillError("GDN prefill tensor identity changed")
+    entries = {
+        entry.get("name"): entry
+        for entry in manifest["tensors"]
+        if isinstance(entry, dict)
+    }
+    if set(entries) != set(_REAL_TENSOR_LAYOUTS) or len(entries) != len(
+        manifest["tensors"]
+    ):
+        raise GdnChunkPrefillError("GDN prefill tensor inventory changed")
+
+    loaded: dict[str, object] = {}
+    for name, (dtype_name, shape_fn) in _REAL_TENSOR_LAYOUTS.items():
+        entry = entries[name]
+        shape = shape_fn(rows)
+        element_bytes = 2 if dtype_name == "bfloat16" else 4
+        expected_bytes = math.prod(shape) * element_bytes
+        filename = entry.get("file")
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or entry.get("dtype") != dtype_name
+            or tuple(entry.get("shape", ())) != shape
+            or entry.get("bytes") != expected_bytes
+        ):
+            raise GdnChunkPrefillError("GDN prefill tensor layout changed")
+        tensor_path = bundle / filename
+        try:
+            if tensor_path.is_symlink():
+                raise GdnChunkPrefillError("GDN prefill tensor path changed")
+            payload = tensor_path.read_bytes()
+        except OSError as exc:
+            raise GdnChunkPrefillError("GDN prefill tensor unavailable") from exc
+        if (
+            len(payload) != expected_bytes
+            or hashlib.sha256(payload).hexdigest() != entry.get("sha256")
+        ):
+            raise GdnChunkPrefillError("GDN prefill tensor payload changed")
+        dtype = getattr(torch_module, dtype_name)
+        loaded[name] = (
+            torch_module.frombuffer(bytearray(payload), dtype=dtype)
+            .clone()
+            .reshape(shape)
+            .to("cuda:0")
+        )
+    loaded["output"] = torch_module.empty(
+        (rows, VALUE_HEADS, HEAD_DIM), dtype=torch_module.bfloat16, device="cuda:0"
+    )
+    loaded["final_state"] = torch_module.empty(
+        (1, VALUE_HEADS, HEAD_DIM, HEAD_DIM),
+        dtype=torch_module.float32,
+        device="cuda:0",
+    )
+    loaded["cu_seqlens"] = torch_module.tensor(
+        [0, rows], dtype=torch_module.int64, device="cuda:0"
+    )
+    return rank, layer, GdnChunkPrefillTensors(**loaded)
+
+
+def execute_authenticated_real_tensor_bundle(
+    bundle: Path,
     *,
-    rank: int,
-    layer: int,
-    rows: int,
-    oracle_manifest_sha256: str,
     torch_module: object | None = None,
     backend: GdnChunkPrefillBackend | None = None,
 ) -> dict[str, object]:
-    """Execute one bounded real chunk-prefill call from Torch-owned tensors.
-
-    This is the process-local executable boundary. It never accepts addresses:
-    every device allocation is a Torch tensor whose ownership remains in this
-    frame through synchronization and digest publication.
-    """
-    if oracle_manifest_sha256 != ORACLE_MANIFEST_SHA256:
-        raise GdnChunkPrefillError("GDN chunk-prefill oracle identity changed")
-    if rows not in ORACLE_PREFILL_ROWS:
-        raise GdnChunkPrefillError("GDN chunk-prefill row count changed")
-
     if torch_module is None:
         import torch as torch_module
+    rank, layer, tensors = load_authenticated_real_tensor_bundle(bundle, torch_module)
     tracer = _ProofTracer()
     implementation = backend or FlashInferSm121GdnChunkBackend()
-    device = "cuda:0"
-    bf16 = torch_module.bfloat16
-    fp32 = torch_module.float32
-    tensors = GdnChunkPrefillTensors(
-        q=torch_module.full(
-            (rows, KEY_HEADS, HEAD_DIM), 0.125, dtype=bf16, device=device
-        ),
-        k=torch_module.full(
-            (rows, KEY_HEADS, HEAD_DIM), -0.25, dtype=bf16, device=device
-        ),
-        v=torch_module.full(
-            (rows, VALUE_HEADS, HEAD_DIM), 0.5, dtype=bf16, device=device
-        ),
-        log_decay=torch_module.full(
-            (rows, VALUE_HEADS), math.log(0.99), dtype=fp32, device=device
-        ),
-        beta=torch_module.full((rows, VALUE_HEADS), 0.5, dtype=fp32, device=device),
-        initial_state=torch_module.zeros(
-            (1, VALUE_HEADS, HEAD_DIM, HEAD_DIM), dtype=fp32, device=device
-        ),
-        output=torch_module.empty(
-            (rows, VALUE_HEADS, HEAD_DIM), dtype=bf16, device=device
-        ),
-        final_state=torch_module.empty(
-            (1, VALUE_HEADS, HEAD_DIM, HEAD_DIM), dtype=fp32, device=device
-        ),
-        cu_seqlens=torch_module.tensor(
-            [0, rows], dtype=torch_module.int64, device=device
-        ),
-    )
-    adapter = AuthenticatedGdnChunkPrefillAdapter(rank, layer, implementation, tracer)
-    output, final_state = adapter.execute(tensors)
+    output, final_state = AuthenticatedGdnChunkPrefillAdapter(
+        rank, layer, implementation, tracer
+    ).execute(tensors)
     torch_module.cuda.synchronize(0)
     return {
         "status": "success",
         "implementation": implementation.implementation_identity,
         "rank": rank,
         "layer": layer,
-        "rows": rows,
+        "rows": tensors.q.shape[0],
         "output_sha256": _tensor_sha256(output, torch_module),
         "final_state_sha256": _tensor_sha256(final_state, torch_module),
         "telemetry": tracer.attributes,
@@ -322,18 +392,10 @@ def executable_main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rank", required=True, type=int)
-    parser.add_argument("--layer", required=True, type=int)
-    parser.add_argument("--rows", required=True, type=int)
-    parser.add_argument("--oracle-manifest-sha256", required=True)
+    parser.add_argument("--tensor-bundle", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
-        result = execute_authenticated_sm121a_chunk_prefill(
-            rank=args.rank,
-            layer=args.layer,
-            rows=args.rows,
-            oracle_manifest_sha256=args.oracle_manifest_sha256,
-        )
+        result = execute_authenticated_real_tensor_bundle(args.tensor_bundle)
     except BaseException:
         print(json.dumps({"status": "error", "stage": "chunk_prefill"}, sort_keys=True))
         return 1
@@ -352,9 +414,11 @@ __all__ = [
     "KEY_HEADS",
     "ORACLE_PREFILL_ROWS",
     "ORACLE_MANIFEST_SHA256",
+    "REAL_TENSOR_BUNDLE_SCHEMA",
     "PINNED_FLASHINFER_VERSION",
     "PINNED_VLLM_COMMIT",
     "VALUE_HEADS",
-    "execute_authenticated_sm121a_chunk_prefill",
+    "execute_authenticated_real_tensor_bundle",
     "executable_main",
+    "load_authenticated_real_tensor_bundle",
 ]
