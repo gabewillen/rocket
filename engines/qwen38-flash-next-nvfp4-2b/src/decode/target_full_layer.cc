@@ -8,7 +8,6 @@
 namespace rocket::qwen38::decode {
 namespace {
 using Clock = std::chrono::steady_clock;
-constexpr int kLayer = 3;
 constexpr std::uint64_t kHiddenBytes = 2 * pair_reduce::kHidden;
 constexpr std::uint64_t kHyperBytes = 4 * kHiddenBytes;
 
@@ -18,15 +17,16 @@ std::uint64_t elapsed_ns(Clock::time_point start) noexcept {
           .count());
 }
 
-void require(bool condition, int rank, const char* message) {
+void require(bool condition, int rank, int layer, const char* message) {
   if (!condition)
     throw DecodeExecutionContractError(
         "qwen38 rank " + std::to_string(rank) +
-        " layer 3 K0 comparator: " + message);
+        " layer " + std::to_string(layer) + " K0 QSA: " + message);
 }
 
-std::string stage(std::string_view name) {
-  return "rocket.qwen38.layer3.composite." + std::string(name);
+std::string stage(int layer, std::string_view name) {
+  return "rocket.qwen38.layer" + std::to_string(layer) +
+         ".composite." + std::string(name);
 }
 }  // namespace
 
@@ -38,19 +38,20 @@ TargetFullLayer::TargetFullLayer(
     : attention_(attention), moe_(moe),
       attention_reducer_(attention_reducer), moe_reducer_(moe_reducer),
       hyperconnection_(hyperconnection), telemetry_(telemetry),
-      rank_(attention.rank()) {
+      rank_(attention.rank()), layer_(attention.layer()) {
   const std::string expected = rank_ == 0 ? "rank0-target" : "rank1-target";
-  require((rank_ == 0 || rank_ == 1) && attention.layer() == kLayer &&
-              moe.rank() == rank_ && moe.layer() == kLayer,
-          rank_, "rank/layer participants changed");
+  require((rank_ == 0 || rank_ == 1) && is_full_attention_layer(layer_) &&
+              moe.rank() == rank_ && moe.layer() == layer_,
+          rank_, layer_, "rank/layer participants changed");
   require(attention.checkpoint_revision() == kFullAttentionCheckpointRevision &&
               moe.checkpoint_revision() == kFullAttentionCheckpointRevision &&
               attention.slab_key() == expected && moe.slab_key() == expected,
-          rank_, "checkpoint or target slab identity changed");
+          rank_, layer_, "checkpoint or target slab identity changed");
   require(attention_reducer.rank() == rank_ &&
               attention_reducer.world_size() == 2 &&
               moe_reducer.rank() == rank_ && moe_reducer.world_size() == 2,
-          rank_, "both PairReduce participants must bind the same TP2 rank");
+          rank_, layer_,
+          "both PairReduce participants must bind the same TP2 rank");
 }
 
 TargetFullLayerResult TargetFullLayer::execute(
@@ -78,15 +79,15 @@ TargetFullLayerResult TargetFullLayer::execute(
          elapsed_ns(lifecycle), 0);
   };
   try {
-    require(!faulted_, rank_, "faulted transition cannot replay");
-    require(generation != 0 && generation == last_generation_ + 1, rank_,
+    require(!faulted_, rank_, layer_, "faulted transition cannot replay");
+    require(generation != 0 && generation == last_generation_ + 1, rank_, layer_,
             "generation must increase by one");
-    attention::validate_target_qsa_state_view(qsa_state, rank_, kLayer,
+    attention::validate_target_qsa_state_view(qsa_state, rank_, layer_,
                                                generation);
     require(materialized_pre_layer && attention_input && attention_injection &&
                 reduced_attention && post_attention_hidden && moe_input &&
                 moe_injection && reduced_moe && post_layer && stream,
-            rank_, "all caller-owned c1 buffers and stream are required");
+            rank_, layer_, "all caller-owned c1 buffers and stream are required");
 
     auto start = Clock::now();
     hyperconnection_.mix(materialized_pre_layer, attention_input,
@@ -98,7 +99,7 @@ TargetFullLayerResult TargetFullLayer::execute(
     start = Clock::now();
     attention_.launch(attention_input, qsa_state, generation, 1, stream);
     hyperconnection_.synchronize(stream);
-    require(attention_.projected_output(), rank_,
+    require(attention_.projected_output(), rank_, layer_,
             "QSA participant published no rank-local partial");
     emit("qsa", pair_reduce::Outcome::kOk, trace_id, request_id,
          elapsed_ns(start), kHiddenBytes);
@@ -124,7 +125,7 @@ TargetFullLayerResult TargetFullLayer::execute(
     moe_needs_failure_fence = false;
     moe_.terminal_fence_succeeded(generation);
     moe_.publish_after_fence(generation);
-    require(moe_.projected_output(), rank_,
+    require(moe_.projected_output(), rank_, layer_,
             "target MoE participant published no rank-local partial");
     emit("target_moe", pair_reduce::Outcome::kOk, trace_id, request_id,
          elapsed_ns(start), kHiddenBytes);
@@ -172,14 +173,14 @@ TargetFullLayerResult TargetFullLayer::execute(
   last_generation_ = generation;
   emit("lifecycle", pair_reduce::Outcome::kOk, trace_id, request_id,
        elapsed_ns(lifecycle), 0);
-  return {generation, rank_, kLayer, post_layer};
+  return {generation, rank_, layer_, post_layer};
 }
 
 void TargetFullLayer::emit(
     std::string_view name, pair_reduce::Outcome outcome,
     std::string_view trace_id, std::string_view request_id,
     std::uint64_t duration_ns, std::uint64_t bytes) noexcept {
-  telemetry_.emit_span_and_log({stage(name), trace_id, request_id, rank_, 1,
+  telemetry_.emit_span_and_log({stage(layer_, name), trace_id, request_id, rank_, 1,
                                 pair_reduce::kDtype, outcome, duration_ns,
                                 bytes});
 }
