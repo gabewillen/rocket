@@ -23,6 +23,7 @@ FLASHINFER_GDN_CHUNK_IDENTITY = (
     "vllm:8e685d198:flashinfer:0.6.17:gdn-prefill-sm121a"
 )
 NATIVE_GDN_M35_IDENTITY = "rocket:qwen38:native-cuda:gdn-prefill-m35:v1"
+GDN_PREFILL_ACCURACY_IDENTITY = FLASHINFER_GDN_CHUNK_IDENTITY
 ORACLE_MANIFEST_SHA256 = (
     "05ea3af1c4694a9c035ce2fe9ce006acc58881df0fe86771b1846f4bd8e5f48b"
 )
@@ -584,15 +585,30 @@ def compare_native_real_tensor_bundle(
                 "rms": float(difference.square().mean().sqrt().item()),
             }
 
+        native_output_sha256 = _tensor_sha256(native_output, torch)
+        reference_output_sha256 = _tensor_sha256(reference_output, torch)
+        native_final_state_sha256 = _tensor_sha256(native_state, torch)
+        reference_final_state_sha256 = _tensor_sha256(reference_state, torch)
+        exact_parity = (
+            native_output_sha256 == reference_output_sha256
+            and native_final_state_sha256 == reference_final_state_sha256
+        )
         return {
             "status": "success",
             "rows": int(native.q.shape[0]),
             "output": drift(native_output, reference_output),
             "final_state": drift(native_state, reference_state),
-            "native_output_sha256": _tensor_sha256(native_output, torch),
-            "reference_output_sha256": _tensor_sha256(reference_output, torch),
-            "native_final_state_sha256": _tensor_sha256(native_state, torch),
-            "reference_final_state_sha256": _tensor_sha256(reference_state, torch),
+            "native_output_sha256": native_output_sha256,
+            "reference_output_sha256": reference_output_sha256,
+            "native_final_state_sha256": native_final_state_sha256,
+            "reference_final_state_sha256": reference_final_state_sha256,
+            "exact_parity": exact_parity,
+            "accepted_tolerance": "exact_hash",
+            "accuracy_implementation": (
+                NATIVE_GDN_M35_IDENTITY
+                if exact_parity
+                else GDN_PREFILL_ACCURACY_IDENTITY
+            ),
             "native_records": native_backend.telemetry_records,
         }
     finally:
@@ -647,6 +663,7 @@ __all__ = [
     "PINNED_FLASHINFER_VERSION",
     "PINNED_VLLM_COMMIT",
     "NATIVE_GDN_M35_IDENTITY",
+    "GDN_PREFILL_ACCURACY_IDENTITY",
     "NativeGdnM35PrefillBackend",
     "VALUE_HEADS",
     "execute_authenticated_real_tensor_bundle",

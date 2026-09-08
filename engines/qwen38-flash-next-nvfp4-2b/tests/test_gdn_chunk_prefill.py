@@ -14,6 +14,7 @@ from unittest.mock import patch
 from qwen38_slab.gdn_chunk_prefill import (
     ATTENTION_SCALE,
     FLASHINFER_GDN_CHUNK_IDENTITY,
+    GDN_PREFILL_ACCURACY_IDENTITY,
     AuthenticatedGdnChunkPrefillAdapter,
     FlashInferSm121GdnChunkBackend,
     GdnChunkPrefillError,
@@ -111,6 +112,11 @@ class Backend:
 
 
 class GdnChunkPrefillTests(unittest.TestCase):
+    def test_flashinfer_remains_the_accuracy_implementation(self):
+        self.assertEqual(
+            GDN_PREFILL_ACCURACY_IDENTITY, FLASHINFER_GDN_CHUNK_IDENTITY
+        )
+
     def test_real_tensor_bundle_owns_tensors_and_runs_supported_backend(self):
         allocations = []
         torch = types.SimpleNamespace(
