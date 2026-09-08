@@ -10,6 +10,7 @@ CLASS_ANCHOR = "class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):\n
 HELPER = r'''_ROCKET_CALIBRATION_MAXIMA = {}
 _ROCKET_TELEMETRY_CALLS = {}
 _ROCKET_ROUTER_PREFILL_BARRIERS = set()
+_ROCKET_ROUTER_DIAGNOSTIC_SAMPLES = []
 _ROCKET_TELEMETRY_SCHEMA = "rocket.qwen38.activation-telemetry.v4"
 
 
@@ -311,6 +312,17 @@ def _rocket_emit(name, kind, value, *, output_index=None, top_k=None):
         record["selected_expert_count"] = int(selected.numel())
         record["cohort_call"] = cohort_count
         record.update(router_cohort)
+        if len(_ROCKET_ROUTER_DIAGNOSTIC_SAMPLES) < 4:
+            _ROCKET_ROUTER_DIAGNOSTIC_SAMPLES.append(
+                {
+                    "channel": name,
+                    "cohort_call": cohort_count,
+                    "rank": router_cohort["rank"],
+                    "route_rows": len(router_cohort["route_rows"]),
+                    "request_widths": router_cohort["request_widths"][:16],
+                    "row_offsets": router_cohort["row_offsets"][:17],
+                }
+            )
     print("ROCKET_NVFP4_TELEMETRY\t" + json.dumps(record, sort_keys=True), flush=True)
 
 

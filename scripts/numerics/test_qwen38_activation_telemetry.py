@@ -62,6 +62,10 @@ class PatchTests(unittest.TestCase):
         patcher = importlib.util.module_from_spec(patch_spec)
         assert patch_spec.loader is not None
         patch_spec.loader.exec_module(patcher)
+        self.assertIn("_ROCKET_ROUTER_DIAGNOSTIC_SAMPLES = []", patcher.HELPER)
+        self.assertIn(
+            "len(_ROCKET_ROUTER_DIAGNOSTIC_SAMPLES) < 4", patcher.HELPER
+        )
         config_path = Path(
             "/home/glwillen/.cache/huggingface/hub/"
             "models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/"

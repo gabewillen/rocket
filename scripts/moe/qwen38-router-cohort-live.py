@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from datetime import datetime, timezone
 
 
@@ -44,7 +45,167 @@ def _publishable_cache_tokens(
     return finalized // block_size * block_size
 
 
-def main() -> None:
+class CohortContractError(RuntimeError):
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+def _validate_c16_cache_counts(counts: list[int], expected: int) -> None:
+    if len(counts) != 16 or any(count != expected for count in counts):
+        raise CohortContractError(
+            "cache_counts_mismatch",
+            f"c16 cache barrier requires 16 cached counts equal to {expected}",
+        )
+
+
+def _observed_router_samples() -> list[dict]:
+    for module in tuple(sys.modules.values()):
+        samples = getattr(module, "_ROCKET_ROUTER_DIAGNOSTIC_SAMPLES", None)
+        if isinstance(samples, list):
+            return list(samples[:4])
+    return []
+
+
+_DIAGNOSTIC_PHASES = {
+    "startup",
+    "engine_initialization",
+    "root_warmup",
+    "prompt_construction",
+    "cache_prime",
+    "cache_barrier",
+    "verifier",
+    "complete",
+}
+
+
+def _failure_fields(error: BaseException | None, phase: str) -> tuple[str | None, str | None]:
+    if error is None:
+        return None, None
+    failure_class = (
+        "contract_error"
+        if isinstance(error, CohortContractError)
+        else "runtime_error"
+        if isinstance(error, RuntimeError)
+        else "argument_error"
+        if isinstance(error, SystemExit)
+        else "unexpected_error"
+    )
+    reason = getattr(error, "reason", None)
+    failure_reason = (
+        reason
+        if reason == "cache_counts_mismatch"
+        else f"{phase}_failed"
+    )
+    return failure_class, failure_reason
+
+
+def _bounded_router_samples() -> list[dict]:
+    bounded = []
+    for sample in _observed_router_samples()[:4]:
+        if not isinstance(sample, dict):
+            continue
+        bounded.append(
+            {
+                "channel": str(sample.get("channel", ""))[:96],
+                "cohort_call": int(sample.get("cohort_call", 0)),
+                "rank": int(sample.get("rank", -1)),
+                "route_rows": int(sample.get("route_rows", 0)),
+                "request_widths": [
+                    int(item) for item in sample.get("request_widths", [])[:16]
+                ],
+                "row_offsets": [
+                    int(item) for item in sample.get("row_offsets", [])[:17]
+                ],
+            }
+        )
+    return bounded
+
+
+def _emit_diagnostic(state: dict, error: BaseException | None) -> None:
+    failed = error is not None
+    phase = state["phase"] if state["phase"] in _DIAGNOSTIC_PHASES else "startup"
+    failure_class, failure_reason = _failure_fields(error, phase)
+    counts = [
+        int(item)
+        for item in state.get("cached_prompt_tokens", [])[:16]
+        if isinstance(item, int)
+    ]
+    token_text = state.get("continuation_token_text")
+    print(
+        "ROCKET_ROUTER_DIAGNOSTIC\t"
+        + json.dumps(
+            {
+                "schema": "rocket.qwen38.router-diagnostic.v4",
+                "phase": phase,
+                "failure_class": failure_class,
+                "failure_reason": failure_reason,
+                "cached_prompt_tokens": counts,
+                "continuation_token_id": state["continuation_token_id"],
+                "continuation_token_sha256": state["continuation_token_sha256"],
+                "continuation_token_text": (
+                    token_text[:64]
+                    if isinstance(token_text, str)
+                    else None
+                ),
+                "router_samples": _bounded_router_samples(),
+                "valid": not failed,
+                "complete": not failed,
+                "benchmark_accepted": False,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
+def _emit_diagnostic_without_masking(state: dict, error: BaseException | None) -> None:
+    try:
+        _emit_diagnostic(state, error)
+    except BaseException:
+        phase = state.get("phase", "startup")
+        if phase not in _DIAGNOSTIC_PHASES:
+            phase = "startup"
+        failure_class, failure_reason = _failure_fields(error, phase)
+        fallback = {
+            "schema": "rocket.qwen38.router-diagnostic.v4",
+            "phase": phase,
+            "failure_class": failure_class or "diagnostic_error",
+            "failure_reason": failure_reason or "diagnostic_serialization_failed",
+            "cached_prompt_tokens": [],
+            "continuation_token_id": None,
+            "continuation_token_sha256": None,
+            "continuation_token_text": None,
+            "router_samples": [],
+            "valid": False,
+            "complete": False,
+            "benchmark_accepted": False,
+        }
+        sys.stdout.write(
+            "ROCKET_ROUTER_DIAGNOSTIC\t"
+            + json.dumps(fallback, sort_keys=True)
+            + "\n"
+        )
+        sys.stdout.flush()
+
+
+def _run_with_diagnostics(operation) -> None:
+    state = {
+        "phase": "startup",
+        "cached_prompt_tokens": [],
+        "continuation_token_id": None,
+        "continuation_token_sha256": None,
+        "continuation_token_text": None,
+    }
+    try:
+        operation(state)
+    except BaseException as error:
+        _emit_diagnostic_without_masking(state, error)
+        raise
+    _emit_diagnostic_without_masking(state, None)
+
+
+def _run(state: dict) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--concurrency", type=int, required=True, choices=SUPPORTED_CONCURRENCY
@@ -65,6 +226,7 @@ def main() -> None:
     if args.concurrency * args.divergence_tokens > 8192:
         parser.error("fresh cohort prefill exceeds max_num_batched_tokens")
 
+    state["phase"] = "engine_initialization"
     from vllm import LLM, SamplingParams
 
     rank = int(os.environ["RANK"])
@@ -107,6 +269,14 @@ def main() -> None:
     continuation_token_sha256 = hashlib.sha256(
         json.dumps([continuation_token_id], separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    state.update(
+        {
+            "continuation_token_id": continuation_token_id,
+            "continuation_token_sha256": continuation_token_sha256,
+            "continuation_token_text": continuation_token_text,
+        }
+    )
+    state["phase"] = "root_warmup"
     warm_sampling = SamplingParams(
         temperature=0.0, max_tokens=1, min_tokens=1, ignore_eos=True
     )
@@ -129,6 +299,7 @@ def main() -> None:
             "c16 requires prefix=6304, divergence=128, and expected cache block size=3216"
         )
     prompts = []
+    state["phase"] = "prompt_construction"
     for stream in range(concurrency):
         divergence = (
             f" Worker {stream} technical memory systems branch. "
@@ -144,6 +315,7 @@ def main() -> None:
     cache_barrier = None
     cached_prompt_tokens = []
     if concurrency == 16:
+        state["phase"] = "cache_prime"
         # Avoid the pinned hybrid-attention c16 failure on interleaved chunked
         # prefill and decode. Prime one complete prompt at a time while router
         # metadata is absent, then prove concurrent lookups hit each maximal
@@ -179,10 +351,12 @@ def main() -> None:
                 raise RuntimeError("c16 full-prompt cache prime did not finish")
             prime_output_token_ids.append(prime_outputs[0].outputs[0].token_ids[0])
         prompts = measured_prompts
+        state["phase"] = "cache_barrier"
         barrier_outputs = engine.generate(prompts, warm_sampling, use_tqdm=False)
         cached_prompt_tokens = [
             output.num_cached_tokens for output in barrier_outputs
         ]
+        state["cached_prompt_tokens"] = cached_prompt_tokens
         print(
             "ROCKET_ROUTER_CACHE_BARRIER\t"
             + json.dumps(
@@ -197,8 +371,7 @@ def main() -> None:
             ),
             flush=True,
         )
-        if len(barrier_outputs) != concurrency:
-            raise RuntimeError("c16 cache barrier returned the wrong request count")
+        _validate_c16_cache_counts(cached_prompt_tokens, 6432)
         for prompt, output in zip(prompts, barrier_outputs):
             prompt_tokens = len(prompt["prompt_token_ids"])
             expected_cached_tokens = (
@@ -237,6 +410,7 @@ def main() -> None:
             args.expected_cache_block_size
         )
     os.environ.update(cohort_metadata)
+    state["phase"] = "verifier"
     sampling = SamplingParams(
         temperature=0.0,
         max_tokens=args.decode,
@@ -303,7 +477,8 @@ def main() -> None:
             ),
             flush=True,
         )
+    state["phase"] = "complete"
 
 
 if __name__ == "__main__":
-    main()
+    _run_with_diagnostics(_run)

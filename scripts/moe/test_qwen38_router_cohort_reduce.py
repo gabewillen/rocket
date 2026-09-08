@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -161,6 +163,116 @@ class ReducerTests(unittest.TestCase):
         self.assertEqual(
             LIVE_MODULE._publishable_cache_tokens(6433, block_size), 6432
         )
+
+    def test_r7_cache_barrier_failure_publishes_rejected_diagnostic(self):
+        counts = [0] + [3216] * 15
+        output = io.StringIO()
+
+        def reproduce(state):
+            state.update(
+                {
+                    "phase": "cache_barrier",
+                    "cached_prompt_tokens": counts,
+                    "continuation_token_id": 77259,
+                    "continuation_token_sha256": (
+                        "02f852f23f4b0c77bdfca3ae6021a4577e5a4744817d48202c6e139b5c2b9d22"
+                    ),
+                    "continuation_token_text": "Rocket",
+                }
+            )
+            LIVE_MODULE._validate_c16_cache_counts(counts, 6432)
+
+        with redirect_stdout(output), self.assertRaises(RuntimeError):
+            LIVE_MODULE._run_with_diagnostics(reproduce)
+
+        marker, raw = output.getvalue().strip().split("\t", 1)
+        self.assertEqual(marker, "ROCKET_ROUTER_DIAGNOSTIC")
+        diagnostic = json.loads(raw)
+        self.assertEqual(
+            diagnostic["schema"], "rocket.qwen38.router-diagnostic.v4"
+        )
+        self.assertEqual(diagnostic["phase"], "cache_barrier")
+        self.assertEqual(diagnostic["failure_class"], "contract_error")
+        self.assertEqual(diagnostic["failure_reason"], "cache_counts_mismatch")
+        self.assertEqual(diagnostic["cached_prompt_tokens"], counts)
+        self.assertEqual(diagnostic["continuation_token_id"], 77259)
+        self.assertFalse(diagnostic["valid"])
+        self.assertFalse(diagnostic["complete"])
+        self.assertFalse(diagnostic["benchmark_accepted"])
+        self.assertEqual(diagnostic["router_samples"], [])
+
+    def test_diagnostic_serialization_failure_preserves_original_reason(self):
+        output = io.StringIO()
+        original_emit = LIVE_MODULE._emit_diagnostic
+
+        def broken_emit(state, error):
+            raise TypeError("diagnostic serialization failed")
+
+        def reproduce(state):
+            state["phase"] = "cache_barrier"
+            raise LIVE_MODULE.CohortContractError(
+                "cache_counts_mismatch", "original cache failure"
+            )
+
+        LIVE_MODULE._emit_diagnostic = broken_emit
+        try:
+            with redirect_stdout(output), self.assertRaisesRegex(
+                RuntimeError, "original cache failure"
+            ):
+                LIVE_MODULE._run_with_diagnostics(reproduce)
+        finally:
+            LIVE_MODULE._emit_diagnostic = original_emit
+
+        diagnostic = json.loads(output.getvalue().strip().split("\t", 1)[1])
+        self.assertEqual(diagnostic["failure_reason"], "cache_counts_mismatch")
+        self.assertFalse(diagnostic["benchmark_accepted"])
+
+    def test_diagnostic_router_samples_have_fixed_bounds(self):
+        output = io.StringIO()
+        original_samples = LIVE_MODULE._observed_router_samples
+        sample = {
+            "channel": "x" * 200,
+            "cohort_call": 1,
+            "rank": 0,
+            "route_rows": 80,
+            "request_widths": [5] * 32,
+            "row_offsets": list(range(40)),
+        }
+        LIVE_MODULE._observed_router_samples = lambda: [sample] * 8
+        try:
+            with redirect_stdout(output):
+                LIVE_MODULE._run_with_diagnostics(
+                    lambda state: state.update({"phase": "complete"})
+                )
+        finally:
+            LIVE_MODULE._observed_router_samples = original_samples
+
+        diagnostic = json.loads(output.getvalue().strip().split("\t", 1)[1])
+        self.assertEqual(len(diagnostic["router_samples"]), 4)
+        for bounded in diagnostic["router_samples"]:
+            self.assertEqual(len(bounded["channel"]), 96)
+            self.assertEqual(len(bounded["request_widths"]), 16)
+            self.assertEqual(len(bounded["row_offsets"]), 17)
+
+    def test_rejected_diagnostic_cannot_satisfy_strict_reducer(self):
+        diagnostic = {
+            "schema": "rocket.qwen38.router-diagnostic.v4",
+            "phase": "cache_barrier",
+            "failure_class": "contract_error",
+            "failure_reason": "cache_counts_mismatch",
+            "cached_prompt_tokens": [0] + [3216] * 15,
+            "valid": False,
+            "complete": False,
+            "benchmark_accepted": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rejected.log"
+            path.write_text(
+                "ROCKET_ROUTER_DIAGNOSTIC\t" + json.dumps(diagnostic) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "no router cohort records"):
+                MODULE.reduce([path])
 
     def test_decode_exceeds_observed_c2_three_call_terminal_by_full_iteration(self):
         self.assertEqual(LIVE_MODULE.VERIFY_WIDTH, 5)
