@@ -52,6 +52,13 @@ int main() {
           0, changed_identity, production_weights) !=
       moe::TargetMoeCreateFailure::kLayoutSha256)
     std::abort();
+  try {
+    moe::TargetMoeB12xAot malformed(0, changed_identity, production_weights);
+    std::abort();
+  } catch (const moe::TargetMoeAotConstructionError& error) {
+    if (error.stage() != moe::TargetMoeAotConstructionStage::kIdentity)
+      std::abort();
+  }
   void* handle = nullptr;
   if (rocket_qwen38_target_moe_b12x_create(0, nullptr, nullptr, &handle) !=
           static_cast<int>(moe::TargetMoeOutcome::kContractError) ||

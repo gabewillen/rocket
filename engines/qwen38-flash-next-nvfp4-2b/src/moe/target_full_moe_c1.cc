@@ -10,7 +10,8 @@ TargetMoeB12xIdentity routed_identity(const TargetDenseIdentity& identity) {
   TargetMoeB12xIdentity result{
       identity.artifact_sha256, {}, identity.rank, identity.layer};
   if (!target_moe_compact_layout_sha256(&result.layout_sha256))
-    throw std::invalid_argument("target MoE compact layout identity changed");
+    throw TargetMoeAotConstructionError(
+        TargetMoeAotConstructionStage::kIdentity);
   return result;
 }
 
