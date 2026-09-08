@@ -30,6 +30,21 @@ const TargetLayerNativeExtent& extent(
   return *found;
 }
 
+const TargetLayerNativeExtent& storage_extent(
+    const TargetLayerNativePlan& plan, std::string_view suffix,
+    std::string_view storage, std::uint64_t bytes) {
+  const std::string name = "model.language_model.layers." +
+                           std::to_string(plan.layer) + "." +
+                           std::string(suffix);
+  const auto found = std::find_if(
+      plan.extents.begin(), plan.extents.end(),
+      [&](const auto& item) { return item.name == name; });
+  if (found == plan.extents.end() || found->storage != storage ||
+      found->length_bytes != bytes)
+    fail("required extent changed: " + name);
+  return *found;
+}
+
 const TargetLayerNativeExtent& typed_extent(
     const TargetLayerNativePlan& plan, std::string_view suffix,
     std::uint64_t bytes, std::string_view dtype, std::string_view layout,
@@ -135,6 +150,85 @@ TargetLayerNativeMoeWeights bind_target_layer_native_moe_weights(
       "modelopt_nvfp4_group16_cutlass_sm121_sfb",
       std::string(moe::kTargetMoeDeviceStageAbi),
       "route_position_iota10_unique_positive_remote_zero_v1"};
+  return result;
+}
+
+TargetQsaLayerNativeWeights bind_target_qsa_layer_native_weights(
+    const TargetLayerNativePlan& plan,
+    const model::TargetSlabPublication& slab,
+    const attention::QsaSidecarPublication& sidecar,
+    const attention::Layer3RopeIdentity& rope_identity,
+    const attention::Layer3RopeView& rope) {
+  validate_target_layer_native_plan_binding(plan);
+  const auto expected_sidecar =
+      attention::target_qsa_sidecar_identity(plan.rank, plan.layer);
+  const auto expected_rope =
+      attention::target_qsa_rope_identity(plan.rank, plan.layer);
+  if (plan.attention_kind != TargetK0AttentionKind::kQsa ||
+      !slab.device_base || !slab.ready_event || slab.rank != plan.rank ||
+      slab.bytes != plan.slab_bytes || slab.artifact_key != plan.artifact_key ||
+      slab.slab_key != plan.slab_key ||
+      slab.layout_sha256 != plan.slab_publication_layout_sha256 ||
+      !sidecar.device_base || sidecar.device != slab.device ||
+      sidecar.bytes != attention::kQsaSidecarBytes ||
+      sidecar.identity.artifact_key != expected_sidecar.artifact_key ||
+      sidecar.identity.payload_sha256 != expected_sidecar.payload_sha256 ||
+      sidecar.identity.layer3_sha256 != expected_sidecar.layer3_sha256 ||
+      sidecar.identity.rank != plan.rank || sidecar.identity.layer != plan.layer ||
+      rope_identity.checkpoint_revision != expected_rope.checkpoint_revision ||
+      rope_identity.config_sha256 != expected_rope.config_sha256 ||
+      rope_identity.vllm_revision != expected_rope.vllm_revision ||
+      rope_identity.rank != plan.rank || rope_identity.layer != plan.layer ||
+      !rope.cos_sin || !rope.ready ||
+      rope.payload_sha256 != attention::kLayer3RopePayloadSha256 ||
+      rope.rows != attention::kLayer3RopeRows ||
+      rope.columns != attention::kLayer3RopeColumns ||
+      rope.row_stride != attention::kLayer3RopeColumns)
+    fail("QSA publication identity changed");
+  const auto target = [&](std::string_view suffix, std::uint64_t bytes) ->
+      const TargetLayerNativeExtent& {
+    return storage_extent(plan, suffix, "target_slab", bytes);
+  };
+  const auto side = [&](std::string_view suffix, std::uint64_t bytes) ->
+      const TargetLayerNativeExtent& {
+    return storage_extent(plan, suffix, "indexer_sidecar", bytes);
+  };
+  const auto* base = slab.device_base;
+  TargetQsaLayerNativeWeights result{};
+  result.projection = {
+      address<std::uint8_t>(base, target("self_attn.q_proj.weight", 7'864'320)),
+      address<std::uint8_t>(base, target("self_attn.q_proj.weight_scale", 983'040)),
+      plan.attention_projection_globals[0],
+      address<std::uint8_t>(base, target("self_attn.k_proj.weight", 327'680)),
+      address<std::uint8_t>(base, target("self_attn.k_proj.weight_scale", 40'960)),
+      plan.attention_projection_globals[1],
+      address<std::uint8_t>(base, target("self_attn.v_proj.weight", 327'680)),
+      address<std::uint8_t>(base, target("self_attn.v_proj.weight_scale", 40'960)),
+      plan.attention_projection_globals[2],
+      address<std::uint8_t>(base, target("self_attn.o_proj.weight", 3'932'160)),
+      address<std::uint8_t>(base, target("self_attn.o_proj.weight_scale", 491'520)),
+      plan.attention_projection_globals[3]};
+  result.preprocess = {
+      address<__nv_bfloat16>(base, target("self_attn.q_norm.weight", 512)),
+      address<__nv_bfloat16>(base, target("self_attn.k_norm.weight", 512)),
+      address<__nv_bfloat16>(sidecar.device_base,
+          side("self_attn.indexer.index_qk_proj.weight", 3'276'800)),
+      address<__nv_bfloat16>(base,
+          target("self_attn.indexer.q_layernorm.weight", 256)),
+      address<__nv_bfloat16>(base,
+          target("self_attn.indexer.k_layernorm.weight", 256)),
+      rope.cos_sin};
+  const auto hyper = [&](std::string_view family) {
+    const std::string prefix = std::string(family) + "_hyper_connection.";
+    return hyperconnection::Weights{
+        address<__nv_bfloat16>(base, target(prefix + "hc_norm.weight", 20'480)),
+        address<__nv_bfloat16>(base, target(prefix + "input_mix_weight_down.weight", 6'553'600)),
+        address<__nv_bfloat16>(base, target(prefix + "block_inject_weight.weight", 81'920)),
+        address<__nv_bfloat16>(base, target(prefix + "input_mix_weight_up.weight", 6'553'600))};
+  };
+  result.rope_ready_event = rope.ready;
+  result.attention_hyperconnection = hyper("attn");
+  result.mlp_hyperconnection = hyper("mlp");
   return result;
 }
 

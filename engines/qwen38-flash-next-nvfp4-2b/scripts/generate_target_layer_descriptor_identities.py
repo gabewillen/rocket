@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 from qwen38_slab.target_layer_descriptor import descriptor_identity, target_layer_descriptor
+from qwen38_slab.contract import canonical_bytes
 
 
 def main() -> None:
@@ -17,11 +18,13 @@ def main() -> None:
     parser.add_argument("--sidecar", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cpp-output", type=Path)
+    parser.add_argument("--descriptor-directory", type=Path)
     args = parser.parse_args()
-    identities = [
-        descriptor_identity(target_layer_descriptor(args.artifact, args.sidecar, rank, layer))
+    descriptors = [
+        target_layer_descriptor(args.artifact, args.sidecar, rank, layer)
         for rank in (0, 1) for layer in range(48)
     ]
+    identities = [descriptor_identity(item) for item in descriptors]
     args.output.write_text(json.dumps(identities, sort_keys=True, separators=(",", ":")) + "\n")
     if args.cpp_output is not None:
         lines = [
@@ -37,6 +40,13 @@ def main() -> None:
                 f'"{item["slab_publication_layout_sha256"]}"}},')
         lines.append("// clang-format on")
         args.cpp_output.write_text("\n".join(lines) + "\n")
+    if args.descriptor_directory is not None:
+        args.descriptor_directory.mkdir(parents=True, exist_ok=True)
+        for descriptor in descriptors:
+            name = (f'rank{descriptor["rank"]}-layer'
+                    f'{descriptor["layer"]}.json')
+            (args.descriptor_directory / name).write_bytes(
+                canonical_bytes(descriptor) + b"\n")
 
 
 if __name__ == "__main__":
