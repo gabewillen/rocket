@@ -369,6 +369,42 @@ set_target_properties(qwen38_target_moe_c1 PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
   POSITION_INDEPENDENT_CODE ON)
 
+set(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR "" CACHE PATH
+  "Directory containing the generated fixed-c1 target MoE header and object")
+add_library(qwen38_target_moe_b12x_aot STATIC
+  src/moe/target_moe_b12x_aot.cc)
+target_include_directories(qwen38_target_moe_b12x_aot PUBLIC src)
+target_link_libraries(qwen38_target_moe_b12x_aot PUBLIC
+  qwen38_target_moe_c1_contract CUDA::cudart)
+target_compile_options(qwen38_target_moe_b12x_aot PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_moe_b12x_aot PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
+  if(NOT EXISTS "${ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR}/target_moe_b12x_c1.h" OR
+     NOT EXISTS "${ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR}/target_moe_b12x_c1.o")
+    message(FATAL_ERROR "Incomplete target MoE B12X AOT fixed-c1 export")
+  endif()
+  if(NOT EXISTS "${ROCKET_QWEN38_CUTE_DSL_RUNTIME}")
+    message(FATAL_ERROR "ROCKET_QWEN38_CUTE_DSL_RUNTIME is required for target MoE AOT")
+  endif()
+  set(_target_moe_b12x_object
+    "${ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR}/target_moe_b12x_c1.o")
+  set_source_files_properties(${_target_moe_b12x_object} PROPERTIES
+    EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  target_sources(qwen38_target_moe_b12x_aot PRIVATE
+    ${_target_moe_b12x_object})
+  target_include_directories(qwen38_target_moe_b12x_aot SYSTEM PRIVATE
+    "${ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR}")
+  target_compile_definitions(qwen38_target_moe_b12x_aot PRIVATE
+    ROCKET_QWEN38_TARGET_MOE_B12X_AOT=1)
+  target_link_libraries(qwen38_target_moe_b12x_aot PRIVATE
+    "${ROCKET_QWEN38_CUTE_DSL_RUNTIME}")
+else()
+  target_compile_definitions(qwen38_target_moe_b12x_aot PRIVATE
+    ROCKET_QWEN38_TARGET_MOE_B12X_AOT=0)
+endif()
+
 add_library(qwen38_mtp_executor STATIC
   src/mtp/graph_runtime.cu
   src/mtp/input_fusion.cu
@@ -516,6 +552,15 @@ target_compile_options(qwen38-test-target-moe-c1 PRIVATE
   -Wall -Wextra -Werror)
 add_test(NAME qwen38-target-moe-c1-cpu-contract
   COMMAND qwen38-test-target-moe-c1)
+
+add_executable(qwen38-test-target-moe-b12x-aot-contract
+  tests/test_target_moe_b12x_aot_contract.cc)
+target_link_libraries(qwen38-test-target-moe-b12x-aot-contract PRIVATE
+  qwen38_target_moe_b12x_aot)
+target_compile_options(qwen38-test-target-moe-b12x-aot-contract PRIVATE
+  -Wall -Wextra -Werror)
+add_test(NAME qwen38-target-moe-b12x-aot-cpu-contract
+  COMMAND qwen38-test-target-moe-b12x-aot-contract)
 
 add_executable(qwen38-test-fp8-routed-experts
   tests/test_fp8_routed_experts.cc)
