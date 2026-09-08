@@ -89,6 +89,9 @@ class QsaPrefillSourceContractTest(unittest.TestCase):
             "while (m != sentinel) and (u < self._max_union)", self.cute
         )
         self.assertNotIn("if m == sentinel:\n                break", self.cute)
+        self.assertIn("mUnionTokenCount[work_idx] = u", self.cute)
+        self.assertIn("mUnionTileCount[work_idx] = tile_count", self.cute)
+        self.assertIn("mUnionBlocks[work_idx, u + lane] = -1", self.cute)
         self.assertIn("mUnionMasks[work_idx, u, token_slot]", self.cute)
         self.assertIn("bit == 0 or k_pos < 0", self.cute)
         self.assertIn("cO = cute.make_identity_tensor", self.cute)
@@ -96,8 +99,12 @@ class QsaPrefillSourceContractTest(unittest.TestCase):
         runner = (
             ROOT.parents[1] / "scripts/kernels/qwen38-qsa-prefill-cute.py"
         ).read_text()
-        self.assertIn("union_tokens = torch.where(valid, union_tokens, -1)", runner)
-        self.assertIn("union_masks = torch.where(valid, union_masks, 0)", runner)
+        self.assertNotIn("_build_union_metadata_device", runner)
+        self.assertNotIn("torch.where(valid, union_tokens", runner)
+        self.assertIn("tiles_per_sequence = args.query_tokens // TOKENS_PER_TILE", runner)
+        self.assertIn("union_tokens_flat = torch.empty", runner)
+        self.assertIn("def launch_stage():", runner)
+        self.assertIn("with torch.cuda.graph(graph):\n        launch_stage()", runner)
         self.assertLess(runner.index("difference ="), runner.index("kernel_samples ="))
 
 

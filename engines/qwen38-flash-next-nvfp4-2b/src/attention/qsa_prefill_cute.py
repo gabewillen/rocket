@@ -767,6 +767,7 @@ class BuildUnionMetaSm12x:
             raise ValueError("Qwen union metadata requires topk2051/tile4")
         self._topk = topk
         self._tpt = tokens_per_tile
+        self._n_block_size = 16
         # Distinct blocks in a union are bounded by the total list length.
         self._max_union = tokens_per_tile * topk
 
@@ -780,7 +781,8 @@ class BuildUnionMetaSm12x:
         mTileNtok: cute.Tensor,  # (total_tiles,) int32, valid tokens in the tile
         mUnionBlocks: cute.Tensor,  # (work_items, max_union) int32 (out)
         mUnionMasks: cute.Tensor,  # (work_items, max_union) int32 (out)
-        mUnionCount: cute.Tensor,  # (work_items,) int32 (out)
+        mUnionTokenCount: cute.Tensor,  # (work_items,) raw token count (out)
+        mUnionTileCount: cute.Tensor,  # (work_items,) N16 tile count (out)
         mWorkMeta: cute.Tensor,  # (work_items, 3) int32 {batch, q_tile, kv_head} (out)
         H: cutlass.Int32,
         total_tiles: cutlass.Int32,
@@ -794,7 +796,8 @@ class BuildUnionMetaSm12x:
             mTileNtok,
             mUnionBlocks,
             mUnionMasks,
-            mUnionCount,
+            mUnionTokenCount,
+            mUnionTileCount,
             mWorkMeta,
             H,
         ).launch(
@@ -813,7 +816,8 @@ class BuildUnionMetaSm12x:
         mTileNtok: cute.Tensor,
         mUnionBlocks: cute.Tensor,
         mUnionMasks: cute.Tensor,
-        mUnionCount: cute.Tensor,
+        mUnionTokenCount: cute.Tensor,
+        mUnionTileCount: cute.Tensor,
         mWorkMeta: cute.Tensor,
         H: cutlass.Int32,
     ):
@@ -868,8 +872,15 @@ class BuildUnionMetaSm12x:
                     p += 1
                 u += 1
 
+        tile_count = (u + self._n_block_size - 1) // self._n_block_size
+        padded_u = tile_count * self._n_block_size
+        if (lane < self._n_block_size) and (u + lane < padded_u):
+            mUnionBlocks[work_idx, u + lane] = -1
+            mUnionMasks[work_idx, u + lane] = 0
+
         if lane == 0:
-            mUnionCount[work_idx] = u
+            mUnionTokenCount[work_idx] = u
+            mUnionTileCount[work_idx] = tile_count
             mWorkMeta[work_idx, 0] = batch_idx
             mWorkMeta[work_idx, 1] = q_tile
             mWorkMeta[work_idx, 2] = h
