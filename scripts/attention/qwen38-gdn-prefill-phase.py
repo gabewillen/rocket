@@ -33,6 +33,15 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[math.ceil(len(ordered) * fraction) - 1]
 
 
+def attribute_projection_backend(
+    result: dict[str, object], method: object
+) -> None:
+    """Attach the selected vLLM linear kernel to a projection measurement."""
+    kernel = method.kernel
+    kernel_type = type(kernel)
+    result["nvfp4_kernel"] = f"{kernel_type.__module__}.{kernel_type.__qualname__}"
+
+
 def measure(
     phase: str,
     operation: Callable[[], None],
@@ -224,6 +233,7 @@ def run(tokens: int, warmup: int, iterations: int) -> list[dict[str, object]]:
     input_result = measure(
         "nvfp4_input_projection", input_projection, warmup, iterations
     )
+    attribute_projection_backend(input_result, method)
 
     norm_input = torch.randn(tokens * 24, 128, dtype=torch.bfloat16,
                              device=device)
@@ -255,6 +265,7 @@ def run(tokens: int, warmup: int, iterations: int) -> list[dict[str, object]]:
     output_result = measure(
         "nvfp4_output_projection", output_projection, warmup, iterations
     )
+    attribute_projection_backend(output_result, method)
 
     inactive_state = torch.empty_like(final_state)
 
