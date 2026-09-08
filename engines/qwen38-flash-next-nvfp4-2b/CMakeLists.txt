@@ -109,6 +109,7 @@ set_target_properties(qwen38_pair_reduce PROPERTIES
 add_library(qwen38_decode_execution STATIC
   src/decode/execution.cc
   src/decode/full_attention_layer.cc
+  src/decode/target_full_layer.cc
   src/decode/linear_attention_layer.cc
 )
 target_include_directories(qwen38_decode_execution PUBLIC src)
@@ -487,6 +488,12 @@ target_link_libraries(qwen38-test-full-attention-layer PRIVATE qwen38_decode_exe
 target_compile_options(qwen38-test-full-attention-layer PRIVATE -Wall -Wextra -Werror)
 set_target_properties(qwen38-test-full-attention-layer PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-full-attention-layer-contract COMMAND qwen38-test-full-attention-layer)
+
+add_executable(qwen38-test-target-full-layer tests/test_target_full_layer.cc)
+target_link_libraries(qwen38-test-target-full-layer PRIVATE qwen38_decode_execution)
+target_compile_options(qwen38-test-target-full-layer PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-full-layer PROPERTIES LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-target-full-layer-contract COMMAND qwen38-test-target-full-layer)
 
 add_executable(qwen38-test-linear-attention-layer tests/test_linear_attention_layer.cc)
 target_link_libraries(qwen38-test-linear-attention-layer PRIVATE qwen38_decode_execution)

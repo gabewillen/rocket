@@ -48,6 +48,12 @@ class FullAttentionHyperConnection {
       const __nv_bfloat16* injection, __nv_bfloat16* updated_hidden,
       __nv_bfloat16* next_block_input, __nv_bfloat16* next_injection, int m,
       cudaStream_t stream) = 0;
+  // Materialize the pending MLP residual after its TP2 reduction. This is the
+  // exact layer boundary saved by the 51-artifact vLLM K0 oracle.
+  virtual void combine(const __nv_bfloat16* hidden, const float* block_output,
+                       const __nv_bfloat16* injection,
+                       __nv_bfloat16* updated_hidden, int m,
+                       cudaStream_t stream) = 0;
   // Fence every operation previously enqueued on stream and surface deferred
   // CUDA failures before a stage or generation can be published.
   virtual void synchronize(cudaStream_t stream) = 0;

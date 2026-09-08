@@ -98,6 +98,15 @@ class HyperConnection final : public decode::FullAttentionHyperConnection {
           "combine-and-mix contract drift");
     calls.push_back("combine_and_mix");
   }
+  void combine(const __nv_bfloat16* hidden, const float* block_output,
+               const __nv_bfloat16* injection,
+               __nv_bfloat16* updated_hidden, int m,
+               cudaStream_t stream) override {
+    check(hidden && block_output && injection && updated_hidden && m == 1 &&
+              stream,
+          "combine contract drift");
+    calls.push_back("combine");
+  }
   void synchronize(cudaStream_t stream) override {
     check(stream == reinterpret_cast<cudaStream_t>(0x1230),
           "completion stream drift");

@@ -137,6 +137,24 @@ __global__ void combine_norm(const __nv_bfloat16* residual,
   }
 }
 
+__global__ void combine_only(const __nv_bfloat16* residual,
+                             const float* block_output,
+                             const __nv_bfloat16* injection,
+                             __nv_bfloat16* updated) {
+  const int row = blockIdx.x / kStreams;
+  const int stream = blockIdx.x % kStreams;
+  const int base = row * kHyperHidden + stream * kHidden;
+  const float inj = 2.0F /
+      (1.0F + expf(-__bfloat162float(injection[row * kStreams + stream]) /
+                         static_cast<float>(kStreams)));
+  for (int column = threadIdx.x; column < kHidden; column += blockDim.x) {
+    const float block = __bfloat162float(
+        __float2bfloat16(block_output[row * kHidden + column]));
+    updated[base + column] = __float2bfloat16(
+        __bfloat162float(residual[base + column]) + block * inj);
+  }
+}
+
 void gemm(cublasHandle_t handle, const __nv_bfloat16* input,
           const __nv_bfloat16* weight, __nv_bfloat16* output,
           int m, int n, int k) {
@@ -329,6 +347,18 @@ void Plan::combine_and_mix(
   cuda_check(cudaPeekAtLastError(), "launch combine-and-mix");
 }
 
+void Plan::combine(const __nv_bfloat16* hidden, const float* block_output,
+                   const __nv_bfloat16* injection,
+                   __nv_bfloat16* updated_hidden, int m,
+                   cudaStream_t stream) {
+  if (!hidden || !block_output || !injection || !updated_hidden ||
+      !allowed_m(m) || !stream)
+    throw std::invalid_argument("Qwen HC combine contract drift");
+  combine_only<<<m * kStreams, kThreads, 0, stream>>>(
+      hidden, block_output, injection, updated_hidden);
+  cuda_check(cudaPeekAtLastError(), "launch combine");
+}
+
 }  // namespace rocket::qwen38::hyperconnection
 
 namespace {
@@ -384,6 +414,17 @@ extern "C" int qwen38_hc_combine_and_mix(
     static_cast<rocket::qwen38::hyperconnection::Plan*>(opaque)
         ->combine_and_mix(hidden, block_output, injection, updated_hidden,
                           next_block_input, next_injection, m, stream);
+  });
+}
+
+extern "C" int qwen38_hc_combine(
+    void* opaque, const __nv_bfloat16* hidden, const float* block_output,
+    const __nv_bfloat16* injection, __nv_bfloat16* updated_hidden, int m,
+    cudaStream_t stream) {
+  if (!opaque) return 1;
+  return hc_call([&] {
+    static_cast<rocket::qwen38::hyperconnection::Plan*>(opaque)->combine(
+        hidden, block_output, injection, updated_hidden, m, stream);
   });
 }
 
