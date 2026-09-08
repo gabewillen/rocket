@@ -45,6 +45,18 @@ struct GdnWeights {
   return input_global_scale * weight_global_scale;
 }
 
+[[nodiscard]] constexpr float gdn_fused_projection_alpha(
+    float input_global_scale, float first_weight_global_scale,
+    float second_weight_global_scale) noexcept {
+  // Pinned vLLM collapses MergedColumnParallelLinear partition scales with
+  // weight_scale_2.max() before selecting the NVFP4 linear kernel.
+  return gdn_projection_alpha(
+      input_global_scale,
+      first_weight_global_scale > second_weight_global_scale
+          ? first_weight_global_scale
+          : second_weight_global_scale);
+}
+
 [[nodiscard]] constexpr bool allowed_prefill_tokens(int tokens) noexcept {
   return tokens == 300 || tokens == 8'192;
 }

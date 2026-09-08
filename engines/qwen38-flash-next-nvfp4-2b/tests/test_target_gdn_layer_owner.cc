@@ -43,10 +43,15 @@ int main() {
       linear::gdn_projection_alpha(0.001331147737801075F,
                                    0.0003022693563F) < 4.03e-7F);
   static_assert(
+      linear::gdn_fused_projection_alpha(
+          0.001331147737801075F, 0.0003022693563F, 0.0002615792328F) ==
       linear::gdn_projection_alpha(0.001331147737801075F,
-                                   0.0003022693563F) !=
+                                   0.0003022693563F));
+  static_assert(
+      linear::gdn_fused_projection_alpha(
+          0.001331147737801075F, 0.00007375080895F, 0.00007520403597F) ==
       linear::gdn_projection_alpha(0.001331147737801075F,
-                                   0.0002615792328F));
+                                   0.00007520403597F));
 
   void* storage = nullptr;
   if (posix_memalign(&storage, 256, decode::kTargetGdnOwnerStorageBytes) != 0)

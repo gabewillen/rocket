@@ -506,6 +506,12 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
     // restores input_global_scale * weight_global_scale before BF16 rounding.
     impl_->input_global_scale = input_scales[0];
     impl_->output_global_scale = input_scales[4];
+    const float qkvz_alpha = gdn_fused_projection_alpha(
+        impl_->input_global_scale, weights.qkv.global_scale,
+        weights.z.global_scale);
+    const float ba_alpha = gdn_fused_projection_alpha(
+        impl_->input_global_scale, weights.b.global_scale,
+        weights.a.global_scale);
     cuda_check(cudaMalloc(&impl_->input_packed, kM * kInputK / 2), "malloc input A");
     cuda_check(cudaMalloc(&impl_->input_sfa, kInputSfaBytes), "malloc input SFA");
     cuda_check(cudaMalloc(&impl_->qkvz_weight,
@@ -615,30 +621,26 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
           FixedGemm::workspace_size(
               rows, kQkvN, kInputK, impl_->input_packed, impl_->input_sfa,
               impl_->qkvz_weight, impl_->qkvz_scale, impl_->qkv,
-              gdn_projection_alpha(impl_->input_global_scale,
-                                   weights.qkv.global_scale)));
+              qkvz_alpha));
     decode_workspace_bytes = std::max(
         decode_workspace_bytes,
           FixedGemm::workspace_size(
               rows, kZN, kInputK, impl_->input_packed, impl_->input_sfa,
               impl_->qkvz_weight + qkv_w, impl_->qkvz_scale + qkv_s,
               impl_->z,
-              gdn_projection_alpha(impl_->input_global_scale,
-                                   weights.z.global_scale)));
+              qkvz_alpha));
       decode_workspace_bytes = std::max(
           decode_workspace_bytes,
           FixedGemm::workspace_size(
               rows, kBN, kInputK, impl_->input_packed, impl_->input_sfa,
               impl_->ba_weight, impl_->b_scale, impl_->b,
-              gdn_projection_alpha(impl_->input_global_scale,
-                                   weights.b.global_scale)));
+              ba_alpha));
       decode_workspace_bytes = std::max(
           decode_workspace_bytes,
           FixedGemm::workspace_size(
               rows, kAN, kInputK, impl_->input_packed, impl_->input_sfa,
               impl_->ba_weight + ba_w, impl_->a_scale, impl_->a,
-              gdn_projection_alpha(impl_->input_global_scale,
-                                   weights.a.global_scale)));
+              ba_alpha));
       decode_workspace_bytes = std::max(
           decode_workspace_bytes,
           FixedGemm::workspace_size(
@@ -654,27 +656,23 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
       impl_->qkv_gemms[bucket].init(
           rows, kQkvN, kInputK, impl_->input_packed, impl_->input_sfa,
           impl_->qkvz_weight, impl_->qkvz_scale, impl_->qkv,
-          gdn_projection_alpha(impl_->input_global_scale,
-                               weights.qkv.global_scale),
+          qkvz_alpha,
           impl_->decode_workspace.get());
       impl_->z_gemms[bucket].init(
           rows, kZN, kInputK, impl_->input_packed, impl_->input_sfa,
           impl_->qkvz_weight + qkv_w, impl_->qkvz_scale + qkv_s,
           impl_->z,
-          gdn_projection_alpha(impl_->input_global_scale,
-                               weights.z.global_scale),
+          qkvz_alpha,
           impl_->decode_workspace.get());
       impl_->b_gemms[bucket].init(
           rows, kBN, kInputK, impl_->input_packed, impl_->input_sfa,
           impl_->ba_weight, impl_->b_scale, impl_->b,
-          gdn_projection_alpha(impl_->input_global_scale,
-                               weights.b.global_scale),
+          ba_alpha,
           impl_->decode_workspace.get());
       impl_->a_gemms[bucket].init(
           rows, kAN, kInputK, impl_->input_packed, impl_->input_sfa,
           impl_->ba_weight + ba_w, impl_->a_scale, impl_->a,
-          gdn_projection_alpha(impl_->input_global_scale,
-                               weights.a.global_scale),
+          ba_alpha,
           impl_->decode_workspace.get());
       impl_->output_gemms[bucket].init(
           rows, kOutputN, kOutputK, impl_->output_packed, impl_->output_sfa,
@@ -701,26 +699,22 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
         kMaxVerifierRows, kQkvN, kInputK, impl_->verify_input_packed,
         impl_->verify_input_sfa, impl_->qkvz_weight, impl_->qkvz_scale,
         impl_->verify_qkv,
-        gdn_projection_alpha(impl_->input_global_scale,
-                             weights.qkv.global_scale));
+        qkvz_alpha);
     impl_->verify_z_gemm.init(
         kMaxVerifierRows, kZN, kInputK, impl_->verify_input_packed,
         impl_->verify_input_sfa, impl_->qkvz_weight + qkv_w,
         impl_->qkvz_scale + qkv_s, impl_->verify_z,
-        gdn_projection_alpha(impl_->input_global_scale,
-                             weights.z.global_scale));
+        qkvz_alpha);
     impl_->verify_b_gemm.init(
         kMaxVerifierRows, kBN, kInputK, impl_->verify_input_packed,
         impl_->verify_input_sfa, impl_->ba_weight, impl_->b_scale,
         impl_->verify_b,
-        gdn_projection_alpha(impl_->input_global_scale,
-                             weights.b.global_scale));
+        ba_alpha);
     impl_->verify_a_gemm.init(
         kMaxVerifierRows, kAN, kInputK, impl_->verify_input_packed,
         impl_->verify_input_sfa, impl_->ba_weight + ba_w, impl_->a_scale,
         impl_->verify_a,
-        gdn_projection_alpha(impl_->input_global_scale,
-                             weights.a.global_scale));
+        ba_alpha);
     impl_->verify_output_gemm.init(
         kMaxVerifierRows, kOutputN, kOutputK, impl_->verify_output_packed,
         impl_->verify_output_sfa, impl_->output_weight, impl_->output_scale,
