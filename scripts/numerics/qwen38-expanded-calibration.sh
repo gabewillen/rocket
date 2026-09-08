@@ -10,6 +10,7 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 
 IMAGE_TAG="vllm/vllm-openai:qwen38-flash-next"
 IMAGE_ID="sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a"
+IMAGE_REPO_DIGEST="vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8"
 MIA_REPOSITORY="https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks.git"
 MIA_COMMIT="c2325b22602b51a5faf55fc2bebccc34f3f80b9f"
 MODEL_ID="nvidia/Qwen3.8-Flash-Next-NVFP4"
@@ -55,6 +56,7 @@ NVFP4_HAS_BASE_ROUTERS=false
 LAUNCH=false
 KEEP_RUNNING=false
 PRODUCTION=false
+ORACLE_K0=false
 TWO_NODE_PREFLIGHT=false
 STARTUP_TIMEOUT_SECONDS=3600
 GPU_MEMORY_UTILIZATION="0.835"
@@ -75,6 +77,7 @@ Options:
   --two-node-preflight   Transfer and verify both nodes without launching
   --production           Launch without telemetry/eager mode and benchmark throughput
   --production-preflight Prepare/deploy production launch scripts without launching
+  --oracle-k0            Capture one target-only K0 coding-prompt oracle
   --keep-running         Leave containers running after a successful calibration
   --mia-source DIR       Existing checkout at the pinned MiaAI-Lab commit
   --fp8-artifact-dir DIR Immutable linear-attention FP8 artifact directory
@@ -99,6 +102,28 @@ EOF
 }
 
 fail() {
+    if [[ "${ORACLE_K0:-false}" == true && -n "${OUTPUT_DIR:-}" && -d "${OUTPUT_DIR:-}" ]]; then
+        python3 - "$OUTPUT_DIR/oracle-failure.json" "$*" <<'PY' || true
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+identity_path = path.with_name("oracle-identity.json")
+identity = json.loads(identity_path.read_text()) if identity_path.is_file() else {}
+capture = path.with_name("capture")
+record = {
+    "schema": "rocket.qwen38.k0-target-oracle-failure.v1",
+    "valid": False,
+    "complete": False,
+    "phase": "launcher",
+    "reason": sys.argv[2][:1024],
+    "identity": identity,
+    "completed": sorted(item.name for item in capture.glob("*.bin"))[:51] if capture.is_dir() else [],
+}
+path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+PY
+    fi
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
 }
@@ -109,6 +134,7 @@ while (($#)); do
         --launch) LAUNCH=true; shift ;;
         --two-node-preflight) TWO_NODE_PREFLIGHT=true; shift ;;
         --production) PRODUCTION=true; LAUNCH=true; shift ;;
+        --oracle-k0) ORACLE_K0=true; MTP_DEPTH=0; shift ;;
         --production-preflight)
             PRODUCTION=true
             TWO_NODE_PREFLIGHT=true
@@ -161,7 +187,9 @@ fi
 # Pinned image d464f3b4 declares SpeculativeConfig.num_speculative_tokens with
 # Pydantic Field(gt=0). Omitting speculative_config also omits the MTP model and
 # its cache path, so neither CLI shape represents K0 with synchronized MTP state.
-[[ "$MTP_DEPTH" != 0 ]] || fail "pinned vLLM requires num_speculative_tokens > 0; true K0 with loaded MTP state is unavailable"
+[[ "$MTP_DEPTH" != 0 || "$ORACLE_K0" == true ]] || fail "K0 is only available through --oracle-k0"
+[[ "$ORACLE_K0" != true || "$PRODUCTION" != true ]] || fail "--oracle-k0 and --production are mutually exclusive"
+[[ "$ORACLE_K0" != true || -n "$NVFP4_ARTIFACT_DIR" ]] || fail "--oracle-k0 requires the accepted --nvfp4-artifact-dir"
 # The pinned Qwen path reuses its one MTP layer. Its GDN and PLE cache shapes add
 # num_speculative_tokens to their convolution history, while the model weights,
 # model revision, and persistent recurrent-state shapes remain unchanged. K7's
@@ -296,6 +324,11 @@ remote_image_id=$(ssh -o BatchMode=yes "$SSH_TARGET" \
     "docker image inspect --format '{{.Id}}' '$IMAGE_TAG' 2>/dev/null" || true)
 [[ "$remote_image_id" == "$IMAGE_ID" ]] || fail \
     "worker image mismatch: expected $IMAGE_ID, got ${remote_image_id:-missing}"
+actual_image_digest=$(docker image inspect --format '{{join .RepoDigests "\n"}}' "$IMAGE_TAG" | grep -Fx "$IMAGE_REPO_DIGEST" || true)
+[[ "$actual_image_digest" == "$IMAGE_REPO_DIGEST" ]] || fail "head image repo digest mismatch"
+remote_image_digest=$(ssh -o BatchMode=yes "$SSH_TARGET" \
+    "docker image inspect --format '{{join .RepoDigests \"\\n\"}}' '$IMAGE_TAG'" | grep -Fx "$IMAGE_REPO_DIGEST" || true)
+[[ "$remote_image_digest" == "$IMAGE_REPO_DIGEST" ]] || fail "worker image repo digest mismatch"
 
 head_page_size=$(getconf PAGESIZE)
 worker_page_size=$(ssh -o BatchMode=yes "$SSH_TARGET" getconf PAGESIZE)
@@ -401,6 +434,10 @@ if [[ "$NVFP4_HAS_BASE_ROUTERS" == true ]]; then
 fi
 cp "$ARTIFACT_DIR/model_router.py" "$ARTIFACT_DIR/model_telemetry.py"
 python3 "$SCRIPT_DIR/patch-qwen38-activation-telemetry.py" "$ARTIFACT_DIR/model_telemetry.py"
+if [[ "${ORACLE_K0:-false}" == true ]]; then
+    cp "$ARTIFACT_DIR/model_router.py" "$ARTIFACT_DIR/model_oracle.py"
+    python3 "$REPO_ROOT/scripts/runtime/patch-qwen38-k0-oracle.py" "$ARTIFACT_DIR/model_oracle.py"
+fi
 
 for file in ple_layer_patched.py modelopt_patched.py qsa_ops_patched.py \
     qsa_nvidia_patched.py config_patched.json hf_quant_config_patched.json; do
@@ -467,6 +504,25 @@ docker run --rm \
     -v "$ARTIFACT_DIR/platform_qsa_patched.py:/work/platform.py:ro" \
     --entrypoint /usr/bin/python3 "$IMAGE_TAG" -m py_compile \
     /work/model.py /work/model_router.py /work/platform.py
+if [[ "${ORACLE_K0:-false}" == true ]]; then
+    docker run --rm -v "$ARTIFACT_DIR/model_oracle.py:/work/model_oracle.py:ro" \
+        --entrypoint /usr/bin/python3 "$IMAGE_TAG" -m py_compile /work/model_oracle.py
+    docker run --rm \
+        -v "$HF_CACHE:/root/.cache/huggingface:ro" \
+        -v "$OUTPUT_DIR:/rocket/output" \
+        -v "$REPO_ROOT/scripts/runtime/qwen38-k0-oracle.py:/rocket/qwen38-k0-oracle.py:ro" \
+        --entrypoint /usr/bin/python3 "$IMAGE_TAG" \
+        /rocket/qwen38-k0-oracle.py prepare \
+        --model-dir "/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION" \
+        --output /rocket/output/oracle-request.json
+    ORACLE_EXPECTED_IDS=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["input_token_ids"],separators=(",",":")))' "$OUTPUT_DIR/oracle-request.json")
+    nvfp4_manifest_sha=$(sha256sum "$NVFP4_ARTIFACT_DIR/manifest.json" | cut -d' ' -f1)
+    nvfp4_payload_sha=$(sha256sum "$NVFP4_ARTIFACT_DIR/$NVFP4_OVERLAY_FILE" | cut -d' ' -f1)
+    nvfp4_quant_sha=$(sha256sum "$NVFP4_ARTIFACT_DIR/hf_quant_config.json" | cut -d' ' -f1)
+    ORACLE_IDENTITY=$(python3 -c 'import json,sys; print(json.dumps({"image_id":sys.argv[1],"image_repo_digest":sys.argv[2],"model":sys.argv[3],"model_revision":sys.argv[4],"mia_commit":sys.argv[5],"overlay_manifest_sha256":sys.argv[6],"overlay_payload_sha256":sys.argv[7],"overlay_quant_config_sha256":sys.argv[8],"speculation":"disabled","tensor_parallel_size":2,"node_count":2},sort_keys=True,separators=(",",":")))' "$IMAGE_ID" "$IMAGE_REPO_DIGEST" "$MODEL_ID" "$MODEL_REVISION" "$MIA_COMMIT" "$nvfp4_manifest_sha" "$nvfp4_payload_sha" "$nvfp4_quant_sha")
+    python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]),indent=2,sort_keys=True))' \
+        "$ORACLE_IDENTITY" > "$OUTPUT_DIR/oracle-identity.json"
+fi
 if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
     FP8_CONTAINER_DIR="/rocket/qwen38-linear-fp8"
     docker run --rm \
@@ -512,7 +568,7 @@ fi
     sha256sum ./* > SHA256SUMS
 )
 cat > "$OUTPUT_DIR/run.json" <<EOF
-{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size,"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS,"gpu_memory_utilization":$GPU_MEMORY_UTILIZATION,"mtp_depth":$MTP_DEPTH,"worker_cache_kind":"$WORKER_CACHE_KIND","head_cache_filesystem":"$HEAD_CACHE_FILESYSTEM","worker_cache_filesystem":"$WORKER_CACHE_FILESYSTEM","head_snapshot_path":"$HEAD_SNAPSHOT","worker_snapshot_path":"$WORKER_SNAPSHOT","head_runtime_cache_path":"$HEAD_RUNTIME_CACHE_MOUNT","worker_runtime_cache_path":"$WORKER_RUNTIME_CACHE_MOUNT","checkpoint_manifest_sha256":"$CHECKPOINT_MANIFEST_SHA256","checkpoint_safetensor_shards":$CHECKPOINT_SHARD_COUNT}
+{"image_id":"$IMAGE_ID","image_tag":"$IMAGE_TAG","image_repo_digest":"$IMAGE_REPO_DIGEST","mia_commit":"$MIA_COMMIT","model":"$MODEL_ID","model_revision":"$MODEL_REVISION","head_page_size":$head_page_size,"worker_page_size":$worker_page_size,"startup_timeout_seconds":$STARTUP_TIMEOUT_SECONDS,"gpu_memory_utilization":$GPU_MEMORY_UTILIZATION,"mtp_depth":$MTP_DEPTH,"oracle_k0":$ORACLE_K0,"worker_cache_kind":"$WORKER_CACHE_KIND","head_cache_filesystem":"$HEAD_CACHE_FILESYSTEM","worker_cache_filesystem":"$WORKER_CACHE_FILESYSTEM","head_snapshot_path":"$HEAD_SNAPSHOT","worker_snapshot_path":"$WORKER_SNAPSHOT","head_runtime_cache_path":"$HEAD_RUNTIME_CACHE_MOUNT","worker_runtime_cache_path":"$WORKER_RUNTIME_CACHE_MOUNT","checkpoint_manifest_sha256":"$CHECKPOINT_MANIFEST_SHA256","checkpoint_safetensor_shards":$CHECKPOINT_SHARD_COUNT}
 EOF
 
 printf 'Prepared and verified pinned calibration artifacts in %s\n' "$ARTIFACT_DIR"
@@ -549,7 +605,7 @@ ssh -o BatchMode=yes "$SSH_TARGET" \
 write_launch_script() {
     local destination=$1 node_rank=$2 node_ip=$3 iface=$4 hca=$5 cache_mount=$6 artifact_dir=$7 mode=$8 cache_access=$9 fp8_host_dir=${10} nvfp4_host_dir=${11}
     local use_immutable_cache_view=${12:-false}
-    local fp8_options="" nvfp4_options="" quant_config_source="$artifact_dir/hf_quant_config_patched.json" config_source="$artifact_dir/config_patched.json"
+    local fp8_options="" nvfp4_options="" oracle_options="" speculative_options="--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":$MTP_DEPTH}' \\" quant_config_source="$artifact_dir/hf_quant_config_patched.json" config_source="$artifact_dir/config_patched.json"
     if [[ -n "$fp8_host_dir" ]]; then
         quant_config_source="$fp8_host_dir/hf_quant_config.json"
         config_source="$artifact_dir/config_fp8_patched.json"
@@ -565,6 +621,17 @@ write_launch_script() {
   -v $(printf '%q' "$nvfp4_host_dir"):/rocket/qwen38-linear-nvfp4:ro \\
   -e ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=/rocket/qwen38-linear-nvfp4/manifest.json \\
   -e ROCKET_QWEN38_NVFP4_QUANT_CONFIG=/rocket/qwen38-linear-nvfp4/hf_quant_config.json \\"
+    fi
+    if [[ "${ORACLE_K0:-false}" == true ]]; then
+        speculative_options="--disable-log-requests \\"
+        if [[ "$node_rank" == 0 ]]; then
+            oracle_options="
+  -e ROCKET_QWEN38_K0_ORACLE=1 \\
+  -e ROCKET_QWEN38_K0_EXPECTED_IDS=$(printf '%q' "$ORACLE_EXPECTED_IDS") \\
+  -e ROCKET_QWEN38_K0_IDENTITY=$(printf '%q' "$ORACLE_IDENTITY") \\
+  -e ROCKET_QWEN38_K0_ORACLE_DIR=/rocket/oracle-root/capture \\
+  -v $(printf '%q' "$OUTPUT_DIR"):/rocket/oracle-root \\"
+        fi
     fi
     cat > "$destination" <<EOF
 #!/usr/bin/env bash
@@ -582,7 +649,7 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   -e VLLM_HOST_IP=$(printf '%q' "$node_ip") -e HF_HOME=/root/.cache/huggingface \\
   -e ROCKET_NVFP4_CALIBRATE=1 -e ROCKET_NVFP4_SAMPLE_ELEMENTS=2048 \\
   -e ROCKET_QWEN38_LOAD_TRACE=1 \\
-  -e ROCKET_NVFP4_MAX_EMISSIONS=12 \\$fp8_options$nvfp4_options
+  -e ROCKET_NVFP4_MAX_EMISSIONS=12 \\$fp8_options$nvfp4_options$oracle_options
   -v $(printf '%q' "$artifact_dir/ple_layer_patched.py"):$CONTAINER_MODEL_DIR/ple_layer.py:ro \\
   -v $(printf '%q' "$artifact_dir/modelopt_patched.py"):$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro \\
   -v $(printf '%q' "$artifact_dir/weight_utils_64k.py"):$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py:ro \\
@@ -603,7 +670,7 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   --tool-call-parser qwen3_coder --distributed-executor-backend mp \\
   --mm-encoder-tp-mode data --nnodes 2 --master-addr $HEAD_IP --master-port $MASTER_PORT \\
   --enable-expert-parallel --all2all-backend allgather_reducescatter \\
-  --speculative-config '{"method":"mtp","num_speculative_tokens":$MTP_DEPTH}' \\
+  $speculative_options
   --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' \\
   --hf-overrides '{"text_config":{"ple_embedding_dtype":"float8_e4m3fn"}}' \\
   --enforce-eager --node-rank $node_rank $mode
@@ -714,6 +781,18 @@ if [[ "$PRODUCTION" == true ]]; then
         fi
     done
 fi
+if [[ "${ORACLE_K0:-false}" == true ]]; then
+    for launch_script in "$OUTPUT_DIR/launch-head.sh" "$OUTPUT_DIR/launch-worker.sh"; do
+        sed -i \
+            -e '/ROCKET_NVFP4_CALIBRATE=/d' \
+            -e '/ROCKET_NVFP4_SAMPLE_ELEMENTS=/d' \
+            -e '/ROCKET_NVFP4_MAX_EMISSIONS=/d' \
+            -e '/ROCKET_QWEN38_LOAD_TRACE=/d' \
+            -e 's/model_telemetry.py:/model_oracle.py:/' \
+            -e 's/--enable-chunked-prefill /--disable-prefix-caching /' \
+            "$launch_script"
+    done
+fi
 scp -q "$OUTPUT_DIR/launch-worker.sh" "$SSH_TARGET:$REMOTE_OUTPUT/launch-worker.sh"
 
 if [[ "$LAUNCH" != true ]]; then
@@ -761,6 +840,26 @@ until curl -fsS "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; do
         fail "worker container exited during startup"
     sleep 10
 done
+
+if [[ "${ORACLE_K0:-false}" == true ]]; then
+    if ! python3 "$REPO_ROOT/scripts/runtime/qwen38-k0-oracle.py" invoke \
+        --endpoint "http://127.0.0.1:$API_PORT" \
+        --request "$OUTPUT_DIR/oracle-request.json" \
+        --output "$OUTPUT_DIR/oracle-response.json" \
+        --arm "$OUTPUT_DIR/ARMED"; then
+        fail "oracle request invocation failed"
+    fi
+    if ! python3 "$REPO_ROOT/scripts/runtime/qwen38-k0-oracle.py" validate \
+        --request "$OUTPUT_DIR/oracle-request.json" \
+        --capture-dir "$OUTPUT_DIR/capture" \
+        --response "$OUTPUT_DIR/oracle-response.json" \
+        --output "$OUTPUT_DIR/oracle-result.json"; then
+        fail "oracle artifact validation failed"
+    fi
+    cat "$OUTPUT_DIR/oracle-result.json"
+    printf 'K0 target oracle complete: %s\n' "$OUTPUT_DIR"
+    exit 0
+fi
 
 if [[ "$PRODUCTION" == true ]]; then
     # Keep startup records out of the fixed-depth acceptance sample.

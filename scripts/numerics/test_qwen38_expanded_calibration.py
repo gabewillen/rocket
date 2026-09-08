@@ -36,6 +36,17 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("--fp8-artifact-dir", help_result.stdout)
         self.assertIn("--production", help_result.stdout)
         self.assertIn("--worker-hf-cache", help_result.stdout)
+        self.assertIn("--oracle-k0", help_result.stdout)
+
+    def test_k0_oracle_omits_speculation_and_is_fail_closed(self):
+        self.assertIn('ORACLE_K0=true; MTP_DEPTH=0', self.source)
+        self.assertIn('--oracle-k0 requires the accepted --nvfp4-artifact-dir', self.source)
+        self.assertIn('speculative_options="--disable-log-requests', self.source)
+        self.assertIn("patch-qwen38-k0-oracle.py", self.source)
+        self.assertIn("qwen38-k0-oracle.py\" validate", self.source)
+        self.assertIn('model_oracle.py:', self.source)
+        self.assertIn('ROCKET_QWEN38_K0_EXPECTED_IDS', self.source)
+        self.assertIn('"valid": False', self.source)
 
     def test_worker_host_cache_is_ext4_and_manifest_matched_fail_closed(self):
         self.assertIn('[[ "$WORKER_HF_CACHE" == /* ]]', self.source)
@@ -382,6 +393,37 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
                 "--gpu-memory-utilization 0.60", low_memory_script.read_text()
             )
 
+    def test_generated_k0_head_is_syntax_valid_and_has_no_speculative_config(self):
+        function = self.source[
+            self.source.index("write_launch_script() {"):
+            self.source.index('\nREMOTE_FP8_ARTIFACT=""')
+        ]
+        with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+            root = pathlib.Path(directory)
+            destination = root / "oracle-head.sh"
+            harness = root / "generate-oracle.sh"
+            harness.write_text(
+                "set -euo pipefail\n"
+                'HEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n'
+                'CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n'
+                'MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n'
+                'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.60\nMTP_DEPTH=0\n'
+                f'ORACLE_K0=true\nOUTPUT_DIR={root}\n'
+                "ORACLE_EXPECTED_IDS='[1,2]'\n"
+                "ORACLE_IDENTITY='{\"model_revision\":\"fc694\"}'\n"
+                + function
+                + f'\nwrite_launch_script {destination} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" /durable/nvfp4\n'
+            )
+            result = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            syntax = subprocess.run(["bash", "-n", str(destination)], capture_output=True, text=True)
+            self.assertEqual(syntax.returncode, 0, syntax.stderr)
+            generated = destination.read_text()
+            self.assertNotIn("--speculative-config", generated)
+            self.assertIn("ROCKET_QWEN38_K0_ORACLE=1", generated)
+            self.assertIn("/rocket/oracle-root/capture", generated)
+            self.assertIn("--disable-log-requests", generated)
+
     def test_gpu_memory_utilization_is_validated_before_external_work(self):
         validation = 'fail "--gpu-memory-utilization must be a finite number in (0,1]"'
         external = "actual_image_id=$(docker image inspect"
@@ -447,7 +489,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             if depth == "0":
-                self.assertIn("true K0 with loaded MTP state is unavailable", result.stderr)
+                self.assertIn("K0 is only available through --oracle-k0", result.stderr)
             else:
                 self.assertIn("must be one of 0,1,2,3,4,5,6,7", result.stderr)
 
