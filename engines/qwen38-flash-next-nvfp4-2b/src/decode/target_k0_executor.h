@@ -101,6 +101,7 @@ class TargetK0OracleComparator {
   virtual int rows() const noexcept = 0;
   virtual std::string_view manifest_sha256() const noexcept = 0;
   virtual bool authenticated() const noexcept = 0;
+  virtual std::int32_t expected_input_token(int row) const = 0;
   // Synchronous comparison boundary. The comparator owns any D2H staging and
   // fence. `layer` is 0..47 only for kLayer and -1 otherwise.
   virtual void compare(TargetK0Boundary boundary, int row, int layer,

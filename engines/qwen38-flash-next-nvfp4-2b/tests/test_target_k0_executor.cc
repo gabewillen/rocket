@@ -96,6 +96,7 @@ struct Comparator final : decode::TargetK0OracleComparator {
     return decode::kTargetK0OracleManifestSha256;
   }
   bool authenticated() const noexcept override { return true; }
+  std::int32_t expected_input_token(int) const override { return 13; }
   void compare(decode::TargetK0Boundary boundary, int row, int layer,
                const void* values, std::size_t elements,
                cudaStream_t stream) override {

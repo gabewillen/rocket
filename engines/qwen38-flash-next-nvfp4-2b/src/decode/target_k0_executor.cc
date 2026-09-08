@@ -53,6 +53,10 @@ TargetK0ExecutionResult TargetK0Executor::execute_prefill(
   for (const auto token : prompt_tokens)
     if (token < 0 || token >= 248'320)
       throw std::invalid_argument("K0 prompt token changed");
+  for (std::size_t row = 0; row < prompt_tokens.size(); ++row)
+    if (prompt_tokens[row] !=
+        comparator_.expected_input_token(static_cast<int>(row)))
+      throw std::invalid_argument("K0 prompt/oracle identity changed");
 
   phase_ = TargetK0ExecutorPhase::kActive;
   std::uint64_t bytes = 0;
