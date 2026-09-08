@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 namespace decode = rocket::qwen38::decode;
+namespace linear = rocket::qwen38::linear_attention;
 
 namespace {
 void check(bool value, const char* message) {
@@ -17,6 +18,19 @@ int main() {
   static_assert(decode::kTargetGdnConvSlotElements == 30'720);
   static_assert(decode::kTargetGdnRecurrentSlotElements == 393'216);
   static_assert(decode::kTargetGdnOwnerStorageBytes == 3'320'576);
+  static_assert(linear::gdn_bucket_index(1) == 0);
+  static_assert(linear::gdn_bucket_index(2) == 1);
+  static_assert(linear::gdn_bucket_index(4) == 2);
+  static_assert(linear::gdn_bucket_index(8) == 3);
+  static_assert(linear::gdn_bucket_index(16) == 4);
+  static_assert(linear::gdn_bucket_index(3) == -1);
+  static_assert(linear::gdn_bucket_rows(0) == 1);
+  static_assert(linear::gdn_bucket_rows(1) == 2);
+  static_assert(linear::gdn_bucket_rows(2) == 4);
+  static_assert(linear::gdn_bucket_rows(3) == 8);
+  static_assert(linear::gdn_bucket_rows(4) == 16);
+  static_assert(linear::gdn_bucket_rows(-1) == 0);
+  static_assert(linear::gdn_bucket_rows(5) == 0);
 
   void* storage = nullptr;
   if (posix_memalign(&storage, 256, decode::kTargetGdnOwnerStorageBytes) != 0)

@@ -23,6 +23,28 @@ constexpr bool allowed_m(int m) noexcept {
   return m == 1 || m == 2 || m == 4 || m == 8 || m == 16;
 }
 
+constexpr int gdn_bucket_index(int m) noexcept {
+  switch (m) {
+    case 1:
+      return 0;
+    case 2:
+      return 1;
+    case 4:
+      return 2;
+    case 8:
+      return 3;
+    case 16:
+      return 4;
+    default:
+      return -1;
+  }
+}
+
+constexpr int gdn_bucket_rows(int bucket) noexcept {
+  constexpr int rows[] = {1, 2, 4, 8, 16};
+  return bucket >= 0 && bucket < 5 ? rows[bucket] : 0;
+}
+
 // Stable buffers for the exact Qwen3.8 TP2 GDN core after QKVZ/BA projection.
 // The caller owns weights and accepted state. Plan owns only graph-stable
 // intermediates. State pool slot 0 is null; indices <=0 produce zero output.
