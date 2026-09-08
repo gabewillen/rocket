@@ -1,0 +1,73 @@
+---
+title: "Fixed Qwen CUTE QSA prefill beats vLLM by 1.26x and 2.52x at c1"
+description: "A fixed SM121 FlashInfer fork reduced QSA sparse-prefill latency to 0.698 ms for 300 tokens and 6.353 ms for 8192 tokens with matched outputs."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, attention, kernels, cache, numerics, telemetry]
+verdict: accepted
+rocket: "#kernels"
+supersedes: posts/attention/2026-09-07-qwen38-query-pair-prefill-union-loses
+---
+
+**Question.** Does a fixed Hq12/Hkv1/D256/top-k2051 FlashInfer CUTE fork beat the pinned vLLM QSA sparse-prefill stage on GB10?
+
+| setup | |
+| --- | --- |
+| node | `gx10-5e36`, one GB10 |
+| kernel | 6.17.13-rocket64k, 64 KiB |
+| Rocket code | `6075397e5c930a5bdca1d1d1461db10d28dd2216` |
+| vLLM control | `8e685d198`, Apache-2.0 |
+| FlashInfer source | `91bda04c66f7cb851e1ab3b78b9fecea644b9844`, Apache-2.0 |
+| FlashInfer source SHA-256 | `cfdee49ee968868dee7ce1a0b4e2b62a79e2af8990a3961178388d209627a32f` |
+| artifact SHA-256 | `c5f0e70ede9ff571e81c46a3ea80f7a79832135fc7f471de706d06a0fc5b9d33` |
+
+```bash
+set -euo pipefail
+curve_container=rocket-qsa-prefill-fixedmeta-curve-6075397-01
+curve_artifact=/var/tmp/qwen38-qsa-prefill-fixedmeta-curve-6075397-20260908.txt
+cleanup_curve() { docker rm -f "$curve_container" >/dev/null 2>&1 || true; }
+trap cleanup_curve EXIT INT TERM
+docker run --rm --name "$curve_container" --gpus all --ipc host --network none \
+  --entrypoint bash -e CUDA_VISIBLE_DEVICES=0 \
+  -v /home/glwillen/Development/rocket-attention-worktree:/rocket:ro \
+  -w /rocket vllm/vllm-openai:qwen38-flash-next -lc \
+  'set -euo pipefail; for t in 300 8192; do for c in 1 2 4 8 16; do
+    python3 scripts/kernels/qwen38-qsa-prefill-cute.py "$c" "$t" --pattern overlap
+  done; done' | tee "$curve_artifact"
+```
+
+The p95 ceiling below is the maximum of seven samples. Throughput counts input tokens through this QSA stage. Scaling efficiency is `aggregate(c) / (c * aggregate(c1))`.
+
+| tokens | c | p50 | p95 ceiling | stddev | aggregate | per stream | scaling efficiency |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 300 | 1 | 0.698336 ms | 0.700384 ms | 0.001925 ms | 429,593 tok/s | 429,593 tok/s | 100.0% |
+| 300 | 2 | 1.134176 ms | 1.139520 ms | 0.002380 ms | 529,018 tok/s | 264,509 tok/s | 61.57% |
+| 300 | 4 | 1.610240 ms | 1.816608 ms | 0.078766 ms | 745,231 tok/s | 186,308 tok/s | 43.37% |
+| 300 | 8 | 2.432480 ms | 2.857664 ms | 0.168187 ms | 986,647 tok/s | 123,331 tok/s | 28.71% |
+| 300 | 16 | 4.809440 ms | 4.868960 ms | 0.022612 ms | 998,037 tok/s | 62,377 tok/s | 14.52% |
+| 8192 | 1 | 6.352736 ms | 6.847904 ms | 0.227165 ms | 1,289,523 tok/s | 1,289,523 tok/s | 100.0% |
+| 8192 | 2 | 12.275424 ms | 12.884192 ms | 0.304106 ms | 1,334,699 tok/s | 667,350 tok/s | 51.75% |
+| 8192 | 4 | 23.954111 ms | 24.521761 ms | 0.285025 ms | 1,367,949 tok/s | 341,987 tok/s | 26.52% |
+| 8192 | 8 | 48.150272 ms | 49.463585 ms | 0.823676 ms | 1,361,072 tok/s | 170,134 tok/s | 13.19% |
+| 8192 | 16 | 96.012611 ms | 96.858658 ms | 0.430114 ms | 1,365,154 tok/s | 85,322 tok/s | 6.62% |
+
+| c1 shape | Rocket p50 | matched vLLM p50 | speedup | max abs | mean abs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 300 tokens after an 8192-token prefix | 0.698336 ms | 0.878752 ms | 1.258x | 0.000033379 | 0.000004676 |
+| 8192-token prefix | 6.352736 ms | 16.035200 ms | 2.524x | 0.000976562 | 0.000003991 |
+
+All ten shapes returned `graph_exact=true` and `state_unchanged=true`. The 300-token maximum error was at most `0.000033379`; the 8192-token maximum was `0.000976562`. The c4 and c8 300-token rows contained isolated high samples. Their seven-sample coefficients of variation were 4.89% and 6.91%.
+
+The earlier kernel wrote only 16 of 256 output dimensions. The fork now uses an independent D256 output coordinate tensor. Fixed tile geometry, an 8208-wide caller-owned workspace, and builder-side N16 tail finalization removed the per-call allocation and full-workspace sanitization path. The captured graph contains metadata construction and attention on one caller stream.
+
+**Verdict.** Accepted for the QSA sparse-prefill component. The c1 matched comparisons pass output, immutable-state, graph replay, and value gates at both prompt anchors. c2 through c16 have matched-vLLM numerical controls but no matched-vLLM timing. These rates do not measure whole prefill or generated-token throughput.
+
+**Next.**
+
+- Integrate the selected component with QSA state publication and the full prefill graph.
+- Measure matched-vLLM prefill latency across c2 through c16.
+- Measure end-to-end quality-accepted prefill and decode across the concurrency curve.
+
+**Reopen if.**
+
+- A newer SM121 FlashInfer, vLLM, or CUDA compiler release changes either c1 matched control by more than the seven-sample variance above.
