@@ -37,13 +37,15 @@ bool valid_launch(const TargetMoeB12xLaunch& launch) noexcept {
 #if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
 template <class Module>
 TargetMoeAotConstructionStage load_module(
-    Module* module, int device, auto init, auto load) noexcept {
+    Module* module, int device, auto init, auto load,
+    TargetMoeAotConstructionStage* progress) noexcept {
   cudaLibrary_t* library = &module->module;
   cudaError_t status = cudaSuccess;
   struct InitArgs {
     cudaLibrary_t** library;
     cudaError_t* status;
   } init_args{&library, &status};
+  if (progress) *progress = TargetMoeAotConstructionStage::kModuleData;
   init(reinterpret_cast<void**>(&init_args));
   if (status != cudaSuccess) return TargetMoeAotConstructionStage::kModuleData;
   std::int32_t selected_device = device;
@@ -52,6 +54,7 @@ TargetMoeAotConstructionStage load_module(
     std::int32_t* device;
     cudaError_t* status;
   } load_args{&library, &selected_device, &status};
+  if (progress) *progress = TargetMoeAotConstructionStage::kModuleLoad;
   load(reinterpret_cast<void**>(&load_args));
   return status == cudaSuccess ? TargetMoeAotConstructionStage{}
                                : TargetMoeAotConstructionStage::kModuleLoad;
@@ -172,20 +175,24 @@ struct TargetMoeB12xAot::Impl {
 };
 
 TargetMoeB12xAot::TargetMoeB12xAot(
-    int device, TargetMoeB12xIdentity identity, TargetMoeB12xWeights weights)
+    int device, TargetMoeB12xIdentity identity, TargetMoeB12xWeights weights,
+    TargetMoeAotConstructionStage* construction_stage)
     : impl_(nullptr) {
+  if (construction_stage)
+    *construction_stage = TargetMoeAotConstructionStage::kIdentity;
   if (diagnose_target_moe_b12x_create(device, identity, weights) !=
       TargetMoeCreateFailure::kNone)
     throw TargetMoeAotConstructionError(
         TargetMoeAotConstructionStage::kIdentity);
   impl_ = new Impl{device, identity, weights};
-  const auto construction_stage = load_module(
+  const auto outcome_stage = load_module(
       &impl_->module, device, _mlir_qwen38_target_moe_b12x_c1_cuda_init,
-      _mlir_qwen38_target_moe_b12x_c1_cuda_load_to_device);
-  if (construction_stage != TargetMoeAotConstructionStage{}) {
+      _mlir_qwen38_target_moe_b12x_c1_cuda_load_to_device,
+      construction_stage);
+  if (outcome_stage != TargetMoeAotConstructionStage{}) {
     delete impl_;
     impl_ = nullptr;
-    throw TargetMoeAotConstructionError(construction_stage);
+    throw TargetMoeAotConstructionError(outcome_stage);
   }
 }
 

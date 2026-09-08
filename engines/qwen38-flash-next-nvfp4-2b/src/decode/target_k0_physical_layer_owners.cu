@@ -82,11 +82,12 @@ TargetK0PhysicalLayerOwners::create(
       mark(TargetK0PhysicalLayerConstructionStage::kGdnOwner, layer);
       moe::TargetLayerMoeConstructionStage moe_stage =
           moe::TargetLayerMoeConstructionStage::kUnknown;
+      moe::TargetMoeAotConstructionStage aot_stage{};
       std::unique_ptr<moe::TargetLayerMoeDeviceOwner> moe;
       try {
         moe = moe::TargetLayerMoeDeviceOwner::create(
             device, plan, accepted_loader_lease_handle, moe_telemetry,
-            stage_telemetry, &moe_stage);
+            stage_telemetry, &moe_stage, &aot_stage);
       } catch (const moe::TargetMoeAotConstructionError& error) {
         if (progress) {
           progress->gdn_stage =
@@ -105,10 +106,16 @@ TargetK0PhysicalLayerOwners::create(
         throw;
       } catch (...) {
         if (progress) {
-          progress->gdn_stage =
-              moe_stage == moe::TargetLayerMoeConstructionStage::kAot
-                  ? TargetGdnOwnerConstructionStage::kMoeAot
-                  : (moe_stage == moe::TargetLayerMoeConstructionStage::kStage
+          progress->gdn_stage = aot_stage ==
+                                        moe::TargetMoeAotConstructionStage::kIdentity
+                                    ? TargetGdnOwnerConstructionStage::kMoeAotIdentity
+                                : aot_stage == moe::TargetMoeAotConstructionStage::kModuleData
+                                    ? TargetGdnOwnerConstructionStage::kMoeAotModuleData
+                                : aot_stage == moe::TargetMoeAotConstructionStage::kModuleLoad
+                                    ? TargetGdnOwnerConstructionStage::kMoeAotModuleLoad
+                                : moe_stage == moe::TargetLayerMoeConstructionStage::kAot
+                                    ? TargetGdnOwnerConstructionStage::kMoeParticipantContract
+                                : (moe_stage == moe::TargetLayerMoeConstructionStage::kStage
                          ? TargetGdnOwnerConstructionStage::kMoeStage
                          : TargetGdnOwnerConstructionStage::kPlanBinder);
         }

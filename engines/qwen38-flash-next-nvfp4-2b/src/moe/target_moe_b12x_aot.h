@@ -135,7 +135,8 @@ enum class TargetMoeCreateFailure : std::uint8_t {
 class TargetMoeB12xAot final {
  public:
   TargetMoeB12xAot(int device, TargetMoeB12xIdentity identity,
-                   TargetMoeB12xWeights weights);
+                   TargetMoeB12xWeights weights,
+                   TargetMoeAotConstructionStage* construction_stage = nullptr);
   ~TargetMoeB12xAot();
   TargetMoeB12xAot(const TargetMoeB12xAot&) = delete;
   TargetMoeB12xAot& operator=(const TargetMoeB12xAot&) = delete;

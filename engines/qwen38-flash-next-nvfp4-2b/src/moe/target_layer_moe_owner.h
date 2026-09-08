@@ -90,7 +90,8 @@ class TargetLayerMoeDeviceOwner final {
       void* accepted_loader_lease_handle,
       std::shared_ptr<TargetFullMoeOtelSink> telemetry,
       std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry,
-      TargetLayerMoeConstructionStage* construction_stage = nullptr);
+      TargetLayerMoeConstructionStage* construction_stage = nullptr,
+      TargetMoeAotConstructionStage* aot_stage = nullptr);
   ~TargetLayerMoeDeviceOwner();
   TargetLayerMoeDeviceOwner(const TargetLayerMoeDeviceOwner&) = delete;
   TargetLayerMoeDeviceOwner& operator=(const TargetLayerMoeDeviceOwner&) = delete;
@@ -110,7 +111,8 @@ class TargetLayerMoeDeviceOwner final {
       std::shared_ptr<const model::TargetSlabLease> slab_lease,
       std::shared_ptr<TargetFullMoeOtelSink> telemetry,
       std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry,
-      TargetLayerMoeConstructionStage* construction_stage);
+      TargetLayerMoeConstructionStage* construction_stage,
+      TargetMoeAotConstructionStage* aot_stage);
   int device_ = -1;
   int rank_ = -1;
   int layer_ = -1;
