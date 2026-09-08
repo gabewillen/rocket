@@ -193,6 +193,12 @@ class FlashInferRoutedMoeBackend:
             with self._forced_selector(selector):
                 self._wrappers[(m, selector)] = self._new_wrapper(m)
 
+    @property
+    def implementation_identity(self) -> str:
+        """Frozen identity used only by the eager correctness adapter."""
+
+        return f"flashinfer-b12x:{FLASHINFER_COMMIT}:target-nvfp4"
+
     @classmethod
     def for_external_mtp(
         cls, source: ExternalMtpSource, weights: FlashInferMoeWeights, *, torch_api=None
