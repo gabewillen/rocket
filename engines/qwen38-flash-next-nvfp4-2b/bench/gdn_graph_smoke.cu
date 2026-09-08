@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Live-only proof for the authenticated rank-0/layer-0 fixed GDN graph.
 #include "linear_attention/gdn_cutlass.h"
+#include "linear_attention/gdn_flashinfer_wheel.h"
 #include "linear_attention/gdn_verifier.h"
 
 #include <cuda_bf16.h>
@@ -16,6 +17,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
@@ -185,12 +187,22 @@ std::pair<float, float> capture_measure(cudaStream_t stream, Launch launch) {
 
 void run_prefill_projection(int device,
                             rocket::qwen38::linear_attention::GdnWeights weights,
-                            bool use_b12x) {
+                            rocket::qwen38::linear_attention::GdnPrefillInputBackend backend,
+                            std::string_view wheel_shared_object) {
   using rocket::qwen38::linear_attention::CutlassGdnPrefillProjection;
   using rocket::qwen38::linear_attention::GdnPrefillInputBackend;
-  const auto backend = use_b12x ? GdnPrefillInputBackend::kB12x
-                                : GdnPrefillInputBackend::kFlashInferCutlass;
-  CutlassGdnPrefillProjection projection(device, weights, true, backend);
+  CutlassGdnPrefillProjection projection(device, weights, true, backend,
+                                         wheel_shared_object);
+  if (backend == GdnPrefillInputBackend::kFlashInferWheelBenchmark) {
+    std::cout
+        << "prefill_wheel_sha256="
+        << rocket::qwen38::linear_attention::kGdnFlashInferWheelSha256
+        << " wheel_architecture="
+        << rocket::qwen38::linear_attention::kGdnFlashInferWheelArchitecture
+        << " fallback_tactic=-1 fallback_cta=128x128x256"
+        << " fallback_scheduler=dp fallback_swap_ab=false"
+        << " fallback_cluster=1x1x1\n";
+  }
   DeviceBlob hidden(8'192ULL * kHidden * 2);
   DeviceBlob normalized(8'192ULL * kHeads * kDim * 2);
   constexpr std::size_t hidden_elements = 8'192ULL * kHidden;
@@ -260,7 +272,12 @@ void run_prefill_projection(int device,
         projection.ba(tokens), projection.reference_ba(tokens),
         static_cast<std::size_t>(tokens) * 48 * 2);
     std::cout << "prefill_backend="
-              << (use_b12x ? "b12x" : "flashinfer_cutlass_91bda04")
+              << (backend == GdnPrefillInputBackend::kB12x
+                      ? "b12x"
+                      : backend ==
+                                GdnPrefillInputBackend::kFlashInferWheelBenchmark
+                            ? "flashinfer_wheel_0.6.17_sm120f_fallback"
+                            : "flashinfer_cutlass_91bda04")
               << " prefill_tokens=" << tokens
               << " shared_input_quantizations=1 input_p50_us=" << input.first
               << " input_p95_us=" << input.second
@@ -287,12 +304,16 @@ void run_prefill_projection(int device,
 }  // namespace
 
 int main(int argc, char** argv) try {
-  if (argc != 3 && argc != 4)
+  if (argc != 3 && argc != 4 && argc != 5)
     throw std::invalid_argument(
         "usage: qwen38-gdn-graph-smoke SLAB DEVICE "
-        "[--prefill-projection|--prefill-projection-b12x]");
+        "[--prefill-projection|--prefill-projection-b12x|"
+        "--prefill-projection-flashinfer-wheel SO]");
   if (argc == 4 && std::string(argv[3]) != "--prefill-projection" &&
       std::string(argv[3]) != "--prefill-projection-b12x")
+    throw std::invalid_argument("unknown GDN graph smoke mode");
+  if (argc == 5 &&
+      std::string(argv[3]) != "--prefill-projection-flashinfer-wheel")
     throw std::invalid_argument("unknown GDN graph smoke mode");
   const int device = std::stoi(argv[2]);
   check(cudaSetDevice(device), "cudaSetDevice");
@@ -334,9 +355,18 @@ int main(int argc, char** argv) try {
       static_cast<__nv_bfloat16*>(alog.pointer),
       static_cast<__nv_bfloat16*>(dt.pointer),
       static_cast<__nv_bfloat16*>(norm.pointer)};
-  if (argc == 4) {
-    run_prefill_projection(device, weights,
-                           std::string(argv[3]) == "--prefill-projection-b12x");
+  if (argc >= 4) {
+    using rocket::qwen38::linear_attention::GdnPrefillInputBackend;
+    const std::string mode(argv[3]);
+    const auto backend =
+        mode == "--prefill-projection-b12x"
+            ? GdnPrefillInputBackend::kB12x
+            : mode == "--prefill-projection-flashinfer-wheel"
+                  ? GdnPrefillInputBackend::kFlashInferWheelBenchmark
+                  : GdnPrefillInputBackend::kFlashInferCutlass;
+    run_prefill_projection(device, weights, backend,
+                           argc == 5 ? std::string_view(argv[4])
+                                     : std::string_view{});
     return 0;
   }
 

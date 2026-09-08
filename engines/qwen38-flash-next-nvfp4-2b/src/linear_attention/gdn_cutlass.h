@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 
 #include "decode/linear_attention_layer.h"
 #include "linear_attention/gdn_core.h"
@@ -49,6 +50,7 @@ inline constexpr char kPrefillB12xQuantSourceRevision[] = "8e685d198";
 enum class GdnPrefillInputBackend {
   kFlashInferCutlass,
   kB12x,
+  kFlashInferWheelBenchmark,
 };
 
 #if defined(__CUDACC__)
@@ -119,7 +121,8 @@ class CutlassGdnPrefillProjection final {
   CutlassGdnPrefillProjection(int device, GdnWeights weights,
                               bool enable_reference = false,
                               GdnPrefillInputBackend input_backend =
-                                  GdnPrefillInputBackend::kFlashInferCutlass);
+                                  GdnPrefillInputBackend::kFlashInferCutlass,
+                              std::string_view wheel_shared_object = {});
   ~CutlassGdnPrefillProjection();
   CutlassGdnPrefillProjection(const CutlassGdnPrefillProjection&) = delete;
   CutlassGdnPrefillProjection& operator=(

@@ -103,6 +103,46 @@ class GdnFlashInferCutlassContract(unittest.TestCase):
         self.assertIn("bucket->ba_gemm.run(stream)", graph)
         self.assertIn('"flashinfer_cutlass_91bda04"', smoke)
 
+    def test_wheel_runner_is_diagnostic_and_fails_closed(self) -> None:
+        header = (ENGINE / "src/linear_attention/gdn_flashinfer_wheel.h").read_text()
+        adapter = (ENGINE / "src/linear_attention/gdn_flashinfer_wheel.cc").read_text()
+        graph_header = (ENGINE / "src/linear_attention/gdn_cutlass.h").read_text()
+        smoke = (ENGINE / "bench/gdn_graph_smoke.cu").read_text()
+        cmake = (ENGINE / "CMakeLists.txt").read_text()
+        self.assertIn("Diagnostic-only adapter", header)
+        self.assertIn("flashinfer-jit-cache==0.6.17+cu130", header)
+        self.assertIn("13.0.88", header)
+        self.assertIn("sm_120f", header)
+        self.assertIn("b46b16d003484063bca4ed365e44095c4c6ed633", header)
+        self.assertIn(
+            "dfd9f2076fda819e45d169c88774bd26a9fc93bdc714592ab5dfe12b90bbf5ae",
+            header,
+        )
+        self.assertIn("posix_spawn", adapter)
+        self.assertIn("O_RDONLY | O_CLOEXEC | O_NOFOLLOW", adapter)
+        self.assertIn('const_cast<char*>("-")', adapter)
+        self.assertIn('"/proc/self/fd/"', adapter)
+        self.assertIn("expected.st_ino == observed.st_ino", adapter)
+        self.assertIn("RTLD_LAZY | RTLD_LOCAL", adapter)
+        self.assertIn("gdn_flashinfer_cutlass_fallback_symbol()", adapter)
+        self.assertIn("dlsym(impl_->library, symbol)", adapter)
+        self.assertIn("fallback runner ABI mismatch", adapter)
+        self.assertIn("fallback symbol interposed", adapter)
+        self.assertNotIn("torch::", adapter)
+        self.assertNotIn("tvm::", adapter)
+        self.assertIn("kFlashInferWheelBenchmark", graph_header)
+        self.assertIn(
+            "GdnPrefillInputBackend::kFlashInferCutlass,\n"
+            "                              std::string_view wheel_shared_object = {}",
+            graph_header,
+        )
+        self.assertIn("--prefill-projection-flashinfer-wheel", smoke)
+        self.assertIn("fallback_tactic=-1 fallback_cta=128x128x256", smoke)
+        self.assertIn("fallback_scheduler=dp fallback_swap_ab=false", smoke)
+        self.assertIn("fallback_cluster=1x1x1", smoke)
+        self.assertIn("src/linear_attention/gdn_flashinfer_wheel.cc", cmake)
+        self.assertIn("${CMAKE_DL_LIBS}", cmake)
+
 
 if __name__ == "__main__":
     unittest.main()

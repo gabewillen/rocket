@@ -6,6 +6,7 @@
 
 #include "linear_attention/gdn_b12x_aot.h"
 #include "linear_attention/gdn_flashinfer_cutlass.h"
+#include "linear_attention/gdn_flashinfer_wheel.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -652,6 +653,8 @@ struct PrefillProjectionBucket {
   __nv_bfloat16* reference_ba = nullptr;
   GdnFlashInferCutlassGemm qkvz_gemm;
   GdnFlashInferCutlassGemm ba_gemm;
+  GdnFlashInferWheelGemm wheel_qkvz_gemm;
+  GdnFlashInferWheelGemm wheel_ba_gemm;
   FixedGemm output_gemm;
   FixedGemm reference_qkvz_gemm;
   FixedGemm reference_ba_gemm;
@@ -661,9 +664,11 @@ struct PrefillProjectionBucket {
 
 struct CutlassGdnPrefillProjection::Impl {
   Impl(int selected_device, GdnWeights selected_weights,
-       bool selected_reference, GdnPrefillInputBackend selected_backend)
+       bool selected_reference, GdnPrefillInputBackend selected_backend,
+       std::string_view selected_wheel_shared_object)
       : device(selected_device), globals(selected_weights),
-        reference_enabled(selected_reference), input_backend(selected_backend) {}
+        reference_enabled(selected_reference), input_backend(selected_backend),
+        wheel_shared_object(selected_wheel_shared_object) {}
   ~Impl() {
     cudaSetDevice(device);
     cudaFree(projection_alpha);
@@ -687,6 +692,7 @@ struct CutlassGdnPrefillProjection::Impl {
   GdnWeights globals;
   bool reference_enabled;
   GdnPrefillInputBackend input_backend;
+  std::string wheel_shared_object;
   std::unique_ptr<GdnB12xAot> b12x;
   float* projection_alpha = nullptr;
   std::uint8_t* qkvz_weight = nullptr;
@@ -701,8 +707,10 @@ struct CutlassGdnPrefillProjection::Impl {
 CutlassGdnPrefillProjection::CutlassGdnPrefillProjection(int device,
                                                          GdnWeights weights,
                                                          bool enable_reference,
-                                                         GdnPrefillInputBackend input_backend)
-    : impl_(new Impl(device, weights, enable_reference, input_backend)) {
+                                                         GdnPrefillInputBackend input_backend,
+                                                         std::string_view wheel_shared_object)
+    : impl_(new Impl(device, weights, enable_reference, input_backend,
+                     wheel_shared_object)) {
   const Nvfp4Matrix matrices[] = {weights.qkv, weights.z, weights.b,
                                   weights.a, weights.output};
   if (device < 0) {
@@ -711,10 +719,17 @@ CutlassGdnPrefillProjection::CutlassGdnPrefillProjection(int device,
     throw std::invalid_argument("prefill projection device is invalid");
   }
   if (input_backend != GdnPrefillInputBackend::kFlashInferCutlass &&
-      input_backend != GdnPrefillInputBackend::kB12x) {
+      input_backend != GdnPrefillInputBackend::kB12x &&
+      input_backend != GdnPrefillInputBackend::kFlashInferWheelBenchmark) {
     delete impl_;
     impl_ = nullptr;
     throw std::invalid_argument("prefill projection backend is invalid");
+  }
+  if ((input_backend == GdnPrefillInputBackend::kFlashInferWheelBenchmark) !=
+      !wheel_shared_object.empty()) {
+    delete impl_;
+    impl_ = nullptr;
+    throw std::invalid_argument("FlashInfer wheel benchmark path is invalid");
   }
   for (const auto& matrix : matrices) {
     if (!matrix.weight || !matrix.scale || !std::isfinite(matrix.global_scale) ||
@@ -817,6 +832,16 @@ CutlassGdnPrefillProjection::CutlassGdnPrefillProjection(int device,
                              bucket->input_sfa, impl_->ba_weight,
                              impl_->ba_scale, impl_->projection_alpha,
                              bucket->ba);
+      } else if (input_backend ==
+                 GdnPrefillInputBackend::kFlashInferWheelBenchmark) {
+        bucket->wheel_qkvz_gemm.init(
+            impl_->wheel_shared_object, tokens, kQkvzN, kInputK,
+            bucket->input_packed, bucket->input_sfa, impl_->qkvz_weight,
+            impl_->qkvz_scale, impl_->projection_alpha, bucket->qkvz);
+        bucket->wheel_ba_gemm.init(
+            impl_->wheel_shared_object, tokens, kBaN, kInputK,
+            bucket->input_packed, bucket->input_sfa, impl_->ba_weight,
+            impl_->ba_scale, impl_->projection_alpha, bucket->ba);
       }
       bucket->output_gemm.init(tokens, kOutputN, kOutputK,
                                bucket->output_packed, bucket->output_sfa,
@@ -891,6 +916,9 @@ void CutlassGdnPrefillProjection::launch_qkvz(int tokens,
     impl_->b12x->launch({bucket->input_packed, bucket->input_sfa,
                          impl_->qkvz_weight, impl_->qkvz_scale, bucket->qkvz,
                          impl_->projection_alpha, tokens, kQkvzN, stream});
+  } else if (impl_->input_backend ==
+             GdnPrefillInputBackend::kFlashInferWheelBenchmark) {
+    bucket->wheel_qkvz_gemm.run(stream);
   } else {
     bucket->qkvz_gemm.run(stream);
   }
@@ -909,6 +937,9 @@ void CutlassGdnPrefillProjection::launch_ba(int tokens,
     impl_->b12x->launch({bucket->input_packed, bucket->input_sfa,
                          impl_->ba_weight, impl_->ba_scale, bucket->ba,
                          impl_->projection_alpha, tokens, kBaN, stream});
+  } else if (impl_->input_backend ==
+             GdnPrefillInputBackend::kFlashInferWheelBenchmark) {
+    bucket->wheel_ba_gemm.run(stream);
   } else {
     bucket->ba_gemm.run(stream);
   }

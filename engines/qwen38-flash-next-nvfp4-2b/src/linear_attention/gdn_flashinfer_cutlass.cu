@@ -3,6 +3,8 @@
 // Apache-2.0 template without reconstructing the kernel locally.
 #include "linear_attention/gdn_flashinfer_cutlass.h"
 
+#include <dlfcn.h>
+
 #include <stdexcept>
 #include <string>
 
@@ -28,6 +30,13 @@ constexpr ImportedLauncher kImportedLauncher =
         cute::Int<1>, cute::Int<1>, cute::Int<1>, flashinfer::gemm::_1SM,
         false>;
 
+using ImportedRawRunner = std::size_t (*)(
+    void*, const void*, const void*, const void*, const void*, const float*,
+    int, int, int, int, char*, std::size_t, cudaStream_t, const char*);
+constexpr ImportedRawRunner kImportedRawRunner =
+    &flashinfer::gemm::runFp4GemmImpl<
+        flashinfer::gemm::Fp4Gemm___nv_bfloat16_128_128_256false>;
+
 flashinfer::gemm::CutlassGemmConfig fallback_config() {
   return {flashinfer::gemm::CutlassTileConfigSM120::CtaShape128x128x128B,
           flashinfer::gemm::MainloopScheduleType::AUTO,
@@ -44,6 +53,16 @@ void cuda_check(cudaError_t status, const char* operation) {
 }
 
 }  // namespace
+
+const char* gdn_flashinfer_cutlass_fallback_symbol() {
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<const void*>(kImportedRawRunner), &info) == 0 ||
+      !info.dli_sname) {
+    throw std::runtime_error(
+        "resolve FlashInfer CUTLASS fallback compiler ABI symbol");
+  }
+  return info.dli_sname;
+}
 
 struct GdnFlashInferCutlassGemm::Impl {
   int m = 0;

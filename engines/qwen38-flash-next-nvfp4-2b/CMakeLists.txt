@@ -215,6 +215,7 @@ set_target_properties(qwen38_gdn_flashinfer_cutlass PROPERTIES
 
 add_library(qwen38_gdn_graph SHARED
   src/linear_attention/gdn_cutlass.cu
+  src/linear_attention/gdn_flashinfer_wheel.cc
   src/linear_attention/gdn_verifier.cu)
 target_include_directories(qwen38_gdn_graph PUBLIC
   src
@@ -223,9 +224,10 @@ target_include_directories(qwen38_gdn_graph PUBLIC
 )
 target_link_libraries(qwen38_gdn_graph PUBLIC
   qwen38_gdn_core qwen38_gdn_b12x_aot qwen38_gdn_flashinfer_cutlass
-  qwen38_decode_execution CUDA::cudart
+  qwen38_decode_execution CUDA::cudart ${CMAKE_DL_LIBS}
 )
 target_compile_options(qwen38_gdn_graph PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror>
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>
 )
 set_target_properties(qwen38_gdn_graph PROPERTIES

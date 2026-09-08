@@ -17,6 +17,11 @@ inline constexpr int kGdnFlashInferCutlassTileK = 256;
 inline constexpr bool kGdnFlashInferCutlassSwapAb = false;
 inline constexpr bool kGdnFlashInferCutlassStreamK = false;
 
+// Returns the compiler ABI name of the exact fallback runner instantiated in
+// this target. The wheel benchmark uses it for dlsym so source and binary ABI
+// drift fails closed instead of relying on a copied mangled-name literal.
+const char* gdn_flashinfer_cutlass_fallback_symbol();
+
 class GdnFlashInferCutlassGemm final {
  public:
   GdnFlashInferCutlassGemm();
