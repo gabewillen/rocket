@@ -131,6 +131,41 @@ class TargetSlabOwnerContractTests(unittest.TestCase):
         self.assertLess(opened, direct_open)
         self.assertLess(direct_open, publication)
 
+    def test_guard_rejection_preserves_complete_bounded_evidence(self):
+        harness = (
+            ROOT
+            / "engines/qwen38-flash-next-nvfp4-2b/bench/target_slab_load.cc"
+        ).read_text()
+        self.assertNotIn(
+            'throw std::logic_error("target slab cold-load regression guard exceeded")',
+            harness,
+        )
+        self.assertIn("return guard_passed ? 0 : 1", harness)
+        for field in (
+            "benchmark_accepted",
+            "performance_guard",
+            "cold_load_regression_guard_exceeded",
+            "publication_identity_authenticated",
+            "publication_fence_completed",
+            "chunks_authenticated",
+            "samples_match",
+            "open_to_publish_ns",
+            "bytes_per_second",
+            "stage_open_ns",
+            "stage_allocate_ns",
+            "stage_direct_read_ns",
+            "stage_digest_ns",
+            "stage_h2d_enqueue_ns",
+            "stage_h2d_fence_ns",
+            "stage_transient_cleanup_ns",
+            "gpu_allocation_delta_bytes",
+            "peak_host_pinned_bytes",
+            "gpu_cleanup_delta_bytes",
+            "cleanup",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, harness)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -58,6 +58,18 @@ struct TargetSlabTelemetryRecord {
   bool success;
 };
 
+// Host-observed stage durations. Read, digest, enqueue, and fence durations may
+// overlap, so their sum is not an alternative wall-clock measurement.
+struct TargetSlabStageTimings {
+  std::uint64_t open_ns;
+  std::uint64_t allocate_ns;
+  std::uint64_t direct_read_ns;
+  std::uint64_t digest_ns;
+  std::uint64_t h2d_enqueue_ns;
+  std::uint64_t h2d_fence_ns;
+  std::uint64_t transient_cleanup_ns;
+};
+
 // OpenTelemetry adapter boundary owned by the engine embedder. Records contain
 // only fixed enums, rank {-1,0,1}, chunk bucket {0..7}, and success boolean.
 // Implementations synchronously export/copy the record and must not throw.
@@ -80,6 +92,7 @@ struct TargetSlabPublication {
   std::string_view manifest_sha256;
   std::string_view layout_sha256;
   std::uint64_t open_to_publish_ns;
+  TargetSlabStageTimings stage_timings;
   std::size_t chunks_authenticated;
   std::size_t peak_host_pinned_bytes;
 };

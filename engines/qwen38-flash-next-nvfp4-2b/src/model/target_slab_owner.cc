@@ -92,7 +92,9 @@ class Sha256 final {
 
 std::array<std::uint8_t, 32> hash_fd(int fd, std::uint64_t offset,
                                     std::uint64_t bytes,
-                                    std::uint8_t* direct_buffer = nullptr) {
+                                    std::uint8_t* direct_buffer = nullptr,
+                                    std::uint64_t* read_ns = nullptr,
+                                    std::uint64_t* digest_ns = nullptr) {
   Sha256 digest;
   std::vector<std::uint8_t> ordinary;
   if (!direct_buffer) ordinary.resize(1 << 20);
@@ -101,11 +103,19 @@ std::array<std::uint8_t, 32> hash_fd(int fd, std::uint64_t offset,
     const std::size_t requested = static_cast<std::size_t>(std::min<std::uint64_t>(
         direct_buffer ? bytes : ordinary.size(), bytes - consumed));
     auto* destination = direct_buffer ? direct_buffer + consumed : ordinary.data();
+    const auto read_started = Clock::now();
     const ssize_t count = pread(fd, destination, requested, offset + consumed);
+    if (read_ns)
+      *read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          Clock::now() - read_started).count();
     if (count < 0 && errno == EINTR) continue;
     if (count <= 0 || static_cast<std::size_t>(count) != requested)
       throw IoError("target slab read was short");
+    const auto digest_started = Clock::now();
     digest.update(destination, requested);
+    if (digest_ns)
+      *digest_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          Clock::now() - digest_started).count();
     consumed += requested;
   }
   return digest.finish();
@@ -191,6 +201,7 @@ std::unique_ptr<TargetSlabDeviceOwner> TargetSlabDeviceOwner::load(
     TargetSlabTelemetrySink& telemetry) {
   TargetSlabLoadPhase phase = TargetSlabLoadPhase::kValidate;
   std::size_t chunk_index = 0;
+  TargetSlabStageTimings timings{};
   auto owner = std::unique_ptr<TargetSlabDeviceOwner>(new TargetSlabDeviceOwner);
   owner->device_ = device;
   owner->rank_ = rank;
@@ -210,7 +221,10 @@ std::unique_ptr<TargetSlabDeviceOwner> TargetSlabDeviceOwner::load(
         !S_ISREG(payload_stat.st_mode) ||
         static_cast<std::uint64_t>(payload_stat.st_size) != kTargetSlabBytes)
       throw IoError("target slab O_DIRECT payload extent changed");
+    timings.open_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        Clock::now() - opened).count();
     phase = TargetSlabLoadPhase::kAllocate;
+    const auto allocate_started = Clock::now();
     cuda_require(cudaSetDevice(device), "target slab device selection failed");
     cuda_require(cudaMalloc(reinterpret_cast<void**>(&owner->allocation_),
                             kTargetSlabBytes),
@@ -233,35 +247,53 @@ std::unique_ptr<TargetSlabDeviceOwner> TargetSlabDeviceOwner::load(
                                             cudaEventDisableTiming),
                    "target slab slot event creation failed");
     }
+    timings.allocate_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        Clock::now() - allocate_started).count();
 
     std::array<bool, kTargetSlabRingDepth> pending{};
     for (chunk_index = 0; chunk_index < metadata.chunks->size(); ++chunk_index) {
       const auto& chunk = (*metadata.chunks)[chunk_index];
       const std::size_t slot = chunk_index % kTargetSlabRingDepth;
-      if (pending[slot])
+      if (pending[slot]) {
+        const auto fence_started = Clock::now();
         cuda_require(cudaEventSynchronize(owner->slot_events_[slot]),
                      "target slab slot reuse fence failed");
+        timings.h2d_fence_ns +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                Clock::now() - fence_started).count();
+      }
       phase = TargetSlabLoadPhase::kRead;
       const auto observed = hash_fd(payload.fd, chunk.offset, chunk.bytes,
-                                    owner->staging_[slot]);
+                                    owner->staging_[slot],
+                                    &timings.direct_read_ns,
+                                    &timings.digest_ns);
       phase = TargetSlabLoadPhase::kDigest;
       if (observed != parse_digest(chunk.sha256))
         throw std::invalid_argument("target slab chunk hash changed");
       phase = TargetSlabLoadPhase::kTransfer;
+      const auto enqueue_started = Clock::now();
       cuda_require(cudaMemcpyAsync(owner->allocation_ + chunk.offset,
                                    owner->staging_[slot], chunk.bytes,
                                    cudaMemcpyHostToDevice, owner->stream_),
                    "target slab H2D enqueue failed");
       cuda_require(cudaEventRecord(owner->slot_events_[slot], owner->stream_),
                    "target slab slot event record failed");
+      timings.h2d_enqueue_ns +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              Clock::now() - enqueue_started).count();
       pending[slot] = true;
     }
     phase = TargetSlabLoadPhase::kPublish;
+    const auto publication_fence_started = Clock::now();
     cuda_require(cudaEventRecord(owner->publication_event_, owner->stream_),
                  "target slab publication event record failed");
     cuda_require(cudaEventSynchronize(owner->publication_event_),
                  "target slab publication fence failed");
+    timings.h2d_fence_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - publication_fence_started).count();
     phase = TargetSlabLoadPhase::kCleanup;
+    const auto cleanup_started = Clock::now();
     for (auto& event : owner->slot_events_) {
       cuda_require(cudaEventDestroy(event),
                    "target slab slot event cleanup failed");
@@ -276,6 +308,9 @@ std::unique_ptr<TargetSlabDeviceOwner> TargetSlabDeviceOwner::load(
       allocation = nullptr;
     }
     owner->staging_.fill(nullptr);
+    timings.transient_cleanup_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - cleanup_started).count();
     phase = TargetSlabLoadPhase::kPublish;
     const auto open_to_publish_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - opened)
@@ -284,7 +319,7 @@ std::unique_ptr<TargetSlabDeviceOwner> TargetSlabDeviceOwner::load(
         owner->allocation_, owner->publication_event_, kTargetSlabBytes, device,
         rank, kTargetSlabArtifactKey, metadata.slab_key,
         kTargetSlabManifestSha256, metadata.layout_sha256,
-        static_cast<std::uint64_t>(open_to_publish_ns),
+        static_cast<std::uint64_t>(open_to_publish_ns), timings,
         kTargetSlabChunks, kTargetSlabPeakPinnedBytes};
     emit(telemetry, TargetSlabLoadPhase::kPublish,
          TargetSlabFailureClass::kNone, rank,

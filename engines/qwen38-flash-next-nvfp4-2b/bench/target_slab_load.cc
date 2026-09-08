@@ -71,7 +71,7 @@ int main(int argc, char** argv) {
 
     auto owner = model::TargetSlabDeviceOwner::load(
         device, rank, artifact, telemetry);
-    const auto& view = owner->publication();
+    const auto view = owner->publication();
     std::size_t free_published = 0;
     cuda_require(cudaMemGetInfo(&free_published, &total),
                  "published CUDA memory query failed");
@@ -102,8 +102,7 @@ int main(int argc, char** argv) {
       throw std::logic_error("target slab device sample changed");
 
     const std::uint64_t elapsed_ns = view.open_to_publish_ns;
-    if (elapsed_ns > kColdLoadRegressionGuardNs)
-      throw std::logic_error("target slab cold-load regression guard exceeded");
+    const bool guard_passed = elapsed_ns <= kColdLoadRegressionGuardNs;
     const std::size_t allocation_delta = free_before > free_published
                                              ? free_before - free_published : 0;
     owner.reset();
@@ -119,7 +118,15 @@ int main(int argc, char** argv) {
       throw std::logic_error("target slab cleanup telemetry changed");
 
     std::cout << "{\"schema\":\"rocket.qwen38.target-slab-load.v1\""
-              << ",\"valid\":true,\"complete\":true"
+              << ",\"valid\":" << (guard_passed ? "true" : "false")
+              << ",\"complete\":" << (guard_passed ? "true" : "false")
+              << ",\"benchmark_accepted\":"
+              << (guard_passed ? "true" : "false")
+              << ",\"failure_class\":\""
+              << (guard_passed ? "none" : "performance_guard") << "\""
+              << ",\"reason\":\""
+              << (guard_passed ? "none"
+                               : "cold_load_regression_guard_exceeded") << "\""
               << ",\"rank\":" << rank << ",\"device\":0"
               << ",\"artifact_key\":\"" << model::kTargetSlabArtifactKey << "\""
               << ",\"slab_key\":\"" << metadata.slab_key << "\""
@@ -135,10 +142,23 @@ int main(int argc, char** argv) {
               << ",\"gpu_allocation_delta_bytes\":" << allocation_delta
               << ",\"gpu_cleanup_delta_bytes\":" << cleanup_delta
               << ",\"open_to_publish_ns\":" << elapsed_ns
+              << ",\"stage_open_ns\":" << view.stage_timings.open_ns
+              << ",\"stage_allocate_ns\":" << view.stage_timings.allocate_ns
+              << ",\"stage_direct_read_ns\":"
+              << view.stage_timings.direct_read_ns
+              << ",\"stage_digest_ns\":" << view.stage_timings.digest_ns
+              << ",\"stage_h2d_enqueue_ns\":"
+              << view.stage_timings.h2d_enqueue_ns
+              << ",\"stage_h2d_fence_ns\":"
+              << view.stage_timings.h2d_fence_ns
+              << ",\"stage_transient_cleanup_ns\":"
+              << view.stage_timings.transient_cleanup_ns
               << ",\"cold_load_regression_guard_ns\":"
               << kColdLoadRegressionGuardNs
-              << ",\"cold_load_regression_guard_passed\":true"
+              << ",\"cold_load_regression_guard_passed\":"
+              << (guard_passed ? "true" : "false")
               << ",\"publication_fence_completed\":true"
+              << ",\"publication_identity_authenticated\":true"
               << ",\"bytes_per_second\":"
               << (static_cast<long double>(model::kTargetSlabBytes) * 1.0e9L /
                   static_cast<long double>(elapsed_ns))
@@ -148,7 +168,7 @@ int main(int argc, char** argv) {
               << ",\"samples_match\":[true,true,true]"
               << ",\"telemetry_records\":" << telemetry.count
               << ",\"telemetry_overflow\":false,\"cleanup\":true}\n";
-    return 0;
+    return guard_passed ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << "{\"schema\":\"rocket.qwen38.target-slab-load.v1\""
               << ",\"valid\":false,\"complete\":false"
