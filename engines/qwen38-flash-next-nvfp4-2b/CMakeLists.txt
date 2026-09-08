@@ -330,6 +330,24 @@ set_target_properties(qwen38_route_compaction PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
   POSITION_INDEPENDENT_CODE ON)
 
+add_library(qwen38_target_moe_c1_contract STATIC src/moe/target_moe_c1.cc)
+target_include_directories(qwen38_target_moe_c1_contract PUBLIC src)
+target_link_libraries(qwen38_target_moe_c1_contract PUBLIC CUDA::cudart)
+target_compile_options(qwen38_target_moe_c1_contract PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_moe_c1_contract PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+
+add_library(qwen38_target_moe_c1 STATIC src/moe/target_moe_c1.cu)
+target_include_directories(qwen38_target_moe_c1 PUBLIC src)
+target_link_libraries(qwen38_target_moe_c1 PUBLIC
+  qwen38_target_moe_c1_contract CUDA::cudart)
+target_compile_options(qwen38_target_moe_c1 PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+set_target_properties(qwen38_target_moe_c1 PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON)
+
 add_library(qwen38_mtp_executor STATIC
   src/mtp/graph_runtime.cu
   src/mtp/input_fusion.cu
@@ -469,6 +487,14 @@ target_compile_options(qwen38-test-route-compaction PRIVATE
   -Wall -Wextra -Werror)
 add_test(NAME qwen38-route-compaction-cpu-contract
   COMMAND qwen38-test-route-compaction)
+
+add_executable(qwen38-test-target-moe-c1 tests/test_target_moe_c1.cc)
+target_link_libraries(qwen38-test-target-moe-c1 PRIVATE
+  qwen38_target_moe_c1_contract)
+target_compile_options(qwen38-test-target-moe-c1 PRIVATE
+  -Wall -Wextra -Werror)
+add_test(NAME qwen38-target-moe-c1-cpu-contract
+  COMMAND qwen38-test-target-moe-c1)
 
 add_executable(qwen38-test-fp8-routed-experts
   tests/test_fp8_routed_experts.cc)
