@@ -33,15 +33,21 @@ int main() {
   if (!model::validate_accepted_loader_publication(
           publication, probe, 1, 2, chunks, model::kTargetSlabChunks))
     return 1;
+  auto padded_probe = probe;
+  padded_probe.allocation_bytes += 1'703'936;
+  if (!model::validate_accepted_loader_publication(
+          publication, padded_probe, 1, 2, chunks,
+          model::kTargetSlabChunks))
+    return 2;
   auto bad_probe = probe;
   --bad_probe.allocation_bytes;
   if (model::validate_accepted_loader_publication(
           publication, bad_probe, 1, 2, chunks, model::kTargetSlabChunks))
-    return 2;
+    return 3;
   --chunks[7].bytes;
   if (model::validate_accepted_loader_publication(
           publication, probe, 1, 2, chunks, model::kTargetSlabChunks))
-    return 3;
+    return 4;
   ++chunks[7].bytes;
   const auto retain = [&](std::uintptr_t base, void** output) {
     return model::qwen38_target_slab_retain_accepted_loader(
@@ -51,9 +57,9 @@ int main() {
         model::kTargetSlabChunks, output);
   };
   const auto invalid_probe = retain(0x100000000000ULL, &first);
-  if ((invalid_probe < 31 || invalid_probe > 35) || first) return 4;
+  if ((invalid_probe < 31 || invalid_probe > 35) || first) return 5;
   if (model::TargetSlabStartupFactory::lease_from_handle(
           reinterpret_cast<void*>(0x1234)))
-    return 5;
+    return 6;
   return 0;
 }

@@ -199,7 +199,10 @@ TargetSlabPublicationValidation diagnose_accepted_loader_publication(
   if (probe.allocation_base !=
       reinterpret_cast<std::uintptr_t>(publication.device_base))
     return TargetSlabPublicationValidation::kAllocationBase;
-  if (probe.allocation_bytes != publication.bytes)
+  // CUDA allocators may round the backing allocation up. The authenticated
+  // publication still starts at the allocation base and exposes exactly the
+  // slab bytes; reject only when the backing range cannot cover it.
+  if (probe.allocation_bytes < publication.bytes)
     return TargetSlabPublicationValidation::kAllocationExtent;
   const auto& expected =
       publication.rank == 0 ? kRank0Chunks : kRank1Chunks;
