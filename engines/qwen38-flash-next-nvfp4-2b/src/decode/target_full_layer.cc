@@ -63,6 +63,20 @@ TargetFullLayerResult TargetFullLayer::execute(
     std::string_view trace_id, std::string_view request_id,
     cudaStream_t stream) {
   const auto lifecycle = Clock::now();
+  bool moe_needs_failure_fence = false;
+  const auto fail = [&](pair_reduce::Outcome outcome) noexcept {
+    if (moe_needs_failure_fence) {
+      try {
+        hyperconnection_.synchronize(stream);
+      } catch (...) {
+        outcome = pair_reduce::Outcome::kCudaError;
+      }
+      moe_.fault_after_fence(generation);
+    }
+    faulted_ = true;
+    emit("lifecycle", outcome, trace_id, request_id,
+         elapsed_ns(lifecycle), 0);
+  };
   try {
     require(!faulted_, rank_, "faulted transition cannot replay");
     require(generation != 0 && generation == last_generation_ + 1, rank_,
@@ -104,8 +118,11 @@ TargetFullLayerResult TargetFullLayer::execute(
          elapsed_ns(start), kHyperBytes);
 
     start = Clock::now();
+    moe_needs_failure_fence = true;
     moe_.launch(moe_input, generation, 1, stream);
     hyperconnection_.synchronize(stream);
+    moe_needs_failure_fence = false;
+    moe_.terminal_fence_succeeded(generation);
     moe_.publish_after_fence(generation);
     require(moe_.projected_output(), rank_,
             "target MoE participant published no rank-local partial");
@@ -124,10 +141,32 @@ TargetFullLayerResult TargetFullLayer::execute(
     hyperconnection_.synchronize(stream);
     emit("post_layer", pair_reduce::Outcome::kOk, trace_id, request_id,
          elapsed_ns(start), kHyperBytes);
+  } catch (const pair_reduce::PairReduceContractError&) {
+    fail(pair_reduce::Outcome::kContractError);
+    throw;
+  } catch (const DecodeExecutionContractError&) {
+    fail(pair_reduce::Outcome::kContractError);
+    throw;
+  } catch (const std::invalid_argument&) {
+    fail(pair_reduce::Outcome::kContractError);
+    throw;
+  } catch (const std::logic_error&) {
+    fail(pair_reduce::Outcome::kContractError);
+    throw;
+  } catch (const pair_reduce::PairReduceTransportError&) {
+    fail(pair_reduce::Outcome::kTransportError);
+    throw;
+  } catch (const DecodeExecutionTransportError&) {
+    fail(pair_reduce::Outcome::kTransportError);
+    throw;
+  } catch (const pair_reduce::PairReduceCudaError&) {
+    fail(pair_reduce::Outcome::kCudaError);
+    throw;
+  } catch (const DecodeExecutionCudaError&) {
+    fail(pair_reduce::Outcome::kCudaError);
+    throw;
   } catch (...) {
-    faulted_ = true;
-    emit("lifecycle", pair_reduce::Outcome::kCudaError, trace_id, request_id,
-         elapsed_ns(lifecycle), 0);
+    fail(pair_reduce::Outcome::kCudaError);
     throw;
   }
   last_generation_ = generation;

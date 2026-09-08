@@ -18,14 +18,21 @@ class TargetFullMoeC1SourceContract(unittest.TestCase):
         end = source.index("const TargetDenseIdentity&", begin)
         enqueue = source[begin:end]
         calls = (
+            "enqueue_pending_evidence",
             "enqueue_target_router_c1",
             "enqueue_target_moe_c1_routes",
+            "routed_stage->enqueue",
             "impl_->routed.enqueue",
             "enqueue_target_shared_c1",
         )
         offsets = [enqueue.index(call) for call in calls]
         self.assertEqual(offsets, sorted(offsets))
         self.assertIn("launch.rank_local_partial_bf16", enqueue)
+        self.assertIn("w.routed_stage.compact_expert_ids", enqueue)
+        self.assertIn("w.routed_stage.compact_routing_weights", enqueue)
+        routed = enqueue[enqueue.index("const TargetMoeB12xLaunch"):]
+        self.assertNotIn("w.local_ids_i32", routed)
+        self.assertNotIn("w.local_weights_f32", routed)
 
     def test_enqueue_owns_nothing_and_never_synchronizes(self) -> None:
         source = SOURCE.read_text(encoding="utf-8")

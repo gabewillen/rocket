@@ -13,7 +13,7 @@ struct Sink final : moe::TargetMoeStageOtelSink {
   void add_counter(const moe::TargetMoeStageOtelPoint& point) noexcept override {
     points[count++] = point;
   }
-  std::array<moe::TargetMoeStageOtelPoint, 8> points{};
+  std::array<moe::TargetMoeStageOtelPoint, 16> points{};
   int count = 0;
 };
 
@@ -48,12 +48,19 @@ int main() {
   scratch.compact_expert_ids = reinterpret_cast<std::int32_t*>(0xa000);
   scratch.compact_routing_weights = reinterpret_cast<float*>(0xb000);
   scratch.evidence = reinterpret_cast<moe::TargetMoeN640StageEvidence*>(0xc000);
+  moe::TargetMoeN640StageEvidence host_evidence{};
+  scratch.host_evidence = &host_evidence;
   scratch.scalar_capacity = 10;
   scratch.route_capacity = 10;
   require(moe::validate_target_moe_stage_scratch(scratch));
   auto short_scratch = scratch;
   --short_scratch.down_scale_bytes;
   require(!moe::validate_target_moe_stage_scratch(short_scratch));
+  host_evidence = {7, 4, moe::TargetMoeOutcome::kOk};
+  require(moe::validate_target_moe_stage_after_fence(scratch, 7) ==
+          moe::TargetMoeOutcome::kOk);
+  require(moe::validate_target_moe_stage_after_fence(scratch, 8) ==
+          moe::TargetMoeOutcome::kContractError);
   const auto weights = moe::target_moe_staged_weights(scratch);
   require(weights.w13_packed == scratch.w13_packed &&
           weights.w13_scale == scratch.w13_scale &&
@@ -102,4 +109,14 @@ int main() {
   moe::export_target_moe_stage_otel_after_fence(stale, 7, 1, 3, sink);
   require(sink.count == 8 &&
           sink.points[4].outcome == moe::TargetMoeOutcome::kContractError);
+  const moe::TargetMoeN640StageEvidence pending{
+      7, -1, moe::TargetMoeOutcome::kContractError};
+  moe::export_target_moe_stage_otel_after_fence(pending, 7, 1, 3, sink);
+  require(sink.count == 12 && sink.points[8].value == 0 &&
+          sink.points[8].outcome == moe::TargetMoeOutcome::kContractError);
+  const moe::TargetMoeN640StageEvidence unknown{
+      7, 0, static_cast<moe::TargetMoeOutcome>(99)};
+  moe::export_target_moe_stage_otel_after_fence(unknown, 7, 1, 3, sink);
+  require(sink.count == 16 &&
+          sink.points[12].outcome == moe::TargetMoeOutcome::kContractError);
 }

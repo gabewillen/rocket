@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import os
 import threading
 import unittest
+import weakref
 from contextlib import nullcontext
 from pathlib import Path
 
-from qwen38_slab.cuda_slab_loader import CudaRankSlabLoader, CudaSlabLoadError
+from qwen38_slab.cuda_slab_loader import (
+    CudaRankSlabLoader, CudaSlabLoadError, CudaSlabPublicationError,
+    CudaSlabCleanupIncompleteError,
+    accepted_native_handoff,
+)
 from test_stage_a import Fixture, Tracer
 
 
@@ -44,18 +50,22 @@ class FakeTensor:
 
 
 class FakeStream:
-    def __init__(self, api):
+    def __init__(self, api, index):
         self.api = api
+        self.index = index
         self.synchronized = False
 
     def synchronize(self):
         self.synchronized = True
         self.api.synchronizations += 1
+        if self.index in self.api.fail_stream_indices:
+            raise ValueError("injected stream fence failure")
 
 
 class FakeEvent:
     next_handle = 1
-    def __init__(self):
+    def __init__(self, api=None):
+        self.api = api
         self.recorded = False
         self._handle = type(self).next_handle
         type(self).next_handle += 1
@@ -64,21 +74,31 @@ class FakeEvent:
     def record(self, stream): self.recorded = True
     def synchronize(self):
         if not self.recorded: raise ValueError("unrecorded event")
+        if getattr(self.api, "fail_event", False):
+            raise ValueError("injected event failure")
 
 
 class FakeCuda:
     def __init__(self):
         self.streams = []
         self.synchronizations = 0
+        self.fail_event = False
+        self.fail_stream_indices = set()
+        self.fail_device_sync = False
 
     def is_available(self): return True
     def Stream(self, device):
         if device != "cuda:0": raise ValueError("unexpected device")
-        stream = FakeStream(self)
+        stream = FakeStream(self, len(self.streams))
         self.streams.append(stream)
         return stream
-    def Event(self): return FakeEvent()
+    def Event(self): return FakeEvent(self)
     def stream(self, stream): return nullcontext()
+    def synchronize(self, device):
+        if device != "cuda:0": raise ValueError("unexpected device")
+        self.synchronizations += 1
+        if self.fail_device_sync:
+            raise ValueError("injected device fence failure")
 
 
 class FakeTorch:
@@ -105,10 +125,19 @@ class Owner:
         self.calls.append((rank, dict(slabs)))
 
 
+class RejectingOwner(Owner):
+    def publish_rank_slabs(self, rank, slabs):
+        raise ValueError("injected Python publication rejection")
+
+
 class Metric:
     def __init__(self, name, records): self.name = name; self.records = records
     def add(self, amount, attributes): self.records.append((self.name, amount, dict(attributes)))
     def record(self, amount, attributes): self.records.append((self.name, amount, dict(attributes)))
+
+
+class InterruptingMetric:
+    def add(self, amount, attributes): raise KeyboardInterrupt("injected telemetry failure")
 
 
 class Meter:
@@ -121,6 +150,17 @@ class Meter:
         return Metric(name, self.records)
 
 
+class ThrowingExitTracer(Tracer):
+    def start_as_current_span(self, name):
+        inner = super().start_as_current_span(name)
+        class ThrowingSpan:
+            def __enter__(self): return inner.__enter__()
+            def __exit__(self, exc_type, exc, traceback):
+                inner.__exit__(exc_type, exc, traceback)
+                raise ValueError("injected tracer exit failure")
+        return ThrowingSpan()
+
+
 class BarrierLoader(CudaRankSlabLoader):
     def __init__(self, *args, **kwargs):
         self.barrier = threading.Barrier(2)
@@ -129,6 +169,53 @@ class BarrierLoader(CudaRankSlabLoader):
     def _load_one(self, descriptor, destination, pipeline):
         self.barrier.wait(timeout=5)
         return super()._load_one(descriptor, destination, pipeline)
+
+
+class MetricsFailureLoader(BarrierLoader):
+    def _record_metrics(self, receipt):
+        raise ValueError("injected metrics boundary failure")
+
+
+class ResultFailureLoader(BarrierLoader):
+    def _loaded_result(self, slabs, receipt, ready_event, capability):
+        raise ValueError("injected result boundary failure")
+
+
+class AdmissionBarrierLoader(BarrierLoader):
+    def __init__(self, *args, **kwargs):
+        self.admitted = threading.Event()
+        self.continue_load = threading.Event()
+        super().__init__(*args, **kwargs)
+    def _load_locked(self):
+        self.admitted.set()
+        if not self.continue_load.wait(timeout=5):
+            raise ValueError("admission barrier timed out")
+        return super()._load_locked()
+
+
+class NativeFinalizer:
+    def __init__(self): self.calls = []
+    def retain_accepted_loader(self, **publication):
+        self.calls.append(publication)
+        return object()
+
+
+class RejectingNativeFinalizer:
+    def retain_accepted_loader(self, **publication):
+        raise ValueError("injected native publication rejection")
+
+
+class BlockingNativeFinalizer(NativeFinalizer):
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+    def retain_accepted_loader(self, **publication):
+        self.calls.append(publication)
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise ValueError("blocking finalizer timed out")
+        return object()
 
 
 class CudaRankSlabLoaderTests(unittest.TestCase):
@@ -142,6 +229,10 @@ class CudaRankSlabLoaderTests(unittest.TestCase):
         self.owner = Owner(self.torch)
         self.tracer = Tracer()
         self.meter = Meter()
+        import qwen38_slab.cuda_slab_loader as loader_module
+        loader_module._PROCESS_LIFETIME_NATIVE_SLAB_OWNERS[:] = [None, None]
+        loader_module._FAILED_LOAD_FLIGHTS[:] = [[None, None], [None, None]]
+        loader_module._RANK_LOAD_STATES[:] = ["idle", "idle"]
 
     def tearDown(self): self.temp.cleanup()
 
@@ -203,6 +294,244 @@ class CudaRankSlabLoaderTests(unittest.TestCase):
                 frozenset(("rank", "slab.kind", "stage")),
             },
         )
+
+    def test_native_capability_is_minted_only_after_authenticated_publication(self):
+        finalizer = NativeFinalizer()
+        loader = BarrierLoader(
+            self.artifact, rank=0, owner=self.owner, tracer=self.tracer,
+            meter=self.meter, torch_api=self.torch, device="cuda:0",
+            contract=self.fixture.contract, native_target_finalizer=finalizer,
+            target_layout_sha256="1" * 64,
+        )
+        loaded = loader.load()
+        capability = accepted_native_handoff(loaded)
+        self.assertIsNotNone(capability)
+        self.assertEqual(len(finalizer.calls), 1)
+        publication = finalizer.calls[0]
+        self.assertEqual(publication["device_base"], loaded.slabs["rank0-target"].data_ptr())
+        self.assertEqual(publication["ready_event"], loaded.ready_event.cuda_event)
+        self.assertIs(publication["receipt"], loaded.receipt.target)
+        self.assertEqual(publication["receipt_sha256"], capability[1])
+        self.assertEqual(publication["chunks_authenticated"], 1)
+        self.assertTrue(self.owner.calls)
+        target_owner = weakref.ref(loaded.slabs["rank0-target"])
+        self.owner.calls.clear()
+        del loaded
+        gc.collect()
+        self.assertIsNotNone(target_owner())
+
+    def test_native_finalizer_rejection_never_publishes_python_owner(self):
+        import qwen38_slab.cuda_slab_loader as loader_module
+        loader = BarrierLoader(
+            self.artifact, rank=0, owner=self.owner, tracer=self.tracer,
+            meter=self.meter, torch_api=self.torch, device="cuda:0",
+            contract=self.fixture.contract,
+            native_target_finalizer=RejectingNativeFinalizer(),
+            target_layout_sha256="1" * 64,
+        )
+        with self.assertRaisesRegex(CudaSlabLoadError, "before publication"):
+            loader.load()
+        self.assertEqual(self.owner.calls, [])
+        self.assertIsNone(loader_module._PROCESS_LIFETIME_NATIVE_SLAB_OWNERS[0])
+        retry = BarrierLoader(
+            self.artifact, rank=0, owner=self.owner, tracer=self.tracer,
+            meter=self.meter, torch_api=self.torch, device="cuda:0",
+            contract=self.fixture.contract,
+            native_target_finalizer=NativeFinalizer(),
+            target_layout_sha256="1" * 64,
+        ).load()
+        self.assertIsNotNone(accepted_native_handoff(retry))
+        self.assertEqual(len(self.owner.calls), 1)
+
+    def test_post_native_python_publication_failure_quarantines_all_owners(self):
+        import qwen38_slab.cuda_slab_loader as loader_module
+        finalizer = NativeFinalizer()
+        loader = BarrierLoader(
+            self.artifact, rank=0, owner=RejectingOwner(self.torch),
+            tracer=self.tracer, meter=self.meter, torch_api=self.torch,
+            device="cuda:0", contract=self.fixture.contract,
+            native_target_finalizer=finalizer, target_layout_sha256="1" * 64,
+        )
+        with self.assertRaisesRegex(CudaSlabPublicationError, "rejected publication"):
+            loader.load()
+        self.assertEqual(len(finalizer.calls), 1)
+        self.assertIsNotNone(loader_module._PROCESS_LIFETIME_NATIVE_SLAB_OWNERS[0])
+
+    def test_every_post_registration_exception_preserves_fixed_owner_slot(self):
+        import qwen38_slab.cuda_slab_loader as loader_module
+        for loader_type, message in (
+            (MetricsFailureLoader, "metrics boundary"),
+            (ResultFailureLoader, "result boundary"),
+        ):
+            loader_module._PROCESS_LIFETIME_NATIVE_SLAB_OWNERS[:] = [None, None]
+            finalizer = NativeFinalizer()
+            loader = loader_type(
+                self.artifact, rank=0, owner=self.owner, tracer=self.tracer,
+                meter=self.meter, torch_api=self.torch, device="cuda:0",
+                contract=self.fixture.contract,
+                native_target_finalizer=finalizer, target_layout_sha256="1" * 64,
+            )
+            with self.assertRaisesRegex(CudaSlabLoadError, "before publication"):
+                loader.load()
+            retained = loader_module._PROCESS_LIFETIME_NATIVE_SLAB_OWNERS[0]
+            self.assertIsNotNone(retained, message)
+            self.assertIsNotNone(retained.capability.handle, message)
+            self.assertEqual(self.owner.calls, [], message)
+
+    def test_same_rank_loader_instances_serialize_one_native_reservation(self):
+        first_finalizer = BlockingNativeFinalizer()
+        second_finalizer = NativeFinalizer()
+        second_torch = FakeTorch()
+        outcomes = []
+        first = BarrierLoader(
+            self.artifact, rank=0, owner=self.owner, tracer=self.tracer,
+            meter=self.meter, torch_api=self.torch, device="cuda:0",
+            contract=self.fixture.contract,
+            native_target_finalizer=first_finalizer,
+            target_layout_sha256="1" * 64,
+        )
+        second = BarrierLoader(
+            self.artifact, rank=0, owner=Owner(second_torch), tracer=Tracer(),
+            meter=Meter(), torch_api=second_torch, device="cuda:0",
+            contract=self.fixture.contract,
+            native_target_finalizer=second_finalizer,
+            target_layout_sha256="1" * 64,
+        )
+        def run(loader):
+            try:
+                loader.load()
+                outcomes.append("success")
+            except CudaSlabLoadError as exc:
+                outcomes.append(str(exc))
+        first_thread = threading.Thread(target=run, args=(first,))
+        second_thread = threading.Thread(target=run, args=(second,))
+        first_thread.start()
+        self.assertTrue(first_finalizer.entered.wait(timeout=5))
+        second_thread.start()
+        self.assertEqual(second_finalizer.calls, [])
+        first_finalizer.release.set()
+        first_thread.join(timeout=5)
+        second_thread.join(timeout=5)
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(outcomes.count("success"), 1)
+        self.assertEqual(len(second_finalizer.calls), 0)
+        self.assertEqual(second_torch.cuda.streams, [])
+        self.assertTrue(any("already active" in outcome for outcome in outcomes))
+
+    def test_tracer_exit_is_settled_before_terminal_owner_publication(self):
+        loader = BarrierLoader(
+            self.artifact, rank=0, owner=self.owner,
+            tracer=ThrowingExitTracer(), meter=self.meter,
+            torch_api=self.torch, device="cuda:0", contract=self.fixture.contract,
+        )
+        with self.assertRaisesRegex(ValueError, "tracer exit failure"):
+            loader.load()
+        self.assertEqual(self.owner.calls, [])
+
+    def test_event_failure_attempts_all_streams_and_device_fallback(self):
+        self.torch.cuda.fail_event = True
+        self.torch.cuda.fail_stream_indices = {0, 2, 4}
+        with self.assertRaisesRegex(CudaSlabLoadError, "rank slab load failed"):
+            self.loader().load()
+        self.assertEqual(len(self.torch.cuda.streams), 6)
+        self.assertTrue(all(stream.synchronized for stream in self.torch.cuda.streams))
+        self.assertGreaterEqual(self.torch.cuda.synchronizations, 8)
+        self.assertEqual(self.owner.calls, [])
+
+    def test_double_fence_failure_quarantines_full_flight_and_primary(self):
+        import qwen38_slab.cuda_slab_loader as loader_module
+        self.torch.cuda.fail_event = True
+        self.torch.cuda.fail_stream_indices = {0, 1, 2, 3, 4, 5}
+        self.torch.cuda.fail_device_sync = True
+        with self.assertRaises(CudaSlabCleanupIncompleteError) as raised:
+            self.loader().load()
+        self.assertIsNotNone(raised.exception.primary)
+        self.assertTrue(all(stream.synchronized for stream in self.torch.cuda.streams))
+        retained = loader_module._FAILED_LOAD_FLIGHTS[0]
+        self.assertTrue(any(owner is not None for owner in retained))
+        self.assertEqual(self.owner.calls, [])
+        retained_identity = tuple(id(owner) if owner is not None else None
+                                  for owner in retained)
+        second_torch = FakeTorch()
+        with self.assertRaises(CudaSlabCleanupIncompleteError):
+            BarrierLoader(
+                self.artifact, rank=0, owner=Owner(second_torch),
+                tracer=Tracer(), meter=Meter(), torch_api=second_torch,
+                device="cuda:0", contract=self.fixture.contract,
+            ).load()
+        self.assertEqual(second_torch.streams if hasattr(second_torch, "streams") else
+                         second_torch.cuda.streams, [])
+        self.assertEqual(
+            tuple(id(owner) if owner is not None else None for owner in retained),
+            retained_identity,
+        )
+
+    def test_close_failure_still_attempts_every_stream_fence(self):
+        from unittest import mock
+        real_close = os.close
+        def close_then_fail(fd):
+            real_close(fd)
+            raise OSError("injected close failure")
+        with mock.patch("qwen38_slab.cuda_slab_loader.os.close",
+                        side_effect=close_then_fail):
+            with self.assertRaisesRegex(CudaSlabLoadError, "descriptor close"):
+                self.loader().load()
+        self.assertEqual(len(self.torch.cuda.streams), 6)
+        self.assertTrue(all(stream.synchronized for stream in self.torch.cuda.streams))
+        self.assertEqual(self.owner.calls, [])
+
+    def test_cleanup_telemetry_cannot_interrupt_double_failure_quarantine(self):
+        import qwen38_slab.cuda_slab_loader as loader_module
+        self.torch.cuda.fail_event = True
+        self.torch.cuda.fail_stream_indices = {0, 1, 2, 3, 4, 5}
+        self.torch.cuda.fail_device_sync = True
+        loader = self.loader()
+        loader._cleanup_counter = InterruptingMetric()
+        with self.assertRaises(CudaSlabCleanupIncompleteError):
+            loader.load()
+        self.assertTrue(all(stream.synchronized for stream in self.torch.cuda.streams))
+        self.assertEqual(loader_module._RANK_LOAD_STATES[0], "poisoned")
+        self.assertTrue(any(owner is not None
+                            for owner in loader_module._FAILED_LOAD_FLIGHTS[0]))
+
+    def test_rank_admission_rejects_concurrent_loader_before_double_failure(self):
+        import qwen38_slab.cuda_slab_loader as loader_module
+        self.torch.cuda.fail_event = True
+        self.torch.cuda.fail_stream_indices = {0, 1, 2, 3, 4, 5}
+        self.torch.cuda.fail_device_sync = True
+        first = AdmissionBarrierLoader(
+            self.artifact, rank=0, owner=self.owner, tracer=self.tracer,
+            meter=self.meter, torch_api=self.torch, device="cuda:0",
+            contract=self.fixture.contract,
+        )
+        outcome = []
+        thread = threading.Thread(
+            target=lambda: outcome.append(self._capture_load_error(first))
+        )
+        thread.start()
+        self.assertTrue(first.admitted.wait(timeout=5))
+        second_torch = FakeTorch()
+        with self.assertRaisesRegex(CudaSlabLoadError, "already active"):
+            BarrierLoader(
+                self.artifact, rank=0, owner=Owner(second_torch),
+                tracer=Tracer(), meter=Meter(), torch_api=second_torch,
+                device="cuda:0", contract=self.fixture.contract,
+            ).load()
+        self.assertEqual(second_torch.cuda.streams, [])
+        first.continue_load.set()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertIsInstance(outcome[0], CudaSlabCleanupIncompleteError)
+        self.assertEqual(loader_module._RANK_LOAD_STATES[0], "poisoned")
+
+    @staticmethod
+    def _capture_load_error(loader):
+        try:
+            loader.load()
+        except BaseException as exc:
+            return exc
+        return None
 
     def test_digest_failure_drains_both_streams_and_never_publishes(self):
         path = self.artifact / "rank0-mtp.slab"

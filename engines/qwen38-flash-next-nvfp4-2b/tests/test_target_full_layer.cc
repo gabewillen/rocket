@@ -60,6 +60,12 @@ struct Moe final : decode::TargetMoeGraph {
   void publish_after_fence(std::uint64_t) override {
     order.emplace_back("moe_publish");
   }
+  void terminal_fence_succeeded(std::uint64_t) override {
+    order.emplace_back("moe_fenced");
+  }
+  void fault_after_fence(std::uint64_t) noexcept override {
+    order.emplace_back("moe_fault");
+  }
   const __nv_bfloat16* projected_output() const noexcept override {
     return &partial;
   }
@@ -131,7 +137,8 @@ int main() {
           "post-layer publication changed");
     check(order == std::vector<std::string>{
         "mix", "fence", "qsa", "fence", "attention_reduce",
-        "combine_and_mix", "fence", "moe", "fence", "moe_publish", "moe_reduce",
+        "combine_and_mix", "fence", "moe", "fence", "moe_fenced",
+        "moe_publish", "moe_reduce",
         "combine", "fence"}, "layer-3 composition order changed");
     check(trace.stages.size() == 8 && trace.outcomes.back() == pr::Outcome::kOk,
           "bounded success telemetry changed");

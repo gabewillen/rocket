@@ -29,7 +29,7 @@ SOURCE_ABI = "modelopt_nvfp4_group16_cutlass_sm121_sfb"
 TRANSFORM_ABI = "rocket.qwen38.target-moe.device-stage.v1"
 ROUTE_REMAP_ABI = "route_position_iota10_unique_positive_remote_zero_v1"
 PINNED_COMPACT_CONFIG_SHA256 = (
-    "4d7c327c6363b0e0dc200f80df1ae3b7ec85c574f64811d595cbd6e945ff1d39"
+    "2ec6180161706b6c4b6c3d6656d86279736865567e2456726451cc6c910dfe16"
 )
 
 

@@ -36,13 +36,13 @@
   "ranks": [
     {
       "rank": 0,
-      "descriptor_sha256": "a596da067a2a4a498c661929872c6ee81ec6c6a1f448b90edfd3d8986fad64d5",
+      "descriptor_sha256": "4b603bda78cb22f5a6d59b4d97f9b07a0e5ec3a824e5e08f563a715dbd2a1e46",
       "binding_inventory_sha256": "0f88201c81e6ace3991969dc397fca345773b7a28f317e08a6727c7903ee30c5",
       "publication_layout_sha256": "4f03ccc90c9020ff2e87f044867f2ac9896ac20c0d97c85055beef0b125ce6d6"
     },
     {
       "rank": 1,
-      "descriptor_sha256": "1983df9eebd04977fe7889e69bc8c6ef5a170297b743e9f21d015aa7770c5f71",
+      "descriptor_sha256": "a43673a5df67bcce95ed582a15df844b1f537f2bccf6c589daf9b452148d131c",
       "binding_inventory_sha256": "5d6a7b322e1a78059f7abea9d9b6a20a1e7c76263713b5e6dff940d9247e3d93",
       "publication_layout_sha256": "afd718cf00b6fffa61336ac53e744209750b1c9bd0399622f73cf99cb81de2e9"
     }

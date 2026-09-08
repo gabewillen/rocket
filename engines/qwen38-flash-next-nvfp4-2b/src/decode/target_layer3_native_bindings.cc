@@ -100,6 +100,86 @@ bool CudaTargetLayer3ReadyEventProbe::complete(cudaEvent_t event) noexcept {
   return event && cudaEventQuery(event) == cudaSuccess;
 }
 
+TargetLayer3NativeMoeWeights bind_target_layer3_native_moe_weights(
+    const TargetLayer3NativePlan& plan,
+    const model::TargetSlabPublication& slab) {
+  validate_target_layer3_native_plan_binding(plan);
+  validate_plan_storage(plan);
+  if ((plan.rank != 0 && plan.rank != 1) || plan.layer != 3 ||
+      plan.peer_rank != 1 - plan.rank || !slab.device_base ||
+      !slab.ready_event || slab.bytes != plan.slab_bytes || slab.device < 0 ||
+      slab.rank != plan.rank || slab.artifact_key != model::kTargetSlabArtifactKey ||
+      slab.artifact_key != plan.artifact_key || slab.slab_key != plan.slab_key ||
+      slab.manifest_sha256 != model::kTargetSlabManifestSha256 ||
+      slab.layout_sha256 != plan.slab_publication_layout_sha256 ||
+      slab.open_to_publish_ns == 0 ||
+      slab.chunks_authenticated != model::kTargetSlabChunks ||
+      slab.peak_host_pinned_bytes != model::kTargetSlabPeakPinnedBytes)
+    fail("MoE slab publication identity changed");
+  const auto target = [&](std::string_view name, std::uint64_t bytes) {
+    return extent(plan, name, "target_slab", bytes);
+  };
+  const auto* base = slab.device_base;
+  TargetLayer3NativeMoeWeights result{};
+  result.router = {
+      address<std::uint8_t>(base, target("mlp.gate.weight", 655'360)),
+      address<std::uint8_t>(base, target("mlp.gate.weight_scale", 81'920)),
+      address<float>(base, target("mlp.gate.weight_scale_2", 4))};
+  result.shared = {
+      address<__nv_bfloat16>(base,
+          target("mlp.shared_expert.gate_proj.weight", 1'638'400)),
+      address<__nv_bfloat16>(base,
+          target("mlp.shared_expert.up_proj.weight", 1'638'400)),
+      address<__nv_bfloat16>(base,
+          target("mlp.shared_expert.down_proj.weight", 1'638'400)),
+      address<__nv_bfloat16>(base,
+          target("mlp.shared_expert_gate.weight", 5'120))};
+  const int first = plan.rank * moe::kTargetMoeLocalExperts;
+  for (int local = 0; local < moe::kTargetMoeLocalExperts; ++local) {
+    const auto root = "mlp.experts." + std::to_string(first + local) + ".";
+    const auto packed = [&](std::string_view projection) {
+      return address<std::uint8_t>(base, typed_extent(
+          plan, root + std::string(projection) + ".weight", 819'200,
+          "U8", "checkpoint",
+          projection == "down_proj"
+              ? std::initializer_list<std::uint64_t>{2'560, 320}
+              : std::initializer_list<std::uint64_t>{640, 1'280},
+          projection == "down_proj"
+              ? std::initializer_list<std::uint64_t>{320, 1}
+              : std::initializer_list<std::uint64_t>{1'280, 1}));
+    };
+    const auto scale = [&](std::string_view projection) {
+      return address<std::uint8_t>(base, typed_extent(
+          plan, root + std::string(projection) + ".weight_scale", 102'400,
+          "F8_E4M3", "cutlass_sm121_sfb", {102'400}, {1}));
+    };
+    const auto scalar = [&](std::string_view projection,
+                            std::string_view leaf) {
+      return address<float>(base, typed_extent(
+          plan, root + std::string(projection) + "." + std::string(leaf),
+          4, "F32", "checkpoint", {}, {}));
+    };
+    result.routed_source[local] = {
+        packed("up_proj"), scale("up_proj"),
+        scalar("up_proj", "input_scale"),
+        scalar("up_proj", "weight_scale_2"),
+        packed("gate_proj"), scale("gate_proj"),
+        scalar("gate_proj", "input_scale"),
+        scalar("gate_proj", "weight_scale_2"),
+        packed("down_proj"), scale("down_proj"),
+        scalar("down_proj", "input_scale"),
+        scalar("down_proj", "weight_scale_2")};
+  }
+  result.routed_identity = moe::TargetMoeCompactRuntimeIdentity{
+      plan.rank, std::string(plan.descriptor_sha256),
+      std::string(plan.native_binding_inventory_sha256),
+      std::string(plan.slab_publication_layout_sha256),
+      std::string("modelopt_nvfp4_group16_cutlass_sm121_sfb"),
+      std::string(moe::kTargetMoeDeviceStageAbi),
+      std::string("route_position_iota10_unique_positive_remote_zero_v1")};
+  return result;
+}
+
 TargetLayer3NativeWeightBindings bind_target_layer3_native_weights(
     const TargetLayer3NativePlan& plan,
     const model::TargetSlabPublication& slab,
@@ -195,65 +275,11 @@ TargetLayer3NativeWeightBindings bind_target_layer3_native_weights(
           address<__nv_bfloat16>(target_base,
               target(prefix + "input_mix_weight_up.weight", 6'553'600))};
     };
-    const auto router = moe::TargetRouterNvfp4Weights{
-        address<std::uint8_t>(target_base, target("mlp.gate.weight", 655'360)),
-        address<std::uint8_t>(target_base,
-            target("mlp.gate.weight_scale", 81'920)),
-        address<float>(target_base, target("mlp.gate.weight_scale_2", 4))};
-    const auto shared = moe::TargetSharedBf16Weights{
-        address<__nv_bfloat16>(target_base,
-            target("mlp.shared_expert.gate_proj.weight", 1'638'400)),
-        address<__nv_bfloat16>(target_base,
-            target("mlp.shared_expert.up_proj.weight", 1'638'400)),
-        address<__nv_bfloat16>(target_base,
-            target("mlp.shared_expert.down_proj.weight", 1'638'400)),
-        address<__nv_bfloat16>(target_base,
-            target("mlp.shared_expert_gate.weight", 5'120))};
-    std::array<moe::TargetMoeN640DeviceExpert,
-               moe::kTargetMoeLocalExperts> routed_source{};
-    const int first_expert = plan.rank * moe::kTargetMoeLocalExperts;
-    for (int local = 0; local < moe::kTargetMoeLocalExperts; ++local) {
-      const auto root = "mlp.experts." +
-                        std::to_string(first_expert + local) + ".";
-      const auto packed = [&](std::string_view projection) {
-        return address<std::uint8_t>(target_base,
-            typed_extent(plan, root + std::string(projection) + ".weight",
-                         819'200, "U8", "checkpoint",
-                         projection == "down_proj"
-                             ? std::initializer_list<std::uint64_t>{2'560, 320}
-                             : std::initializer_list<std::uint64_t>{640, 1'280},
-                         projection == "down_proj"
-                             ? std::initializer_list<std::uint64_t>{320, 1}
-                             : std::initializer_list<std::uint64_t>{1'280, 1}));
-      };
-      const auto scale = [&](std::string_view projection) {
-        return address<std::uint8_t>(target_base,
-            typed_extent(plan,
-                         root + std::string(projection) + ".weight_scale",
-                         102'400, "F8_E4M3", "cutlass_sm121_sfb",
-                         {102'400}, {1}));
-      };
-      const auto scalar = [&](std::string_view projection,
-                              std::string_view leaf) {
-        return address<float>(target_base,
-            typed_extent(plan, root + std::string(projection) + "." +
-                                   std::string(leaf),
-                         4, "F32", "checkpoint", {}, {}));
-      };
-      routed_source[local] = {
-          packed("up_proj"), scale("up_proj"),
-          scalar("up_proj", "input_scale"),
-          scalar("up_proj", "weight_scale_2"),
-          packed("gate_proj"), scale("gate_proj"),
-          scalar("gate_proj", "input_scale"),
-          scalar("gate_proj", "weight_scale_2"),
-          packed("down_proj"), scale("down_proj"),
-          scalar("down_proj", "input_scale"),
-          scalar("down_proj", "weight_scale_2")};
-    }
+    const auto moe_weights = bind_target_layer3_native_moe_weights(plan, slab);
     TargetLayer3NativeWeightBindings result{
         qsa_projection, qsa_preprocess, rope.ready, hyper("attn"),
-        hyper("mlp"), router, shared, routed_source};
+        hyper("mlp"), moe_weights.router, moe_weights.shared,
+        moe_weights.routed_source, moe_weights.routed_identity};
     emit(telemetry, plan.rank, pair_reduce::Outcome::kOk);
     return result;
   } catch (...) {

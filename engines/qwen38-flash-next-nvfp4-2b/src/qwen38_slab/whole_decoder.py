@@ -1,6 +1,6 @@
 """Single-owner whole-decoder topology for the specialized Qwen3.8 engine.
 
-The executor composes fixed GDN/QSA, TP2 reduction, owner-local E256 MoE, and
+The executor composes fixed GDN/QSA, TP2 reduction, rank-local target MoE, and
 greedy vocab-output adapters. It owns graph selection and execution order. The
 adapters own CUDA buffers, streams, and kernels; values returned by adapters are
 borrowed until the next synchronous adapter call.
@@ -220,7 +220,7 @@ class InputEmbedder(Protocol):
 
 
 class MoeExecutor(Protocol):
-    """Synchronous owner-local E256 MoE adapter."""
+    """Synchronous rank-local target-MoE graph adapter."""
 
     def execute(
         self, layer: int, hidden: object, shape: MoeShape,

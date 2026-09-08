@@ -7,8 +7,11 @@ namespace rocket::qwen38::moe {
 namespace {
 
 TargetMoeB12xIdentity routed_identity(const TargetDenseIdentity& identity) {
-  return {identity.artifact_sha256, identity.layout_sha256, identity.rank,
-          identity.layer};
+  TargetMoeB12xIdentity result{
+      identity.artifact_sha256, {}, identity.rank, identity.layer};
+  if (!target_moe_compact_layout_sha256(&result.layout_sha256))
+    throw std::invalid_argument("target MoE compact layout identity changed");
+  return result;
 }
 
 bool valid_workspace(const TargetFullMoeC1Workspace& workspace) noexcept {
@@ -17,6 +20,7 @@ bool valid_workspace(const TargetFullMoeC1Workspace& workspace) noexcept {
          workspace.local_weights_f32 && workspace.source_generation &&
          workspace.requested_generation && workspace.route_summary &&
          workspace.source_generation != workspace.requested_generation &&
+         validate_target_moe_stage_scratch(workspace.routed_stage) &&
          workspace.shared_gate_scratch_f32 &&
          workspace.shared_up_scratch_f32 &&
          workspace.shared_gate_scalar_f32;
@@ -30,17 +34,40 @@ TargetDenseOutcome map_outcome(TargetMoeOutcome outcome) noexcept {
   return TargetDenseOutcome::kCudaError;
 }
 
+bool same_stage_scratch(const TargetMoeN768StageScratch& a,
+                        const TargetMoeN768StageScratch& b) noexcept {
+  return a.w13_packed == b.w13_packed && a.w13_scale == b.w13_scale &&
+         a.down_packed == b.down_packed && a.down_scale == b.down_scale &&
+         a.input_global_scale == b.input_global_scale &&
+         a.folded_w1_alpha == b.folded_w1_alpha &&
+         a.w2_alpha == b.w2_alpha &&
+         a.down_input_scale == b.down_input_scale &&
+         a.source_expert_ids == b.source_expert_ids &&
+         a.compact_expert_ids == b.compact_expert_ids &&
+         a.compact_routing_weights == b.compact_routing_weights &&
+         a.evidence == b.evidence && a.host_evidence == b.host_evidence &&
+         a.w13_packed_bytes == b.w13_packed_bytes &&
+         a.w13_scale_bytes == b.w13_scale_bytes &&
+         a.down_packed_bytes == b.down_packed_bytes &&
+         a.down_scale_bytes == b.down_scale_bytes &&
+         a.scalar_capacity == b.scalar_capacity &&
+         a.route_capacity == b.route_capacity;
+}
+
 }  // namespace
 
 struct TargetFullMoeC1::Impl {
   TargetDenseIdentity identity;
   TargetFullMoeC1Weights weights;
   TargetMoeB12xAot routed;
+  mutable TargetMoeN768StageScratch last_stage{};
+  mutable bool stage_pending = false;
+  cudaStream_t source_stream = nullptr;
 
   Impl(int device, TargetDenseIdentity identity, TargetFullMoeC1Weights weights)
-      : identity(identity),
-        weights(weights),
-        routed(device, routed_identity(identity), weights.routed) {}
+      : identity(identity), weights(weights),
+        routed(device, routed_identity(identity),
+               target_moe_staged_weights(weights.routed_stage_scratch)) {}
 };
 
 TargetFullMoeC1::TargetFullMoeC1(
@@ -62,6 +89,13 @@ TargetFullMoeC1::TargetFullMoeC1(
   shared_probe.shared_gate_scratch_f32 = reinterpret_cast<float*>(1);
   shared_probe.stream = reinterpret_cast<cudaStream_t>(1);
   if (device < 0 ||
+      !authenticate_target_moe_compact_runtime_identity(
+          weights.routed_identity) ||
+      weights.routed_identity.rank != identity.rank ||
+      !weights.routed_stage || weights.routed_stage->rank() != identity.rank ||
+      weights.routed_stage->layer() != identity.layer ||
+      !weights.routed_stage_telemetry ||
+      !validate_target_moe_stage_scratch(weights.routed_stage_scratch) ||
       diagnose_target_router_c1(identity, weights.router, router_probe) !=
           TargetDenseFailure::kNone ||
       diagnose_target_shared_c1(identity, weights.shared, shared_probe) !=
@@ -70,7 +104,18 @@ TargetFullMoeC1::TargetFullMoeC1(
   impl_ = new Impl(device, identity, weights);
 }
 
-TargetFullMoeC1::~TargetFullMoeC1() { delete impl_; }
+TargetFullMoeC1::~TargetFullMoeC1() {
+  if (impl_ && impl_->stage_pending) {
+    impl_->weights.routed_stage_telemetry->add_counter(
+        {TargetMoeStageCounter::kLaunch, TargetMoeOutcome::kCudaError,
+         impl_->identity.rank, impl_->identity.layer, 0});
+    // Only the owning graph may prove a terminal fence. A standalone pending
+    // participant cannot safely unload its module or release borrowed views.
+    impl_ = nullptr;
+    return;
+  }
+  delete impl_;
+}
 
 TargetDenseOutcome TargetFullMoeC1::enqueue(
     const TargetFullMoeC1Launch& launch) const noexcept {
@@ -84,7 +129,10 @@ TargetDenseOutcome TargetFullMoeC1::enqueue_with_telemetry(
     const TargetFullMoeC1Launch& launch,
     TargetFullMoeOtelSink& telemetry) const noexcept {
   if (!impl_ || !launch.hidden_bf16 || !launch.rank_local_partial_bf16 ||
-      !valid_workspace(launch.workspace) || !launch.stream)
+      impl_->stage_pending || !valid_workspace(launch.workspace) ||
+      !same_stage_scratch(impl_->weights.routed_stage_scratch,
+                          launch.workspace.routed_stage) || !launch.stream ||
+      launch.stream != impl_->source_stream)
     return TargetDenseOutcome::kContractError;
   const auto emit = [&](TargetFullMoeComponent component,
                         TargetDenseOutcome outcome) {
@@ -93,6 +141,14 @@ TargetDenseOutcome TargetFullMoeC1::enqueue_with_telemetry(
     return outcome;
   };
   const auto& w = launch.workspace;
+  impl_->last_stage = w.routed_stage;
+  impl_->stage_pending = true;
+  const auto pending_outcome = impl_->weights.routed_stage->
+      enqueue_pending_evidence(w.requested_generation, w.routed_stage,
+                               launch.stream);
+  if (pending_outcome != TargetMoeOutcome::kOk)
+    return emit(TargetFullMoeComponent::kStaging,
+                map_outcome(pending_outcome));
   const TargetRouterC1Launch router_launch{
       launch.hidden_bf16, w.router_logits_f32, w.global_ids_i32,
       w.routing_weights_f32, w.source_generation, w.requested_generation,
@@ -116,8 +172,16 @@ TargetDenseOutcome TargetFullMoeC1::enqueue_with_telemetry(
   const auto localized_outcome = map_outcome(route_outcome);
   emit(TargetFullMoeComponent::kLocalization, localized_outcome);
   if (route_outcome != TargetMoeOutcome::kOk) return localized_outcome;
+  const TargetMoeN640StageLaunch stage_launch{
+      w.local_ids_i32, w.local_weights_f32, w.source_generation,
+      w.requested_generation, w.routed_stage, launch.stream};
+  const auto stage_outcome = impl_->weights.routed_stage->enqueue(stage_launch);
+  const auto staged_dense_outcome = map_outcome(stage_outcome);
+  emit(TargetFullMoeComponent::kStaging, staged_dense_outcome);
+  if (stage_outcome != TargetMoeOutcome::kOk) return staged_dense_outcome;
   const TargetMoeB12xLaunch routed_launch{
-      launch.hidden_bf16, w.local_ids_i32, w.local_weights_f32,
+      launch.hidden_bf16, w.routed_stage.compact_expert_ids,
+      w.routed_stage.compact_routing_weights,
       launch.rank_local_partial_bf16, w.routed, launch.stream};
   const auto routed_outcome = impl_->routed.enqueue(routed_launch);
   const auto routed_dense_outcome = map_outcome(routed_outcome);
@@ -127,47 +191,37 @@ TargetDenseOutcome TargetFullMoeC1::enqueue_with_telemetry(
       launch.hidden_bf16, launch.rank_local_partial_bf16,
       w.shared_gate_scratch_f32, w.shared_up_scratch_f32,
       w.shared_gate_scalar_f32, launch.stream};
-  return emit(TargetFullMoeComponent::kSharedExpert,
-              enqueue_target_shared_c1(impl_->identity, impl_->weights.shared,
-                                       shared_launch));
+  const auto shared_outcome = enqueue_target_shared_c1(
+      impl_->identity, impl_->weights.shared, shared_launch);
+  emit(TargetFullMoeComponent::kSharedExpert, shared_outcome);
+  return shared_outcome;
 }
 
 const TargetDenseIdentity& TargetFullMoeC1::identity() const noexcept {
   return impl_->identity;
 }
 
+void TargetFullMoeC1::wait_source(cudaStream_t stream) {
+  if (!impl_ || !impl_->weights.routed_stage || !stream ||
+      impl_->source_stream)
+    throw std::logic_error("target full MoE stage owner changed");
+  impl_->weights.routed_stage->wait_source(stream);
+  impl_->source_stream = stream;
+}
+
+TargetDenseOutcome TargetFullMoeC1::publish_after_fence(
+    std::uint64_t generation, TargetFullMoeOtelSink& telemetry) noexcept {
+  if (!impl_ || !impl_->stage_pending)
+    return TargetDenseOutcome::kContractError;
+  const auto outcome = map_outcome(validate_target_moe_stage_after_fence(
+      impl_->last_stage, generation));
+  export_target_moe_stage_otel_after_fence(
+      *impl_->last_stage.host_evidence, generation, impl_->identity.rank,
+      impl_->identity.layer, *impl_->weights.routed_stage_telemetry);
+  telemetry.emit({TargetFullMoeComponent::kStaging, outcome,
+                  impl_->identity.rank, impl_->identity.layer});
+  impl_->stage_pending = false;
+  return outcome;
+}
+
 }  // namespace rocket::qwen38::moe
-
-extern "C" int rocket_qwen38_target_full_moe_c1_create(
-    int device, const rocket::qwen38::moe::TargetDenseIdentity* identity,
-    const rocket::qwen38::moe::TargetFullMoeC1Weights* weights,
-    void** handle) noexcept {
-  using namespace rocket::qwen38::moe;
-  if (!identity || !weights || !handle || *handle)
-    return static_cast<int>(TargetDenseOutcome::kContractError);
-  try {
-    *handle = new TargetFullMoeC1(device, *identity, *weights);
-    return static_cast<int>(TargetDenseOutcome::kOk);
-  } catch (const std::invalid_argument&) {
-    *handle = nullptr;
-    return static_cast<int>(TargetDenseOutcome::kContractError);
-  } catch (...) {
-    *handle = nullptr;
-    return static_cast<int>(TargetDenseOutcome::kCudaError);
-  }
-}
-
-extern "C" int rocket_qwen38_target_full_moe_c1_enqueue(
-    void* handle,
-    const rocket::qwen38::moe::TargetFullMoeC1Launch* launch) noexcept {
-  using namespace rocket::qwen38::moe;
-  if (!handle || !launch)
-    return static_cast<int>(TargetDenseOutcome::kContractError);
-  return static_cast<int>(
-      static_cast<TargetFullMoeC1*>(handle)->enqueue(*launch));
-}
-
-extern "C" void rocket_qwen38_target_full_moe_c1_destroy(
-    void* handle) noexcept {
-  delete static_cast<rocket::qwen38::moe::TargetFullMoeC1*>(handle);
-}

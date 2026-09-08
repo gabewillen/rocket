@@ -95,6 +95,10 @@ struct TargetMoeN768StageScratch {
   std::int32_t* compact_expert_ids = nullptr;
   float* compact_routing_weights = nullptr;
   TargetMoeN640StageEvidence* evidence = nullptr;
+  // Host alias of mapped, caller-owned evidence storage. The device pointer
+  // above is written in-stream; this alias is read only after the enclosing
+  // stream fence, so failure publication needs no D2H copy.
+  const TargetMoeN640StageEvidence* host_evidence = nullptr;
   std::size_t scalar_capacity = 0;
   std::size_t route_capacity = 0;
 };
@@ -148,6 +152,12 @@ class TargetMoeN640DeviceStage final {
   TargetMoeN640DeviceStage& operator=(const TargetMoeN640DeviceStage&) = delete;
 
   void wait_source(cudaStream_t stream);
+  // First node of every captured enqueue. It replaces prior-generation mapped
+  // evidence with a bounded contract-failure envelope before any router work.
+  [[nodiscard]] TargetMoeOutcome enqueue_pending_evidence(
+      const std::uint64_t* requested_generation,
+      const TargetMoeN768StageScratch& scratch,
+      cudaStream_t stream) const noexcept;
   [[nodiscard]] TargetMoeOutcome enqueue(
       const TargetMoeN640StageLaunch& launch) const noexcept;
   int rank() const noexcept { return rank_; }
@@ -167,6 +177,9 @@ TargetMoeB12xWeights target_moe_staged_weights(
     const TargetMoeN768StageScratch& scratch) noexcept;
 bool validate_target_moe_stage_scratch(
     const TargetMoeN768StageScratch& scratch) noexcept;
+TargetMoeOutcome validate_target_moe_stage_after_fence(
+    const TargetMoeN768StageScratch& scratch,
+    std::uint64_t requested_generation) noexcept;
 
 // Call only after the borrowed stream's terminal fence. Cardinality is
 // counter(4) x outcome(4) x rank(2) x layer(48) = 1,536 bounded series.

@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <string_view>
+#include <string>
 
 namespace rocket::qwen38::moe {
 
@@ -24,6 +25,19 @@ struct TargetMoeB12xIdentity {
   int rank;
   int layer;
 };
+
+struct TargetMoeCompactRuntimeIdentity {
+  int rank;
+  std::string descriptor_sha256;
+  std::string binding_inventory_sha256;
+  std::string publication_layout_sha256;
+  std::string source_abi;
+  std::string transform_abi;
+  std::string route_remap_abi;
+};
+
+[[nodiscard]] bool authenticate_target_moe_compact_runtime_identity(
+    const TargetMoeCompactRuntimeIdentity& identity) noexcept;
 
 struct TargetMoeB12xWeights {
   // Compact route-position E10, init-padded physical N768 ModelOpt NVFP4
@@ -94,6 +108,8 @@ enum class TargetMoeCreateFailure : std::uint8_t {
 [[nodiscard]] bool parse_target_moe_artifact_key(
     std::string_view ascii, std::array<std::uint8_t, 32>* bytes) noexcept;
 [[nodiscard]] std::string_view target_moe_artifact_key_ascii() noexcept;
+[[nodiscard]] bool target_moe_compact_layout_sha256(
+    std::array<std::uint8_t, 32>* bytes) noexcept;
 
 // Owns the pinned fixed-c1 CuTe module only. All activations, dense routes,
 // weights, output, workspace, and stream remain caller-owned. Construction is

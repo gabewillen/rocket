@@ -20,6 +20,10 @@ class TargetMoeGraph {
   // Called only after the enclosing owner has fenced the borrowed stream.
   // Deferred CUDA failures prevent this publication hook from running.
   virtual void publish_after_fence(std::uint64_t generation) = 0;
+  virtual void terminal_fence_succeeded(std::uint64_t generation) = 0;
+  // Called after a failed terminal stream fence. Implementations publish
+  // bounded incomplete evidence exactly once and permanently fault.
+  virtual void fault_after_fence(std::uint64_t generation) noexcept = 0;
   virtual const __nv_bfloat16* projected_output() const noexcept = 0;
 };
 

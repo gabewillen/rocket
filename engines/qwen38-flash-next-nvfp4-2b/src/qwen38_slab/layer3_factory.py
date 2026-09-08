@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import ipaddress
 import json
 import math
@@ -12,10 +13,12 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from typing import Mapping, Protocol, Sequence
 
 from .contract import PINNED_CONTRACT, SCHEMA, canonical_bytes
-from .cuda_slab_loader import LoadedRankSlabs
+from .cuda_slab_loader import (
+    LoadedRankSlabs, NativeTargetSlabFinalizer, accepted_native_handoff,
+)
 from .qsa_weights import RankQsaWeights, load_qsa_weights
 from .routed_moe import OwnerLocalMoeSlab, load_owner_local_moe
 from .layer3_runtime import ARENA_SPECS
@@ -36,6 +39,12 @@ ROWS = 35
 HC_WIDTH = 10_240
 HIDDEN = 2_560
 LAYER = 3
+
+# The accepted loader owns CUDA allocations through Torch tensors. Native
+# consumers may retain raw aliases after handoff, including after an
+# unprovable CUDA fence, so these owners are intentionally never released
+# before process exit. Registration is append-only and rejects replacement.
+_PROCESS_LIFETIME_SLAB_OWNERS: dict[int, tuple[LoadedRankSlabs, str]] = {}
 
 
 class Layer3FactoryError(RuntimeError):
@@ -111,12 +120,15 @@ class Layer3PhysicalPlan:
 class NativeTargetSlabHandoff:
     """Owner-retaining, zero-copy startup handoff to the native factory.
 
-    ``owner`` keeps the Torch tensor and readiness event alive for every native
-    borrower. Native execution receives only the remaining scalar fields once;
-    it must not call Python or Torch after that handoff.
+    ``owner`` is also pinned in the module's append-only process-lifetime
+    registry, keeping the Torch tensor and readiness event alive for every
+    native borrower and quarantine. Native execution and cleanup receive only
+    the native lease handle and make no Python or Torch call after handoff.
+    The Python registry is released only as part of process teardown.
     """
 
     owner: LoadedRankSlabs
+    native_lease: object
     device_base: int
     ready_event: int
     bytes: int
@@ -129,6 +141,59 @@ class NativeTargetSlabHandoff:
     open_to_publish_ns: int
     chunks_authenticated: int
     peak_host_pinned_bytes: int
+    receipt_sha256: str
+
+
+class CtypesNativeTargetSlabLeaseFactory:
+    """Native finalizer used only by ``CudaRankSlabLoader._load_locked``."""
+
+    def __init__(self, library: Path):
+        class _ChunkReceipt(ctypes.Structure):
+            _fields_ = (
+                ("index", ctypes.c_uint64), ("bytes", ctypes.c_uint64),
+                ("direct_read_ns", ctypes.c_uint64),
+                ("sha256_ns", ctypes.c_uint64),
+                ("h2d_fence_ns", ctypes.c_uint64),
+            )
+        self._chunk_receipt = _ChunkReceipt
+        self._native = ctypes.CDLL(str(library))
+        self._retain = self._native.qwen38_target_slab_retain_accepted_loader
+        self._retain.argtypes = (
+            ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_char_p, ctypes.c_uint64, ctypes.c_size_t,
+            ctypes.c_size_t, ctypes.c_uint64, ctypes.c_uint64,
+            ctypes.POINTER(_ChunkReceipt), ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        self._retain.restype = ctypes.c_int
+
+    def retain_accepted_loader(self, **publication: object) -> object:
+        receipt = publication["receipt"]
+        chunks = tuple(receipt.chunks)
+        chunk_array = (self._chunk_receipt * len(chunks))(*(
+            self._chunk_receipt(
+                chunk.index, chunk.bytes, chunk.direct_read_ns,
+                chunk.sha256_ns, chunk.h2d_fence_ns,
+            ) for chunk in chunks
+        ))
+        handle = ctypes.c_void_p()
+        result = self._retain(
+            int(publication["device_base"]), int(publication["ready_event"]),
+            int(publication["bytes"]), int(publication["device"]),
+            int(publication["rank"]),
+            str(publication["slab_key"]).encode("ascii"),
+            str(publication["layout_sha256"]).encode("ascii"),
+            str(publication["receipt_sha256"]).encode("ascii"),
+            int(publication["open_to_publish_ns"]),
+            int(publication["chunks_authenticated"]),
+            int(publication["peak_host_pinned_bytes"]),
+            int(receipt.started_ns), int(receipt.completed_ns),
+            chunk_array, len(chunks), ctypes.byref(handle),
+        )
+        if result != 0 or not handle.value:
+            raise Layer3FactoryError("native process-lifetime slab lease rejected")
+        return handle
 
 
 def _sha256(path: Path) -> str:
@@ -530,8 +595,8 @@ def native_rank_descriptor(plan: Layer3PhysicalPlan, rank: int) -> Mapping[str, 
             "sequence_lengths", "token_to_request", "compression_work",
         )],
     ]
-    # Fixed FlashInfer 91bda04 static-c1 workspace with E257 state slots,
-    # E256 weights, max_rows=10, H2560, physical N768, top-k10.
+    # Fixed FlashInfer 91bda04 compact-c1 workspace with E11 state slots,
+    # E10 staged weights, max_rows=10, H2560, physical N768, top-k10.
     moe_workspace = [
         _buffer("router_logits", (512,), "float32"),
         _buffer("global_ids", (10,), "int32"),
@@ -541,18 +606,30 @@ def native_rank_descriptor(plan: Layer3PhysicalPlan, rank: int) -> Mapping[str, 
         _buffer("source_generation", (1,), "int64"),
         _buffer("requested_generation", (1,), "int64"),
         _buffer("route_summary", (16,), "uint8"),
-        _buffer("packed_a", (258, 10, 1280), "uint8"),
-        _buffer("packed_a_scale", (258, 128, 160), "uint8"),
+        _buffer("staged_w13_packed", (10, 1536, 1280), "uint8"),
+        _buffer("staged_w13_scale", (10, 1536, 160), "uint8"),
+        _buffer("staged_down_packed", (10, 2560, 384), "uint8"),
+        _buffer("staged_down_scale", (10, 2560, 48), "uint8"),
+        *[_buffer(name, (10,), "float32") for name in (
+            "staged_input_global_scale", "staged_folded_w1_alpha",
+            "staged_w2_alpha", "staged_down_input_scale",
+        )],
+        _buffer("staged_source_expert_ids", (10,), "int32"),
+        _buffer("staged_compact_expert_ids", (10,), "int32"),
+        _buffer("staged_compact_routing_weights", (10,), "float32"),
+        _buffer("staged_evidence", (16,), "uint8"),
+        _buffer("packed_a", (11, 10, 1280), "uint8"),
+        _buffer("packed_a_scale", (11, 128, 160), "uint8"),
         _buffer("route_output_scratch", (10, 3, 2560), "bfloat16"),
         _buffer("barrier_count", (1,), "int32"),
         _buffer("barrier_epoch", (1,), "int32"),
-        _buffer("row_counts", (258,), "int32"),
+        _buffer("row_counts", (11,), "int32"),
         _buffer("active_expert_count", (1,), "int32"),
-        _buffer("weight_expert_ids", (258,), "int32"),
-        _buffer("global_to_local_expert", (256,), "int32"),
-        _buffer("virtual_route_scratch", (520,), "int32"),
-        _buffer("token_map", (258, 10), "int32"),
-        _buffer("token_weights", (258, 10), "float32"),
+        _buffer("weight_expert_ids", (11,), "int32"),
+        _buffer("global_to_local_expert", (10,), "int32"),
+        _buffer("virtual_route_scratch", (28,), "int32"),
+        _buffer("token_map", (11, 10), "int32"),
+        _buffer("token_weights", (11, 10), "float32"),
         _buffer("shared_gate_scratch", (160,), "float32"),
         _buffer("shared_up_scratch", (160,), "float32"),
         _buffer("shared_gate_scalar", (1,), "float32"),
@@ -599,7 +676,8 @@ def native_rank_descriptor(plan: Layer3PhysicalPlan, rank: int) -> Mapping[str, 
         },
         "native_abis": {
             "target_slab_publication": 1, "qsa_c1": 1,
-            "hyperconnection": 1, "target_full_moe_c1": 1,
+            "hyperconnection": 1, "target_moe_device_stage": 1,
+            "target_full_moe_c1": 2,
             "pair_reduce_bootstrap": 3, "oracle_comparator": 1,
         },
     }
@@ -630,8 +708,10 @@ def native_target_slab_handoff(
 ) -> NativeTargetSlabHandoff:
     """Alias the accepted CUDA loader's target allocation without copying it."""
 
+    capability = accepted_native_handoff(loaded)
     if (
         not isinstance(loaded, LoadedRankSlabs)
+        or capability is None
         or descriptor.get("schema") != NATIVE_PLAN_SCHEMA
         or descriptor.get("artifact_key") != TARGET_ARTIFACT
         or descriptor.get("manifest_sha256") != TARGET_MANIFEST_SHA256
@@ -663,8 +743,27 @@ def native_target_slab_handoff(
         or receipt.completed_ns <= receipt.started_ns
     ):
         raise Layer3FactoryError("native target slab publication changed")
+    observed_receipt_sha256 = hashlib.sha256(canonical_bytes({
+        "rank": rank, "slab_key": receipt.key,
+        "bytes_read": receipt.bytes_read, "h2d_bytes": receipt.h2d_bytes,
+        "direct_reads": receipt.direct_reads,
+        "h2d_copies": receipt.h2d_copies,
+        "started_ns": receipt.started_ns,
+        "completed_ns": receipt.completed_ns,
+        "chunks": [vars(chunk) for chunk in receipt.chunks],
+    })).hexdigest()
+    native_lease, receipt_sha256 = capability
+    if receipt_sha256 != observed_receipt_sha256:
+        raise Layer3FactoryError("native target slab receipt changed after load")
+    prior = _PROCESS_LIFETIME_SLAB_OWNERS.get(rank)
+    if prior is not None and (prior[0] is not loaded or prior[1] != receipt_sha256):
+        raise Layer3FactoryError("process-lifetime target slab owner replaced")
+    _PROCESS_LIFETIME_SLAB_OWNERS[rank] = (loaded, receipt_sha256)
+    if native_lease is None:
+        raise Layer3FactoryError("native process-lifetime slab lease absent")
     return NativeTargetSlabHandoff(
-        owner=loaded, device_base=pointer, ready_event=event_handle,
+        owner=loaded, native_lease=native_lease,
+        device_base=pointer, ready_event=event_handle,
         bytes=expected_bytes, device=device, rank=rank,
         artifact_key=TARGET_ARTIFACT, slab_key=slab_key,
         manifest_sha256=TARGET_MANIFEST_SHA256,
@@ -672,10 +771,13 @@ def native_target_slab_handoff(
         open_to_publish_ns=receipt.completed_ns - receipt.started_ns,
         chunks_authenticated=receipt.direct_reads,
         peak_host_pinned_bytes=4 * (268_435_456 + 65_536 - 1),
+        receipt_sha256=receipt_sha256,
     )
 
 
 __all__ = ["Layer3FactoryError", "Layer3ExtentPlan", "Layer3PairReducePlan",
            "Layer3PhysicalPlan", "Layer3RankPlan", "native_rank_descriptor",
-           "NativeTargetSlabHandoff", "native_target_slab_handoff",
+           "NativeTargetSlabHandoff", "NativeTargetSlabFinalizer",
+           "CtypesNativeTargetSlabLeaseFactory",
+           "native_target_slab_handoff",
            "prepare_layer3_physical_plan", "public_plan"]

@@ -20,7 +20,9 @@ int main() {
                                    artifact_key,
                                    &production_identity.artifact_sha256))
     std::abort();
-  production_identity.layout_sha256[0] = 1;
+  if (!moe::target_moe_compact_layout_sha256(
+          &production_identity.layout_sha256))
+    std::abort();
   production_identity.rank = 0;
   production_identity.layer = 0;
   const auto p = reinterpret_cast<const void*>(1);

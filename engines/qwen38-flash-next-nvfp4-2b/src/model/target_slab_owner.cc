@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "model/target_slab_owner.h"
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
@@ -9,10 +10,12 @@
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 extern "C" {
@@ -28,11 +31,162 @@ unsigned long OpenSSL_version_num();
 }
 
 namespace rocket::qwen38::model {
+
+#include "model/target_slab_contract.inc"
+
+ProcessLifetimeTargetSlabLease::ProcessLifetimeTargetSlabLease(
+    TargetSlabPublication publication, std::string receipt_sha256)
+    : artifact_key_(publication.artifact_key),
+      slab_key_(publication.slab_key),
+      manifest_sha256_(publication.manifest_sha256),
+      layout_sha256_(publication.layout_sha256),
+      receipt_sha256_(std::move(receipt_sha256)),
+      publication_(publication) {
+  if (!publication.device_base || !publication.ready_event ||
+      publication.bytes != kTargetSlabBytes || publication.device < 0 ||
+      (publication.rank != 0 && publication.rank != 1) ||
+      artifact_key_ != kTargetSlabArtifactKey ||
+      manifest_sha256_ != kTargetSlabManifestSha256 ||
+      publication.chunks_authenticated != kTargetSlabChunks ||
+      publication.open_to_publish_ns == 0 || layout_sha256_.size() != 64 ||
+      receipt_sha256_.size() != 64 ||
+      !std::all_of(receipt_sha256_.begin(), receipt_sha256_.end(),
+                   [](char value) {
+                     return (value >= '0' && value <= '9') ||
+                            (value >= 'a' && value <= 'f');
+                   }))
+    throw std::invalid_argument("process-lifetime target slab lease changed");
+  publication_.artifact_key = artifact_key_;
+  publication_.slab_key = slab_key_;
+  publication_.manifest_sha256 = manifest_sha256_;
+  publication_.layout_sha256 = layout_sha256_;
+}
+
+namespace {
+struct RetainedTargetSlabLease {
+  std::shared_ptr<const TargetSlabLease> lease;
+  std::string receipt;
+};
+std::mutex g_retained_target_slab_lock;
+std::array<RetainedTargetSlabLease*, 2> g_retained_target_slabs{};
+}  // namespace
+
+std::shared_ptr<const TargetSlabLease>
+TargetSlabStartupFactory::lease_from_handle(void* lease_handle) noexcept {
+  if (!lease_handle) return {};
+  std::lock_guard guard(g_retained_target_slab_lock);
+  for (const auto* retained : g_retained_target_slabs)
+    if (retained && retained == lease_handle) return retained->lease;
+  return {};
+}
+
+extern "C" int qwen38_target_slab_retain_accepted_loader(
+    std::uintptr_t device_base, std::uintptr_t ready_event,
+    std::size_t bytes, int device, int rank, const char* slab_key,
+    const char* layout_sha256, const char* receipt_sha256,
+    std::uint64_t open_to_publish_ns, std::size_t chunks_authenticated,
+    std::size_t peak_host_pinned_bytes, std::uint64_t receipt_started_ns,
+    std::uint64_t receipt_completed_ns,
+    const TargetSlabChunkReceipt* chunk_receipts,
+    std::size_t chunk_receipt_count, void** lease_handle) noexcept {
+  if (!device_base || !ready_event || !slab_key || !layout_sha256 ||
+      !receipt_sha256 || !lease_handle || (rank != 0 && rank != 1))
+    return 1;
+  *lease_handle = nullptr;
+  cudaPointerAttributes attributes{};
+  CUdeviceptr allocation_base = 0;
+  std::size_t allocation_bytes = 0;
+  if (cudaSetDevice(device) != cudaSuccess ||
+      cudaPointerGetAttributes(
+          &attributes, reinterpret_cast<const void*>(device_base)) !=
+          cudaSuccess ||
+      cuMemGetAddressRange(&allocation_base, &allocation_bytes,
+                           static_cast<CUdeviceptr>(device_base)) != CUDA_SUCCESS ||
+      cudaEventQuery(reinterpret_cast<cudaEvent_t>(ready_event)) != cudaSuccess)
+    return 3;
+  try {
+    const TargetSlabPublication publication{
+        reinterpret_cast<const std::uint8_t*>(device_base),
+        reinterpret_cast<cudaEvent_t>(ready_event), bytes, device, rank,
+        kTargetSlabArtifactKey, slab_key, kTargetSlabManifestSha256,
+        layout_sha256, open_to_publish_ns, chunks_authenticated,
+        peak_host_pinned_bytes};
+    const TargetSlabCudaProbeResult probe{
+        static_cast<std::uintptr_t>(allocation_base), allocation_bytes,
+        attributes.device, attributes.type == cudaMemoryTypeDevice, true};
+    if (!validate_accepted_loader_publication(
+            publication, probe, receipt_started_ns, receipt_completed_ns,
+            chunk_receipts, chunk_receipt_count))
+      return 3;
+    const std::string receipt(receipt_sha256);
+    std::lock_guard guard(g_retained_target_slab_lock);
+    if (auto* prior = g_retained_target_slabs[rank]) {
+      const auto& previous = prior->lease->publication();
+      if (previous.device_base != publication.device_base ||
+          previous.ready_event != publication.ready_event ||
+          previous.bytes != publication.bytes ||
+          previous.device != publication.device ||
+          previous.slab_key != publication.slab_key ||
+          previous.layout_sha256 != publication.layout_sha256 ||
+          previous.open_to_publish_ns != publication.open_to_publish_ns ||
+          previous.chunks_authenticated != publication.chunks_authenticated ||
+          previous.peak_host_pinned_bytes !=
+              publication.peak_host_pinned_bytes ||
+          prior->receipt != receipt)
+        return 2;
+      *lease_handle = prior;
+      return 0;
+    }
+    auto* value = new RetainedTargetSlabLease{
+        std::shared_ptr<const TargetSlabLease>(
+            new ProcessLifetimeTargetSlabLease(publication, receipt)),
+        receipt};
+    g_retained_target_slabs[rank] = value;
+    *lease_handle = value;
+    return 0;
+  } catch (...) {
+    return 1;
+  }
+}
+bool validate_accepted_loader_publication(
+    const TargetSlabPublication& publication,
+    const TargetSlabCudaProbeResult& probe, std::uint64_t started_ns,
+    std::uint64_t completed_ns,
+    const TargetSlabChunkReceipt* receipts, std::size_t count) noexcept {
+  if (!receipts || count != kTargetSlabChunks || started_ns == 0 ||
+      completed_ns <= started_ns || !publication.device_base ||
+      !publication.ready_event || publication.bytes != kTargetSlabBytes ||
+      publication.device < 0 || (publication.rank != 0 && publication.rank != 1) ||
+      publication.slab_key !=
+          (publication.rank == 0 ? "rank0-target" : "rank1-target") ||
+      publication.artifact_key != kTargetSlabArtifactKey ||
+      publication.manifest_sha256 != kTargetSlabManifestSha256 ||
+      publication.chunks_authenticated != kTargetSlabChunks ||
+      publication.peak_host_pinned_bytes != kTargetSlabPeakPinnedBytes ||
+      publication.open_to_publish_ns != completed_ns - started_ns ||
+      !probe.device_memory || !probe.ready_event_complete ||
+      probe.device != publication.device ||
+      probe.allocation_base !=
+          reinterpret_cast<std::uintptr_t>(publication.device_base) ||
+      probe.allocation_bytes != publication.bytes)
+    return false;
+  const auto& expected =
+      publication.rank == 0 ? kRank0Chunks : kRank1Chunks;
+  std::uint64_t observed_bytes = 0;
+  for (std::size_t index = 0; index < count; ++index) {
+    const auto& observed = receipts[index];
+    if (observed.index != index || observed.bytes != expected[index].bytes ||
+        observed.direct_read_ns == 0 || observed.sha256_ns == 0 ||
+        observed.h2d_fence_ns == 0)
+      return false;
+    observed_bytes += observed.bytes;
+  }
+  return observed_bytes == kTargetSlabBytes;
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
-
-#include "model/target_slab_contract.inc"
 
 class IoError final : public std::runtime_error {
  public:

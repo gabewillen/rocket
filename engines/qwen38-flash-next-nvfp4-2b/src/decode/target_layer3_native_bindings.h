@@ -24,7 +24,23 @@ struct TargetLayer3NativeWeightBindings {
   moe::TargetSharedBf16Weights shared;
   std::array<moe::TargetMoeN640DeviceExpert,
              moe::kTargetMoeLocalExperts> routed_source;
+  moe::TargetMoeCompactRuntimeIdentity routed_identity;
 };
+
+struct TargetLayer3NativeMoeWeights {
+  moe::TargetRouterNvfp4Weights router;
+  moe::TargetSharedBf16Weights shared;
+  std::array<moe::TargetMoeN640DeviceExpert,
+             moe::kTargetMoeLocalExperts> routed_source;
+  moe::TargetMoeCompactRuntimeIdentity routed_identity;
+};
+
+// Resolves the complete layer-3 MoE pointer set from one authenticated target
+// slab publication. The returned pointers are aliases into that publication;
+// callers cannot substitute independently cross-wirable weight aggregates.
+TargetLayer3NativeMoeWeights bind_target_layer3_native_moe_weights(
+    const TargetLayer3NativePlan& plan,
+    const model::TargetSlabPublication& slab);
 
 class TargetLayer3ReadyEventProbe {
  public:

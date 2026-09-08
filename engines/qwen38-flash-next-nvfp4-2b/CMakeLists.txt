@@ -224,10 +224,10 @@ target_link_libraries(qwen38-test-layer3-rope-owner PRIVATE
 target_compile_options(qwen38-test-layer3-rope-owner PRIVATE
   -Wall -Wextra -Werror)
 
-add_library(qwen38_target_slab_owner STATIC src/model/target_slab_owner.cc)
+add_library(qwen38_target_slab_owner SHARED src/model/target_slab_owner.cc)
 target_include_directories(qwen38_target_slab_owner PUBLIC src)
 target_link_libraries(qwen38_target_slab_owner PUBLIC
-  CUDA::cudart rocket_qwen38_openssl3_crypto)
+  CUDA::cudart CUDA::cuda_driver rocket_qwen38_openssl3_crypto)
 target_compile_options(qwen38_target_slab_owner PRIVATE
   -Wall -Wextra -Werror)
 set_target_properties(qwen38_target_slab_owner PROPERTIES
@@ -235,6 +235,15 @@ set_target_properties(qwen38_target_slab_owner PROPERTIES
 
 add_executable(qwen38-target-slab-auth tests/target_slab_auth.cc)
 target_link_libraries(qwen38-target-slab-auth PRIVATE qwen38_target_slab_owner)
+
+add_executable(qwen38-test-target-slab-process-lease
+  tests/test_target_slab_process_lease.cc)
+target_link_libraries(qwen38-test-target-slab-process-lease PRIVATE
+  qwen38_target_slab_owner)
+target_compile_options(qwen38-test-target-slab-process-lease PRIVATE
+  -Wall -Wextra -Werror)
+add_test(NAME qwen38-target-slab-process-lease-cpu-contract
+  COMMAND qwen38-test-target-slab-process-lease)
 target_compile_options(qwen38-target-slab-auth PRIVATE
   -Wall -Wextra -Werror)
 
@@ -584,7 +593,7 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
   target_include_directories(qwen38_target_full_moe_c1 PUBLIC src)
   target_link_libraries(qwen38_target_full_moe_c1 PUBLIC CUDA::cudart PRIVATE
     qwen38_target_router_shared_c1 qwen38_target_moe_c1
-    qwen38_target_moe_b12x_aot)
+    qwen38_target_moe_b12x_aot qwen38_target_moe_n640_device_stage)
   target_compile_options(qwen38_target_full_moe_c1 PRIVATE
     -Wall -Wextra -Werror)
   set_target_properties(qwen38_target_full_moe_c1 PROPERTIES
@@ -599,6 +608,18 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
     -Wall -Wextra -Werror)
   set_target_properties(qwen38_native_target_moe_graph PROPERTIES
     POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
+
+  add_library(qwen38_target_layer3_moe_owner STATIC
+    src/moe/target_layer3_moe_owner.cu)
+  target_include_directories(qwen38_target_layer3_moe_owner PUBLIC src)
+  target_link_libraries(qwen38_target_layer3_moe_owner PUBLIC
+    qwen38_target_layer3_native_bindings qwen38_native_target_moe_graph
+    qwen38_target_moe_n640_device_stage qwen38_target_full_moe_c1
+    qwen38_target_moe_b12x_aot qwen38_target_router_shared_c1 CUDA::cudart)
+  target_compile_options(qwen38_target_layer3_moe_owner PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+  set_target_properties(qwen38_target_layer3_moe_owner PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
 else()
   target_compile_definitions(qwen38_target_moe_b12x_aot PRIVATE
     ROCKET_QWEN38_TARGET_MOE_B12X_AOT=0)
@@ -915,6 +936,17 @@ if(TARGET qwen38_target_router_shared_c1)
     -Wall -Wextra -Werror)
   add_test(NAME qwen38-native-target-moe-graph-cpu-contract
     COMMAND qwen38-test-native-target-moe-graph-contract)
+
+  add_executable(qwen38-test-target-layer3-moe-owner-plan
+    tests/test_target_layer3_moe_owner_plan.cc)
+  target_link_libraries(qwen38-test-target-layer3-moe-owner-plan PRIVATE
+    qwen38_target_layer3_moe_owner)
+  target_compile_options(qwen38-test-target-layer3-moe-owner-plan PRIVATE
+    -Wall -Wextra -Werror)
+  set_target_properties(qwen38-test-target-layer3-moe-owner-plan PROPERTIES
+    LINKER_LANGUAGE CUDA)
+  add_test(NAME qwen38-target-layer3-moe-owner-plan-cpu-contract
+    COMMAND qwen38-test-target-layer3-moe-owner-plan)
 endif()
 
 add_executable(qwen38-test-fp8-routed-experts
@@ -993,6 +1025,18 @@ add_test(NAME qwen38-gdn-prefill-projection-cpu-contract
   COMMAND qwen38-test-gdn-prefill-projection-contract)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME qwen38-cuda-slab-loader-cpu-contract
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_slab_loader.py)
+set_tests_properties(qwen38-cuda-slab-loader-cpu-contract
+  PROPERTIES ENVIRONMENT
+    "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src:${CMAKE_CURRENT_SOURCE_DIR}/tests")
+add_test(NAME qwen38-layer3-factory-accepted-loader-cpu-contract
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_layer3_factory.py)
+set_tests_properties(qwen38-layer3-factory-accepted-loader-cpu-contract
+  PROPERTIES ENVIRONMENT
+    "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src;ROCKET_QWEN38_TARGET_SLAB_OWNER_LIBRARY=$<TARGET_FILE:qwen38_target_slab_owner>")
 add_test(NAME qwen38-target-moe-n640-materializer-source-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_target_moe_n640_materializer_source.py)

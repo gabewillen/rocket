@@ -77,7 +77,7 @@ constexpr std::array<std::string_view, 2> kExtentInventories{
     "0d5ad9150c7632ecab86abd320ddea486971db79453c919a4ec8f42ccb6e49b6",
     "9e2a66e4f78d2ac6d13cc2afea164f8c3f4b7329a98f84279015f739c3027cdf"};
 constexpr std::string_view kBufferInventory =
-    "7e48bcfb21f1f5f1136754a635215318696878f599c75a3a01e6a4dc45f7cc45";
+    "a0840e70cec9824b33339d8807ea548eef3b2dbe85f6ee9c82a715799ab6c42e";
 constexpr std::array<std::string_view, 2> kProjectionGlobalInventories{
     "e9196b3e9efed6cc5cdcfc27a2d4aee0c0a81ac088ef2e73ccb8dad04bee5b7d",
     "44ef127172e3c065479e9dbbcf47686a21b9151cdb316cbd5486fca3a6115668"};
@@ -259,7 +259,7 @@ void validate_buffers(json_object* root) {
   if (json_object_object_length(buffers) != 4) fail("buffer family inventory changed");
   const std::array<std::pair<const char*, std::size_t>, 4> families{{
       {"qsa_arena", 18}, {"qsa_state", 16},
-      {"target_moe_workspace", 24}, {"row", 9}}};
+      {"target_moe_workspace", 36}, {"row", 9}}};
   for (const auto& [family, expected_count] : families) {
     auto* array = field(buffers, family, kJsonArray);
     if (json_object_array_length(array) != expected_count)
@@ -306,11 +306,12 @@ void validate_fixed_contract(json_object* root) {
       array_string(rails, 1) != "roceP2p1s0f1")
     fail("PairReduce rail identity changed");
   auto* abis = field(root, "native_abis", kJsonObject);
-  if (json_object_object_length(abis) != 6) fail("native ABI inventory changed");
+  if (json_object_object_length(abis) != 7) fail("native ABI inventory changed");
   for (const auto& [name, version] :
-       std::array<std::pair<const char*, std::uint64_t>, 6>{{
+       std::array<std::pair<const char*, std::uint64_t>, 7>{{
            {"target_slab_publication", 1}, {"qsa_c1", 1},
-           {"hyperconnection", 1}, {"target_full_moe_c1", 1},
+           {"hyperconnection", 1}, {"target_moe_device_stage", 1},
+           {"target_full_moe_c1", 2},
            {"pair_reduce_bootstrap", 3}, {"oracle_comparator", 1}}})
     if (uint_field(abis, name) != version) fail("native ABI version changed");
 }

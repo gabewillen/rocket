@@ -29,13 +29,20 @@ bool valid_scratch(const TargetMoeN768StageScratch& s) noexcept {
   return s.w13_packed && s.w13_scale && s.down_packed && s.down_scale &&
          s.input_global_scale && s.folded_w1_alpha && s.w2_alpha &&
          s.down_input_scale && s.source_expert_ids && s.compact_expert_ids &&
-         s.compact_routing_weights && s.evidence &&
+         s.compact_routing_weights && s.evidence && s.host_evidence &&
          s.w13_packed_bytes == kTargetMoeStagedW13PackedBytes &&
          s.w13_scale_bytes == kTargetMoeStagedW13ScaleBytes &&
          s.down_packed_bytes == kTargetMoeStagedDownPackedBytes &&
          s.down_scale_bytes == kTargetMoeStagedDownScaleBytes &&
          s.scalar_capacity == kTargetMoeStagedExperts &&
          s.route_capacity == kTargetMoeC1TopK;
+}
+
+bool known_outcome(TargetMoeOutcome outcome) noexcept {
+  return outcome == TargetMoeOutcome::kOk ||
+         outcome == TargetMoeOutcome::kContractError ||
+         outcome == TargetMoeOutcome::kStaleGeneration ||
+         outcome == TargetMoeOutcome::kCudaError;
 }
 
 __device__ std::size_t swizzled_scale_offset(
@@ -126,6 +133,13 @@ __global__ void select_experts(
       return;
     }
   }
+}
+
+__global__ void mark_evidence_pending(
+    const std::uint64_t* requested_generation,
+    TargetMoeN640StageEvidence* evidence) {
+  if (threadIdx.x == 0 && blockIdx.x == 0)
+    *evidence = {*requested_generation, -1, TargetMoeOutcome::kContractError};
 }
 
 __global__ void stage_packed(
@@ -273,6 +287,20 @@ void TargetMoeN640DeviceStage::wait_source(cudaStream_t stream) {
   source_wait_enqueued_ = true;
 }
 
+TargetMoeOutcome TargetMoeN640DeviceStage::enqueue_pending_evidence(
+    const std::uint64_t* requested_generation,
+    const TargetMoeN768StageScratch& scratch,
+    cudaStream_t stream) const noexcept {
+  if (!device_experts_ || !source_wait_enqueued_ ||
+      stream != source_stream_ || !requested_generation ||
+      !valid_scratch(scratch) || !stream)
+    return TargetMoeOutcome::kContractError;
+  mark_evidence_pending<<<1, 1, 0, stream>>>(requested_generation,
+                                             scratch.evidence);
+  return cudaPeekAtLastError() == cudaSuccess ? TargetMoeOutcome::kOk
+                                              : TargetMoeOutcome::kCudaError;
+}
+
 TargetMoeOutcome TargetMoeN640DeviceStage::enqueue(
     const TargetMoeN640StageLaunch& launch) const noexcept {
   if (!device_experts_ || !source_wait_enqueued_ ||
@@ -319,6 +347,20 @@ bool validate_target_moe_stage_scratch(
   return valid_scratch(scratch);
 }
 
+TargetMoeOutcome validate_target_moe_stage_after_fence(
+    const TargetMoeN768StageScratch& scratch,
+    std::uint64_t requested_generation) noexcept {
+  if (!valid_scratch(scratch) || requested_generation == 0)
+    return TargetMoeOutcome::kContractError;
+  const auto& evidence = *scratch.host_evidence;
+  if (evidence.generation != requested_generation ||
+      evidence.active_experts < 0 ||
+      evidence.active_experts > kTargetMoeStagedExperts ||
+      !known_outcome(evidence.outcome))
+    return TargetMoeOutcome::kContractError;
+  return evidence.outcome;
+}
+
 TargetMoeN640StageReference target_moe_n640_stage_reference(
     const std::array<std::int32_t, kTargetMoeC1TopK>& ids,
     const std::array<float, kTargetMoeC1TopK>& weights,
@@ -340,7 +382,8 @@ void export_target_moe_stage_otel_after_fence(
   if ((rank != 0 && rank != 1) || layer < 0 || layer >= 48 ||
       requested_generation == 0 || evidence.generation != requested_generation ||
       evidence.active_experts < 0 ||
-      evidence.active_experts > kTargetMoeStagedExperts)
+      evidence.active_experts > kTargetMoeStagedExperts ||
+      !known_outcome(evidence.outcome))
     outcome = TargetMoeOutcome::kContractError;
   const std::uint64_t active =
       evidence.active_experts >= 0 &&
@@ -353,7 +396,9 @@ void export_target_moe_stage_otel_after_fence(
       1ULL * kTargetMoeHidden * kTargetMoeLogicalIntermediate / 2 +
       1ULL * kTargetMoeHidden * (kTargetMoeLogicalIntermediate / 16) +
       4ULL * sizeof(float);
-  sink.add_counter({TargetMoeStageCounter::kLaunch, outcome, rank, layer, 1});
+  const std::uint64_t launched = evidence.active_experts >= 0 ? 1 : 0;
+  sink.add_counter(
+      {TargetMoeStageCounter::kLaunch, outcome, rank, layer, launched});
   sink.add_counter(
       {TargetMoeStageCounter::kActiveExperts, outcome, rank, layer, active});
   sink.add_counter({TargetMoeStageCounter::kSourceBytes, outcome, rank, layer,

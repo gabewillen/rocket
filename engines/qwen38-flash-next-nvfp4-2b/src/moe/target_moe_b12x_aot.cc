@@ -14,6 +14,13 @@
 namespace rocket::qwen38::moe {
 namespace {
 
+constexpr std::string_view kSourceAbi =
+    "modelopt_nvfp4_group16_cutlass_sm121_sfb";
+constexpr std::string_view kTransformAbi =
+    "rocket.qwen38.target-moe.device-stage.v1";
+constexpr std::string_view kRouteRemapAbi =
+    "route_position_iota10_unique_positive_remote_zero_v1";
+
 bool valid_launch(const TargetMoeB12xLaunch& launch) noexcept {
   const auto& w = launch.workspace;
   return launch.hidden_bf16 && launch.local_expert_ids &&
@@ -49,6 +56,39 @@ bool load_module(Module* module, int device, auto init, auto load) noexcept {
 
 }  // namespace
 
+bool authenticate_target_moe_compact_runtime_identity(
+    const TargetMoeCompactRuntimeIdentity& identity) noexcept {
+#if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
+  static_assert(std::string_view(kRocketQwen38TargetMoeCompactConfigSha256) ==
+                "2ec6180161706b6c4b6c3d6656d86279736865567e2456726451cc6c910dfe16");
+  static_assert(std::string_view(kRocketQwen38TargetMoeCompactSourceAbiSha256) ==
+                "3ad245a506f425529cca9e989ca157e22831eaa6e7452eefb2f9a9290271dc84");
+  static_assert(std::string_view(kRocketQwen38TargetMoeCompactTransformAbiSha256) ==
+                "3eba3e23ff7f67feb496fde266674516d9d864bb6e92b7f50874992abdfe5d27");
+  static_assert(std::string_view(kRocketQwen38TargetMoeCompactRouteRemapAbiSha256) ==
+                "5c603e36be3f2a271c4702edfb361608e268100a44dcd3123673fee152d83ea8");
+  const std::string_view descriptor = identity.rank == 0
+      ? kRocketQwen38TargetMoeCompactRank0DescriptorSha256
+      : kRocketQwen38TargetMoeCompactRank1DescriptorSha256;
+  const std::string_view inventory = identity.rank == 0
+      ? kRocketQwen38TargetMoeCompactRank0BindingInventorySha256
+      : kRocketQwen38TargetMoeCompactRank1BindingInventorySha256;
+  const std::string_view publication = identity.rank == 0
+      ? kRocketQwen38TargetMoeCompactRank0PublicationLayoutSha256
+      : kRocketQwen38TargetMoeCompactRank1PublicationLayoutSha256;
+  return (identity.rank == 0 || identity.rank == 1) &&
+         identity.descriptor_sha256 == descriptor &&
+         identity.binding_inventory_sha256 == inventory &&
+         identity.publication_layout_sha256 == publication &&
+         identity.source_abi == kSourceAbi &&
+         identity.transform_abi == kTransformAbi &&
+         identity.route_remap_abi == kRouteRemapAbi;
+#else
+  (void)identity;
+  return false;
+#endif
+}
+
 bool parse_target_moe_artifact_key(
     std::string_view ascii, std::array<std::uint8_t, 32>* bytes) noexcept {
   if (!bytes || ascii.size() != 64) return false;
@@ -76,6 +116,17 @@ std::string_view target_moe_artifact_key_ascii() noexcept {
 #endif
 }
 
+bool target_moe_compact_layout_sha256(
+    std::array<std::uint8_t, 32>* bytes) noexcept {
+#if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
+  return parse_target_moe_artifact_key(
+      kRocketQwen38TargetMoeCompactLayoutSha256, bytes);
+#else
+  (void)bytes;
+  return false;
+#endif
+}
+
 TargetMoeCreateFailure diagnose_target_moe_b12x_create(
     int device, const TargetMoeB12xIdentity& identity,
     const TargetMoeB12xWeights& weights) noexcept {
@@ -91,6 +142,10 @@ TargetMoeCreateFailure diagnose_target_moe_b12x_create(
                                      &artifact_sha256) ||
       identity.artifact_sha256 != artifact_sha256)
     return TargetMoeCreateFailure::kArtifactSha256;
+  std::array<std::uint8_t, 32> layout_sha256{};
+  if (!target_moe_compact_layout_sha256(&layout_sha256) ||
+      identity.layout_sha256 != layout_sha256)
+    return TargetMoeCreateFailure::kLayoutSha256;
 #endif
   if (!std::any_of(identity.layout_sha256.begin(), identity.layout_sha256.end(),
                    [](std::uint8_t byte) { return byte != 0; }))

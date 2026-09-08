@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace rocket::qwen38::model {
@@ -84,6 +85,87 @@ struct TargetSlabPublication {
   std::size_t peak_host_pinned_bytes;
 };
 
+// Owning lifetime boundary for every publication borrower. Implementations
+// retain the allocation and ready event until the last shared lease releases.
+class TargetSlabLease {
+ public:
+  enum class Lifetime : std::uint8_t { kOwnerScoped, kProcessLifetime };
+  virtual ~TargetSlabLease() = default;
+  virtual const TargetSlabPublication& publication() const noexcept = 0;
+  virtual Lifetime lifetime() const noexcept = 0;
+};
+
+struct TargetSlabChunkReceipt {
+  std::uint64_t index;
+  std::uint64_t bytes;
+  std::uint64_t direct_read_ns;
+  std::uint64_t sha256_ns;
+  std::uint64_t h2d_fence_ns;
+};
+
+struct TargetSlabCudaProbeResult {
+  std::uintptr_t allocation_base;
+  std::size_t allocation_bytes;
+  int device;
+  bool device_memory;
+  bool ready_event_complete;
+};
+
+// Allocation-free validation seam. Production supplies values obtained from
+// CUDA pointer/address-range/event probes. CPU tests inject the same typed
+// result without gaining a capability-minting API.
+bool validate_accepted_loader_publication(
+    const TargetSlabPublication& publication,
+    const TargetSlabCudaProbeResult& probe, std::uint64_t receipt_started_ns,
+    std::uint64_t receipt_completed_ns,
+    const TargetSlabChunkReceipt* chunk_receipts,
+    std::size_t chunk_receipt_count) noexcept;
+
+extern "C" int qwen38_target_slab_retain_accepted_loader(
+    std::uintptr_t device_base, std::uintptr_t ready_event,
+    std::size_t bytes, int device, int rank, const char* slab_key,
+    const char* layout_sha256, const char* receipt_sha256,
+    std::uint64_t open_to_publish_ns, std::size_t chunks_authenticated,
+    std::size_t peak_host_pinned_bytes, std::uint64_t receipt_started_ns,
+    std::uint64_t receipt_completed_ns,
+    const TargetSlabChunkReceipt* chunk_receipts,
+    std::size_t chunk_receipt_count, void** lease_handle) noexcept;
+
+// Token for the accepted Python CudaRankSlabLoader handoff. The startup
+// control plane pins the corresponding LoadedRankSlabs object in an
+// append-only process-lifetime registry before constructing this token. This
+// object copies all publication identities and never releases device memory.
+class ProcessLifetimeTargetSlabLease final : public TargetSlabLease {
+ public:
+  const TargetSlabPublication& publication() const noexcept override {
+    return publication_;
+  }
+  Lifetime lifetime() const noexcept override {
+    return Lifetime::kProcessLifetime;
+  }
+
+ private:
+  friend int qwen38_target_slab_retain_accepted_loader(
+      std::uintptr_t, std::uintptr_t, std::size_t, int, int, const char*,
+      const char*, const char*, std::uint64_t, std::size_t, std::size_t,
+      std::uint64_t, std::uint64_t, const TargetSlabChunkReceipt*, std::size_t,
+      void**) noexcept;
+  ProcessLifetimeTargetSlabLease(TargetSlabPublication publication,
+                                 std::string receipt_sha256);
+  std::string artifact_key_;
+  std::string slab_key_;
+  std::string manifest_sha256_;
+  std::string layout_sha256_;
+  std::string receipt_sha256_;
+  TargetSlabPublication publication_{};
+};
+
+class TargetSlabStartupFactory final {
+ public:
+  static std::shared_ptr<const TargetSlabLease> lease_from_handle(
+      void* lease_handle) noexcept;
+};
+
 struct TargetSlabMetadata {
   int rank;
   std::filesystem::path payload;
@@ -101,7 +183,7 @@ TargetSlabMetadata authenticate_target_slab_metadata(
 // chunk and the final private-stream publication event have completed. The
 // telemetry sink is borrowed for the owner lifetime so cleanup failures remain
 // observable without throwing from the destructor.
-class TargetSlabDeviceOwner final {
+class TargetSlabDeviceOwner final : public TargetSlabLease {
  public:
   static std::unique_ptr<TargetSlabDeviceOwner> load(
       int device, int rank, const std::filesystem::path& artifact,
@@ -110,9 +192,10 @@ class TargetSlabDeviceOwner final {
   TargetSlabDeviceOwner(const TargetSlabDeviceOwner&) = delete;
   TargetSlabDeviceOwner& operator=(const TargetSlabDeviceOwner&) = delete;
 
-  const TargetSlabPublication& publication() const noexcept {
+  const TargetSlabPublication& publication() const noexcept override {
     return publication_;
   }
+  Lifetime lifetime() const noexcept override { return Lifetime::kOwnerScoped; }
 
  private:
   TargetSlabDeviceOwner() = default;

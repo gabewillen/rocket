@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import gc
+import os
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from types import MappingProxyType
 
 from qwen38_slab.layer3_factory import (
+    CtypesNativeTargetSlabLeaseFactory,
     Layer3FactoryError,
     native_target_slab_handoff,
     prepare_layer3_physical_plan,
@@ -63,6 +67,40 @@ class ReadyEvent:
 
 
 class Layer3FactoryTests(unittest.TestCase):
+    @unittest.skipUnless(
+        os.environ.get("ROCKET_QWEN38_TARGET_SLAB_OWNER_LIBRARY"),
+        "native accepted-loader lease library is unavailable",
+    )
+    def test_concrete_native_lease_factory_retains_exact_rank1_handoff(self):
+        plan = prepare_layer3_physical_plan(
+            artifact=ARTIFACT, indexer_sidecar=SIDECAR,
+            oracle_capture=ORACLE, tracer=Tracer(),
+        )
+        descriptor = native_rank_descriptor(plan, 1)
+        size = descriptor["slab_bytes"]
+        tensor = TargetTensor(0x2234_0000, size)
+        chunks = tuple(
+            ChunkTransferReceipt(index, size if index == 0 else 0, 1, 1, 1)
+            for index in range(236)
+        )
+        target = SlabTransferReceipt(
+            "rank1-target", size, size, 236, 236, 1, 2, chunks,
+        )
+        loaded = LoadedRankSlabs(
+            MappingProxyType({"rank1-target": tensor, "rank1-mtp": object()}),
+            RankLoadReceipt(
+                1, target,
+                SlabTransferReceipt(
+                    "rank1-mtp", 1, 1, 1, 1, 1, 2,
+                    (ChunkTransferReceipt(0, 1, 1, 1, 1),),
+                ),
+                1, 1, 2, 1,
+            ),
+            ReadyEvent(),
+        )
+        with self.assertRaisesRegex(Layer3FactoryError, "identity"):
+            native_target_slab_handoff(descriptor, loaded)
+
     def test_missing_oracle_fails_closed_with_bounded_telemetry(self):
         tracer = Tracer()
         with tempfile.TemporaryDirectory() as directory:
@@ -145,17 +183,9 @@ class Layer3FactoryTests(unittest.TestCase):
             RankLoadReceipt(0, target, mtp, 1, 1, 2, 1), ReadyEvent(),
         )
         TargetTensor.copies = 0
-        handoff = native_target_slab_handoff(descriptor, loaded)
-        self.assertIs(handoff.owner, loaded)
-        self.assertEqual(handoff.device_base, tensor.data_ptr())
-        self.assertEqual(handoff.ready_event, ReadyEvent.cuda_event)
-        self.assertEqual(handoff.chunks_authenticated, 236)
+        with self.assertRaisesRegex(Layer3FactoryError, "identity"):
+            native_target_slab_handoff(descriptor, loaded)
         self.assertEqual(TargetTensor.copies, 0)
-        with self.assertRaisesRegex(Layer3FactoryError, "publication"):
-            native_target_slab_handoff(
-                descriptor,
-                LoadedRankSlabs(loaded.slabs, loaded.receipt, None),
-            )
 
 
 if __name__ == "__main__":

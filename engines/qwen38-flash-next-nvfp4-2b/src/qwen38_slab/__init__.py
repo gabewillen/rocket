@@ -28,12 +28,6 @@ from .native_qsa import (
     bind_slab_pointers,
     bind_state_view,
 )
-from .target_moe import (
-    TargetMoeBinding,
-    TargetMoeError,
-    TargetMoeGeneration,
-    TargetMoeLayerParticipant,
-)
 from .whole_decoder import (
     DecoderSlabs,
     DraftArchitecture,
@@ -66,10 +60,6 @@ __all__ = [
     "PINNED_CONTRACT",
     "SlabContract",
     "SlabError",
-    "TargetMoeBinding",
-    "TargetMoeError",
-    "TargetMoeGeneration",
-    "TargetMoeLayerParticipant",
     "TwoRankLayer3Binding",
     "TwoRankLayer3Factory",
     "WholeDecoderColdLoader",
