@@ -13,6 +13,7 @@ class TestGdnPrefillBundlePatcher(unittest.TestCase):
         self.assertIn("q, k, v, fi_g, fi_beta, fi_state", source)
         self.assertIn("ROCKET_QWEN38_K0_GDN_CAPTURE_ACTIVE", source)
         self.assertIn("get_tensor_model_parallel_rank", source)
+        self.assertIn("is_device_capability_family(120)", source)
         self.assertIn("hashlib.sha256(canonical).hexdigest()", source)
         self.assertNotIn("repeat(", source)
 

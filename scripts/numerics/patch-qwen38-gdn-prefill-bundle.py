@@ -35,6 +35,20 @@ def main() -> None:
         "import os\nimport hashlib\nimport json\nfrom pathlib import Path\n"
         "from typing import Literal",
     )
+    source = replace_once(
+        source,
+        "    elif (\n"
+        "        current_platform.is_device_capability_family(100)\n"
+        "        and head_k_dim == 128\n"
+        "        and current_platform.get_cuda_runtime_major() >= 13\n"
+        "    ):\n",
+        "    elif (\n"
+        "        (current_platform.is_device_capability_family(100)\n"
+        "         or current_platform.is_device_capability_family(120))\n"
+        "        and head_k_dim == 128\n"
+        "        and current_platform.get_cuda_runtime_major() >= 13\n"
+        "    ):\n",
+    )
     helper = r'''
 _ROCKET_GDN_PREFILL_BUNDLE_CAPTURED = False
 
