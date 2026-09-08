@@ -27,6 +27,8 @@ _HC_CONTRACTS = {
     "block_inject_weight.weight": (81_920, (4, 10_240)),
     "input_mix_weight_up.weight": (6_553_600, (10_240, 320)),
 }
+_NVFP4_ABI = "modelopt_nvfp4_group16_cutlass_sm121_sfb"
+_PLE_EMBEDDING_SHARDS = 64
 
 
 class TargetLayerDescriptorError(RuntimeError):
@@ -137,6 +139,53 @@ def _moe(entries: Mapping[str, object], rank: int,
     } for item in selected]
 
 
+def _ple(entries: Mapping[str, object], rank: int,
+         layer: int) -> list[dict[str, object]]:
+    """Return the complete rank-local layer-2 PLE inventory."""
+
+    if layer != 1:
+        return []
+    prefix = "model.language_model.layers.1.ple."
+    contracts: list[tuple[str, int, tuple[int, ...], str, str, str]] = [
+        ("conv1d.weight", 81_920, (10_240, 1, 4), "BF16", "checkpoint", "native"),
+        ("key_proj.weight", 13_107_200, (10_240, 1_280), "U8", "packed_e2m1_row_major", _NVFP4_ABI),
+        ("key_proj.weight_scale", 1_638_400, (1_638_400,), "F8_E4M3", "cutlass_sm121_sfb", _NVFP4_ABI),
+        ("key_proj.weight_scale_2", 4, (1,), "F32", "scalar", _NVFP4_ABI),
+        ("key_proj.input_scale", 4, (1,), "F32", "scalar", _NVFP4_ABI),
+        ("value_proj.weight", 3_276_800, (2_560, 1_280), "U8", "packed_e2m1_row_major", _NVFP4_ABI),
+        ("value_proj.weight_scale", 409_600, (409_600,), "F8_E4M3", "cutlass_sm121_sfb", _NVFP4_ABI),
+        ("value_proj.weight_scale_2", 4, (1,), "F32", "scalar", _NVFP4_ABI),
+        ("value_proj.input_scale", 4, (1,), "F32", "scalar", _NVFP4_ABI),
+        ("norm_key.weight", 20_480, (10_240,), "BF16", "checkpoint", "native"),
+        ("norm_query.weight", 20_480, (10_240,), "BF16", "checkpoint", "native"),
+        ("norm_conv.weight", 20_480, (10_240,), "BF16", "checkpoint", "native"),
+        ("ple_embedding.layer_multipliers", 24, (3,), "I64", "checkpoint", "native"),
+        ("ple_embedding.ngram_heads_offsets", 128, (16,), "I64", "checkpoint", "native"),
+        ("ple_embedding.ngram_heads_vocab_sizes", 128, (16,), "I64", "checkpoint", "native"),
+        ("ple_embedding.ngram_embedding.weight_scale", 2, (1,), "BF16", "checkpoint", "native"),
+    ]
+    contracts.extend(
+        (f"ple_embedding.ngram_embedding.shard_{index}.weight", 400_001_920,
+         (2_500_012, 160), "F8_E4M3", "checkpoint", "native")
+        for index in range(rank * _PLE_EMBEDDING_SHARDS,
+                           (rank + 1) * _PLE_EMBEDDING_SHARDS)
+    )
+    result = []
+    for suffix, length, shape, dtype, layout, abi in contracts:
+        name = prefix + suffix
+        item = entries.get(name)
+        if (
+            not isinstance(item, dict) or item.get("length_bytes") != length
+            or tuple(item.get("shape", ())) != shape or item.get("dtype") != dtype
+            or item.get("layout") != layout or item.get("abi") != abi
+            or not isinstance(item.get("offset_bytes"), int)
+            or item["offset_bytes"] % 256
+        ):
+            raise TargetLayerDescriptorError(f"PLE extent changed: {name}")
+        result.append(_extent(item))
+    return result
+
+
 def target_layer_descriptor(artifact: Path, sidecar: Path, rank: int,
                             layer: int) -> dict[str, object]:
     """Build one pointer-free descriptor from authenticated publication metadata."""
@@ -192,6 +241,7 @@ def target_layer_descriptor(artifact: Path, sidecar: Path, rank: int,
                 scalar_bits[family] = raw.hex()
         finally:
             os.close(fd)
+    extents.extend(_ple(entries, rank, layer))
     moe_extents = _moe(entries, rank, layer)
     extents.extend(moe_extents)
     extents.sort(key=lambda item: str(item["name"]))

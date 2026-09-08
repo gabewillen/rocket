@@ -275,7 +275,8 @@ void validate_target_layer_native_plan_binding(
       plan.layout_sha256 != expected->moe_layout ||
       plan.slab_publication_layout_sha256 != expected->publication)
     fail("rank, layer, kind, or publication identity changed");
-  const std::size_t expected_extents = qsa ? 3'108 : 3'111;
+  const std::size_t expected_extents =
+      plan.layer == 1 ? 3'191 : (qsa ? 3'108 : 3'111);
   if (plan.extents.size() != expected_extents)
     fail("extent inventory cardinality changed");
   std::set<std::string_view> names;

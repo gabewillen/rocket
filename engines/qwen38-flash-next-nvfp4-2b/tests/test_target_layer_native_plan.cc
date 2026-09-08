@@ -8,10 +8,10 @@
 
 int main(int argc, char** argv) {
   using namespace rocket::qwen38::decode;
-  if (argc != 7) return 2;
-  const std::array<int, 6> expected_ranks{0, 0, 0, 1, 1, 1};
-  const std::array<int, 6> expected_layers{0, 3, 47, 0, 3, 47};
-  for (int index = 0; index < 6; ++index) {
+  if (argc != 9) return 2;
+  const std::array<int, 8> expected_ranks{0, 0, 0, 0, 1, 1, 1, 1};
+  const std::array<int, 8> expected_layers{0, 1, 3, 47, 0, 1, 3, 47};
+  for (int index = 0; index < 8; ++index) {
     const auto plan = load_target_layer_native_plan(
         std::filesystem::path(argv[index + 1]));
     const bool qsa = expected_layers[index] % 4 == 3;
@@ -19,7 +19,9 @@ int main(int argc, char** argv) {
         plan.layer != expected_layers[index] ||
         plan.attention_kind != (qsa ? TargetK0AttentionKind::kQsa
                                     : TargetK0AttentionKind::kGdn) ||
-        plan.extents.size() != (qsa ? 3'108U : 3'111U)) return 3;
+        plan.extents.size() !=
+            (expected_layers[index] == 1 ? 3'191U
+                                         : (qsa ? 3'108U : 3'111U))) return 3;
     const rocket::qwen38::moe::TargetMoeCompactRuntimeIdentity moe_identity{
         plan.rank, plan.layer, plan.descriptor_sha256,
         plan.native_binding_inventory_sha256,

@@ -839,6 +839,23 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
   add_test(NAME qwen38-target-gdn-layer-owner-cpu-contract
     COMMAND qwen38-test-target-gdn-layer-owner)
 
+  add_library(qwen38_target_ple_layer_owner STATIC
+    src/decode/target_ple_layer_owner.cc)
+  target_include_directories(qwen38_target_ple_layer_owner PUBLIC src)
+  target_link_libraries(qwen38_target_ple_layer_owner PUBLIC
+    qwen38_target_layer_native_plan)
+  target_compile_options(qwen38_target_ple_layer_owner PRIVATE
+    -Wall -Wextra -Werror)
+
+  add_executable(qwen38-test-target-ple-layer-owner
+    tests/test_target_ple_layer_owner.cc)
+  target_link_libraries(qwen38-test-target-ple-layer-owner PRIVATE
+    qwen38_target_ple_layer_owner)
+  target_compile_options(qwen38-test-target-ple-layer-owner PRIVATE
+    -Wall -Wextra -Werror)
+  set_target_properties(qwen38-test-target-ple-layer-owner PROPERTIES
+    LINKER_LANGUAGE CUDA)
+
   add_library(qwen38_target_k0_physical_layer_owners STATIC
     src/decode/target_k0_physical_layer_owners.cu)
   target_include_directories(qwen38_target_k0_physical_layer_owners PUBLIC src)
