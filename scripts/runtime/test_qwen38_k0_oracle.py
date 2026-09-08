@@ -145,6 +145,70 @@ class Qwen3_8FlashNextModel(nn.Module):
             with self.assertRaisesRegex(RuntimeError, "missing logits"):
                 stale.begin(FakeTensor([1, 2], [2]), FakeTensor([], [2, 8]))
 
+    def test_decode_oracle_has_one_prefill_and_seven_one_token_decisions(self):
+        patcher = self.load_patcher()
+
+        class FakeTensor:
+            def __init__(self, values, shape):
+                self.values, self.shape, self.ndim = values, shape, len(shape)
+            def detach(self): return self
+            def cpu(self): return self
+            def tolist(self): return self.values
+            def __getitem__(self, index): return self.values[index] if self.ndim == 1 else self
+            def float(self): return self
+            def numel(self): return self.shape[-1]
+
+        class FakeTorch:
+            @staticmethod
+            def topk(_tensor, count, sorted=True):
+                del sorted
+                return FakeTensor([1.0] * count, [count]), FakeTensor(list(range(count)), [count])
+
+        namespace = {"Path": Path, "hashlib": hashlib, "json": json,
+                     "os": __import__("os"), "torch": FakeTorch}
+        exec(patcher.HELPER, namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            oracle = namespace["_RocketK0Oracle"].__new__(namespace["_RocketK0Oracle"])
+            oracle.output = Path(directory)
+            oracle.expected_ids = [11, 12]
+            oracle.identity = {"request_sha256": "fixture", "decision_forwards": 8}
+            oracle.request_sha256 = "fixture"
+            oracle.generation_index = 0
+            oracle.schema = "rocket.qwen38.k0-target-decode-oracle.v1"
+            oracle.decode_mode = True
+            oracle.decision_forwards = 8
+            oracle.eos_token_ids = {99}
+            oracle.artifacts = []
+            oracle.artifact_by_name = {}
+            oracle.expected_forward_names = ["embedding", *[f"layer.{i:02d}" for i in range(48)], "final_norm"]
+            oracle.consumed_tokens = 0
+            oracle.active_forward = False
+            oracle.forward_names = []
+            oracle.complete = False
+            oracle.phase = 0
+            oracle.generations = []
+            oracle.append = lambda name, _tensor: oracle.artifacts.append({"name": name})
+
+            inputs = [[11, 12], *([[0]] * 7)]
+            for token_ids in inputs:
+                oracle.begin(FakeTensor(token_ids, [len(token_ids)]), FakeTensor([], [len(token_ids), 8]))
+                for index in range(48):
+                    oracle.save(f"layer.{index:02d}", FakeTensor([], [len(token_ids), 16]))
+                oracle.save("final_norm", FakeTensor([], [len(token_ids), 8]))
+                oracle.finish(FakeTensor([], [1, 32]))
+            manifest = json.loads((Path(directory) / "manifest.json").read_text())
+            self.assertEqual(manifest["decision_forwards"], 8)
+            self.assertEqual(manifest["post_prefill_decode_forwards"], 7)
+            self.assertEqual(len(manifest["generations"]), 8)
+            self.assertEqual(
+                [item["decision_index"] for item in manifest["generations"]],
+                list(range(8)),
+            )
+            self.assertTrue(all(item["request_sha256"] == "fixture" for item in manifest["generations"]))
+            self.assertEqual(len(manifest["artifacts"]), 408)
+            self.assertEqual(manifest["artifacts"][0]["name"], "prefill.embedding")
+            self.assertEqual(manifest["artifacts"][-1]["name"], "decode.07.logits")
+
     def test_validator_accepts_only_complete_lossless_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -211,9 +275,13 @@ class Qwen3_8FlashNextModel(nn.Module):
         source = CLIENT.read_text()
         self.assertIn("is_prime(n: int)", source)
         self.assertIn('"temperature": 0', source)
-        self.assertIn('"max_tokens": 1', source)
+        self.assertIn('"max_tokens": DECODE_DECISIONS if decode else 1', source)
         self.assertIn('"request_sha256": sha256(request_path)', source)
         self.assertIn('"generation_index": 0', source)
+        self.assertIn('"/v1/chat/completions"', source)
+        self.assertIn('"return_token_ids": True', source)
+        self.assertIn('add_generation_prompt=True', source)
+        self.assertIn("DECODE_DECISIONS = 8", source)
 
 
 if __name__ == "__main__":

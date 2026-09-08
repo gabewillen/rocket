@@ -68,6 +68,14 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("patch-qwen38-k0-oracle.py", self.source)
         self.assertIn("qwen38-k0-oracle.py\" validate", self.source)
         self.assertIn('model_oracle.py:', self.source)
+
+    def test_decode_oracle_is_eight_decisions_and_seven_post_prefill_forwards(self):
+        self.assertIn('--oracle-k0-decode', self.source)
+        self.assertIn('ORACLE_DECISIONS=8', self.source)
+        self.assertIn('--decode-decisions "$ORACLE_DECISIONS"', self.source)
+        self.assertIn('"decision_forwards":n', self.source)
+        self.assertIn('"post_prefill_decode_forwards":n-1', self.source)
+        self.assertIn('ROCKET_QWEN38_K0_EOS_IDS=', self.source)
         self.assertIn('ROCKET_QWEN38_K0_EXPECTED_IDS', self.source)
         self.assertIn('"valid": False', self.source)
         self.assertIn("args.enable_log_requests is False", self.source)

@@ -57,6 +57,7 @@ LAUNCH=false
 KEEP_RUNNING=false
 PRODUCTION=false
 ORACLE_K0=false
+ORACLE_DECISIONS=1
 TWO_NODE_PREFLIGHT=false
 STARTUP_TIMEOUT_SECONDS=3600
 GPU_MEMORY_UTILIZATION="0.835"
@@ -78,6 +79,7 @@ Options:
   --production           Launch without telemetry/eager mode and benchmark throughput
   --production-preflight Prepare/deploy production launch scripts without launching
   --oracle-k0            Capture one target-only K0 coding-prompt oracle
+  --oracle-k0-decode     Capture 8 decisions: prefill plus 7 one-token decodes
   --keep-running         Leave containers running after a successful calibration
   --mia-source DIR       Existing checkout at the pinned MiaAI-Lab commit
   --fp8-artifact-dir DIR Immutable linear-attention FP8 artifact directory
@@ -128,7 +130,7 @@ record = {
     "phase": sys.argv[2][:128],
     "reason": sys.argv[3][:1024],
     "identity": identity,
-    "completed": sorted(item.name for item in capture.glob("*.bin"))[:51] if capture.is_dir() else [],
+    "completed": sorted(item.name for item in capture.glob("*.bin"))[:408] if capture.is_dir() else [],
 }
 path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 PY
@@ -142,6 +144,7 @@ while (($#)); do
         --two-node-preflight) TWO_NODE_PREFLIGHT=true; shift ;;
         --production) PRODUCTION=true; LAUNCH=true; shift ;;
         --oracle-k0) ORACLE_K0=true; MTP_DEPTH=0; shift ;;
+        --oracle-k0-decode) ORACLE_K0=true; ORACLE_DECISIONS=8; MTP_DEPTH=0; shift ;;
         --production-preflight)
             PRODUCTION=true
             TWO_NODE_PREFLIGHT=true
@@ -601,13 +604,15 @@ if [[ "${ORACLE_K0:-false}" == true ]]; then
         --entrypoint /usr/bin/python3 "$IMAGE_TAG" \
         /rocket/qwen38-k0-oracle.py prepare \
         --model-dir "/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION" \
-        --output /rocket/output/oracle-request.json
+        --output /rocket/output/oracle-request.json \
+        --decode-decisions "$ORACLE_DECISIONS"
     ORACLE_EXPECTED_IDS=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["input_token_ids"],separators=(",",":")))' "$OUTPUT_DIR/oracle-request.json")
+    ORACLE_EOS_IDS=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("eos_token_ids",[]),separators=(",",":")))' "$OUTPUT_DIR/oracle-request.json")
     oracle_request_sha=$(sha256sum "$OUTPUT_DIR/oracle-request.json" | cut -d' ' -f1)
     nvfp4_manifest_sha=$(sha256sum "$NVFP4_ARTIFACT_DIR/manifest.json" | cut -d' ' -f1)
     nvfp4_payload_sha=$(sha256sum "$NVFP4_ARTIFACT_DIR/$NVFP4_OVERLAY_FILE" | cut -d' ' -f1)
     nvfp4_quant_sha=$(sha256sum "$NVFP4_ARTIFACT_DIR/hf_quant_config.json" | cut -d' ' -f1)
-    ORACLE_IDENTITY=$(python3 -c 'import json,sys; print(json.dumps({"image_id":sys.argv[1],"image_repo_digest":sys.argv[2],"model":sys.argv[3],"model_revision":sys.argv[4],"mia_commit":sys.argv[5],"overlay_manifest_sha256":sys.argv[6],"overlay_payload_sha256":sys.argv[7],"overlay_quant_config_sha256":sys.argv[8],"request_sha256":sys.argv[9],"generation_index":0,"speculation":"disabled","tensor_parallel_size":2,"node_count":2},sort_keys=True,separators=(",",":")))' "$IMAGE_ID" "$IMAGE_REPO_DIGEST" "$MODEL_ID" "$MODEL_REVISION" "$MIA_COMMIT" "$nvfp4_manifest_sha" "$nvfp4_payload_sha" "$nvfp4_quant_sha" "$oracle_request_sha")
+    ORACLE_IDENTITY=$(python3 -c 'import json,sys; d={"image_id":sys.argv[1],"image_repo_digest":sys.argv[2],"model":sys.argv[3],"model_revision":sys.argv[4],"mia_commit":sys.argv[5],"overlay_manifest_sha256":sys.argv[6],"overlay_payload_sha256":sys.argv[7],"overlay_quant_config_sha256":sys.argv[8],"request_sha256":sys.argv[9],"generation_index":0,"speculation":"disabled","tensor_parallel_size":2,"node_count":2}; n=int(sys.argv[10]); d.update({"decision_forwards":n,"post_prefill_decode_forwards":n-1}) if n>1 else None; print(json.dumps(d,sort_keys=True,separators=(",",":")))' "$IMAGE_ID" "$IMAGE_REPO_DIGEST" "$MODEL_ID" "$MODEL_REVISION" "$MIA_COMMIT" "$nvfp4_manifest_sha" "$nvfp4_payload_sha" "$nvfp4_quant_sha" "$oracle_request_sha" "$ORACLE_DECISIONS")
     python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]),indent=2,sort_keys=True))' \
         "$ORACLE_IDENTITY" > "$OUTPUT_DIR/oracle-identity.json"
     docker run --rm --entrypoint /usr/bin/python3 "$IMAGE_TAG" -c \
@@ -745,7 +750,7 @@ write_launch_script_array() {
     [[ -n "$nvfp4_host_dir" ]] && args+=(-v "$nvfp4_host_dir:/rocket/qwen38-linear-nvfp4:ro" -e ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=/rocket/qwen38-linear-nvfp4/manifest.json -e ROCKET_QWEN38_NVFP4_QUANT_CONFIG=/rocket/qwen38-linear-nvfp4/hf_quant_config.json)
     if [[ "$ORACLE_K0" == true && "$node_rank" == 0 ]]; then
         args+=(-e ROCKET_QWEN38_K0_ORACLE=1 -e "ROCKET_QWEN38_K0_EXPECTED_IDS=$ORACLE_EXPECTED_IDS"
-            -e "ROCKET_QWEN38_K0_IDENTITY=$ORACLE_IDENTITY" -e ROCKET_QWEN38_K0_ORACLE_DIR=/rocket/oracle-root/capture
+            -e "ROCKET_QWEN38_K0_EOS_IDS=${ORACLE_EOS_IDS:-[]}" -e "ROCKET_QWEN38_K0_IDENTITY=$ORACLE_IDENTITY" -e ROCKET_QWEN38_K0_ORACLE_DIR=/rocket/oracle-root/capture
             -v "$OUTPUT_DIR:/rocket/oracle-root")
     elif [[ "$ORACLE_K0" == true ]]; then
         args+=(-v "$WORKER_HF_CACHE:/rocket/source-hf:ro")
@@ -940,11 +945,25 @@ if [[ "${ORACLE_K0:-false}" == true ]]; then
         fail "oracle request invocation failed"
     fi
     CURRENT_PHASE="oracle_validation"
-    if ! python3 "$REPO_ROOT/scripts/runtime/qwen38-k0-oracle.py" validate \
-        --request "$OUTPUT_DIR/oracle-request.json" \
-        --capture-dir "$OUTPUT_DIR/capture" \
-        --response "$OUTPUT_DIR/oracle-response.json" \
-        --output "$OUTPUT_DIR/oracle-result.json"; then
+    oracle_validate=(python3 "$REPO_ROOT/scripts/runtime/qwen38-k0-oracle.py" validate
+        --request "$OUTPUT_DIR/oracle-request.json"
+        --capture-dir "$OUTPUT_DIR/capture"
+        --response "$OUTPUT_DIR/oracle-response.json"
+        --output "$OUTPUT_DIR/oracle-result.json")
+    if [[ "$ORACLE_DECISIONS" == 8 ]]; then
+        oracle_validate=(docker run --rm
+            -v "$OUTPUT_DIR:/rocket/output"
+            -v "$HEAD_RUNTIME_CACHE_MOUNT:/root/.cache/huggingface:ro"
+            -v "$REPO_ROOT/scripts/runtime/qwen38-k0-oracle.py:/rocket/qwen38-k0-oracle.py:ro"
+            --entrypoint /usr/bin/python3 "$IMAGE_TAG"
+            /rocket/qwen38-k0-oracle.py validate
+            --request /rocket/output/oracle-request.json
+            --capture-dir /rocket/output/capture
+            --response /rocket/output/oracle-response.json
+            --output /rocket/output/oracle-result.json
+            --model-dir "/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION")
+    fi
+    if ! "${oracle_validate[@]}"; then
         fail "oracle artifact validation failed"
     fi
     cat "$OUTPUT_DIR/oracle-result.json"

@@ -27,7 +27,12 @@ class _RocketK0Oracle:
         self.expected_ids = json.loads(os.environ["ROCKET_QWEN38_K0_EXPECTED_IDS"])
         self.identity = json.loads(os.environ["ROCKET_QWEN38_K0_IDENTITY"])
         arm = json.loads((self.output.parent / "ARMED").read_text())
-        if set(arm) != {"schema", "request_sha256", "generation_index"}:
+        self.decision_forwards = int(arm.get("decision_forwards", 1))
+        self.decode_mode = self.decision_forwards == 8
+        expected_arm = {"schema", "request_sha256", "generation_index"}
+        if getattr(self, "decode_mode", False):
+            expected_arm.add("decision_forwards")
+        if set(arm) != expected_arm or self.decision_forwards not in (1, 8):
             raise RuntimeError("oracle arm schema differs")
         if arm["schema"] != "rocket.qwen38.k0-target-oracle-arm.v1":
             raise RuntimeError("oracle arm schema differs")
@@ -37,6 +42,11 @@ class _RocketK0Oracle:
             raise RuntimeError("oracle generation identity differs")
         self.request_sha256 = arm["request_sha256"]
         self.generation_index = arm["generation_index"]
+        self.schema = (
+            "rocket.qwen38.k0-target-decode-oracle.v1"
+            if self.decode_mode else type(self).schema
+        )
+        self.eos_token_ids = set(json.loads(os.environ.get("ROCKET_QWEN38_K0_EOS_IDS", "[]")))
         self.artifacts = []
         self.artifact_by_name = {}
         self.expected_forward_names = ["embedding", *[f"layer.{i:02d}" for i in range(48)], "final_norm"]
@@ -44,6 +54,14 @@ class _RocketK0Oracle:
         self.active_forward = False
         self.forward_names = []
         self.complete = False
+        self.phase = 0
+        self.generations = []
+
+    def phase_name(self):
+        return "prefill" if self.phase == 0 else f"decode.{self.phase:02d}"
+
+    def artifact_name(self, name):
+        return f"{self.phase_name()}.{name}" if getattr(self, "decode_mode", False) else name
 
     def fail(self, phase, error):
         record = {
@@ -102,23 +120,31 @@ class _RocketK0Oracle:
         expected = self.expected_forward_names[index] if index < len(self.expected_forward_names) else None
         if name != expected:
             raise RuntimeError(f"oracle forward artifact order differs: expected {expected}, got {name}")
-        self.append(name, tensor)
+        self.append(self.artifact_name(name), tensor)
         self.forward_names.append(name)
 
     def begin(self, input_ids, embedding):
         if self.complete:
             raise RuntimeError("oracle received a second generation after exactly-once consumption")
-        if self.active_forward or self.consumed_tokens == len(self.expected_ids):
+        if self.active_forward:
             raise RuntimeError("oracle previous authenticated forward is missing logits")
         actual = input_ids.detach().cpu().tolist()
-        expected = self.expected_ids[self.consumed_tokens:self.consumed_tokens + len(actual)]
+        if self.consumed_tokens < len(self.expected_ids):
+            expected = self.expected_ids[self.consumed_tokens:self.consumed_tokens + len(actual)]
+        elif self.decode_mode and self.generations and self.phase < self.decision_forwards:
+            expected = [self.generations[-1]["token_id"]]
+            if len(actual) != 1:
+                raise RuntimeError("decode oracle requires one input token per post-prefill forward")
+        else:
+            raise RuntimeError("oracle received a second generation after exactly-once consumption")
         if not actual or actual != expected:
             raise RuntimeError(f"input token IDs differ at offset {self.consumed_tokens}: expected {expected}, got {actual}")
         if embedding.ndim != 2 or embedding.shape[0] != len(actual):
             raise RuntimeError("oracle embedding extent differs from authenticated request")
         self.active_forward = True
         self.forward_names = []
-        self.consumed_tokens += len(actual)
+        if self.consumed_tokens < len(self.expected_ids):
+            self.consumed_tokens += len(actual)
         self.save("embedding", embedding)
 
     def finish(self, logits):
@@ -131,9 +157,31 @@ class _RocketK0Oracle:
             return
         if logits.ndim != 2 or logits.shape[0] != 1:
             raise RuntimeError("oracle logits generation extent differs")
-        self.append("logits", logits)
+        self.append(self.artifact_name("logits"), logits)
         last = logits[-1].detach().float()
         values, indices = torch.topk(last, min(20, last.numel()), sorted=True)
+        top_k = [
+            {"token_id": int(index), "logit": float(value)}
+            for value, index in zip(values.cpu().tolist(), indices.cpu().tolist())
+        ]
+        token_id = int(indices[0])
+        if getattr(self, "decode_mode", False):
+            if token_id in self.eos_token_ids:
+                raise RuntimeError(f"decode oracle encountered EOS at decision {self.phase}")
+            self.generations.append({
+                "request_sha256": self.request_sha256,
+                "generation_index": self.generation_index,
+                "decision_index": self.phase,
+                "kind": "prefill" if self.phase == 0 else "decode",
+                "input_token_ids": (
+                    self.expected_ids if self.phase == 0 else [self.generations[-1]["token_id"]]
+                ),
+                "token_id": token_id,
+                "top_k": top_k,
+            })
+            if len(self.generations) < self.decision_forwards:
+                self.phase += 1
+                return
         manifest = {
             "schema": self.schema,
             "valid": True,
@@ -143,14 +191,22 @@ class _RocketK0Oracle:
             "generation_index": self.generation_index,
             "input_token_ids": self.expected_ids,
             "artifacts": self.artifacts,
-            "top_k": [
-                {"token_id": int(index), "logit": float(value)}
-                for value, index in zip(values.cpu().tolist(), indices.cpu().tolist())
-            ],
-            "greedy_token_id": int(indices[0]),
+            "top_k": top_k,
+            "greedy_token_id": token_id,
         }
+        boundary_names = ["embedding", *[f"layer.{i:02d}" for i in range(48)], "final_norm", "logits"]
+        expected = boundary_names
+        if getattr(self, "decode_mode", False):
+            manifest.update({
+                "decision_forwards": self.decision_forwards,
+                "post_prefill_decode_forwards": self.decision_forwards - 1,
+                "generations": self.generations,
+            })
+            expected = [
+                f"{'prefill' if phase == 0 else f'decode.{phase:02d}'}.{name}"
+                for phase in range(self.decision_forwards) for name in boundary_names
+            ]
         names = [item["name"] for item in self.artifacts]
-        expected = ["embedding", *[f"layer.{i:02d}" for i in range(48)], "final_norm", "logits"]
         if names != expected:
             raise RuntimeError(f"oracle artifact sequence differs: {names}")
         temporary = self.output / ".manifest.json.tmp"
@@ -189,7 +245,7 @@ def _rocket_k0_emergency_failure(phase, error):
         "phase": phase,
         "reason": f"{type(error).__name__}: {error}"[:1024],
         "identity": json.loads(os.environ.get("ROCKET_QWEN38_K0_IDENTITY", "{}")),
-        "completed": sorted(path.stem for path in output.glob("*.bin"))[:51],
+        "completed": sorted(path.stem for path in output.glob("*.bin"))[:408],
     }
     temporary = output / ".failure.json.tmp"
     temporary.write_text(json.dumps(record, sort_keys=True) + "\n")
