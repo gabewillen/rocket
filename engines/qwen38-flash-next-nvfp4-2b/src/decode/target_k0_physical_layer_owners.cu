@@ -34,7 +34,12 @@ TargetK0PhysicalLayerOwners::create(
     std::shared_ptr<moe::TargetFullMoeOtelSink> moe_telemetry,
     std::shared_ptr<moe::TargetMoeStageOtelSink> stage_telemetry,
     std::shared_ptr<attention::TargetK0OracleQsaStateOtelSink>
-        state_telemetry) {
+        state_telemetry,
+    TargetK0PhysicalLayerConstructionProgress* progress) {
+  const auto mark = [progress](TargetK0PhysicalLayerConstructionStage stage,
+                               int layer = -1) {
+    if (progress) *progress = {stage, layer};
+  };
   if (device < 0 || !accepted_loader_lease_handle || !plans ||
       !validate_target_k0_physical_layer_plans(*plans, rank) ||
       reductions.rank() != rank || !layer_telemetry || !moe_telemetry ||
@@ -45,12 +50,15 @@ TargetK0PhysicalLayerOwners::create(
       new TargetK0PhysicalLayerOwners);
   result->rank_ = rank;
   result->plans_ = std::move(plans);
+  mark(TargetK0PhysicalLayerConstructionStage::kQsaArena);
   result->qsa_state_ = attention::TargetK0OracleQsaStateOwner::create(
       device, rank, 35, std::move(state_telemetry));
+  mark(TargetK0PhysicalLayerConstructionStage::kSidecar);
   result->qsa_sidecar_ =
       std::make_unique<attention::QsaSidecarDeviceOwner>(
           device, sidecar_payload,
           attention::target_qsa_sidecar_identity(rank, 3));
+  mark(TargetK0PhysicalLayerConstructionStage::kRope);
   result->qsa_rope_ = std::make_unique<attention::Layer3RopeDeviceOwner>(
       device, attention::target_qsa_rope_identity(rank, 3));
 
@@ -58,6 +66,7 @@ TargetK0PhysicalLayerOwners::create(
   for (int layer = 0; layer < kDecoderLayers; ++layer) {
     const auto& plan = result->plans_->at(rank, layer);
     if (is_qsa_layer(layer)) {
+      mark(TargetK0PhysicalLayerConstructionStage::kQsaOwner, layer);
       auto sidecar = result->qsa_sidecar_->publication();
       sidecar.identity = attention::target_qsa_sidecar_identity(rank, layer);
       owners[static_cast<std::size_t>(layer)] =
@@ -69,6 +78,7 @@ TargetK0PhysicalLayerOwners::create(
               reductions.attention_port(layer), reductions.moe_port(layer),
               layer_telemetry, moe_telemetry, stage_telemetry, 35);
     } else {
+      mark(TargetK0PhysicalLayerConstructionStage::kGdnOwner, layer);
       auto moe = moe::TargetLayerMoeDeviceOwner::create(
           device, plan, accepted_loader_lease_handle, moe_telemetry,
           stage_telemetry);
@@ -78,6 +88,7 @@ TargetK0PhysicalLayerOwners::create(
               reductions, *layer_telemetry);
     }
   }
+  mark(TargetK0PhysicalLayerConstructionStage::kInventoryAssembly);
   result->inventory_ = std::make_unique<TargetK0LayerOwnerInventory>(
       rank, std::move(owners), reductions, *layer_telemetry);
   result->authenticated_ = result->qsa_state_->authenticated() &&

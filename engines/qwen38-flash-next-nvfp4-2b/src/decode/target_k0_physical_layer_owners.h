@@ -13,6 +13,23 @@
 
 namespace rocket::qwen38::decode {
 
+enum class TargetK0PhysicalLayerConstructionStage : std::int32_t {
+  kUnknown = 0,
+  kPlanInventory = 1,
+  kQsaArena = 2,
+  kSidecar = 3,
+  kRope = 4,
+  kGdnOwner = 5,
+  kQsaOwner = 6,
+  kInventoryAssembly = 7,
+};
+
+struct TargetK0PhysicalLayerConstructionProgress {
+  TargetK0PhysicalLayerConstructionStage stage =
+      TargetK0PhysicalLayerConstructionStage::kUnknown;
+  int layer = -1;
+};
+
 bool validate_target_k0_physical_layer_plans(
     const TargetK0NativePlanInventory& plans, int rank) noexcept;
 
@@ -32,7 +49,8 @@ class TargetK0PhysicalLayerOwners final : public TargetK0PhysicalLayers {
       std::shared_ptr<moe::TargetFullMoeOtelSink> moe_telemetry,
       std::shared_ptr<moe::TargetMoeStageOtelSink> stage_telemetry,
       std::shared_ptr<attention::TargetK0OracleQsaStateOtelSink>
-          state_telemetry);
+          state_telemetry,
+      TargetK0PhysicalLayerConstructionProgress* progress = nullptr);
 
   TargetK0LayerOwnerInventory& inventory() noexcept override {
     return *inventory_;

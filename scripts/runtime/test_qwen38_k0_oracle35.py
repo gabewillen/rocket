@@ -100,6 +100,20 @@ class Oracle35LauncherTests(unittest.TestCase):
         unknown = module.NativeRunStatusError(999)
         self.assertEqual(unknown.stage, "unknown")
 
+    def test_physical_layer_substage_and_layer_mapping_is_closed(self):
+        self.assertEqual(set(module.PHYSICAL_LAYER_SUBSTAGES), set(range(8)))
+        for code, name in module.PHYSICAL_LAYER_SUBSTAGES.items():
+            error = module.NativeRunStatusError(31, code, 47)
+            self.assertEqual(error.physical_substage, name)
+            expected_layer = 47 if name in ("gdn_owner", "qsa_owner") else -1
+            self.assertEqual(error.physical_layer, expected_layer)
+        self.assertEqual(
+            module.NativeRunStatusError(31, 999, 47).physical_substage,
+            "unknown",
+        )
+        self.assertEqual(module.NativeRunStatusError(31, 5, 48).physical_layer,
+                         -1)
+
     def test_secret_requires_exact_32_bytes(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "secret"
@@ -126,7 +140,7 @@ class Oracle35LauncherTests(unittest.TestCase):
                 self.records.append((value, attributes))
 
         counter = Counter()
-        module._emit_failure(counter, 1, "load", chain[-1])
+        module._emit_failure(counter, 1, "load", chain[-1], outer)
         self.assertEqual(counter.records, [(1, {
             "rank": 1, "phase": "load", "outcome": "failure",
             "failure.class": "slab_contract",
@@ -160,6 +174,7 @@ class Oracle35LauncherTests(unittest.TestCase):
             "moe_components", "stage_counters", "state_outcomes",
             "nccl_stages", "nccl_outcomes",
             "duration_samples", "total_bytes",
+            "physical_layer_substage",
         })
 
 

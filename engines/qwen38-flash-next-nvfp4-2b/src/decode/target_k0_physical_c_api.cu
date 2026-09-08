@@ -104,15 +104,23 @@ extern "C" int qwen38_target_k0_oracle35_run(
     const std::uint8_t nccl_session_sha256[32],
     const std::uint8_t nccl_authentication_key[32],
     Qwen38TargetK0Oracle35Result* result) noexcept {
-  if (!result) return 1;
+  if (!result) return QWEN38_TARGET_K0_VALIDATION;
   std::memset(result, 0, sizeof(*result));
   result->token = -1;
+  result->physical_layer_index = -1;
   std::shared_ptr<decode::TargetK0BoundedTelemetry> telemetry;
   int failure_status = QWEN38_TARGET_K0_VALIDATION;
   decode::TargetK0PhysicalStartupStage startup_stage =
       decode::TargetK0PhysicalStartupStage::kValidation;
+  decode::TargetK0PhysicalLayerConstructionProgress layer_progress;
   const auto resolved_status = [&]() noexcept {
     return failure_status < 0 ? status_for(startup_stage) : failure_status;
+  };
+  const auto publish_state = [&]() noexcept {
+    result->physical_layer_substage =
+        static_cast<std::int32_t>(layer_progress.stage);
+    result->physical_layer_index = layer_progress.layer;
+    if (telemetry) publish(telemetry->snapshot(), *result);
   };
   try {
     telemetry = std::make_shared<decode::TargetK0BoundedTelemetry>();
@@ -164,7 +172,7 @@ extern "C" int qwen38_target_k0_oracle35_run(
     failure_status = -1;  // Startup owner reports its exact construction stage.
     auto owner = decode::TargetK0PhysicalStartupOwner::create(
         std::move(config), std::move(winner), telemetry, telemetry, telemetry,
-        telemetry, &startup_stage);
+        telemetry, &startup_stage, &layer_progress);
     failure_status = QWEN38_TARGET_K0_PROMPT_EXECUTION;
     const auto generated = owner->execute_oracle35(
         1, "k0-oracle35", "oracle-05ea3af");
@@ -173,34 +181,34 @@ extern "C" int qwen38_target_k0_oracle35_run(
     result->final_generation = generated.execution.final_generation;
     failure_status = QWEN38_TARGET_K0_CLEANUP;
     owner.reset();
-    publish(telemetry->snapshot(), *result);
+    publish_state();
     return 0;
   } catch (const std::invalid_argument&) {
-    if (telemetry) publish(telemetry->snapshot(), *result);
+    publish_state();
     return resolved_status();
   } catch (const mtp::NcclBootstrapContractError&) {
-    if (telemetry) publish(telemetry->snapshot(), *result);
+    publish_state();
     return resolved_status();
   } catch (const mtp::NcclBootstrapTransportError&) {
-    if (telemetry) publish(telemetry->snapshot(), *result);
+    publish_state();
     return resolved_status();
   } catch (const pair_reduce::PairReduceTransportError&) {
-    if (telemetry) publish(telemetry->snapshot(), *result);
+    publish_state();
     return resolved_status();
   } catch (const mtp::NcclBootstrapAuthenticationError&) {
-    if (telemetry) publish(telemetry->snapshot(), *result);
+    publish_state();
     return resolved_status();
   } catch (const mtp::NcclBootstrapCudaError&) {
-    if (telemetry) publish(telemetry->snapshot(), *result);
+    publish_state();
     return resolved_status();
   } catch (const mtp::NcclBootstrapNcclError&) {
-    if (telemetry) publish(telemetry->snapshot(), *result);
+    publish_state();
     return resolved_status();
   } catch (const mtp::NcclBootstrapLibraryError&) {
-    if (telemetry) publish(telemetry->snapshot(), *result);
+    publish_state();
     return resolved_status();
   } catch (...) {
-    if (telemetry) publish(telemetry->snapshot(), *result);
+    publish_state();
     return resolved_status();
   }
 }

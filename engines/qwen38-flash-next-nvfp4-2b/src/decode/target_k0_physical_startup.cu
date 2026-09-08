@@ -24,7 +24,8 @@ TargetK0PhysicalStartupOwner::create(
     std::shared_ptr<moe::TargetMoeStageOtelSink> stage_telemetry,
     std::shared_ptr<attention::TargetK0OracleQsaStateOtelSink>
         state_telemetry,
-    TargetK0PhysicalStartupStage* failure_stage) {
+    TargetK0PhysicalStartupStage* failure_stage,
+    TargetK0PhysicalLayerConstructionProgress* layer_progress) {
   const auto mark = [failure_stage](TargetK0PhysicalStartupStage stage) {
     if (failure_stage) *failure_stage = stage;
   };
@@ -78,13 +79,17 @@ TargetK0PhysicalStartupOwner::create(
       *result->embedding_transport_, *result->winner_exchange_,
       *result->lifecycle_telemetry_, roots);
   mark(TargetK0PhysicalStartupStage::kPhysicalLayerConstruction);
+  if (layer_progress) {
+    *layer_progress = {
+        TargetK0PhysicalLayerConstructionStage::kPlanInventory, -1};
+  }
   auto plans = std::make_unique<TargetK0NativePlanInventory>(
       TargetK0NativePlanInventory::load(config.descriptor_directory));
   auto layers = TargetK0PhysicalLayerOwners::create(
       config.device, config.rank, config.accepted_loader_lease_handle,
       std::move(plans), config.qsa_sidecar_payload, reductions->schedule(),
       result->lifecycle_telemetry_, result->moe_telemetry_,
-      result->stage_telemetry_, result->state_telemetry_);
+      result->stage_telemetry_, result->state_telemetry_, layer_progress);
   mark(TargetK0PhysicalStartupStage::kComparatorStartupConstruction);
   result->startup_ = TargetK0StartupOwner::create(
       config.rank, std::move(reductions), std::move(comparator),

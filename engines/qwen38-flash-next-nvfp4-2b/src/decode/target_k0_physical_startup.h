@@ -55,7 +55,8 @@ class TargetK0PhysicalStartupOwner final {
       std::shared_ptr<moe::TargetMoeStageOtelSink> stage_telemetry,
       std::shared_ptr<attention::TargetK0OracleQsaStateOtelSink>
           state_telemetry,
-      TargetK0PhysicalStartupStage* failure_stage = nullptr);
+      TargetK0PhysicalStartupStage* failure_stage = nullptr,
+      TargetK0PhysicalLayerConstructionProgress* layer_progress = nullptr);
   ~TargetK0PhysicalStartupOwner();
 
   TargetK0PhysicalStartupOwner(const TargetK0PhysicalStartupOwner&) = delete;

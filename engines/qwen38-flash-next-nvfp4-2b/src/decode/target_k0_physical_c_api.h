@@ -17,6 +17,8 @@ struct Qwen38TargetK0Oracle35Result {
   std::uint64_t nccl_outcomes[7];
   std::uint64_t duration_samples;
   std::uint64_t total_bytes;
+  std::int32_t physical_layer_substage;
+  std::int32_t physical_layer_index;
 };
 
 enum Qwen38TargetK0Oracle35Status : int {
