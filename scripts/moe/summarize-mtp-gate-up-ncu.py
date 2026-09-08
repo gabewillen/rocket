@@ -168,8 +168,8 @@ def main() -> int:
     expected_cases = set(CASES) if not args.incomplete else {profile_cases[0]}
     if set(profile_cases) != expected_cases or len(profile_cases) != len(set(profile_cases)):
         parser.error(f"wrong or duplicate profile cases: {profile_cases}")
-    print("| case | duration ms | tensor issue % | compute/memory % | L2 % | occupancy % | top stalls | L2 hit % | backing read MB | active MB | expanded MB | backing/active |")
-    print("| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |")
+    print("| case | duration ms | tensor issue % | compute/memory % | L2 % | occupancy % | top stalls | L2 hit % | L2 requested MB | L2 miss proxy MB | aperture read MB | active MB | expanded MB | miss/active |")
+    print("| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     schemas: set[str] = set()
     for path in args.profiles:
         case = path.stem
@@ -191,14 +191,17 @@ def main() -> int:
         misses = first(metrics, "lts__t_sectors_srcunit_tex_lookup_miss.sum")
         device_reads = first(metrics, "lts__t_sectors_aperture_device_op_read.sum")
         sysmem_reads = first(metrics, "lts__t_sectors_aperture_sysmem_op_read.sum")
-        backing_bytes = sum(value for value in (device_reads, sysmem_reads) if value == value) * SECTOR_BYTES
+        aperture_bytes = (device_reads + sysmem_reads) * SECTOR_BYTES
+        requested_bytes = (hits + misses) * SECTOR_BYTES
+        miss_bytes = misses * SECTOR_BYTES
         active_bytes = experts * BYTES_PER_EXPERT
         expanded_bytes = routes * BYTES_PER_EXPERT
         hit_rate = 100.0 * hits / (hits + misses) if hits + misses > 0 else float("nan")
         print(
             f"| {case} | {elapsed_ms:.3f} | {tensor:.2f} | {compute_memory:.2f} | {l2:.2f} | {occupancy:.2f} "
-            f"| {stall_summary(metrics)} | {hit_rate:.2f} | {backing_bytes / 1e6:.3f} | {active_bytes / 1e6:.3f} "
-            f"| {expanded_bytes / 1e6:.3f} | {backing_bytes / active_bytes:.3f}x |"
+            f"| {stall_summary(metrics)} | {hit_rate:.2f} | {requested_bytes / 1e6:.3f} | {miss_bytes / 1e6:.3f} "
+            f"| {aperture_bytes / 1e6:.3f} | {active_bytes / 1e6:.3f} | {expanded_bytes / 1e6:.3f} "
+            f"| {miss_bytes / active_bytes:.3f}x |"
         )
     if len(schemas) != 1:
         raise ValueError(f"mixed NCU CSV schemas: {sorted(schemas)}")
