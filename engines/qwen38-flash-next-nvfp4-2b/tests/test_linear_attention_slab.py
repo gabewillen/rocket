@@ -151,6 +151,21 @@ class LinearAttentionSlabTests(unittest.TestCase):
         before_verifier = launch[: launch.index("void CutlassGdnGraph::launch_verifier(")]
         self.assertNotIn("scale_projection<<<", before_verifier)
 
+    def test_decode_quantizer_matches_pinned_vllm_nvfp4_rounding(self):
+        source = (
+            Path(__file__).parents[1] / "src" / "linear_attention" / "gdn_cutlass.cu"
+        ).read_text()
+        body = source[source.index("__global__ void quantize_fixed") :]
+        body = body[: body.index("struct alignas(32) PackedBf16x16")]
+        self.assertIn(
+            "const float sf_scale = reciprocal_approximate_ftz(activation_global)",
+            body,
+        )
+        self.assertIn("amax * reciprocal_approximate_ftz(6.0F)", body)
+        self.assertIn("reciprocal_approximate_ftz(sf_scale)", body)
+        self.assertIn("pack_e2m1x16(converted)", body)
+        self.assertNotIn("float_to_e2m1", body)
+
 
 if __name__ == "__main__":
     unittest.main()

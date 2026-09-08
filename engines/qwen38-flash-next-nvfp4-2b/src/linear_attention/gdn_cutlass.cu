@@ -95,9 +95,6 @@ using ScaleConfig =
     typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 using ElementSF = typename Gemm::GemmKernel::CollectiveMainloop::ElementSF;
 
-__constant__ float kE2M1[8] = {0.0F, 0.5F, 1.0F, 1.5F,
-                               2.0F, 3.0F, 4.0F, 6.0F};
-
 void cuda_check(cudaError_t status, const char* operation) {
   if (status != cudaSuccess) {
     throw std::runtime_error(std::string(operation) + ": " +
@@ -117,21 +114,14 @@ __device__ __forceinline__ float e4m3_to_float(std::uint8_t bits) {
   return __uint_as_float(sign | ((exp + 120U) << 23) | (mant << 20));
 }
 
-__device__ __forceinline__ std::uint8_t float_to_e2m1(float value) {
-  const std::uint8_t sign = value < 0.0F ? 8U : 0U;
-  const float magnitude = fabsf(value);
-  int best = 0;
-  float best_error = magnitude;
-#pragma unroll
-  for (int code = 0; code < 8; ++code) {
-    const float error = fabsf(magnitude - kE2M1[code]);
-    if (error < best_error || (error == best_error && (code & 1) == 0)) {
-      best_error = error;
-      best = code;
-    }
-  }
-  return static_cast<std::uint8_t>(sign | best);
-}
+struct PackedE2m1x16 {
+  std::uint32_t lo;
+  std::uint32_t hi;
+};
+
+__device__ __forceinline__ float reciprocal_approximate_ftz(float value);
+__device__ __forceinline__ PackedE2m1x16 pack_e2m1x16(
+    float2 (&values)[8]);
 
 template <int K>
 __global__ void quantize_fixed(std::uint8_t* packed, std::uint8_t* scales,
@@ -146,31 +136,39 @@ __global__ void quantize_fixed(std::uint8_t* packed, std::uint8_t* scales,
       values[item] = __bfloat162float(input[row * K + block * 16 + item]);
       amax = fmaxf(amax, fabsf(values[item]));
     }
+    // Match pinned vLLM nvfp4_utils.cuh: SFScaleVal is the reciprocal of the
+    // authenticated input global scale, and both reciprocal operations use
+    // rcp.approx.ftz. Packing uses the hardware RN/satfinite E2M1 conversion.
+    const float sf_scale = reciprocal_approximate_ftz(activation_global);
+    float scale_value =
+        sf_scale * (amax * reciprocal_approximate_ftz(6.0F));
     const std::uint8_t scale =
         amax > 0.0F
-            ? __nv_cvt_float_to_fp8(amax / (6.0F * activation_global),
-                                    __NV_SATFINITE, __NV_E4M3)
+            ? __nv_cvt_float_to_fp8(scale_value, __NV_SATFINITE, __NV_E4M3)
             : 0;
     scales[prefill_sfa_offset(row, block, K / 16)] = scale;
-    const float combined = e4m3_to_float(scale) * activation_global;
+    scale_value = e4m3_to_float(scale);
+    const float output_scale =
+        scale_value != 0.0F
+            ? reciprocal_approximate_ftz(
+                  scale_value * reciprocal_approximate_ftz(sf_scale))
+            : 0.0F;
+    float2 converted[8];
 #pragma unroll
     for (int item = 0; item < 8; ++item) {
-      const std::uint8_t lo = combined > 0.0F
-          ? float_to_e2m1(values[item * 2] / combined) : 0;
-      const std::uint8_t hi = combined > 0.0F
-          ? float_to_e2m1(values[item * 2 + 1] / combined) : 0;
-      packed[row * (K / 2) + block * 8 + item] = lo | (hi << 4);
+      converted[item] =
+          make_float2(values[item * 2] * output_scale,
+                      values[item * 2 + 1] * output_scale);
     }
+    const auto result = pack_e2m1x16(converted);
+    reinterpret_cast<std::uint64_t*>(packed)[
+        static_cast<std::size_t>(row) * (K / 16) + block] =
+        (static_cast<std::uint64_t>(result.hi) << 32) | result.lo;
   }
 }
 
 struct alignas(32) PackedBf16x16 {
   __nv_bfloat162 values[8];
-};
-
-struct PackedE2m1x16 {
-  std::uint32_t lo;
-  std::uint32_t hi;
 };
 
 __device__ __forceinline__ float reciprocal_approximate_ftz(float value) {
