@@ -722,6 +722,31 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
   set_target_properties(qwen38_target_layer_moe_owner PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
 
+  add_library(qwen38_target_gdn_layer_owner STATIC
+    src/decode/target_gdn_layer_owner.cu)
+  target_include_directories(qwen38_target_gdn_layer_owner PUBLIC src)
+  target_link_libraries(qwen38_target_gdn_layer_owner PUBLIC
+    qwen38_target_layer_moe_owner qwen38_target_layer_native_plan
+    qwen38_target_slab_owner qwen38_gdn_graph
+    qwen38_native_hyperconnection_adapter qwen38_decode_execution
+    CUDA::cudart)
+  target_compile_options(qwen38_target_gdn_layer_owner PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+  set_target_properties(qwen38_target_gdn_layer_owner PROPERTIES
+    CUDA_ARCHITECTURES "121a" CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON)
+
+  add_executable(qwen38-test-target-gdn-layer-owner
+    tests/test_target_gdn_layer_owner.cc)
+  target_link_libraries(qwen38-test-target-gdn-layer-owner PRIVATE
+    qwen38_target_gdn_layer_owner)
+  target_compile_options(qwen38-test-target-gdn-layer-owner PRIVATE
+    -Wall -Wextra -Werror)
+  set_target_properties(qwen38-test-target-gdn-layer-owner PROPERTIES
+    LINKER_LANGUAGE CUDA)
+  add_test(NAME qwen38-target-gdn-layer-owner-cpu-contract
+    COMMAND qwen38-test-target-gdn-layer-owner)
+
   add_library(qwen38_target_layer3_moe_owner_preflight SHARED
     src/moe/target_layer3_moe_owner_preflight.cc)
   target_include_directories(qwen38_target_layer3_moe_owner_preflight PUBLIC src)

@@ -69,7 +69,8 @@ TargetFullLayerResult TargetGdnLayer::execute(
   try {
     require(!faulted_, rank_, layer_, "faulted transition cannot replay");
     require(generation != 0 && generation == last_generation_ + 1 &&
-                replicated_pre_layer && replicated_post_layer && stream,
+                replicated_pre_layer && replicated_post_layer && stream &&
+                trace_id.size() <= 128 && request_id.size() <= 128,
             rank_, layer_, "generation, buffers, or stream changed");
     attention_.execute(
         generation, 1, replicated_pre_layer, buffers_.attention_input,
