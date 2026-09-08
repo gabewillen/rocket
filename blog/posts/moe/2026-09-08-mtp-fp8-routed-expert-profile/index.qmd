@@ -1,0 +1,110 @@
+---
+title: "MTP FP8 routed experts take 10.58 ms at c16 K7, twice the active-byte roofline"
+description: "The six-node native routed-expert graph takes 10.58 ms at c16 K7; gate/up contributes 6.37 ms and is the largest gap against the 238 GB/s per-layer roofline."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, moe, kernels, memory]
+verdict: accepted
+rocket: "#engine-status"
+---
+
+**Question.** Which stage keeps the native FP8 MTP routed-expert replay above its per-layer weight roofline?
+
+| setup | value |
+| --- | --- |
+| node | gx10-5e36, GPU0, NVIDIA GB10 SM121 |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| CUDA / driver | 13.0 / 580.173.02 |
+| commit | `b2dbede42a65cea06a7c504da4aab07339c01635` |
+| tested base | `c640c57e26f5af4540e185e2e6370e3cc0261c09` |
+| binary SHA256 | `6ded262c8c680b34797a89c816ffa0eab1bfad9160a5e985371e77f873821cb7` |
+| primitive | Triton 3.7.1 AOT, four cubin launches per rank, six cubin files covered across ranks |
+| graph | route compaction, publication prepare, four cubins, 6 kernel nodes |
+| source / serving dtype | FP8 E4M3 block 128x128 / FP8 E4M3 block 128x128 |
+| scale / shape | BF16 inverse scale, H2560, logical I640, scratch I768, E512, rank E256, top-10 |
+| graph arena | caller-owned E256, 128 rows, 1,280 routes |
+| sampling | 20 warmups, 100 samples, 3 runs |
+
+```bash
+cmake -S engines/qwen38-flash-next-nvfp4-2b \
+  -B engines/qwen38-flash-next-nvfp4-2b/build-native-triton-aot \
+  -DCMAKE_CUDA_ARCHITECTURES=121
+cmake --build engines/qwen38-flash-next-nvfp4-2b/build-native-triton-aot \
+  --target qwen38-mtp-routed-expert-profile -j2
+for run in 1 2 3; do
+  ./scripts/moe/qwen38-mtp-routed-expert-profile.sh \
+    engines/qwen38-flash-next-nvfp4-2b/build-native-triton-aot 0 20 100 \
+    > "run-${run}.tsv"
+done
+python3 scripts/moe/summarize-mtp-routed-expert-profile.py \
+  run-1.tsv run-2.tsv run-3.tsv
+```
+
+The accepted c1/c2/c4/c8 telemetry provides rank-local K4 median owner routes and expert unions. Owner routes scale with verifier width. A row is omitted when its owner-route prefix cannot contain the median union. The c16 K7 row is the E256/1,280-route capacity control. Each expert has distinct storage. The zero payload preserves matrix traffic while making full-output parity exact.
+
+Whole is the uninstrumented six-node CUDA graph. Stage values use the same enqueue sequence without capture because CUDA event elapsed-time rejects a host-to-graph event pair. Every timing cell is `p50/p95` in milliseconds. Run CV is the variation of whole-replay p50 across the three runs. Active MB is the unique FP8 payload used by the current per-layer map and its [238 GB/s measured read floor](../../hardware/2026-09-06-measured-bandwidth/). Expanded MB is the route-expanded upper bound before cache reuse.
+
+| c | K | rank | rows | routes | experts | active MB | expanded MB | roof ms | whole p50/p95 ms | run CV | compact | prepare | quant | gate/up | SiLU | down |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4 | 0 | 5 | 25 | 19 | 93.400 | 122.895 | 0.392 | 0.697/0.825 | 0.91% | 0.021/0.023 | 0.026/0.027 | 0.008/0.008 | 0.442/0.451 | 0.006/0.006 | 0.207/0.213 |
+| 1 | 4 | 1 | 5 | 25 | 19 | 93.400 | 122.895 | 0.392 | 0.696/0.701 | 1.44% | 0.021/0.023 | 0.026/0.026 | 0.008/0.008 | 0.442/0.446 | 0.006/0.006 | 0.207/0.210 |
+| 1 | 7 | 0 | 8 | 40 | 19 | 93.400 | 196.632 | 0.392 | 0.781/0.950 | 0.56% | 0.031/0.031 | 0.028/0.029 | 0.008/0.008 | 0.506/0.508 | 0.006/0.006 | 0.215/0.218 |
+| 1 | 7 | 1 | 8 | 40 | 19 | 93.400 | 196.632 | 0.392 | 0.781/0.797 | 1.96% | 0.031/0.031 | 0.028/0.029 | 0.008/0.008 | 0.506/0.511 | 0.006/0.006 | 0.215/0.218 |
+| 2 | 4 | 0 | 10 | 49 | 29 | 142.558 | 240.874 | 0.599 | 1.078/1.085 | 1.70% | 0.037/0.037 | 0.039/0.041 | 0.008/0.008 | 0.684/0.691 | 0.006/0.006 | 0.315/0.317 |
+| 2 | 4 | 1 | 10 | 51 | 30 | 147.474 | 250.706 | 0.620 | 1.126/1.131 | 1.00% | 0.037/0.039 | 0.041/0.041 | 0.008/0.008 | 0.723/0.729 | 0.006/0.006 | 0.324/0.327 |
+| 2 | 7 | 0 | 16 | 78 | 29 | 142.558 | 383.432 | 0.599 | 1.208/1.385 | 2.51% | 0.056/0.056 | 0.045/0.045 | 0.008/0.008 | 0.782/0.786 | 0.006/0.006 | 0.322/0.326 |
+| 2 | 7 | 1 | 16 | 82 | 30 | 147.474 | 403.096 | 0.620 | 1.239/1.252 | 1.10% | 0.058/0.058 | 0.047/0.047 | 0.008/0.008 | 0.831/0.840 | 0.006/0.006 | 0.330/0.333 |
+| 4 | 4 | 0 | 20 | 99 | 43 | 211.379 | 486.664 | 0.888 | 1.772/1.783 | 1.71% | 0.070/0.070 | 0.061/0.061 | 0.008/0.008 | 1.180/1.188 | 0.006/0.006 | 0.465/0.469 |
+| 4 | 4 | 1 | 20 | 101 | 44 | 216.295 | 496.496 | 0.909 | 1.784/1.808 | 1.00% | 0.070/0.070 | 0.061/0.061 | 0.008/0.008 | 1.192/1.202 | 0.006/0.006 | 0.471/0.477 |
+| 4 | 7 | 0 | 32 | 158 | 43 | 211.379 | 776.696 | 0.888 | 1.749/1.847 | 2.73% | 0.107/0.109 | 0.071/0.073 | 0.008/0.008 | 1.071/1.081 | 0.006/0.006 | 0.496/0.498 |
+| 4 | 7 | 1 | 32 | 162 | 44 | 216.295 | 796.360 | 0.909 | 1.837/1.877 | 2.15% | 0.109/0.110 | 0.074/0.074 | 0.008/0.008 | 1.151/1.163 | 0.006/0.006 | 0.504/0.506 |
+| 8 | 1 | 0 | 16 | 70 | 48 | 235.958 | 344.106 | 0.991 | 1.758/1.957 | 0.09% | 0.056/0.057 | 0.059/0.059 | 0.008/0.008 | 1.136/1.150 | 0.006/0.006 | 0.507/0.512 |
+| 8 | 1 | 1 | 16 | 73 | 51 | 250.706 | 358.853 | 1.053 | 1.840/2.045 | 0.13% | 0.056/0.058 | 0.063/0.063 | 0.008/0.008 | 1.185/1.194 | 0.006/0.006 | 0.539/0.545 |
+| 8 | 4 | 0 | 40 | 176 | 48 | 235.958 | 865.181 | 0.991 | 2.048/2.281 | 2.06% | 0.129/0.131 | 0.080/0.080 | 0.008/0.008 | 1.292/1.301 | 0.006/0.006 | 0.545/0.549 |
+| 8 | 4 | 1 | 40 | 183 | 51 | 250.706 | 899.591 | 1.053 | 2.181/2.203 | 4.68% | 0.132/0.132 | 0.084/0.084 | 0.008/0.008 | 1.384/1.401 | 0.006/0.006 | 0.576/0.583 |
+| 8 | 7 | 0 | 64 | 281 | 48 | 235.958 | 1381.340 | 0.991 | 2.404/2.418 | 0.40% | 0.205/0.205 | 0.102/0.102 | 0.008/0.008 | 1.397/1.409 | 0.008/0.008 | 0.696/0.705 |
+| 8 | 7 | 1 | 64 | 292 | 51 | 250.706 | 1435.414 | 1.053 | 2.531/2.605 | 0.11% | 0.207/0.208 | 0.106/0.108 | 0.008/0.008 | 1.487/1.495 | 0.008/0.008 | 0.729/0.735 |
+| 16 | 7 | 0 | 128 | 1280 | 256 | 1258.445 | 6292.224 | 5.288 | 10.584/10.645 | 0.09% | 0.539/0.541 | 0.457/0.459 | 0.008/0.008 | 6.374/6.413 | 0.018/0.018 | 3.224/3.250 |
+| 16 | 7 | 1 | 128 | 1280 | 256 | 1258.445 | 6292.224 | 5.288 | 10.584/10.698 | 0.20% | 0.541/0.542 | 0.457/0.459 | 0.008/0.008 | 6.357/6.390 | 0.018/0.018 | 3.217/3.238 |
+
+| c16 K7 rank 0 gap | measured p50 | 238 GB/s floor | excess | ratio |
+| --- | ---: | ---: | ---: | ---: |
+| gate/up | 6.374 ms | 3.525 ms | 2.849 ms | 1.81x |
+| down | 3.224 ms | 1.763 ms | 1.461 ms | 1.83x |
+| whole replay | 10.584 ms | 5.288 ms | 5.296 ms | 2.00x |
+
+| clock sample | SM | graphics | pstate | power | temperature |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| run 1 end | 2,476 MHz | 2,476 MHz | P0 | 54.73 W | 50 C |
+| run 2 end | 2,509 MHz | 2,509 MHz | P0 | 56.02 W | 52 C |
+| run 3 start / end | 2,509 / 2,509 MHz | 2,509 / 2,509 MHz | P0 / P0 | 54.06 / 57.15 W | 52 / 55 C |
+
+```text
+gate_up_silu.cubin rank0: 1280 HMMA.16816.F32 instructions
+down_weighted_reduce.cubin rank0: 160 HMMA.16816.F32 instructions
+gate_up_silu.cubin rank1: 1280 HMMA.16816.F32 instructions
+down_weighted_reduce.cubin rank1: 160 HMMA.16816.F32 instructions
+ROUTED_EXIT=0 ELAPSED=0.39 RSS_KIB=108992
+EXECUTOR_EXIT=0 ELAPSED=0.67 RSS_KIB=683776
+local compute table: empty
+peer compute table: empty
+```
+
+The first profiler attempt stopped before a result row. The clean graph ran, then CUDA rejected the stage query across host and graph event domains. Stage probes were moved outside capture. The measured whole graph did not change.
+
+```text
+ERROR cudaEventElapsedTime: invalid argument
+```
+
+**Verdict.** Accepted. Gate/up has the largest absolute c16 K7 gap, 2.849 ms above its active-byte floor. Whole replay is 2.00x its 5.288 ms floor. No kernel parameter or schedule changed in this experiment.
+
+**Next.**
+
+- profile gate/up tensor-core issue efficiency and cache reuse before changing its schedule
+- test an expert-grouped gate/up launch that loads each active expert once
+- retain the same parity, generation, publication, and six-node replay contracts
+
+**Reopen if.**
+
+- a driver, firmware, or CUDA release moves the measured 238 GB/s device-read roofline
+- the checkpoint changes the FP8 expert shape or block-scale layout
