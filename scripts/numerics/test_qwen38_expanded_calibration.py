@@ -42,12 +42,36 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
     def test_k0_oracle_omits_speculation_and_is_fail_closed(self):
         self.assertIn('ORACLE_K0=true; MTP_DEPTH=0', self.source)
         self.assertIn('--oracle-k0 requires the accepted --nvfp4-artifact-dir', self.source)
-        self.assertIn('speculative_options="--disable-log-requests', self.source)
+        self.assertIn('speculative_options=""', self.source)
         self.assertIn("patch-qwen38-k0-oracle.py", self.source)
         self.assertIn("qwen38-k0-oracle.py\" validate", self.source)
         self.assertIn('model_oracle.py:', self.source)
         self.assertIn('ROCKET_QWEN38_K0_EXPECTED_IDS', self.source)
         self.assertIn('"valid": False', self.source)
+        self.assertIn("args.enable_log_requests is False", self.source)
+        self.assertIn("enable_prefix_caching'].default is True", self.source)
+
+    def test_exact_pinned_cli_rejects_removed_optional_flags(self):
+        image = "vllm/vllm-openai:qwen38-flash-next"
+        parser = (
+            "from vllm.platforms import current_platform; current_platform.device_type='cpu'; "
+            "from vllm.entrypoints.openai.cli_args import make_arg_parser; "
+            "from vllm.utils.argparse_utils import FlexibleArgumentParser; "
+            "make_arg_parser(FlexibleArgumentParser()).parse_args(['model',FLAG])"
+        )
+        for flag in ("--disable-prefix-caching", "--disable-log-requests"):
+            with self.subTest(flag=flag):
+                result = subprocess.run(
+                    [
+                        "docker", "run", "--rm", "--entrypoint", "/usr/bin/python3",
+                        image, "-c", parser.replace("FLAG", repr(flag)),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"unrecognized arguments: {flag}", result.stderr)
 
     def test_remote_prepare_failure_survives_cleanup_and_emits_oracle_failure(self):
         self.assertIn('run_checked "worker_output_prepare" ssh', self.source)
@@ -464,7 +488,8 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             self.assertNotIn("--speculative-config", generated)
             self.assertIn("ROCKET_QWEN38_K0_ORACLE=1", generated)
             self.assertIn("/rocket/oracle-root/capture", generated)
-            self.assertIn("--disable-log-requests", generated)
+            self.assertNotIn("--disable-log-requests", generated)
+            self.assertNotIn("--disable-prefix-caching", generated)
 
     def test_gpu_memory_utilization_is_validated_before_external_work(self):
         validation = 'fail "--gpu-memory-utilization must be a finite number in (0,1]"'

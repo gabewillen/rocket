@@ -590,6 +590,8 @@ if [[ "${ORACLE_K0:-false}" == true ]]; then
     ORACLE_IDENTITY=$(python3 -c 'import json,sys; print(json.dumps({"image_id":sys.argv[1],"image_repo_digest":sys.argv[2],"model":sys.argv[3],"model_revision":sys.argv[4],"mia_commit":sys.argv[5],"overlay_manifest_sha256":sys.argv[6],"overlay_payload_sha256":sys.argv[7],"overlay_quant_config_sha256":sys.argv[8],"speculation":"disabled","tensor_parallel_size":2,"node_count":2},sort_keys=True,separators=(",",":")))' "$IMAGE_ID" "$IMAGE_REPO_DIGEST" "$MODEL_ID" "$MODEL_REVISION" "$MIA_COMMIT" "$nvfp4_manifest_sha" "$nvfp4_payload_sha" "$nvfp4_quant_sha")
     python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]),indent=2,sort_keys=True))' \
         "$ORACLE_IDENTITY" > "$OUTPUT_DIR/oracle-identity.json"
+    docker run --rm --entrypoint /usr/bin/python3 "$IMAGE_TAG" -c \
+        "from vllm.platforms import current_platform; current_platform.device_type='cpu'; from vllm.config.cache import CacheConfig; from vllm.entrypoints.openai.cli_args import make_arg_parser; from vllm.utils.argparse_utils import FlexibleArgumentParser; args=make_arg_parser(FlexibleArgumentParser()).parse_args(['$MODEL_ID']); assert args.enable_prefix_caching is None; assert CacheConfig.__dataclass_fields__['enable_prefix_caching'].default is True; assert args.enable_log_requests is False; assert args.speculative_config is None; print('validated pinned K0 CLI parse/defaults: speculation omitted; prefix caching resolves enabled; request logging disabled')"
 fi
 if [[ -n "$FP8_ARTIFACT_DIR" ]]; then
     FP8_CONTAINER_DIR="/rocket/qwen38-linear-fp8"
@@ -720,7 +722,7 @@ write_launch_script() {
   -e ROCKET_QWEN38_NVFP4_QUANT_CONFIG=/rocket/qwen38-linear-nvfp4/hf_quant_config.json \\"
     fi
     if [[ "${ORACLE_K0:-false}" == true ]]; then
-        speculative_options="--disable-log-requests \\"
+        speculative_options=""
         if [[ "$node_rank" == 0 ]]; then
             oracle_options="
   -e ROCKET_QWEN38_K0_ORACLE=1 \\
@@ -770,7 +772,7 @@ exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_
   --tool-call-parser qwen3_coder --distributed-executor-backend mp \\
   --mm-encoder-tp-mode data --nnodes 2 --master-addr $HEAD_IP --master-port $MASTER_PORT \\
   --enable-expert-parallel --all2all-backend allgather_reducescatter \\
-  $speculative_options
+$(if [[ -n "$speculative_options" ]]; then printf '  %s\n' "$speculative_options"; fi)
   --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' \\
   --hf-overrides '{"text_config":{"ple_embedding_dtype":"float8_e4m3fn"}}' \\
   --enforce-eager --node-rank $node_rank $mode
@@ -900,7 +902,6 @@ if [[ "${ORACLE_K0:-false}" == true ]]; then
             -e '/ROCKET_NVFP4_MAX_EMISSIONS=/d' \
             -e '/ROCKET_QWEN38_LOAD_TRACE=/d' \
             -e 's/model_telemetry.py:/model_oracle.py:/' \
-            -e 's/--enable-chunked-prefill /--disable-prefix-caching /' \
             "$launch_script"
     done
 fi
