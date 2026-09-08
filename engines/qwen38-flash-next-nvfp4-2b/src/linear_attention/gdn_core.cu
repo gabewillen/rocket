@@ -85,7 +85,11 @@ __global__ void causal_conv_update(
   float value = 0.0F;
 #pragma unroll
   for (int index = 0; index < kConvKernel; ++index) {
-    value += inputs[index] * __bfloat162float(weight[w + index]);
+    const float product =
+        inputs[index] * __bfloat162float(weight[w + index]);
+    // Triton preserves the BF16 element type for matrix_x * matrix_w, then
+    // promotes that rounded product when adding it to the FP32 accumulator.
+    value += __bfloat162float(__float2bfloat16(product));
   }
   // Match causal-conv1d's CUDA kernel: accurate expf and a final division.
   value = value / (1.0F + expf(-value));
@@ -113,7 +117,9 @@ __global__ void causal_conv_verify(
     float value = 0.0F;
 #pragma unroll
     for (int index = 0; index < kConvKernel; ++index) {
-      value += inputs[index] * __bfloat162float(weight[w + index]);
+      const float product =
+          inputs[index] * __bfloat162float(weight[w + index]);
+      value += __bfloat162float(__float2bfloat16(product));
     }
     value = value / (1.0F + expf(-value));
     // Reuse the graph-owned mixed buffer as the post-convolution QKV rows.

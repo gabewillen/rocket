@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
+import struct
 import unittest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -132,8 +134,37 @@ class LinearAttentionSlabTests(unittest.TestCase):
         ).read_text()
         conv = source[source.index("__global__ void causal_conv_update") :]
         self.assertEqual(source.count("value = value / (1.0F + expf(-value));"), 2)
-        self.assertIn("value += inputs[index] *", conv)
+        self.assertEqual(
+            source.count(
+                "value += __bfloat162float(__float2bfloat16(product));"
+            ),
+            2,
+        )
+        self.assertNotIn(
+            "value += inputs[index] * __bfloat162float(weight[w + index]);",
+            conv,
+        )
         self.assertNotIn("value *= 1.0F / (1.0F + __expf(-value))", conv)
+
+        def bf16_to_float(bits: int) -> float:
+            return struct.unpack("<f", struct.pack("<I", bits << 16))[0]
+
+        def float_to_bf16(value: float) -> int:
+            bits = struct.unpack("<I", struct.pack("<f", value))[0]
+            return (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
+
+        x = bf16_to_float(0xBF31)  # -0.69140625, captured layer-0 row 0.
+        weight = bf16_to_float(0xBC71)  # -0.01470947265625.
+        full_product = x * weight
+        rounded_product = bf16_to_float(float_to_bf16(full_product))
+        full_result = float_to_bf16(
+            full_product / (1.0 + math.exp(-full_product))
+        )
+        rounded_result = float_to_bf16(
+            rounded_product / (1.0 + math.exp(-rounded_product))
+        )
+        self.assertEqual(full_result, 0x3BA7)
+        self.assertEqual(rounded_result, 0x3BA8)
 
     def test_gdn_debug_capture_is_layer0_once_and_bounded(self):
         source = (
