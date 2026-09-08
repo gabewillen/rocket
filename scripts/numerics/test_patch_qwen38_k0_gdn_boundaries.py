@@ -8,6 +8,7 @@ class TestGdnBoundaryPatcher(unittest.TestCase):
         source = Path(__file__).with_name("patch-qwen38-k0-gdn-boundaries.py").read_text()
         self.assertIn('"qkvz": 8192', source)
         self.assertIn('"ba": 48', source)
+        self.assertIn('"conv": 5120', source)
         self.assertEqual(source.count('"core": 3072'), 1)
         self.assertEqual(source.count('"normalized": 3072'), 1)
         self.assertIn("GDN_CAPTURE_ACTIVE", source)

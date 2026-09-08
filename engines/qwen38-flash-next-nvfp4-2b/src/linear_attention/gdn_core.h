@@ -69,6 +69,8 @@ class CorePlan final {
       float* prefix_recurrent_state, int sequences, int verify_width,
       cudaStream_t stream);
   const __nv_bfloat16* output() const noexcept;
+  const __nv_bfloat16* convolved_qkv() const noexcept;
+  const __nv_bfloat16* recurrent_output() const noexcept;
 
  private:
   struct Impl;

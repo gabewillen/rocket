@@ -424,7 +424,7 @@ struct CutlassGdnGraph::Impl {
   float input_global_scale = 0.0F;
   float output_global_scale = 0.0F;
   std::unique_ptr<CorePlan> core;
-  std::array<bool, 4> debug_dumped{};
+  std::array<bool, 6> debug_dumped{};
 
   void debug_dump(std::size_t stage, const char* name, const void* source,
                   std::size_t bytes, cudaStream_t stream) {
@@ -817,7 +817,11 @@ void CutlassGdnGraph::launch(
       static_cast<std::size_t>(kValueHeads) * kHeadDim * kHeadDim,
       state_indices, m, stream);
   cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN core launch");
-  impl_->debug_dump(2, "core", impl_->core->output(),
+  impl_->debug_dump(2, "conv", impl_->core->convolved_qkv(),
+                    static_cast<std::size_t>(m) * kQkvN * 2, stream);
+  impl_->debug_dump(3, "recurrent", impl_->core->recurrent_output(),
+                    static_cast<std::size_t>(m) * kOutputK * 2, stream);
+  impl_->debug_dump(4, "core", impl_->core->output(),
                     static_cast<std::size_t>(m) * kOutputK * 2, stream);
   decode::target_k0_enter_gdn_graph(
       progress, decode::TargetK0GdnGraphStage::kOutputQuantize);
@@ -832,7 +836,7 @@ void CutlassGdnGraph::launch(
     throw std::runtime_error("fixed Qwen GDN output projection failed");
   }
   cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN output projection launch");
-  impl_->debug_dump(3, "projected", impl_->projected,
+  impl_->debug_dump(5, "projected", impl_->projected,
                     static_cast<std::size_t>(m) * kOutputN * 2, stream);
   decode::target_k0_enter_gdn_graph(progress,
                                     decode::TargetK0GdnGraphStage::kLaunchCheck);

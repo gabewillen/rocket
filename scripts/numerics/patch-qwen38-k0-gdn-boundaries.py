@@ -54,6 +54,7 @@ _ROCKET_K0_GDN_SEEN = set()
 _ROCKET_K0_GDN_EXTENTS = {
     "qkvz": 8192,
     "ba": 48,
+    "conv": 5120,
     "core": 3072,
     "normalized": 3072,
 }
@@ -102,6 +103,13 @@ def _rocket_k0_gdn_save(prefix, name, tensor):
         "        use_fused_gdn_decode = (\n"
         "            os.getenv('ROCKET_QWEN38_K0_GDN_CAPTURE_ACTIVE') != '1'\n"
         "            and self.enable_fused_gdn_decode\n",
+    )
+    gdn = replace_once(
+        gdn,
+        "        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)\n",
+        "        if mixed_qkv_non_spec is not None:\n"
+        "            _rocket_k0_gdn_save(self.prefix, 'conv', mixed_qkv_non_spec)\n\n"
+        "        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)\n",
     )
     gdn = replace_once(
         gdn,

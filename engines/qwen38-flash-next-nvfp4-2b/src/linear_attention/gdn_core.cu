@@ -433,6 +433,14 @@ const __nv_bfloat16* CorePlan::output() const noexcept {
   return impl_ ? impl_->output : nullptr;
 }
 
+const __nv_bfloat16* CorePlan::convolved_qkv() const noexcept {
+  return impl_ ? impl_->mixed_qkv : nullptr;
+}
+
+const __nv_bfloat16* CorePlan::recurrent_output() const noexcept {
+  return impl_ ? impl_->core : nullptr;
+}
+
 }  // namespace rocket::qwen38::linear_attention
 
 namespace {
