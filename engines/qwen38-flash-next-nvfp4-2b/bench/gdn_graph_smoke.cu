@@ -372,7 +372,7 @@ int main(int argc, char** argv) try {
 
   void* graph = nullptr;
   if (qwen38_gdn_graph_create(
-          device, static_cast<std::uint8_t*>(qw.pointer), static_cast<std::uint8_t*>(qs.pointer), qg,
+          device, 0, 0, static_cast<std::uint8_t*>(qw.pointer), static_cast<std::uint8_t*>(qs.pointer), qg,
           static_cast<std::uint8_t*>(zw.pointer), static_cast<std::uint8_t*>(zs.pointer), zg,
           static_cast<std::uint8_t*>(bw.pointer), static_cast<std::uint8_t*>(bs.pointer), bg,
           static_cast<std::uint8_t*>(aw.pointer), static_cast<std::uint8_t*>(as.pointer), ag,

@@ -351,10 +351,16 @@ void copy(void* destination, const void* source, std::size_t bytes,
 }  // namespace
 
 struct CutlassGdnGraph::Impl {
-  Impl(int selected_device, GdnWeights selected_weights)
-      : device(selected_device), globals(selected_weights) {}
+  Impl(int selected_device, int selected_rank, int selected_layer,
+       GdnWeights selected_weights)
+      : device(selected_device), rank(selected_rank), layer(selected_layer),
+        slab_key(selected_rank == 0 ? "rank0-target" : "rank1-target"),
+        globals(selected_weights) {}
 
   int device;
+  int rank;
+  int layer;
+  std::string slab_key;
   GdnWeights globals;
   std::uint8_t *input_packed = nullptr, *input_sfa = nullptr;
   std::uint8_t *qkvz_weight = nullptr, *qkvz_scale = nullptr;
@@ -384,12 +390,14 @@ struct CutlassGdnGraph::Impl {
   }
 };
 
-CutlassGdnGraph::CutlassGdnGraph(int device, GdnWeights weights)
-    : impl_(new Impl(device, weights)) {
+CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
+                                 GdnWeights weights)
+    : impl_(new Impl(device, rank, layer, weights)) {
   const Nvfp4Matrix matrices[] = {weights.qkv, weights.z, weights.b,
                                   weights.a, weights.output};
-  if (device < 0 || !weights.conv || !weights.a_log || !weights.dt_bias ||
-      !weights.norm) {
+  if (device < 0 || (rank != 0 && rank != 1) ||
+      !decode::is_linear_attention_layer(layer) || !weights.conv ||
+      !weights.a_log || !weights.dt_bias || !weights.norm) {
     delete impl_; impl_ = nullptr;
     throw std::invalid_argument("authenticated GDN weight pointers are required");
   }
@@ -508,6 +516,16 @@ CutlassGdnGraph::CutlassGdnGraph(int device, GdnWeights weights)
 }
 
 CutlassGdnGraph::~CutlassGdnGraph() { delete impl_; }
+
+int CutlassGdnGraph::rank() const noexcept { return impl_ ? impl_->rank : -1; }
+
+int CutlassGdnGraph::layer() const noexcept {
+  return impl_ ? impl_->layer : -1;
+}
+
+std::string_view CutlassGdnGraph::slab_key() const noexcept {
+  return impl_ ? std::string_view(impl_->slab_key) : std::string_view{};
+}
 
 std::uint64_t CutlassGdnGraph::logical_bytes_per_row(int m) const noexcept {
   if (!allowed_m(m)) return 0;
@@ -1075,7 +1093,7 @@ int graph_wrap(F&& fn) noexcept {
 }  // namespace
 
 extern "C" int qwen38_gdn_graph_create(
-    int device,
+    int device, int rank, int layer,
     const std::uint8_t* qkv_weight, const std::uint8_t* qkv_scale,
     float qkv_global, const std::uint8_t* z_weight,
     const std::uint8_t* z_scale, float z_global,
@@ -1091,7 +1109,7 @@ extern "C" int qwen38_gdn_graph_create(
     *graph = nullptr;
     using namespace rocket::qwen38::linear_attention;
     *graph = new CutlassGdnGraph(
-        device, {{qkv_weight, qkv_scale, qkv_global},
+        device, rank, layer, {{qkv_weight, qkv_scale, qkv_global},
                  {z_weight, z_scale, z_global},
                  {b_weight, b_scale, b_global},
                  {a_weight, a_scale, a_global},

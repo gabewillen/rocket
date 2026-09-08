@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -25,19 +26,23 @@ class Trace final : public pr::OtelStageSink {
     outcomes.push_back(record.outcome);
   }
   void record_duration(const pr::MetricPoint&) noexcept override {}
-  std::vector<std::string_view> stages;
+  std::vector<std::string> stages;
   std::vector<pr::Outcome> outcomes;
 };
 
 class Graph final : public decode::LinearAttentionGraph {
  public:
-  explicit Graph(std::vector<std::string_view>& ordered) : ordered(ordered) {}
-  int rank() const noexcept override { return 0; }
-  int layer() const noexcept override { return 0; }
+  explicit Graph(std::vector<std::string_view>& ordered, int rank = 1,
+                 int layer = 46)
+      : selected_rank(rank), selected_layer(layer), ordered(ordered) {}
+  int rank() const noexcept override { return selected_rank; }
+  int layer() const noexcept override { return selected_layer; }
   std::string_view checkpoint_revision() const noexcept override {
     return decode::kQwen38CheckpointRevision;
   }
-  std::string_view slab_key() const noexcept override { return "rank0-target"; }
+  std::string_view slab_key() const noexcept override {
+    return selected_rank == 0 ? "rank0-target" : "rank1-target";
+  }
   std::string_view conv_state_family() const noexcept override {
     return "target_gdn_conv";
   }
@@ -64,6 +69,8 @@ class Graph final : public decode::LinearAttentionGraph {
     return &partial;
   }
   __nv_bfloat16 partial{};
+  int selected_rank;
+  int selected_layer;
   cudaStream_t expected_stream = reinterpret_cast<cudaStream_t>(0x1230);
   std::vector<std::string_view> calls;
   std::vector<std::string_view>& ordered;
@@ -71,8 +78,9 @@ class Graph final : public decode::LinearAttentionGraph {
 
 class Reducer final : public decode::HiddenPartialReducer {
  public:
-  explicit Reducer(std::vector<std::string_view>& ordered) : ordered(ordered) {}
-  int rank() const noexcept override { return 0; }
+  explicit Reducer(std::vector<std::string_view>& ordered, int rank = 1)
+      : selected_rank(rank), ordered(ordered) {}
+  int rank() const noexcept override { return selected_rank; }
   int world_size() const noexcept override { return 2; }
   void reduce(const __nv_bfloat16* input, float* output, int m,
               std::string_view, std::string_view,
@@ -83,6 +91,7 @@ class Reducer final : public decode::HiddenPartialReducer {
     ordered.push_back("reduce");
   }
   std::vector<std::string_view> calls;
+  int selected_rank;
   std::vector<std::string_view>& ordered;
 };
 
@@ -142,7 +151,8 @@ int main() {
         1, 4, &hidden, &block_input, &injection, &conv, &recurrent,
         &state_index, &reduced, &updated, &moe_input, &next_injection,
         "trace", "request", graph.expected_stream);
-    check(result.generation == 1 && result.m_bucket == 4,
+    check(result.generation == 1 && result.m_bucket == 4 &&
+              result.rank == 1 && result.layer == 46,
           "linear publication drift");
     check(hc.calls == std::vector<std::string_view>{
                           "mix", "synchronize", "synchronize",
@@ -176,9 +186,9 @@ int main() {
     }
     check(failed && failing_trace.stages.size() == 2 &&
               failing_trace.stages[0] ==
-                  "rocket.qwen38.layer0.linear.attn_hc_mix" &&
+                  "rocket.qwen38.layer46.linear.attn_hc_mix" &&
               failing_trace.stages[1] ==
-                  "rocket.qwen38.layer0.linear.lifecycle",
+                  "rocket.qwen38.layer46.linear.lifecycle",
           "linear deferred failure published");
     check(failing_order == std::vector<std::string_view>{
                                "mix", "synchronize", "gdn_graph",
@@ -191,6 +201,18 @@ int main() {
           "trace-retry", "request-retry", failing_graph.expected_stream);
       check(false, "faulted GDN transition retried");
     } catch (const decode::DecodeExecutionContractError&) {
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+      for (int index = 0; index < 48; ++index) {
+        if (!decode::is_linear_attention_layer(index)) continue;
+        std::vector<std::string_view> topology_order;
+        Graph topology_graph(topology_order, rank, index);
+        Reducer topology_reducer(topology_order, rank);
+        HyperConnection topology_hc(topology_order);
+        Trace topology_trace;
+        decode::LinearAttentionLayer topology_layer(
+            topology_graph, topology_reducer, topology_hc, topology_trace);
+      }
     }
     std::puts("qwen38 linear-attention layer contract passed");
     return 0;

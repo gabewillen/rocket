@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -24,14 +25,22 @@ class Trace final : public pr::OtelStageSink {
     outcomes.push_back(record.outcome);
   }
   void record_duration(const pr::MetricPoint&) noexcept override {}
-  std::vector<std::string_view> stages;
+  std::vector<std::string> stages;
   std::vector<pr::Outcome> outcomes;
 };
 
 class Graph final : public decode::FullAttentionGraph {
  public:
-  int rank() const noexcept override { return 0; }
-  int layer() const noexcept override { return 3; }
+  explicit Graph(int rank = 1, int layer = 47)
+      : selected_rank(rank), selected_layer(layer) {}
+  int rank() const noexcept override { return selected_rank; }
+  int layer() const noexcept override { return selected_layer; }
+  std::string_view checkpoint_revision() const noexcept override {
+    return decode::kFullAttentionCheckpointRevision;
+  }
+  std::string_view slab_key() const noexcept override {
+    return selected_rank == 0 ? "rank0-target" : "rank1-target";
+  }
   void launch(const __nv_bfloat16* block_input, int m,
               cudaStream_t stream) override {
     check(block_input != nullptr && m == expected_m && stream == expected_stream,
@@ -42,6 +51,8 @@ class Graph final : public decode::FullAttentionGraph {
     return &partial;
   }
   int expected_m = 4;
+  int selected_rank;
+  int selected_layer;
   cudaStream_t expected_stream = reinterpret_cast<cudaStream_t>(0x1230);
   __nv_bfloat16 partial{};
   std::vector<std::string_view> calls;
@@ -49,7 +60,8 @@ class Graph final : public decode::FullAttentionGraph {
 
 class Reducer final : public decode::HiddenPartialReducer {
  public:
-  int rank() const noexcept override { return 0; }
+  explicit Reducer(int rank = 1) : selected_rank(rank) {}
+  int rank() const noexcept override { return selected_rank; }
   int world_size() const noexcept override { return 2; }
   void reduce(const __nv_bfloat16* input, float* output, int m,
               std::string_view, std::string_view,
@@ -60,6 +72,7 @@ class Reducer final : public decode::HiddenPartialReducer {
     calls.push_back("reduce");
   }
   std::vector<std::string_view> calls;
+  int selected_rank;
 };
 
 class HyperConnection final : public decode::FullAttentionHyperConnection {
@@ -110,7 +123,8 @@ int main() {
         1, 4, &hidden, &block_input, &injection, &reduced, &updated,
         &moe_input, &next_injection, "trace", "request",
         graph.expected_stream);
-    check(result.generation == 1 && result.m_bucket == 4,
+    check(result.generation == 1 && result.m_bucket == 4 &&
+              result.rank == 1 && result.layer == 47,
           "publication identity drift");
     check(hc.calls == std::vector<std::string_view>{
                           "mix", "synchronize", "synchronize",
@@ -136,7 +150,7 @@ int main() {
                          std::string_view::npos;
     }
     check(deferred_failure && failing_trace.stages.size() == 1 &&
-              failing_trace.stages[0] == "rocket.qwen38.layer3.lifecycle" &&
+              failing_trace.stages[0] == "rocket.qwen38.layer47.lifecycle" &&
               failing_trace.outcomes[0] != pr::Outcome::kOk,
           "deferred completion failure was published");
     bool retried_fault = false;
@@ -149,6 +163,16 @@ int main() {
       retried_fault = true;
     }
     check(retried_fault, "deferred completion failure did not fault transition");
+    for (int rank = 0; rank < 2; ++rank) {
+      for (int index = 3; index < 48; index += 4) {
+        Graph topology_graph(rank, index);
+        Reducer topology_reducer(rank);
+        HyperConnection topology_hc;
+        Trace topology_trace;
+        decode::FullAttentionLayer topology_layer(
+            topology_graph, topology_reducer, topology_hc, topology_trace);
+      }
+    }
     std::puts("qwen38 full-attention layer order and publication contract passed");
     return 0;
   } catch (const std::exception& error) {

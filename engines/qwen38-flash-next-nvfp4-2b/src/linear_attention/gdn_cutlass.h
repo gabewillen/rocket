@@ -69,22 +69,22 @@ ROCKET_QWEN38_GDN_HOST_DEVICE constexpr std::size_t prefill_sfa_offset(
 }
 #undef ROCKET_QWEN38_GDN_HOST_DEVICE
 
-// Exact layer-0 rank-0 graph adapter. Construction copies authenticated weight
+// Exact rank-local GDN-layer graph adapter. Construction copies authenticated weight
 // extents into graph-owned immutable storage before capture. No allocations or
 // pointer changes occur in launch().
 class CutlassGdnGraph final : public decode::LinearAttentionGraph {
  public:
-  CutlassGdnGraph(int device, GdnWeights weights);
+  CutlassGdnGraph(int device, int rank, int layer, GdnWeights weights);
   ~CutlassGdnGraph();
   CutlassGdnGraph(const CutlassGdnGraph&) = delete;
   CutlassGdnGraph& operator=(const CutlassGdnGraph&) = delete;
 
-  int rank() const noexcept override { return 0; }
-  int layer() const noexcept override { return 0; }
+  int rank() const noexcept override;
+  int layer() const noexcept override;
   std::string_view checkpoint_revision() const noexcept override {
     return decode::kQwen38CheckpointRevision;
   }
-  std::string_view slab_key() const noexcept override { return "rank0-target"; }
+  std::string_view slab_key() const noexcept override;
   std::string_view conv_state_family() const noexcept override {
     return "target_gdn_conv";
   }
@@ -173,7 +173,7 @@ class CutlassGdnPrefillProjection final {
 
 extern "C" {
 int qwen38_gdn_graph_create(
-    int device,
+    int device, int rank, int layer,
     const std::uint8_t* qkv_weight, const std::uint8_t* qkv_scale,
     float qkv_global, const std::uint8_t* z_weight,
     const std::uint8_t* z_scale, float z_global,

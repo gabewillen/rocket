@@ -24,8 +24,12 @@ constexpr bool allowed_linear_m(int m) noexcept {
   return m == 1 || m == 2 || m == 4 || m == 8 || m == 16;
 }
 
+[[nodiscard]] constexpr bool is_linear_attention_layer(int layer) noexcept {
+  return layer >= 0 && layer < 48 && layer % 4 != 3;
+}
+
 // Borrowed adapter for five immutable captured graphs. Each graph contains the
-// fixed layer-0 QKVZ/BA projection and requant, causal-convolution update,
+// fixed layer-local QKVZ/BA projection and requant, causal-convolution update,
 // in-place FP32 GDN recurrence, gated RMSNorm, and rank-local output projection
 // in the order used by pinned vLLM 8e685d198. The convolution and recurrent
 // pointers are views of the two authenticated nine-family transaction extents.
@@ -64,9 +68,11 @@ class LinearAttentionHyperConnection {
 struct LinearAttentionResult {
   std::uint64_t generation;
   int m_bucket;
+  int rank;
+  int layer;
 };
 
-// Exact attention half of layer 0. The returned block input and injection are
+// Exact attention half of one GDN layer. The returned block input and injection are
 // the pending MLP HC boundary. A downstream MoE/dense executor consumes them.
 // GDN state mutates in-place, so any failure is terminal and requires restoring
 // the accepted nine-family transaction before retrying.
@@ -95,6 +101,8 @@ class LinearAttentionLayer final {
   HiddenPartialReducer& reducer_;
   LinearAttentionHyperConnection& hyperconnection_;
   pair_reduce::OtelStageSink& telemetry_;
+  int rank_;
+  int layer_;
   std::uint64_t last_generation_ = 0;
   bool faulted_ = false;
 };

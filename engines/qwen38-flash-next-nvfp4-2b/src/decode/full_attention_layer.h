@@ -11,13 +11,22 @@
 
 namespace rocket::qwen38::decode {
 
-// Borrowed adapter for the already captured rank-local layer-3 graph. The
+[[nodiscard]] constexpr bool is_full_attention_layer(int layer) noexcept {
+  return layer >= 0 && layer < 48 && layer % 4 == 3;
+}
+
+inline constexpr std::string_view kFullAttentionCheckpointRevision =
+    "fc694b54fb0174e0913e6adf86691ef85a4ead47";
+
+// Borrowed adapter for one captured rank-local QSA-layer graph. The
 // concrete adapter binds QKV, QSA score/radix/attention, and output projection.
 class FullAttentionGraph {
  public:
   virtual ~FullAttentionGraph() = default;
   virtual int rank() const noexcept = 0;
   virtual int layer() const noexcept = 0;
+  virtual std::string_view checkpoint_revision() const noexcept = 0;
+  virtual std::string_view slab_key() const noexcept = 0;
   virtual void launch(const __nv_bfloat16* block_input, int m,
                       cudaStream_t stream) = 0;
   virtual const __nv_bfloat16* projected_output() const noexcept = 0;
@@ -44,9 +53,11 @@ class FullAttentionHyperConnection {
 struct FullAttentionResult {
   std::uint64_t generation;
   int m_bucket;
+  int rank;
+  int layer;
 };
 
-// Single-owner exact layer-3 attention transition. A result is returned only
+// Single-owner exact QSA-layer attention transition. A result is returned only
 // after every ordered stage succeeds; borrowed output buffers are unpublished
 // until then. Reconstruct after an exception because remote reduction writes
 // or output buffers may have changed.
@@ -73,6 +84,8 @@ class FullAttentionLayer final {
   HiddenPartialReducer& reducer_;
   FullAttentionHyperConnection& hyperconnection_;
   pair_reduce::OtelStageSink& telemetry_;
+  int rank_;
+  int layer_;
   std::uint64_t last_generation_ = 0;
   bool faulted_ = false;
 };
