@@ -23,7 +23,7 @@ TargetDenseFailure diagnose_identity(const TargetDenseIdentity& identity) noexce
     return TargetDenseFailure::kLayout;
   if (identity.rank != 0 && identity.rank != 1)
     return TargetDenseFailure::kRank;
-  if (identity.layer != kTargetCompositionLayer)
+  if (identity.layer < 0 || identity.layer >= 48)
     return TargetDenseFailure::kLayer;
   return TargetDenseFailure::kNone;
 }

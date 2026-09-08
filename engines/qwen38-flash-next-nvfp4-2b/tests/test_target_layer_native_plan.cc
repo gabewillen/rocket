@@ -34,6 +34,10 @@ int main(int argc, char** argv) {
         changed_identity.descriptor_sha256[0] == '0' ? '1' : '0';
     if (rocket::qwen38::moe::authenticate_target_moe_compact_runtime_identity(
             changed_identity)) return 6;
+    changed_identity = moe_identity;
+    changed_identity.layer = (plan.layer + 1) % 48;
+    if (rocket::qwen38::moe::authenticate_target_moe_compact_runtime_identity(
+            changed_identity)) return 7;
     auto mutated = plan;
     ++mutated.extents.back().offset_bytes;
     try {

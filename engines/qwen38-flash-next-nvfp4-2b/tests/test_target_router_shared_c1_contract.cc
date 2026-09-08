@@ -44,12 +44,27 @@ int main() {
       moe::TargetDenseFailure::kNone)
     std::abort();
 
-  auto changed = identity;
-  changed.layer = 4;
-  if (moe::diagnose_target_router_c1(changed, router_weights, router_launch) !=
-      moe::TargetDenseFailure::kLayer ||
-      moe::diagnose_target_shared_c1(changed, shared_weights, shared_launch) !=
-          moe::TargetDenseFailure::kLayer)
-    std::abort();
+  for (const int layer : {0, 3, 47}) {
+    auto changed = identity;
+    changed.layer = layer;
+    if (moe::diagnose_target_router_c1(
+            changed, router_weights, router_launch) !=
+            moe::TargetDenseFailure::kNone ||
+        moe::diagnose_target_shared_c1(
+            changed, shared_weights, shared_launch) !=
+            moe::TargetDenseFailure::kNone)
+      std::abort();
+  }
+  for (const int layer : {-1, 48}) {
+    auto changed = identity;
+    changed.layer = layer;
+    if (moe::diagnose_target_router_c1(
+            changed, router_weights, router_launch) !=
+            moe::TargetDenseFailure::kLayer ||
+        moe::diagnose_target_shared_c1(
+            changed, shared_weights, shared_launch) !=
+            moe::TargetDenseFailure::kLayer)
+      std::abort();
+  }
   return 0;
 }
