@@ -91,7 +91,8 @@ class TargetFullMoeC1 final : public TargetFullMoeC1Port {
  public:
   TargetFullMoeC1(int device, TargetDenseIdentity identity,
                   TargetFullMoeC1Weights weights,
-                  TargetMoeAotConstructionStage* construction_stage = nullptr);
+                  TargetMoeAotConstructionStage* construction_stage = nullptr,
+                  TargetMoeAotCudaFailure* cuda_failure = nullptr);
   ~TargetFullMoeC1();
   TargetFullMoeC1(const TargetFullMoeC1&) = delete;
   TargetFullMoeC1& operator=(const TargetFullMoeC1&) = delete;

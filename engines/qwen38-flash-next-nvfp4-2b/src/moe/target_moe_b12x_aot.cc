@@ -16,6 +16,20 @@
 namespace rocket::qwen38::moe {
 namespace {
 
+TargetMoeAotCudaFailure classify_cuda(cudaError_t status) noexcept {
+  switch (status) {
+    case cudaSuccess: return TargetMoeAotCudaFailure::kSuccess;
+    case cudaErrorInvalidValue: return TargetMoeAotCudaFailure::kInvalidValue;
+    case cudaErrorInvalidKernelImage: return TargetMoeAotCudaFailure::kInvalidImage;
+    case cudaErrorInvalidPtx: return TargetMoeAotCudaFailure::kInvalidPtx;
+    case cudaErrorNoKernelImageForDevice:
+      return TargetMoeAotCudaFailure::kNoBinaryForGpu;
+    case cudaErrorMemoryAllocation: return TargetMoeAotCudaFailure::kOutOfMemory;
+    case cudaErrorNotSupported: return TargetMoeAotCudaFailure::kNotSupported;
+    default: return TargetMoeAotCudaFailure::kOther;
+  }
+}
+
 constexpr std::string_view kSourceAbi =
     "modelopt_nvfp4_group16_cutlass_sm121_sfb";
 constexpr std::string_view kTransformAbi =
@@ -38,7 +52,8 @@ bool valid_launch(const TargetMoeB12xLaunch& launch) noexcept {
 template <class Module>
 TargetMoeAotConstructionStage load_module(
     Module* module, int device, auto init, auto load,
-    TargetMoeAotConstructionStage* progress) noexcept {
+    TargetMoeAotConstructionStage* progress,
+    TargetMoeAotCudaFailure* cuda_failure) noexcept {
   cudaLibrary_t* library = &module->module;
   cudaError_t status = cudaSuccess;
   struct InitArgs {
@@ -47,6 +62,7 @@ TargetMoeAotConstructionStage load_module(
   } init_args{&library, &status};
   if (progress) *progress = TargetMoeAotConstructionStage::kModuleData;
   init(reinterpret_cast<void**>(&init_args));
+  if (cuda_failure) *cuda_failure = classify_cuda(status);
   if (status != cudaSuccess) return TargetMoeAotConstructionStage::kModuleData;
   std::int32_t selected_device = device;
   struct LoadArgs {
@@ -56,6 +72,7 @@ TargetMoeAotConstructionStage load_module(
   } load_args{&library, &selected_device, &status};
   if (progress) *progress = TargetMoeAotConstructionStage::kModuleLoad;
   load(reinterpret_cast<void**>(&load_args));
+  if (cuda_failure) *cuda_failure = classify_cuda(status);
   return status == cudaSuccess ? TargetMoeAotConstructionStage{}
                                : TargetMoeAotConstructionStage::kModuleLoad;
 }
@@ -176,8 +193,10 @@ struct TargetMoeB12xAot::Impl {
 
 TargetMoeB12xAot::TargetMoeB12xAot(
     int device, TargetMoeB12xIdentity identity, TargetMoeB12xWeights weights,
-    TargetMoeAotConstructionStage* construction_stage)
+    TargetMoeAotConstructionStage* construction_stage,
+    TargetMoeAotCudaFailure* cuda_failure)
     : impl_(nullptr) {
+  if (cuda_failure) *cuda_failure = TargetMoeAotCudaFailure::kSuccess;
   if (construction_stage)
     *construction_stage = TargetMoeAotConstructionStage::kIdentity;
   if (diagnose_target_moe_b12x_create(device, identity, weights) !=
@@ -188,7 +207,7 @@ TargetMoeB12xAot::TargetMoeB12xAot(
   const auto outcome_stage = load_module(
       &impl_->module, device, _mlir_qwen38_target_moe_b12x_c1_cuda_init,
       _mlir_qwen38_target_moe_b12x_c1_cuda_load_to_device,
-      construction_stage);
+      construction_stage, cuda_failure);
   if (outcome_stage != TargetMoeAotConstructionStage{}) {
     delete impl_;
     impl_ = nullptr;

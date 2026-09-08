@@ -18,6 +18,16 @@ enum class TargetMoeAotConstructionStage : std::uint8_t {
   kModuleData = 2,
   kModuleLoad = 3,
 };
+enum class TargetMoeAotCudaFailure : std::uint8_t {
+  kSuccess = 0,
+  kInvalidValue = 1,
+  kInvalidImage = 2,
+  kInvalidPtx = 3,
+  kNoBinaryForGpu = 4,
+  kOutOfMemory = 5,
+  kNotSupported = 6,
+  kOther = 7,
+};
 
 class TargetMoeAotConstructionError final : public std::runtime_error {
  public:
@@ -136,7 +146,8 @@ class TargetMoeB12xAot final {
  public:
   TargetMoeB12xAot(int device, TargetMoeB12xIdentity identity,
                    TargetMoeB12xWeights weights,
-                   TargetMoeAotConstructionStage* construction_stage = nullptr);
+                   TargetMoeAotConstructionStage* construction_stage = nullptr,
+                   TargetMoeAotCudaFailure* cuda_failure = nullptr);
   ~TargetMoeB12xAot();
   TargetMoeB12xAot(const TargetMoeB12xAot&) = delete;
   TargetMoeB12xAot& operator=(const TargetMoeB12xAot&) = delete;

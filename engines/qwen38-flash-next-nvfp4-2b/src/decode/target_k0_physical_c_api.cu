@@ -122,6 +122,8 @@ extern "C" int qwen38_target_k0_oracle35_run(
     result->physical_layer_index = layer_progress.layer;
     result->gdn_owner_substage =
         static_cast<std::int32_t>(layer_progress.gdn_stage);
+    result->moe_aot_cuda_failure =
+        static_cast<std::int32_t>(layer_progress.moe_aot_cuda_failure);
     if (telemetry) publish(telemetry->snapshot(), *result);
   };
   try {

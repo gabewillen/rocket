@@ -91,7 +91,8 @@ class TargetLayerMoeDeviceOwner final {
       std::shared_ptr<TargetFullMoeOtelSink> telemetry,
       std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry,
       TargetLayerMoeConstructionStage* construction_stage = nullptr,
-      TargetMoeAotConstructionStage* aot_stage = nullptr);
+      TargetMoeAotConstructionStage* aot_stage = nullptr,
+      TargetMoeAotCudaFailure* cuda_failure = nullptr);
   ~TargetLayerMoeDeviceOwner();
   TargetLayerMoeDeviceOwner(const TargetLayerMoeDeviceOwner&) = delete;
   TargetLayerMoeDeviceOwner& operator=(const TargetLayerMoeDeviceOwner&) = delete;
@@ -112,7 +113,8 @@ class TargetLayerMoeDeviceOwner final {
       std::shared_ptr<TargetFullMoeOtelSink> telemetry,
       std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry,
       TargetLayerMoeConstructionStage* construction_stage,
-      TargetMoeAotConstructionStage* aot_stage);
+      TargetMoeAotConstructionStage* aot_stage,
+      TargetMoeAotCudaFailure* cuda_failure);
   int device_ = -1;
   int rank_ = -1;
   int layer_ = -1;

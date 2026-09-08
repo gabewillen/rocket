@@ -160,7 +160,8 @@ TargetLayerMoeDeviceOwner::create(
     std::shared_ptr<TargetFullMoeOtelSink> telemetry,
     std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry,
     TargetLayerMoeConstructionStage* construction_stage,
-    TargetMoeAotConstructionStage* aot_stage) {
+    TargetMoeAotConstructionStage* aot_stage,
+    TargetMoeAotCudaFailure* cuda_failure) {
   auto lease = model::TargetSlabStartupFactory::lease_from_handle(
       accepted_loader_lease_handle);
   if (!lease)
@@ -168,7 +169,8 @@ TargetLayerMoeDeviceOwner::create(
   return std::unique_ptr<TargetLayerMoeDeviceOwner>(
       new TargetLayerMoeDeviceOwner(
           device, plan, std::move(lease), std::move(telemetry),
-          std::move(stage_telemetry), construction_stage, aot_stage));
+          std::move(stage_telemetry), construction_stage, aot_stage,
+          cuda_failure));
 }
 
 TargetLayerMoeStorageBinding bind_target_layer_moe_storage(
@@ -198,7 +200,8 @@ TargetLayerMoeDeviceOwner::TargetLayerMoeDeviceOwner(
     std::shared_ptr<TargetFullMoeOtelSink> telemetry,
     std::shared_ptr<TargetMoeStageOtelSink> stage_telemetry,
     TargetLayerMoeConstructionStage* construction_stage,
-    TargetMoeAotConstructionStage* aot_stage)
+    TargetMoeAotConstructionStage* aot_stage,
+    TargetMoeAotCudaFailure* cuda_failure)
     : device_(device), rank_(plan.rank), layer_(plan.layer),
       bundle_(std::make_unique<Bundle>()) {
   const auto mark = [construction_stage](TargetLayerMoeConstructionStage stage) {
@@ -276,7 +279,7 @@ TargetLayerMoeDeviceOwner::TargetLayerMoeDeviceOwner(
                                bundle_->stage.get(),
                                bundle_->stage_scratch,
                                bundle_->stage_telemetry.get(),
-                               bindings.shared}, aot_stage);
+                               bindings.shared}, aot_stage, cuda_failure);
     bundle_->graph = std::make_unique<NativeTargetMoeGraph>(
         *bundle_->participant, bundle_->workspace,
         bundle_->rank_local_output, *bundle_->telemetry);

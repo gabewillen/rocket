@@ -20,6 +20,7 @@ struct Qwen38TargetK0Oracle35Result {
   std::int32_t physical_layer_substage;
   std::int32_t physical_layer_index;
   std::int32_t gdn_owner_substage;
+  std::int32_t moe_aot_cuda_failure;
 };
 
 enum Qwen38TargetK0Oracle35Status : int {

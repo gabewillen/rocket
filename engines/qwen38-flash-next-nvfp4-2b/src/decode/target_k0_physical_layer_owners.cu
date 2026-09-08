@@ -39,7 +39,8 @@ TargetK0PhysicalLayerOwners::create(
   const auto mark = [progress](TargetK0PhysicalLayerConstructionStage stage,
                                int layer = -1) {
     if (progress) *progress = {stage, layer,
-        TargetGdnOwnerConstructionStage::kUnknown};
+        TargetGdnOwnerConstructionStage::kUnknown,
+        moe::TargetMoeAotCudaFailure::kSuccess};
   };
   if (device < 0 || !accepted_loader_lease_handle || !plans ||
       !validate_target_k0_physical_layer_plans(*plans, rank) ||
@@ -83,13 +84,16 @@ TargetK0PhysicalLayerOwners::create(
       moe::TargetLayerMoeConstructionStage moe_stage =
           moe::TargetLayerMoeConstructionStage::kUnknown;
       moe::TargetMoeAotConstructionStage aot_stage{};
+      moe::TargetMoeAotCudaFailure cuda_failure =
+          moe::TargetMoeAotCudaFailure::kSuccess;
       std::unique_ptr<moe::TargetLayerMoeDeviceOwner> moe;
       try {
         moe = moe::TargetLayerMoeDeviceOwner::create(
             device, plan, accepted_loader_lease_handle, moe_telemetry,
-            stage_telemetry, &moe_stage, &aot_stage);
+            stage_telemetry, &moe_stage, &aot_stage, &cuda_failure);
       } catch (const moe::TargetMoeAotConstructionError& error) {
         if (progress) {
+          progress->moe_aot_cuda_failure = cuda_failure;
           progress->gdn_stage =
               error.stage() == moe::TargetMoeAotConstructionStage::kIdentity
                   ? TargetGdnOwnerConstructionStage::kMoeAotIdentity
@@ -106,6 +110,7 @@ TargetK0PhysicalLayerOwners::create(
         throw;
       } catch (...) {
         if (progress) {
+          progress->moe_aot_cuda_failure = cuda_failure;
           progress->gdn_stage = aot_stage ==
                                         moe::TargetMoeAotConstructionStage::kIdentity
                                     ? TargetGdnOwnerConstructionStage::kMoeAotIdentity

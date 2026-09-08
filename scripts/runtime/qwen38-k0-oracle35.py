@@ -55,11 +55,17 @@ GDN_OWNER_SUBSTAGES = {
     10: "moe_aot_identity", 11: "moe_aot_module_data",
     12: "moe_aot_module_load", 13: "moe_participant_contract",
 }
+MOE_AOT_CUDA_FAILURES = {
+    0: "success", 1: "invalid_value", 2: "invalid_image", 3: "invalid_ptx",
+    4: "no_binary_for_gpu", 5: "out_of_memory", 6: "not_supported",
+    7: "other",
+}
 
 
 class NativeRunStatusError(RuntimeError):
     def __init__(self, status: int, physical_substage: int = 0,
-                 physical_layer: int = -1, gdn_owner_substage: int = 0):
+                 physical_layer: int = -1, gdn_owner_substage: int = 0,
+                 moe_aot_cuda_failure: int = 0):
         self.stage = NATIVE_STATUS_STAGES.get(status, "unknown")
         self.physical_substage = PHYSICAL_LAYER_SUBSTAGES.get(
             physical_substage, "unknown")
@@ -69,6 +75,8 @@ class NativeRunStatusError(RuntimeError):
         self.gdn_owner_substage = GDN_OWNER_SUBSTAGES.get(
             gdn_owner_substage, "unknown") if self.physical_substage == (
                 "gdn_owner") else "unknown"
+        self.moe_aot_cuda_failure = MOE_AOT_CUDA_FAILURES.get(
+            moe_aot_cuda_failure, "other")
         super().__init__("native K0 run rejected")
 
 
@@ -97,6 +105,7 @@ class _NativeResult(ctypes.Structure):
         ("physical_layer_substage", ctypes.c_int32),
         ("physical_layer_index", ctypes.c_int32),
         ("gdn_owner_substage", ctypes.c_int32),
+        ("moe_aot_cuda_failure", ctypes.c_int32),
     )
 
 
@@ -153,6 +162,7 @@ def _emit_failure(counter: object, rank: int, phase: str,
             if error.physical_layer >= 0:
                 attributes["failure.layer"] = error.physical_layer
             attributes["failure.gdn_owner_substage"] = error.gdn_owner_substage
+            attributes["failure.moe_aot_cuda"] = error.moe_aot_cuda_failure
         counter.add(1, attributes)
     except BaseException:
         pass
@@ -229,6 +239,7 @@ def _native_run(args: argparse.Namespace, lease: object,
         raise NativeRunStatusError(
             status, result.physical_layer_substage,
             result.physical_layer_index, result.gdn_owner_substage,
+            result.moe_aot_cuda_failure,
         )
     return result
 
@@ -249,6 +260,8 @@ def _snapshot(result: _NativeResult) -> dict[str, object]:
             result.physical_layer_substage, "unknown"),
         "gdn_owner_substage": GDN_OWNER_SUBSTAGES.get(
             result.gdn_owner_substage, "unknown"),
+        "moe_aot_cuda_failure": MOE_AOT_CUDA_FAILURES.get(
+            result.moe_aot_cuda_failure, "other"),
     }
 
 
@@ -304,6 +317,7 @@ def worker(args: argparse.Namespace) -> int:
             if error.physical_layer >= 0:
                 physical["physical_layer_index"] = error.physical_layer
             physical["gdn_owner_substage"] = error.gdn_owner_substage
+            physical["moe_aot_cuda_failure"] = error.moe_aot_cuda_failure
         print(json.dumps({"schema": SCHEMA, "valid": False, "complete": False,
                           "rank": args.rank, "phase": phase,
                           "failure_class": failure["class"],

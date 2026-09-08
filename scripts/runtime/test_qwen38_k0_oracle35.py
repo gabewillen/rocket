@@ -114,6 +114,7 @@ class Oracle35LauncherTests(unittest.TestCase):
         self.assertEqual(module.NativeRunStatusError(31, 5, 48).physical_layer,
                          -1)
         self.assertEqual(set(module.GDN_OWNER_SUBSTAGES), set(range(14)))
+        self.assertEqual(set(module.MOE_AOT_CUDA_FAILURES), set(range(8)))
         for code, name in module.GDN_OWNER_SUBSTAGES.items():
             self.assertEqual(
                 module.NativeRunStatusError(31, 5, 0, code).gdn_owner_substage,
@@ -122,6 +123,14 @@ class Oracle35LauncherTests(unittest.TestCase):
         self.assertEqual(
             module.NativeRunStatusError(31, 6, 3, 9).gdn_owner_substage,
             "unknown",
+        )
+        self.assertEqual(
+            module.NativeRunStatusError(31, 5, 0, 12, 4).moe_aot_cuda_failure,
+            "no_binary_for_gpu",
+        )
+        self.assertEqual(
+            module.NativeRunStatusError(31, 5, 0, 12, 99).moe_aot_cuda_failure,
+            "other",
         )
 
     def test_secret_requires_exact_32_bytes(self):
@@ -186,6 +195,7 @@ class Oracle35LauncherTests(unittest.TestCase):
             "duration_samples", "total_bytes",
             "physical_layer_substage",
             "gdn_owner_substage",
+            "moe_aot_cuda_failure",
         })
 
 

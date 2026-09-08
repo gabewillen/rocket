@@ -66,16 +66,18 @@ struct TargetFullMoeC1::Impl {
   cudaStream_t source_stream = nullptr;
 
   Impl(int device, TargetDenseIdentity identity, TargetFullMoeC1Weights weights,
-       TargetMoeAotConstructionStage* construction_stage)
+       TargetMoeAotConstructionStage* construction_stage,
+       TargetMoeAotCudaFailure* cuda_failure)
       : identity(identity), weights(weights),
         routed(device, routed_identity(identity),
                target_moe_staged_weights(weights.routed_stage_scratch),
-               construction_stage) {}
+               construction_stage, cuda_failure) {}
 };
 
 TargetFullMoeC1::TargetFullMoeC1(
     int device, TargetDenseIdentity identity, TargetFullMoeC1Weights weights,
-    TargetMoeAotConstructionStage* construction_stage)
+    TargetMoeAotConstructionStage* construction_stage,
+    TargetMoeAotCudaFailure* cuda_failure)
     : impl_(nullptr) {
   TargetRouterC1Launch router_probe{};
   router_probe.hidden_bf16 = reinterpret_cast<const __nv_bfloat16*>(1);
@@ -105,7 +107,7 @@ TargetFullMoeC1::TargetFullMoeC1(
       diagnose_target_shared_c1(identity, weights.shared, shared_probe) !=
           TargetDenseFailure::kNone)
     throw TargetFullMoeConstructionError();
-  impl_ = new Impl(device, identity, weights, construction_stage);
+  impl_ = new Impl(device, identity, weights, construction_stage, cuda_failure);
 }
 
 TargetFullMoeC1::~TargetFullMoeC1() {

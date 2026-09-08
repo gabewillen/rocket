@@ -30,6 +30,8 @@ struct TargetK0PhysicalLayerConstructionProgress {
   int layer = -1;
   TargetGdnOwnerConstructionStage gdn_stage =
       TargetGdnOwnerConstructionStage::kUnknown;
+  moe::TargetMoeAotCudaFailure moe_aot_cuda_failure =
+      moe::TargetMoeAotCudaFailure::kSuccess;
 };
 
 bool validate_target_k0_physical_layer_plans(
