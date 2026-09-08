@@ -21,6 +21,53 @@ SPEC.loader.exec_module(module)
 
 
 class Oracle35LauncherTests(unittest.TestCase):
+    def _descriptor_inventory(self, root: Path) -> None:
+        for rank in (0, 1):
+            for layer in range(48):
+                descriptor = {
+                    "schema": "test", "rank": rank, "layer": layer,
+                    "attention_kind": "qsa" if layer % 4 == 3 else "gdn",
+                    "native_binding_inventory_sha256": "",
+                    "slab_publication_layout_sha256": "a" * 64,
+                    "moe_layout_sha256": "b" * 64,
+                    "extents": [],
+                }
+                descriptor["native_binding_inventory_sha256"] = module.hashlib.sha256(
+                    module.canonical_bytes(descriptor["extents"])).hexdigest()
+                descriptor["descriptor_sha256"] = module.hashlib.sha256(
+                    module.canonical_bytes(descriptor)).hexdigest()
+                (root / f"rank{rank}-layer{layer}.json").write_bytes(
+                    module.canonical_bytes(descriptor) + b"\n")
+
+    def test_complete_descriptor_inventory_is_consumed_without_regeneration(self):
+        with tempfile.TemporaryDirectory() as root_text:
+            root = Path(root_text)
+            self._descriptor_inventory(root)
+            with mock.patch.object(module, "load_descriptor_allowlist",
+                                   return_value=()), \
+                 mock.patch.object(module, "authenticate_descriptor_identity",
+                                   return_value=True) as authenticate:
+                self.assertIsNone(module._descriptors(root))
+            self.assertEqual(authenticate.call_count, 96)
+            self.assertFalse(hasattr(module, "target_layer_descriptor"))
+
+    def test_descriptor_inventory_rejects_missing_or_noncanonical_file(self):
+        with tempfile.TemporaryDirectory() as root_text:
+            root = Path(root_text)
+            self._descriptor_inventory(root)
+            (root / "rank1-layer47.json").unlink()
+            with self.assertRaisesRegex(ValueError, "inventory changed"):
+                module._descriptors(root)
+            self._descriptor_inventory(root)
+            path = root / "rank1-layer47.json"
+            path.write_bytes(path.read_bytes() + b"\n")
+            with mock.patch.object(module, "load_descriptor_allowlist",
+                                   return_value=()), \
+                 mock.patch.object(module, "authenticate_descriptor_identity",
+                                   return_value=True):
+                with self.assertRaisesRegex(ValueError, "canonical encoding"):
+                    module._descriptors(root)
+
     @unittest.skipUnless(
         os.environ.get("ROCKET_QWEN38_K0_RUNTIME_LIBRARY"),
         "configured K0 runtime library was not supplied",

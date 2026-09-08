@@ -10,7 +10,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -24,7 +23,8 @@ from qwen38_slab.layer3_factory import (  # noqa: E402
     CtypesNativeTargetSlabLeaseFactory, native_target_slab_handoff,
 )
 from qwen38_slab.target_layer_descriptor import (  # noqa: E402
-    target_layer_descriptor,
+    authenticate_descriptor_identity, descriptor_identity,
+    load_descriptor_allowlist,
 )
 
 SCHEMA = "rocket.qwen38.k0-oracle35-run.v1"
@@ -71,40 +71,39 @@ def _native_symbols(library: Path) -> CtypesNativeTargetSlabLeaseFactory:
     )
 
 
-def _descriptors(artifact: Path, sidecar: Path, output: Path) -> dict[str, object]:
-    output.mkdir(mode=0o700, parents=True, exist_ok=True)
-    selected = None
+def _descriptors(output: Path) -> None:
+    """Authenticate a complete pre-generated inventory without source-slab I/O."""
+
     expected = {f"rank{rank}-layer{layer}.json"
                 for rank in (0, 1) for layer in range(48)}
-    observed = {item.name for item in output.iterdir() if item.is_file()}
-    if observed - expected:
-        raise ValueError("descriptor directory contains unknown files")
+    observed = {item.name for item in output.iterdir()}
+    if observed != expected:
+        raise ValueError("descriptor inventory changed")
+    allowlist = load_descriptor_allowlist(
+        ENGINE / "src/decode/target_layer_descriptor_identities.json")
     for rank in (0, 1):
         for layer in range(48):
-            descriptor = target_layer_descriptor(artifact, sidecar, rank, layer)
-            payload = canonical_bytes(descriptor) + b"\n"
-            destination = output / f"rank{rank}-layer{layer}.json"
-            if destination.exists() and destination.read_bytes() != payload:
-                raise ValueError("existing descriptor identity changed")
-            if not destination.exists():
-                fd, temporary = tempfile.mkstemp(dir=output, prefix=".descriptor-")
-                try:
-                    with os.fdopen(fd, "wb") as stream:
-                        stream.write(payload)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(temporary, destination)
-                except BaseException:
-                    try:
-                        os.unlink(temporary)
-                    except FileNotFoundError:
-                        pass
-                    raise
-            if rank == 0 and layer == 0:
-                selected = descriptor
-    if selected is None or {item.name for item in output.iterdir()} != expected:
-        raise ValueError("descriptor inventory changed")
-    return selected
+            source = output / f"rank{rank}-layer{layer}.json"
+            if source.is_symlink() or not source.is_file():
+                raise ValueError("descriptor inventory file changed")
+            payload = source.read_bytes()
+            descriptor = json.loads(payload)
+            if payload != canonical_bytes(descriptor) + b"\n":
+                raise ValueError("descriptor canonical encoding changed")
+            if descriptor.get("rank") != rank or descriptor.get("layer") != layer:
+                raise ValueError("descriptor filename identity changed")
+            claimed = descriptor.get("descriptor_sha256")
+            unsigned = dict(descriptor)
+            unsigned.pop("descriptor_sha256", None)
+            if claimed != hashlib.sha256(canonical_bytes(unsigned)).hexdigest():
+                raise ValueError("descriptor digest changed")
+            extents = descriptor.get("extents")
+            if descriptor.get("native_binding_inventory_sha256") != hashlib.sha256(
+                    canonical_bytes(extents)).hexdigest():
+                raise ValueError("descriptor extent inventory changed")
+            if not authenticate_descriptor_identity(
+                    descriptor_identity(descriptor), allowlist):
+                raise ValueError("descriptor identity is not allowlisted")
 
 
 def _native_run(args: argparse.Namespace, lease: object,
@@ -158,16 +157,17 @@ def worker(args: argparse.Namespace) -> int:
     tracer = trace.get_tracer("rocket.qwen38.k0_oracle35")
     meter = metrics.get_meter("rocket.qwen38.k0_oracle35")
     terminal = meter.create_counter("rocket.qwen38.k0_oracle35", unit="{run}")
-    phase = "descriptor"
+    phase = "session"
     started = time.perf_counter_ns()
     try:
         sessions = tuple(_secret(path) for path in (
             args.layer_session_file, args.embedding_session_file,
             args.nccl_session_file, args.nccl_authentication_key_file,
         ))
+        phase = "native_symbols"
         finalizer = _native_symbols(args.library)
-        descriptor = _descriptors(args.artifact, args.sidecar,
-                                  args.descriptor_directory)
+        phase = "descriptor_inventory"
+        _descriptors(args.descriptor_directory)
         rank_descriptor = json.loads((args.descriptor_directory /
                                       f"rank{args.rank}-layer0.json").read_bytes())
         phase = "load"
