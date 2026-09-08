@@ -43,6 +43,7 @@ constexpr int kExpandedWidth = kTokenTopk + kCompressRatio - 1;
 constexpr int kQsaHeads = 4;
 constexpr int kQsaDim = 128;
 constexpr int kQsaPageSize = 64;
+constexpr int kTargetCompressedPageSize = 400;
 constexpr int kQsaColumns = 262144 / kCompressRatio;
 constexpr int kQsaPages = kQsaColumns / kQsaPageSize;
 constexpr int kAttentionHeads = 12;
@@ -298,6 +299,61 @@ __global__ void score_qsa_c16(const __nv_bfloat16* __restrict__ query,
     }
   }
   logits[static_cast<std::size_t>(row) * kQsaColumns + column] = score;
+}
+
+// Current vLLM main 9ea8f3ffc354901b740f0b31988900897b7221d7 moved
+// decode scoring to nvidia/ops/qsa_indexer.py with BLOCK_N=64. This c1 fixed
+// form retains that column tile and the pinned 8e685d198 score definition,
+// while reading Rocket's external 400-row compressed pages.
+__global__ void score_target_qsa_c1_block64(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ keys,
+    const std::int32_t* __restrict__ page_table,
+    const std::int64_t* logical_positions,
+    const std::int32_t* sequence_lengths,
+    const std::int32_t* token_to_request,
+    float* __restrict__ logits,
+    std::int32_t* __restrict__ visible_blocks,
+    int compressed_blocks) {
+  constexpr int kBlockN = 64;
+  const int column = blockIdx.x * kBlockN + threadIdx.x;
+  if (column >= kQsaColumns) return;
+  const int request = token_to_request[0];
+  int visible = 0;
+  if (request == 0) {
+    const std::int64_t query_end = logical_positions[0] + 1;
+    visible = min(static_cast<int>(query_end / kCompressRatio),
+                  sequence_lengths[0] / kCompressRatio);
+    visible = max(0, min(visible, kQsaColumns));
+  }
+  if (column == 0) visible_blocks[0] = visible;
+  float score = -INFINITY;
+  if (column < visible) {
+    const int logical_page = column / kTargetCompressedPageSize;
+    const int physical_page = page_table[logical_page];
+    if (physical_page >= 0 && physical_page < compressed_blocks) {
+      const __nv_bfloat16* key =
+          keys + (static_cast<std::size_t>(physical_page) *
+                      kTargetCompressedPageSize +
+                  column % kTargetCompressedPageSize) * kQsaDim;
+      float head_scores[kQsaHeads] = {};
+#pragma unroll
+      for (int dim = 0; dim < kQsaDim; ++dim) {
+        const float key_value = __bfloat162float(key[dim]);
+#pragma unroll
+        for (int head = 0; head < kQsaHeads; ++head)
+          head_scores[head] = fmaf(
+              __bfloat162float(query[head * kQsaDim + dim]), key_value,
+              head_scores[head]);
+      }
+      score = 0.0f;
+#pragma unroll
+      for (int head = 0; head < kQsaHeads; ++head)
+        score += fmaxf(head_scores[head], 0.0f);
+      score *= 0.08838834764831845f;
+    }
+  }
+  logits[column] = score;
 }
 
 __global__ void extract_qsa_topk(const float* sorted_logits,
@@ -1254,4 +1310,38 @@ extern "C" int qwen38_qsa_projected_output(void* opaque, void** output,
   *output = static_cast<QsaPlan*>(opaque)->projected_output;
   *elements = static_cast<std::size_t>(kM) * kOutputN;
   return 0;
+}
+
+extern "C" int qwen38_target_qsa_select_c1(
+    const void* index_query, const void* compressed_cache,
+    const std::int32_t* compressed_block_table,
+    const std::int64_t* logical_positions,
+    const std::int32_t* sequence_lengths,
+    const std::int32_t* token_to_request, float* logits,
+    std::int32_t* visible, std::int32_t* selected_blocks,
+    std::int32_t* selected_tokens, int compressed_blocks,
+    cudaStream_t stream) {
+  last_error.clear();
+  if (!index_query || !compressed_cache || !compressed_block_table ||
+      !logical_positions || !sequence_lengths || !token_to_request ||
+      !logits || !visible || !selected_blocks || !selected_tokens ||
+      compressed_blocks <= 0 || !stream) {
+    last_error = "invalid caller-owned target QSA selection bindings";
+    return 1;
+  }
+  score_target_qsa_c1_block64<<<kQsaColumns / 64, 64, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(index_query),
+      static_cast<const __nv_bfloat16*>(compressed_cache),
+      compressed_block_table, logical_positions, sequence_lengths,
+      token_to_request, logits, visible, compressed_blocks);
+  if (!cuda_ok(cudaGetLastError(), "target QSA BLOCK_N=64 score")) return 1;
+  select_qsa_topk_radix512<<<1, 512, 0, stream>>>(
+      logits, visible, selected_blocks);
+  if (!cuda_ok(cudaGetLastError(), "target QSA stable radix-512")) return 1;
+  expand_qsa_topk<<<dim3(1, (kExpandedWidth + 255) / 256), 256, 0, stream>>>(
+      selected_blocks, logical_positions, sequence_lengths, token_to_request,
+      selected_tokens, 1);
+  return cuda_ok(cudaGetLastError(), "target QSA selected-token expansion")
+             ? 0
+             : 1;
 }

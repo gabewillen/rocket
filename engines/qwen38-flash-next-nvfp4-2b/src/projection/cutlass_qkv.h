@@ -91,4 +91,16 @@ int qwen38_qsa_attention_output(void* plan, void** output_bf16,
 int qwen38_qsa_projected_output(void* plan, void** output_bf16,
                                std::size_t* elements);
 
+// Caller-owned c1 target index selection. Scratch extents are logits[65536],
+// visible[1], selected_blocks[512], and selected_tokens[2051].
+int qwen38_target_qsa_select_c1(
+    const void* index_query_bf16, const void* compressed_cache_bf16,
+    const std::int32_t* compressed_block_table,
+    const std::int64_t* logical_positions,
+    const std::int32_t* sequence_lengths,
+    const std::int32_t* token_to_request, float* logits,
+    std::int32_t* visible, std::int32_t* selected_blocks,
+    std::int32_t* selected_tokens, int compressed_blocks,
+    cudaStream_t stream);
+
 }
