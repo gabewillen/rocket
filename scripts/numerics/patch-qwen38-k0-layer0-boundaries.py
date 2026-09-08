@@ -87,6 +87,34 @@ def _rocket_k0_boundary_save(layer_idx, name, tensor):
     )
     source = replace_once(
         source,
+        '''        if not actual or actual != expected:
+            raise RuntimeError(f"input token IDs differ at offset {self.consumed_tokens}: expected {expected}, got {actual}")
+''',
+        '''        if not actual or actual != expected:
+            # vLLM startup profiling runs dummy token IDs before the service is
+            # reachable. Leave the oracle disarmed until the exact request.
+            if self.consumed_tokens == 0 and not self.active_forward:
+                return
+            raise RuntimeError(f"input token IDs differ at offset {self.consumed_tokens}: expected {expected}, got {actual}")
+''',
+    )
+    source = replace_once(
+        source,
+        '''    if oracle is None:
+        return
+    try:
+        callback(oracle)
+''',
+        '''    if oracle is None:
+        return
+    if phase != "embedding" and not oracle.active_forward:
+        return
+    try:
+        callback(oracle)
+''',
+    )
+    source = replace_once(
+        source,
         """        mlp_hc = self.mlp_hyper_connection
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
             hidden_states, attn_out, injection

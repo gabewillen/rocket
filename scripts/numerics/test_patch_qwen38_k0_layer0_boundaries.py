@@ -28,6 +28,8 @@ class BoundaryPatchTest(unittest.TestCase):
             self.assertIn("get_tensor_model_parallel_rank() != 0", patched)
             self.assertIn("tensor[:1].detach().contiguous()", patched)
             self.assertIn("not _ROCKET_K0_ORACLE.active_forward", patched)
+            self.assertIn('phase != "embedding" and not oracle.active_forward', patched)
+            self.assertIn("Leave the oracle disarmed until the exact request", patched)
 
     def test_source_identity_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
