@@ -42,8 +42,11 @@ ARENA_SPECS = {
 
 DEPENDENCY_SUFFIXES = (
     "target_slab", "indexer_sidecar_slab", "qsa_graph", "hyperconnection",
-    "attention_pair_reduce", "target_router", "routed_experts",
-    "shared_expert", "moe_pair_reduce",
+    "attention_pair_reduce", "target_moe_graph", "moe_pair_reduce",
+)
+TARGET_MOE_COMPONENTS = ("router", "routed_experts", "shared_expert")
+TARGET_SLAB_ARTIFACT = (
+    "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4"
 )
 REQUIRED_LAYER3_DEPENDENCIES = (
     "oracle_comparator",
@@ -195,13 +198,14 @@ class TwoRankLayer3Factory:
                     raise Layer3RuntimeError(
                         f"layer-3 dependency rank changed: {name}"
                     )
-            if name.endswith(("qsa_graph", "hyperconnection", "target_router",
-                              "routed_experts", "shared_expert")) and getattr(
-                dependency, "layer", None
-            ) != 3:
+            if name.endswith(
+                ("qsa_graph", "hyperconnection", "target_moe_graph")
+            ) and getattr(dependency, "layer", None) != 3:
                 raise Layer3RuntimeError(
                     f"layer-3 dependency layer changed: {name}"
                 )
+            if name.endswith("target_moe_graph"):
+                _validate_target_moe_graph(name, dependency, expected_rank)
         return TwoRankLayer3Binding(MappingProxyType({
             name: dependencies[name] for name in REQUIRED_LAYER3_DEPENDENCIES
         }))
@@ -216,13 +220,59 @@ def _required_method(name: str) -> str:
         "qsa_graph": "launch",
         "hyperconnection": "mix",
         "attention_pair_reduce": "reduce",
-        "target_router": "enqueue",
-        "routed_experts": "enqueue",
-        "shared_expert": "enqueue",
+        "target_moe_graph": "launch",
         "moe_pair_reduce": "reduce",
     }[suffix]
 
 
+def _validate_target_moe_graph(name: str, dependency: object,
+                               rank: int) -> None:
+    identities = getattr(dependency, "component_identities", None)
+    if (
+        not isinstance(identities, Mapping)
+        or tuple(identities) != TARGET_MOE_COMPONENTS
+    ):
+        raise Layer3RuntimeError(
+            f"layer-3 target MoE component inventory changed: {name}"
+        )
+    layouts = set()
+    serving = {"router": "nvfp4", "routed_experts": "nvfp4",
+               "shared_expert": "bfloat16"}
+    for component in TARGET_MOE_COMPONENTS:
+        identity = identities[component]
+        if not isinstance(identity, Mapping) or (
+            identity.get("artifact_sha256") != TARGET_SLAB_ARTIFACT
+            or identity.get("rank") != rank or identity.get("layer") != 3
+            or identity.get("serving_dtype") != serving[component]
+        ):
+            raise Layer3RuntimeError(
+                f"layer-3 target MoE component identity changed: {name}"
+            )
+        layout = identity.get("layout_sha256")
+        if not isinstance(layout, str) or len(layout) != 64 or any(
+            char not in "0123456789abcdef" for char in layout
+        ):
+            raise Layer3RuntimeError(
+                f"layer-3 target MoE layout identity changed: {name}"
+            )
+        layouts.add(layout)
+    if len(layouts) != 1 or (
+        getattr(dependency, "telemetry_schema", None)
+        != "rocket.qwen38.target-moe.components.v1"
+        or getattr(dependency, "borrowed_stream", None) is not True
+        or getattr(dependency, "composition_owned_buffers", None) is not True
+        or getattr(dependency, "workspace", None) is None
+        or getattr(dependency, "rank_local_partial_bf16", None) is None
+        or getattr(dependency, "output_shape", None) != (1, HIDDEN)
+        or getattr(dependency, "output_dtype", None) != "bfloat16"
+        or getattr(dependency, "generation", None) != 0
+    ):
+        raise Layer3RuntimeError(
+            f"layer-3 target MoE graph contract changed: {name}"
+        )
+
+
 __all__ = ["ARENA_SPECS", "REQUIRED_LAYER3_DEPENDENCIES",
+           "TARGET_MOE_COMPONENTS", "TARGET_SLAB_ARTIFACT",
            "Layer3QsaStorage", "Layer3RuntimeError", "TwoRankLayer3Binding",
            "TwoRankLayer3Factory", "allocate_layer3_qsa_storage"]

@@ -106,6 +106,7 @@ TargetFullLayerResult TargetFullLayer::execute(
     start = Clock::now();
     moe_.launch(moe_input, generation, 1, stream);
     hyperconnection_.synchronize(stream);
+    moe_.publish_after_fence(generation);
     require(moe_.projected_output(), rank_,
             "target MoE participant published no rank-local partial");
     emit("target_moe", pair_reduce::Outcome::kOk, trace_id, request_id,

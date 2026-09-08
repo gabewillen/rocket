@@ -74,9 +74,24 @@ TargetFullMoeC1::~TargetFullMoeC1() { delete impl_; }
 
 TargetDenseOutcome TargetFullMoeC1::enqueue(
     const TargetFullMoeC1Launch& launch) const noexcept {
+  struct Discard final : TargetFullMoeOtelSink {
+    void emit(const TargetFullMoeOtelPoint&) noexcept override {}
+  } discard;
+  return enqueue_with_telemetry(launch, discard);
+}
+
+TargetDenseOutcome TargetFullMoeC1::enqueue_with_telemetry(
+    const TargetFullMoeC1Launch& launch,
+    TargetFullMoeOtelSink& telemetry) const noexcept {
   if (!impl_ || !launch.hidden_bf16 || !launch.rank_local_partial_bf16 ||
       !valid_workspace(launch.workspace) || !launch.stream)
     return TargetDenseOutcome::kContractError;
+  const auto emit = [&](TargetFullMoeComponent component,
+                        TargetDenseOutcome outcome) {
+    telemetry.emit({component, outcome, impl_->identity.rank,
+                    impl_->identity.layer});
+    return outcome;
+  };
   const auto& w = launch.workspace;
   const TargetRouterC1Launch router_launch{
       launch.hidden_bf16, w.router_logits_f32, w.global_ids_i32,
@@ -84,6 +99,7 @@ TargetDenseOutcome TargetFullMoeC1::enqueue(
       launch.stream};
   const auto router_outcome = enqueue_target_router_c1(
       impl_->identity, impl_->weights.router, router_launch);
+  emit(TargetFullMoeComponent::kRouter, router_outcome);
   if (router_outcome != TargetDenseOutcome::kOk) return router_outcome;
   const TargetMoeC1RouteLaunch route_launch{
       impl_->identity.rank,
@@ -97,19 +113,23 @@ TargetDenseOutcome TargetFullMoeC1::enqueue(
       w.route_summary,
       launch.stream};
   const auto route_outcome = enqueue_target_moe_c1_routes(route_launch);
-  if (route_outcome != TargetMoeOutcome::kOk) return map_outcome(route_outcome);
+  const auto localized_outcome = map_outcome(route_outcome);
+  emit(TargetFullMoeComponent::kLocalization, localized_outcome);
+  if (route_outcome != TargetMoeOutcome::kOk) return localized_outcome;
   const TargetMoeB12xLaunch routed_launch{
       launch.hidden_bf16, w.local_ids_i32, w.local_weights_f32,
       launch.rank_local_partial_bf16, w.routed, launch.stream};
   const auto routed_outcome = impl_->routed.enqueue(routed_launch);
-  if (routed_outcome != TargetMoeOutcome::kOk)
-    return map_outcome(routed_outcome);
+  const auto routed_dense_outcome = map_outcome(routed_outcome);
+  emit(TargetFullMoeComponent::kRoutedExperts, routed_dense_outcome);
+  if (routed_outcome != TargetMoeOutcome::kOk) return routed_dense_outcome;
   const TargetSharedC1Launch shared_launch{
       launch.hidden_bf16, launch.rank_local_partial_bf16,
       w.shared_gate_scratch_f32, w.shared_up_scratch_f32,
       w.shared_gate_scalar_f32, launch.stream};
-  return enqueue_target_shared_c1(impl_->identity, impl_->weights.shared,
-                                  shared_launch);
+  return emit(TargetFullMoeComponent::kSharedExpert,
+              enqueue_target_shared_c1(impl_->identity, impl_->weights.shared,
+                                       shared_launch));
 }
 
 const TargetDenseIdentity& TargetFullMoeC1::identity() const noexcept {

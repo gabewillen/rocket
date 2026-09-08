@@ -443,6 +443,16 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
     -Wall -Wextra -Werror)
   set_target_properties(qwen38_target_full_moe_c1 PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
+
+  add_library(qwen38_native_target_moe_graph STATIC
+    src/moe/native_target_moe_graph.cc)
+  target_include_directories(qwen38_native_target_moe_graph PUBLIC src)
+  target_link_libraries(qwen38_native_target_moe_graph PUBLIC
+    qwen38_decode_execution qwen38_target_full_moe_c1 CUDA::cudart)
+  target_compile_options(qwen38_native_target_moe_graph PRIVATE
+    -Wall -Wextra -Werror)
+  set_target_properties(qwen38_native_target_moe_graph PROPERTIES
+    POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
 else()
   target_compile_definitions(qwen38_target_moe_b12x_aot PRIVATE
     ROCKET_QWEN38_TARGET_MOE_B12X_AOT=0)
@@ -659,6 +669,15 @@ if(TARGET qwen38_target_router_shared_c1)
     -Wall -Wextra -Werror)
   add_test(NAME qwen38-target-full-moe-c1-cpu-contract
     COMMAND qwen38-test-target-full-moe-c1-contract)
+
+  add_executable(qwen38-test-native-target-moe-graph-contract
+    tests/test_native_target_moe_graph_contract.cc)
+  target_link_libraries(qwen38-test-native-target-moe-graph-contract PRIVATE
+    qwen38_native_target_moe_graph)
+  target_compile_options(qwen38-test-native-target-moe-graph-contract PRIVATE
+    -Wall -Wextra -Werror)
+  add_test(NAME qwen38-native-target-moe-graph-cpu-contract
+    COMMAND qwen38-test-native-target-moe-graph-contract)
 endif()
 
 add_executable(qwen38-test-fp8-routed-experts

@@ -42,6 +42,28 @@ class Port:
     def enqueue(self): pass
 
 
+class TargetMoeGraph(Port):
+    telemetry_schema = "rocket.qwen38.target-moe.components.v1"
+    borrowed_stream = True
+    composition_owned_buffers = True
+    workspace = object()
+    rank_local_partial_bf16 = object()
+    output_shape = (1, 2560)
+    output_dtype = "bfloat16"
+    generation = 0
+    def __init__(self, rank):
+        super().__init__(rank)
+        layout = "1" * 64
+        artifact = "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4"
+        self.component_identities = {
+            name: {"artifact_sha256": artifact, "layout_sha256": layout,
+                   "rank": rank, "layer": 3, "serving_dtype": dtype}
+            for name, dtype in (("router", "nvfp4"),
+                                ("routed_experts", "nvfp4"),
+                                ("shared_expert", "bfloat16"))
+        }
+
+
 class Slab(Port):
     dtype = "torch.uint8"
     device = "cuda:0"
@@ -69,10 +91,12 @@ class Layer3RuntimeTests(unittest.TestCase):
         for name in dependencies:
             if name.endswith(("target_slab", "indexer_sidecar_slab")):
                 dependencies[name] = Slab()
+            elif name.endswith("target_moe_graph"):
+                dependencies[name] = TargetMoeGraph(int(name[4]))
         binding = TwoRankLayer3Factory().bind(dependencies)
         self.assertEqual(tuple(binding.dependencies), REQUIRED_LAYER3_DEPENDENCIES)
-        dependencies["rank1.shared_expert"] = object()
-        with self.assertRaisesRegex(Layer3RuntimeError, "rank1.shared_expert"):
+        dependencies["rank1.target_moe_graph"].component_identities["shared_expert"]["serving_dtype"] = "nvfp4"
+        with self.assertRaisesRegex(Layer3RuntimeError, "rank1.target_moe_graph"):
             TwoRankLayer3Factory().bind(dependencies)
 
 

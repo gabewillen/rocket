@@ -15,9 +15,9 @@ class TwoRankLayer3ExecutableTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         record = json.loads(result.stdout)
         self.assertEqual(record["phase"], "bind")
-        self.assertEqual(len(record["missing"]), 19)
-        self.assertIn("rank0.target_router", record["missing"])
-        self.assertIn("rank1.shared_expert", record["missing"])
+        self.assertEqual(len(record["missing"]), 15)
+        self.assertIn("rank0.target_moe_graph", record["missing"])
+        self.assertIn("rank1.target_moe_graph", record["missing"])
         self.assertIn("oracle_comparator", record["missing"])
 
 

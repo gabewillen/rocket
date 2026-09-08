@@ -35,10 +35,41 @@ struct TargetFullMoeC1Launch {
   cudaStream_t stream;
 };
 
+enum class TargetFullMoeComponent : std::uint8_t {
+  kRouter,
+  kLocalization,
+  kRoutedExperts,
+  kSharedExpert,
+};
+
+struct TargetFullMoeOtelPoint {
+  TargetFullMoeComponent component;
+  TargetDenseOutcome outcome;
+  int rank;
+  int layer;
+};
+
+class TargetFullMoeOtelSink {
+ public:
+  virtual ~TargetFullMoeOtelSink() = default;
+  virtual void emit(const TargetFullMoeOtelPoint& point) noexcept = 0;
+};
+
+class TargetFullMoeC1Port {
+ public:
+  virtual ~TargetFullMoeC1Port() = default;
+  [[nodiscard]] virtual TargetDenseOutcome enqueue(
+      const TargetFullMoeC1Launch& launch) const noexcept = 0;
+  [[nodiscard]] virtual TargetDenseOutcome enqueue_with_telemetry(
+      const TargetFullMoeC1Launch& launch,
+      TargetFullMoeOtelSink& telemetry) const noexcept = 0;
+  [[nodiscard]] virtual const TargetDenseIdentity& identity() const noexcept = 0;
+};
+
 // Fixed rank/layer3/K0 participant. Construction loads the generated B12X
 // module outside capture. Enqueue only submits work to the borrowed stream and
 // writes the caller-owned rank-local BF16 partial.
-class TargetFullMoeC1 final {
+class TargetFullMoeC1 final : public TargetFullMoeC1Port {
  public:
   TargetFullMoeC1(int device, TargetDenseIdentity identity,
                   TargetFullMoeC1Weights weights);
@@ -47,8 +78,11 @@ class TargetFullMoeC1 final {
   TargetFullMoeC1& operator=(const TargetFullMoeC1&) = delete;
 
   [[nodiscard]] TargetDenseOutcome enqueue(
-      const TargetFullMoeC1Launch& launch) const noexcept;
-  [[nodiscard]] const TargetDenseIdentity& identity() const noexcept;
+      const TargetFullMoeC1Launch& launch) const noexcept override;
+  [[nodiscard]] TargetDenseOutcome enqueue_with_telemetry(
+      const TargetFullMoeC1Launch& launch,
+      TargetFullMoeOtelSink& telemetry) const noexcept override;
+  [[nodiscard]] const TargetDenseIdentity& identity() const noexcept override;
 
  private:
   struct Impl;

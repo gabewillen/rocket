@@ -17,6 +17,9 @@ class TargetMoeGraph {
   virtual void launch(const __nv_bfloat16* block_input,
                       std::uint64_t generation, int m,
                       cudaStream_t stream) = 0;
+  // Called only after the enclosing owner has fenced the borrowed stream.
+  // Deferred CUDA failures prevent this publication hook from running.
+  virtual void publish_after_fence(std::uint64_t generation) = 0;
   virtual const __nv_bfloat16* projected_output() const noexcept = 0;
 };
 
