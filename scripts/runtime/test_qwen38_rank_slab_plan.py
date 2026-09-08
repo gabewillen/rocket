@@ -84,6 +84,19 @@ class RankSlabPlanTests(unittest.TestCase):
         self.assertIsNone(entries[tensors[3].name]["source_slices"][0]["dimension"])
         self.assertEqual(entries[tensors[0].name]["consumers"], ["target", "mtp"])
 
+    def test_index_qk_projection_is_replicated_before_q_proj_suffix_match(self) -> None:
+        item = header(
+            "model.language_model.layers.3.self_attn.indexer.index_qk_proj.weight",
+            (640, 2560),
+        )
+        plan = planner.build_plan([item], Path("checkpoint"))
+        for rank in (0, 1):
+            entry = plan["slabs"][f"rank{rank}-target"]["entries"][0]
+            self.assertEqual(entry["family"], "self_attn.indexer")
+            self.assertEqual(entry["state"], "replicated")
+            self.assertEqual(entry["local_shape"], [640, 2560])
+            self.assertIsNone(entry["source_slices"][0]["dimension"])
+
     def test_every_linear_attention_partition_rule_is_explicit(self) -> None:
         prefix = "model.language_model.layers.0.linear_attn."
         tensors = [

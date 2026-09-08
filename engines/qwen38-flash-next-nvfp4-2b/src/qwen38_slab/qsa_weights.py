@@ -12,6 +12,7 @@ from typing import Any
 from .contract import MODEL_NVFP4_ABI, PINNED_CONTRACT, SCHEMA, canonical_bytes
 
 QSA_WEIGHTS_SCHEMA = "qwen3.8-flash-next:tp2:rank-local:qsa-weights:v1"
+QSA_INDEXER_SIDECAR_SCHEMA = "qwen3.8-flash-next:qsa-indexer-replica-sidecar:v1"
 _NATIVE_ABI = "native"
 
 
@@ -28,6 +29,7 @@ class QsaWeightComponent:
     dtype: str
     layout: str
     abi: str
+    storage: str
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,8 @@ class RankQsaWeights:
     layer: int
     slab_path: Path
     slab_bytes: int
+    indexer_sidecar_key: str
+    indexer_sidecar_path: Path
     chunks: tuple[QsaAuthenticatedChunk, ...]
     components: tuple[QsaWeightComponent, ...]
 
@@ -67,7 +71,6 @@ QSA_WEIGHT_CONTRACTS = (
     *_nvfp4("o_proj", 2560, 3072),
     ("q_norm.weight", 512, (256,), "BF16", "checkpoint", _NATIVE_ABI),
     ("k_norm.weight", 512, (256,), "BF16", "checkpoint", _NATIVE_ABI),
-    ("indexer.index_qk_proj.weight", 1_638_400, (320, 2560), "BF16", "checkpoint", _NATIVE_ABI),
     ("indexer.q_layernorm.weight", 256, (128,), "BF16", "checkpoint", _NATIVE_ABI),
     ("indexer.k_layernorm.weight", 256, (128,), "BF16", "checkpoint", _NATIVE_ABI),
 )
@@ -119,11 +122,74 @@ def validate_qsa_weight_inventory(
             or entry.get("abi") != abi
         ):
             raise QsaWeightsError(f"QSA tensor contract drift: {name}")
-        components.append(QsaWeightComponent(name, offset, length, shape, dtype, layout, abi))
+        components.append(QsaWeightComponent(name, offset, length, shape, dtype, layout, abi, "base-slab"))
     return tuple(components)
 
 
-def load_qsa_weights(artifact: Path, rank: int, layer: int) -> RankQsaWeights:
+def _load_indexer_sidecar(
+    sidecar: Path, base_key: str, rank: int, layer: int
+) -> tuple[str, Path, QsaWeightComponent]:
+    if not isinstance(sidecar, Path):
+        raise QsaWeightsError("QSA indexer sidecar must be a Path")
+    try:
+        raw = (sidecar / "manifest.json").read_bytes()
+        manifest = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise QsaWeightsError("cannot load QSA indexer sidecar") from exc
+    digest_input = dict(manifest) if isinstance(manifest, dict) else {}
+    claimed = digest_input.pop("artifact_key", None)
+    if (
+        claimed != hashlib.sha256(canonical_bytes(digest_input)).hexdigest()
+        or sidecar.name != claimed
+        or manifest.get("schema") != QSA_INDEXER_SIDECAR_SCHEMA
+        or manifest.get("revision") != PINNED_CONTRACT.revision
+        or manifest.get("base_artifact_key") != base_key
+        or manifest.get("old_sharded_index_qk_proj") != "rejected"
+    ):
+        raise QsaWeightsError("QSA indexer sidecar identity drift")
+    rank_key = f"rank{rank}-target"
+    name = f"model.language_model.layers.{layer}.self_attn.indexer.index_qk_proj.weight"
+    if name not in manifest.get("rank_bindings", {}).get(rank_key, []):
+        raise QsaWeightsError("QSA indexer sidecar rank binding is missing")
+    matches = [item for item in manifest.get("components", []) if item.get("name") == name]
+    if len(matches) != 1:
+        raise QsaWeightsError("QSA indexer sidecar tensor inventory drift")
+    item = matches[0]
+    offset, length = item.get("offset_bytes"), item.get("length_bytes")
+    if (
+        item.get("dtype") != "BF16"
+        or item.get("shape") != [640, 2560]
+        or item.get("layout") != "checkpoint"
+        or item.get("abi") != "native-replicated"
+        or isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset < 0
+        or offset % PINNED_CONTRACT.tensor_alignment_bytes
+        or length != 3_276_800
+        or not isinstance(item.get("sha256"), str)
+    ):
+        raise QsaWeightsError("QSA indexer sidecar tensor contract drift")
+    payload = manifest.get("payload", {})
+    payload_path = sidecar / str(payload.get("file", ""))
+    try:
+        if payload_path.stat().st_size != payload.get("bytes"):
+            raise QsaWeightsError("QSA indexer sidecar byte count drift")
+        with payload_path.open("rb") as stream:
+            stream.seek(offset)
+            tensor = stream.read(length)
+    except OSError as exc:
+        raise QsaWeightsError("cannot authenticate QSA indexer sidecar") from exc
+    if len(tensor) != length or hashlib.sha256(tensor).hexdigest() != item["sha256"]:
+        raise QsaWeightsError("QSA indexer sidecar tensor digest mismatch")
+    return claimed, payload_path, QsaWeightComponent(
+        name, offset, length, (640, 2560), "BF16", "checkpoint",
+        "native-replicated", "indexer-sidecar",
+    )
+
+
+def load_qsa_weights(
+    artifact: Path, indexer_sidecar: Path, rank: int, layer: int
+) -> RankQsaWeights:
     if not isinstance(artifact, Path):
         raise QsaWeightsError("rank slab artifact must be a Path")
     try:
@@ -135,6 +201,21 @@ def load_qsa_weights(artifact: Path, rank: int, layer: int) -> RankQsaWeights:
     if claimed != hashlib.sha256(canonical_bytes(digest_input)).hexdigest() or artifact.name != claimed:
         raise QsaWeightsError("rank slab manifest content address mismatch")
     components = validate_qsa_weight_inventory(manifest, rank, layer)
+    old_indexer = next(
+        (
+            item
+            for item in manifest["slabs"][f"rank{rank}-target"]["entries"]
+            if item.get("name")
+            == f"model.language_model.layers.{layer}.self_attn.indexer.index_qk_proj.weight"
+        ),
+        None,
+    )
+    if not isinstance(old_indexer, dict) or old_indexer.get("shape") != [320, 2560]:
+        raise QsaWeightsError("expected old sharded QSA index extent is absent")
+    sidecar_key, sidecar_path, indexer = _load_indexer_sidecar(
+        indexer_sidecar, claimed, rank, layer
+    )
+    components = (*components, indexer)
     slab_key = f"rank{rank}-target"
     slab = manifest["slabs"][slab_key]
     slab_path = artifact / str(slab.get("file", ""))
@@ -181,14 +262,19 @@ def load_qsa_weights(artifact: Path, rank: int, layer: int) -> RankQsaWeights:
                 authenticated.append(QsaAuthenticatedChunk(offset, length, digest))
     except OSError as exc:
         raise QsaWeightsError("cannot authenticate QSA slab chunk") from exc
-    return RankQsaWeights(QSA_WEIGHTS_SCHEMA, claimed, rank, layer, slab_path, slab_bytes, tuple(authenticated), components)
+    return RankQsaWeights(
+        QSA_WEIGHTS_SCHEMA, claimed, rank, layer, slab_path, slab_bytes,
+        sidecar_key, sidecar_path, tuple(authenticated), components,
+    )
 
 
-def validate_all_qsa_bindings(artifact: Path) -> tuple[RankQsaWeights, ...]:
+def validate_all_qsa_bindings(
+    artifact: Path, indexer_sidecar: Path
+) -> tuple[RankQsaWeights, ...]:
     """Authenticate the 24 rank-local QSA layer bindings in topology order."""
 
     return tuple(
-        load_qsa_weights(artifact, rank, layer)
+        load_qsa_weights(artifact, indexer_sidecar, rank, layer)
         for rank in (0, 1)
         for layer in range(3, 48, 4)
     )
