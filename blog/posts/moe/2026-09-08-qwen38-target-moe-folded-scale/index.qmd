@@ -1,0 +1,143 @@
+---
+title: "One FC1 scale fold restores Qwen layer-3 target MoE parity"
+description: "Folding the ModelOpt FC1 input scale once reduced routed B12X error from hundreds to zero and passed fixed-c1 graph capture on both GB10 ranks."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, moe, numerics, kernels, telemetry]
+verdict: accepted
+rocket: "#kernels"
+---
+
+**Question.** Does the explicit-stream target router, routed B12X MoE, and BF16 shared expert match the eager layer-3 fixed-c1 oracle on both TP2 ranks?
+
+| setup | value |
+| --- | --- |
+| nodes | `gx10-5e36` rank 0, `gx10-2a13` rank 1, one GB10 each |
+| kernel | `6.17.13-rocket64k` |
+| red commit | `83937691408263a2a880440673003d0bc1d82e91` |
+| scale fix | `f415995246db7a5569ff0ba7ab9bf8785e02d7c4` |
+| green commit | `64405fc8fa0e8a44eedb1593b58f43fcfe9714a9` |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| rank slab | `a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4` |
+| slab manifest SHA-256 | `a44a450d9c0b6fe3df904ad1a78ecee959f28d9f055301195181e986bdc7028b` |
+| image | `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| shape | layer 3, one BF16 row, hidden 2,560, top-10 of 512 experts, 256 routed experts per rank |
+| routed serving weights | ModelOpt NVFP4, logical N640 padded to physical N768 |
+| shared serving weights | BF16, disjoint N160 contribution per rank |
+
+| reference | identity | inspected contract |
+| --- | --- | --- |
+| [vLLM Qwen3-Next](https://github.com/vllm-project/vllm/blob/54da70c1eb6976fe655efd535f14a01378cd08bc/vllm/model_executor/models/qwen3_next.py) | `54da70c1eb6976fe655efd535f14a01378cd08bc` | replicated router and shared gate, normalized top-10, SiLU gate times up, then down |
+| [FlashInfer](https://github.com/flashinfer-ai/flashinfer/tree/91bda04c66f7cb851e1ab3b78b9fecea644b9844/flashinfer/fused_moe/cute_dsl/blackwell_sm12x) | `91bda04c66f7cb851e1ab3b78b9fecea644b9844` | static B12X ModelOpt NVFP4 dispatch and one-time FC1 scale fold |
+| pinned `moe_dispatch.py` | SHA-256 `61cb17593721d1bacc04c9a4dcc52238d3d99c531f3c6ae01c3d33971448a942` | local N640 retained-tail workspace tree |
+| pinned `moe_static_kernel.py` | SHA-256 `6dbd27625bc059c1246b3ef8445312e84ac76a8f1825ae3fb518f27919d8af64` | fixed-c1 exported kernel source |
+
+The committed producer is `scripts/moe/validate-qwen38-target-full-moe-c1.py`.
+
+```bash
+image=sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a
+slab=${HOME}/calibration/qwen38-rank-slabs-fc694
+bundle=/dev/shm/rocket-target-full-8393769
+common="--gpus device=0 --entrypoint python3 -e PYTHONPATH=/rocket/engines/qwen38-flash-next-nvfp4-2b/src -e LD_LIBRARY_PATH=/native:/aot:/usr/local/cuda/lib64 -v ${bundle}/flashinfer:/usr/local/lib/python3.12/dist-packages/flashinfer:ro -v ${bundle}/rocket:/rocket:ro -v ${bundle}/native:/native:ro -v ${bundle}/aot:/aot:ro -v ${slab}:/slabs:ro"
+
+docker run -d --name rocket-k0-target-full-r0-8393769 ${common} ${image} \
+  /rocket/scripts/moe/validate-qwen38-target-full-moe-c1.py \
+  --artifact /slabs/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4 \
+  --native-library /native/libqwen38_target_full_moe_c1.so \
+  --rank 0 --layer 3
+
+ssh spark2 "docker run -d --name rocket-k0-target-full-r1-8393769 ${common} ${image} \
+  /rocket/scripts/moe/validate-qwen38-target-full-moe-c1.py \
+  --artifact /slabs/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4 \
+  --native-library /native/libqwen38_target_full_moe_c1.so \
+  --rank 1 --layer 3"
+```
+
+```bash
+image=sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a
+slab=${HOME}/calibration/qwen38-rank-slabs-fc694
+bundle=/dev/shm/rocket-target-full-64405fc
+common="--gpus device=0 --entrypoint python3 -e PYTHONPATH=/rocket/engines/qwen38-flash-next-nvfp4-2b/src -e LD_LIBRARY_PATH=/native:/aot:/usr/local/cuda/lib64 -v ${bundle}/flashinfer:/usr/local/lib/python3.12/dist-packages/flashinfer:ro -v ${bundle}/rocket:/rocket:ro -v ${bundle}/native:/native:ro -v ${bundle}/aot:/aot:ro -v ${slab}:/slabs:ro"
+
+docker run -d --name rocket-k0-target-full-r0-64405fc-r1 ${common} ${image} \
+  /rocket/scripts/moe/validate-qwen38-target-full-moe-c1.py \
+  --artifact /slabs/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4 \
+  --native-library /native/libqwen38_target_full_moe_c1.so \
+  --routed-native-library /native/libqwen38_target_moe_b12x_native.so \
+  --rank 0 --layer 3
+
+ssh spark2 "docker run -d --name rocket-k0-target-full-r1-64405fc-r1 ${common} ${image} \
+  /rocket/scripts/moe/validate-qwen38-target-full-moe-c1.py \
+  --artifact /slabs/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4 \
+  --native-library /native/libqwen38_target_full_moe_c1.so \
+  --routed-native-library /native/libqwen38_target_moe_b12x_native.so \
+  --rank 1 --layer 3"
+```
+
+| red output, `8393769` | rank 0 | rank 1 | unit |
+| --- | ---: | ---: | --- |
+| graph captured | true | true | boolean |
+| global top-10 IDs match | true | true | boolean |
+| route-weight maximum absolute error | 0.0000000596 | 0.0000000596 | weight |
+| final maximum absolute error | 793.250 | 465.375 | BF16 value |
+| accepted | false | false | boolean |
+
+| RCA measurement | rank 0 | rank 1 | unit |
+| --- | ---: | ---: | --- |
+| checkpoint FC1 input scale | 0.0018717449 | 0.0018717449 | scale |
+| missing-scale inverse | 534.261 | 534.261 | ratio |
+| shared-path CPU maximum absolute error | 0.00048828125 | 0.00048828125 | BF16 value |
+
+`B12xMoEWrapper.run` folds `w1_alpha * input_global_scale` before caching static weight views. The exported entry received unfolded `w1_alpha`, while activation quantization still received `input_global_scale`. The native field is now `folded_w1_alpha`.
+
+| green output, `64405fc` | rank 0 | rank 1 | unit |
+| --- | ---: | ---: | --- |
+| graph captured | true | true | boolean |
+| global top-10 IDs match | true | true | boolean |
+| local E512 to E256 IDs match | true | true | boolean |
+| route-weight maximum absolute error | 0.0000000596 | 0.0000000596 | weight |
+| local-weight maximum absolute error | 0.0000000596 | 0.0000000447 | weight |
+| routed partial maximum absolute error | 0.000000 | 0.000000 | BF16 value |
+| zero-routed control maximum absolute error | 0.000000 | 0.000000 | BF16 value |
+| single-expert control maximum absolute error | 0.000000 | 0.000000 | BF16 value |
+| shared SiLU gate maximum absolute error | 0.004977 | 0.004833 | value |
+| shared up maximum absolute error | 0.007242 | 0.003888 | value |
+| shared sigmoid gate maximum absolute error | 0.001341 | 0.001341 | scalar |
+| gated shared partial maximum absolute error | 0.000330 | 0.000676 | BF16 value |
+| final maximum absolute error | 0.031250 | 0.062500 | BF16 value |
+| output canaries intact | true | true | boolean |
+| workspace geometry and 16-byte alignment | true | true | boolean |
+| accepted | true | true | boolean |
+
+| variance boundary | value | unit |
+| --- | ---: | --- |
+| runs per rank | 1 | run |
+| run-to-run variance | unavailable | n/a |
+| ranks | 2 | ranks |
+
+| artifact | SHA-256 |
+| --- | --- |
+| red rank-0 log | `ce892111bab7046494eec59df0a113b8d62c78e1a1db29e0600adb5e92811ee0` |
+| red rank-0 container inspect | `b98fe89b4e304e4b6095c3eb0e0393f13e19b37d4bd1a6c05d90a2c63c0e94bb` |
+| red rank-1 log | `bbfcab3c41c6e3ed0467d3b60ed07df21810087a3ef22cc6d4fbbe9911a091c6` |
+| red rank-1 container inspect | `fb6d2287a872d29ac8a6ecc3c9dc6f01bfb6ef8f42e2c3cf33aeb990ae749bc5` |
+| green rank-0 log | `676d26ba02782d2b10a8c24ab07d09b98624d8473ee3ee843b04e5b1d4cbe02b` |
+| green rank-0 container inspect | `a5c30587528cf39f5dd092482eb7d8515974687c8fe1afcd1758caef0204834a` |
+| green rank-1 log | `dafd02c69a6a8cbc158ef449cca3227de9fb4ce5981fd2076e99aa6e0d9850ab` |
+| green rank-1 container inspect | `9c74632c5dc3fe92b5cba98902c36001c1df3cd7b96e8559619b098690a5bde4` |
+| green staged bundle manifest | `ae9be5226ddc3042b243939bd11edefe98f7399c766dff329f7a0d94c5c16b44` |
+| full target-MoE library | `7b40782250976736f0ea5d6bf8cfe43c099f6fa4cbd73a0b73a28cb22a3e55e2` |
+| routed B12X library | `e188649cdfc88c1f95f45e4b6b95b13014bdc55b765f016112fee53eac3d45d6` |
+| router and shared library | `2e2c7a4bdc048326c2df632cce063e98ca9227f37df2bc0bf74d5a4767795738` |
+
+**Verdict.** Accepted for layer 3, fixed-c1, two-rank target-MoE parity and CUDA Graph capture. This result does not measure whole-engine accuracy, generation quality, latency, or throughput.
+
+**Next.**
+
+- Cherry-pick the isolated router, routed, shared, scale-contract, and comparator commits into `qwen38-native-integration`.
+- Bind all authenticated rank and layer registry names through the existing `TargetMoeGraph` interface.
+- Run consecutive-token composition correctness before measuring performance.
+
+**Reopen if.**
+
+- A FlashInfer release changes the ModelOpt FC1 scale-fold contract or static B12X weight-view ABI on GB10.
