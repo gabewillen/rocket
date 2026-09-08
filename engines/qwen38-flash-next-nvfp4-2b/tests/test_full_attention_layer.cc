@@ -41,16 +41,20 @@ class Graph final : public decode::FullAttentionGraph {
   std::string_view slab_key() const noexcept override {
     return selected_rank == 0 ? "rank0-target" : "rank1-target";
   }
-  void launch(const __nv_bfloat16* block_input, int m,
+  void launch(const __nv_bfloat16* block_input,
+              const rocket::qwen38::attention::TargetQsaStateView& state,
+              std::uint64_t generation, int m,
               cudaStream_t stream) override {
-    check(block_input != nullptr && m == expected_m && stream == expected_stream,
+    check(block_input != nullptr && state.rank == selected_rank &&
+              state.layer == selected_layer && state.generation == generation &&
+              m == expected_m && stream == expected_stream,
           "graph launch contract drift");
     calls.push_back("attention");
   }
   const __nv_bfloat16* projected_output() const noexcept override {
     return &partial;
   }
-  int expected_m = 4;
+  int expected_m = 1;
   int selected_rank;
   int selected_layer;
   cudaStream_t expected_stream = reinterpret_cast<cudaStream_t>(0x1230);
@@ -66,7 +70,7 @@ class Reducer final : public decode::HiddenPartialReducer {
   void reduce(const __nv_bfloat16* input, float* output, int m,
               std::string_view, std::string_view,
               cudaStream_t stream) override {
-    check(input != nullptr && output != nullptr && m == 4 &&
+    check(input != nullptr && output != nullptr && m == 1 &&
               stream == reinterpret_cast<cudaStream_t>(0x1230),
           "reducer contract drift");
     calls.push_back("reduce");
@@ -79,7 +83,7 @@ class HyperConnection final : public decode::FullAttentionHyperConnection {
  public:
   void mix(const __nv_bfloat16* hidden, __nv_bfloat16* block_input,
            __nv_bfloat16* injection, int m, cudaStream_t stream) override {
-    check(hidden && block_input && injection && m == 4 && stream,
+    check(hidden && block_input && injection && m == 1 && stream,
           "mix contract drift");
     calls.push_back("mix");
   }
@@ -90,7 +94,7 @@ class HyperConnection final : public decode::FullAttentionHyperConnection {
                        __nv_bfloat16* next_injection, int m,
                        cudaStream_t stream) override {
     check(hidden && block_output && injection && updated_hidden &&
-              next_block_input && next_injection && m == 4 && stream,
+              next_block_input && next_injection && m == 1 && stream,
           "combine-and-mix contract drift");
     calls.push_back("combine_and_mix");
   }
@@ -109,6 +113,22 @@ class HyperConnection final : public decode::FullAttentionHyperConnection {
 
 }  // namespace
 
+rocket::qwen38::attention::TargetQsaStateView state_view(int rank, int layer,
+                                                         std::uint64_t generation) {
+  static __nv_bfloat16 bf16{};
+  static std::int64_t i64{};
+  static std::int32_t i32{};
+  return {&bf16, &bf16, &bf16, &bf16,
+          &i64,  &i32,  &i32,  &i32,
+          &i32,  &i32,  &i32,  &i32,
+          &i32,  &i32,  &i32,  &i32,
+          1,     1,     1,     1,
+          rank,  layer,  false,
+          rocket::qwen38::attention::TargetQsaServingDtype::kBfloat16,
+          rocket::qwen38::attention::TargetQsaServingDtype::kBfloat16,
+          generation, generation};
+}
+
 int main() {
   try {
     Graph graph;
@@ -119,11 +139,12 @@ int main() {
     __nv_bfloat16 hidden{}, block_input{}, injection{}, updated{}, moe_input{},
         next_injection{};
     float reduced{};
+    const auto state = state_view(1, 47, 1);
     const auto result = layer.execute(
-        1, 4, &hidden, &block_input, &injection, &reduced, &updated,
+        1, 1, state, &hidden, &block_input, &injection, &reduced, &updated,
         &moe_input, &next_injection, "trace", "request",
         graph.expected_stream);
-    check(result.generation == 1 && result.m_bucket == 4 &&
+    check(result.generation == 1 && result.m_bucket == 1 &&
               result.rank == 1 && result.layer == 47,
           "publication identity drift");
     check(hc.calls == std::vector<std::string_view>{
@@ -142,7 +163,7 @@ int main() {
     bool deferred_failure = false;
     try {
       failing_layer.execute(
-          1, 4, &hidden, &block_input, &injection, &reduced, &updated,
+          1, 1, state, &hidden, &block_input, &injection, &reduced, &updated,
           &moe_input, &next_injection, "trace-fail", "request-fail",
           graph.expected_stream);
     } catch (const std::runtime_error& error) {
@@ -156,7 +177,7 @@ int main() {
     bool retried_fault = false;
     try {
       failing_layer.execute(
-          1, 4, &hidden, &block_input, &injection, &reduced, &updated,
+          1, 1, state, &hidden, &block_input, &injection, &reduced, &updated,
           &moe_input, &next_injection, "trace-retry", "request-retry",
           graph.expected_stream);
     } catch (const decode::DecodeExecutionContractError&) {
@@ -171,8 +192,35 @@ int main() {
         Trace topology_trace;
         decode::FullAttentionLayer topology_layer(
             topology_graph, topology_reducer, topology_hc, topology_trace);
+        const auto topology_state = state_view(rank, index, 1);
+        topology_layer.execute(
+            1, 1, topology_state, &hidden, &block_input, &injection, &reduced,
+            &updated, &moe_input, &next_injection, "trace-topology",
+            "request-topology", topology_graph.expected_stream);
       }
     }
+
+    Graph stale_graph;
+    Reducer stale_reducer;
+    HyperConnection stale_hc;
+    Trace stale_trace;
+    decode::FullAttentionLayer stale_layer(stale_graph, stale_reducer, stale_hc,
+                                           stale_trace);
+    auto stale_state = state_view(1, 47, 1);
+    stale_state.expected_generation = 2;
+    bool stale_rejected = false;
+    try {
+      stale_layer.execute(1, 1, stale_state, &hidden, &block_input, &injection,
+                          &reduced, &updated, &moe_input, &next_injection,
+                          "trace-stale", "request-stale",
+                          stale_graph.expected_stream);
+    } catch (const rocket::qwen38::attention::TargetQsaStateViewError&) {
+      stale_rejected = true;
+    }
+    check(stale_rejected && stale_graph.calls.empty() &&
+              stale_trace.stages.size() == 1 &&
+              stale_trace.outcomes[0] != pr::Outcome::kOk,
+          "stale QSA state generation reached graph publication");
     std::puts("qwen38 full-attention layer order and publication contract passed");
     return 0;
   } catch (const std::exception& error) {

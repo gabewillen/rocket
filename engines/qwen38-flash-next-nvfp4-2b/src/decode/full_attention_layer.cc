@@ -49,7 +49,9 @@ FullAttentionLayer::FullAttentionLayer(
 }
 
 FullAttentionResult FullAttentionLayer::execute(
-    std::uint64_t generation, int m, const __nv_bfloat16* hidden,
+    std::uint64_t generation, int m,
+    const attention::TargetQsaStateView& state,
+    const __nv_bfloat16* hidden,
     __nv_bfloat16* block_input, __nv_bfloat16* injection,
     float* reduced_attention, __nv_bfloat16* updated_hidden,
     __nv_bfloat16* next_block_input, __nv_bfloat16* next_injection,
@@ -62,6 +64,9 @@ FullAttentionResult FullAttentionLayer::execute(
             rank_, layer_, "generation must increase by one");
     require(pair_reduce::allowed_m(m), rank_, layer_,
             "M must be one of 1,2,4,8,16");
+    attention::validate_target_qsa_state_view(state, rank_, layer_,
+                                              generation);
+    require(m == 1, rank_, layer_, "K0 target QSA requires c1");
     require(hidden && block_input && injection && reduced_attention &&
                 updated_hidden && next_block_input && next_injection && stream,
             rank_, layer_, "all borrowed buffers and stream are required");
@@ -73,7 +78,7 @@ FullAttentionResult FullAttentionLayer::execute(
          trace_id, request_id, elapsed_ns(start), kHyperBytesPerRow * m);
 
     start = Clock::now();
-    graph_.launch(block_input, m, stream);
+    graph_.launch(block_input, state, generation, m, stream);
     hyperconnection_.synchronize(stream);
     const __nv_bfloat16* partial = graph_.projected_output();
     require(partial != nullptr, rank_, layer_,

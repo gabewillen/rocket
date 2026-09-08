@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string_view>
 
+#include "attention/qsa_target_state_view.h"
 #include "decode/execution.h"
 
 namespace rocket::qwen38::decode {
@@ -27,7 +28,9 @@ class FullAttentionGraph {
   virtual int layer() const noexcept = 0;
   virtual std::string_view checkpoint_revision() const noexcept = 0;
   virtual std::string_view slab_key() const noexcept = 0;
-  virtual void launch(const __nv_bfloat16* block_input, int m,
+  virtual void launch(const __nv_bfloat16* block_input,
+                      const attention::TargetQsaStateView& state,
+                      std::uint64_t generation, int m,
                       cudaStream_t stream) = 0;
   virtual const __nv_bfloat16* projected_output() const noexcept = 0;
 };
@@ -68,7 +71,9 @@ class FullAttentionLayer final {
                      pair_reduce::OtelStageSink& telemetry);
 
   FullAttentionResult execute(
-      std::uint64_t generation, int m, const __nv_bfloat16* hidden,
+      std::uint64_t generation, int m,
+      const attention::TargetQsaStateView& state,
+      const __nv_bfloat16* hidden,
       __nv_bfloat16* block_input, __nv_bfloat16* injection,
       float* reduced_attention, __nv_bfloat16* updated_hidden,
       __nv_bfloat16* next_block_input, __nv_bfloat16* next_injection,
