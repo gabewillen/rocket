@@ -10,6 +10,14 @@ from .k0_composition import (
     REQUIRED_K0_PARTICIPANTS,
 )
 from .loader import DirectSlabLoader
+from .layer3_runtime import (
+    REQUIRED_LAYER3_DEPENDENCIES,
+    Layer3QsaStorage,
+    Layer3RuntimeError,
+    TwoRankLayer3Binding,
+    TwoRankLayer3Factory,
+    allocate_layer3_qsa_storage,
+)
 from .materialize import materialize
 from .native_qsa import (
     NativeQsaBindingError,
@@ -43,7 +51,10 @@ __all__ = [
     "K0CompositionError",
     "K0CompositionRoot",
     "K0_DOMAIN",
+    "Layer3QsaStorage",
+    "Layer3RuntimeError",
     "REQUIRED_K0_PARTICIPANTS",
+    "REQUIRED_LAYER3_DEPENDENCIES",
     "CudaRankSlabLoader",
     "CudaSlabLoadError",
     "NativeQsaBindingError",
@@ -57,10 +68,13 @@ __all__ = [
     "TargetMoeError",
     "TargetMoeGeneration",
     "TargetMoeLayerParticipant",
+    "TwoRankLayer3Binding",
+    "TwoRankLayer3Factory",
     "WholeDecoderColdLoader",
     "WholeDecoderError",
     "WholeDecoderExecutor",
     "bind_slab_pointers",
     "bind_state_view",
+    "allocate_layer3_qsa_storage",
     "materialize",
 ]
