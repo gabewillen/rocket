@@ -49,6 +49,8 @@ class Fp8RoutedExpertsSourceTest(unittest.TestCase):
             "cuLaunchKernel",
             "prepare_consumer",
             "ROCKET_QWEN38_MTP_FP8_TRITON_DIR",
+            "global_scratch",
+            "profile_scratch",
         ):
             self.assertIn(required, cuda)
         for scalar_production_path in (
@@ -83,6 +85,10 @@ class Fp8RoutedExpertsSourceTest(unittest.TestCase):
         manifest = json.loads((VENDOR / "manifest.json").read_text())
         self.assertEqual(manifest["target"], "cuda-sm121-warp32")
         self.assertEqual(manifest["triton"], "3.7.1")
+        self.assertEqual(
+            manifest["raw_cubin_abi_suffix"],
+            ["global_scratch", "profile_scratch"],
+        )
         for relative, expected in manifest["artifacts"].items():
             actual = hashlib.sha256((VENDOR / relative).read_bytes()).hexdigest()
             self.assertEqual(actual, expected, relative)
@@ -102,6 +108,8 @@ class Fp8RoutedExpertsSourceTest(unittest.TestCase):
         self.assertIn("expert_summaries_device_", header)
         self.assertIn("require_expert_enqueue", cuda)
         self.assertIn("clear routed expert publication", cuda)
+        self.assertIn("clear_routed_expert_publication<<<", cuda)
+        self.assertNotIn("cudaMemsetAsync(expert_summaries_device_", cuda)
         self.assertIn("validate_routed_expert_summary", cuda)
         self.assertIn("export_routed_expert_otel_after_fence", cuda)
         self.assertLess(cuda.index("enqueue_route_compaction"),

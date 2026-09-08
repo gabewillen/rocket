@@ -238,6 +238,12 @@ int main() {
     assert(rejected);
     missing.commit(1);
     assert(missing.phase()==mtp::ExecutorPhase::kFaulted);
+    assert(sink.routed_experts.size() == 5);
+    for (const auto& point : sink.routed_experts) {
+      assert(point.outcome ==
+             rocket::qwen38::moe::RoutedExpertOutcome::kContractError);
+      assert(point.value == 0);
+    }
   }
   {
     mtp::StateArena failed_state(sequences,depth,false);
@@ -264,6 +270,12 @@ int main() {
     assert(rejected);
     stale.commit(1);
     assert(stale.phase()==mtp::ExecutorPhase::kFaulted);
+    assert(sink.routed_experts.size() == 10);
+    for (std::size_t i = 5; i < sink.routed_experts.size(); ++i) {
+      assert(sink.routed_experts[i].outcome ==
+             rocket::qwen38::moe::RoutedExpertOutcome::kStaleGeneration);
+      assert(sink.routed_experts[i].value == 0);
+    }
   }
   mtp::NativeExecutor executor(
       {depth, sequences, 300}, runtime, middle, exchange, state, sink, stream);
@@ -280,7 +292,8 @@ int main() {
   executor.validate_after_fence(1); executor.commit(1);
   executor.export_telemetry_after_fence(1); assert(sink.experts.size()==depth);
   assert(sink.routes.size() >= static_cast<std::size_t>(depth * 3));
-  assert(sink.routed_experts.size() == static_cast<std::size_t>(depth * 5));
+  assert(sink.routed_experts.size() ==
+         static_cast<std::size_t>(2 * 5 + depth * 5));
   assert(middle.moe_calls_ == depth);
   assert(executor.phase()==mtp::ExecutorPhase::kReady);
   cudaFree(dwidths); cudaFree(inactive); cudaStreamDestroy(stream); cudaFree(slab); cudaFree(target);

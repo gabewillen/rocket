@@ -228,6 +228,7 @@ def main() -> None:
         "license": "Apache-2.0",
         "target": "cuda-sm121-warp32",
         "triton": triton.__version__,
+        "raw_cubin_abi_suffix": ["global_scratch", "profile_scratch"],
         "source_checkpoint": {
             "schema": "rocket.qwen38-rank-slab.v1",
             "artifact": "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4",

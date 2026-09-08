@@ -18,6 +18,20 @@ void require_expert_enqueue(moe::RoutedExpertOutcome outcome) {
   if (outcome == moe::RoutedExpertOutcome::kOk) return;
   throw NativeExecutorError("MTP routed expert enqueue contract changed");
 }
+__global__ void clear_routed_expert_publication(
+    moe::RoutedExpertDeviceSummary* summary) {
+  if (threadIdx.x == 0) {
+    *summary = {
+        .generation = 0,
+        .active_weight_bytes = 0,
+        .fc1_tiles = 0,
+        .fc2_tiles = 0,
+        .active_experts = 0,
+        .active_routes = 0,
+        .outcome = moe::RoutedExpertOutcome::kContractError,
+    };
+  }
+}
 }  // namespace
 
 void NativeExecutor::CudaDeleter::operator()(void* pointer) const noexcept {
@@ -105,9 +119,9 @@ DeviceDraftView NativeExecutor::draft(std::uint64_t generation) {
           .output = router.compacted,
           .stream = stream_,
       }));
-      check(cudaMemsetAsync(expert_summaries_device_.get() + step, 0,
-                            sizeof(moe::RoutedExpertDeviceSummary), stream_),
-            "clear routed expert publication");
+      clear_routed_expert_publication<<<1, 1, 0, stream_>>>(
+          expert_summaries_device_.get() + step);
+      check(cudaPeekAtLastError(), "clear routed expert publication");
       require_expert_enqueue(middle_.stage_moe(
           arena, router.compacted, expert_summaries_device_.get() + step, step,
           key_, stream_));

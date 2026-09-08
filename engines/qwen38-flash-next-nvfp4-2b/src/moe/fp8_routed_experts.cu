@@ -242,8 +242,13 @@ RoutedExpertOutcome Fp8RoutedExperts::enqueue(
   auto* hidden = launch.buffers.hidden;
   auto* quantized_hidden = launch.buffers.quantized_hidden;
   auto* hidden_scales = launch.buffers.hidden_scale_inv;
-  std::array<void*, 3> quantize_args{&hidden, &quantized_hidden,
-                                     &hidden_scales};
+  // Triton 3.7.1 appends global_scratch and profile_scratch pointers to its
+  // raw cubin ABI even when metadata reports both scratch sizes as zero.
+  CUdeviceptr global_scratch = 0;
+  CUdeviceptr profile_scratch = 0;
+  std::array<void*, 5> quantize_args{&hidden, &quantized_hidden,
+                                     &hidden_scales, &global_scratch,
+                                     &profile_scratch};
   if (launch_kernel(impl_->quantize,
                     dim3(launch.capacity.rows, kHiddenBlocks),
                     kMetadataSharedBytes, launch.stream,
@@ -262,11 +267,11 @@ RoutedExpertOutcome Fp8RoutedExperts::enqueue(
   auto* gate_scales = launch.experts.gate_scale_inv;
   auto* up_tables = launch.experts.up_weights;
   auto* up_scales = launch.experts.up_scale_inv;
-  std::array<void*, 13> gate_args{
+  std::array<void*, 15> gate_args{
       &quantized_hidden, &hidden_scales, &gate_up,       &active_routes,
-      &active_ids,      &local_to_active, &owner_ids,    &owner_rows,
-      &permutation,     &gate_tables,     &gate_scales,  &up_tables,
-      &up_scales};
+      &active_ids,       &local_to_active, &owner_ids,   &owner_rows,
+      &permutation,      &gate_tables,     &gate_scales, &up_tables,
+      &up_scales,        &global_scratch,  &profile_scratch};
   if (launch_kernel(impl_->gate_up,
                     dim3(launch.capacity.routes, kIntermediateBlocks),
                     kDotSharedBytes, launch.stream, gate_args.data()) !=
@@ -276,8 +281,9 @@ RoutedExpertOutcome Fp8RoutedExperts::enqueue(
 
   auto* activated = launch.buffers.activated;
   auto* activated_scales = launch.buffers.activated_scale_inv;
-  std::array<void*, 4> silu_args{&gate_up, &activated, &activated_scales,
-                                 &active_routes};
+  std::array<void*, 6> silu_args{&gate_up, &activated, &activated_scales,
+                                 &active_routes, &global_scratch,
+                                 &profile_scratch};
   if (launch_kernel(impl_->silu,
                     dim3(launch.capacity.routes, kIntermediateBlocks),
                     kMetadataSharedBytes, launch.stream, silu_args.data()) !=
@@ -289,10 +295,11 @@ RoutedExpertOutcome Fp8RoutedExperts::enqueue(
   auto* owner_weights = launch.routes.owner_route_weights;
   auto* down_tables = launch.experts.down_weights;
   auto* down_scales = launch.experts.down_scale_inv;
-  std::array<void*, 12> down_args{
-      &activated,    &activated_scales, &output,       &active_routes,
-      &active_ids,   &local_to_active,  &owner_ids,    &owner_weights,
-      &owner_rows,   &permutation,      &down_tables,  &down_scales};
+  std::array<void*, 14> down_args{
+      &activated,      &activated_scales, &output,         &active_routes,
+      &active_ids,     &local_to_active,  &owner_ids,      &owner_weights,
+      &owner_rows,     &permutation,      &down_tables,    &down_scales,
+      &global_scratch, &profile_scratch};
   if (launch_kernel(impl_->down,
                     dim3(launch.capacity.routes, kHiddenBlocks),
                     kDotSharedBytes, launch.stream, down_args.data()) !=

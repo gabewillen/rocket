@@ -3,6 +3,10 @@
   "license": "Apache-2.0",
   "target": "cuda-sm121-warp32",
   "triton": "3.7.1",
+  "raw_cubin_abi_suffix": [
+    "global_scratch",
+    "profile_scratch"
+  ],
   "source_checkpoint": {
     "schema": "rocket.qwen38-rank-slab.v1",
     "artifact": "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4",
@@ -20,11 +24,11 @@
     "pinned_fused_moe_sha256": "d5955a3460746b66740b024f470aeca79bbebd10872c327f765f2d7fcb805f28"
   },
   "artifacts": {
-    "quantize_hidden.cubin": "9a879af8f08890374eaf7f006299c6899fb43dfecf15d1a96ea1860d2729f8a8",
-    "rank0/down_weighted_reduce.cubin": "ea937033af8cf95f0e04a78ce56d202265454df486d95ba12490a3b1e19adc62",
-    "rank0/gate_up_silu.cubin": "dcd9640fb423867d4e735e77ca93fbf199e4227e179accbde7ec11cedbb51bd7",
-    "rank1/down_weighted_reduce.cubin": "087fb52fe6071c312e61d569155edb1ebac1edad4abb6cdd9069de455084fca6",
-    "rank1/gate_up_silu.cubin": "f6bc1a61f6e2169e29e2416c8a5c544e90f600f05f4d032e64cde097796ccb04",
-    "silu_mul_quantize.cubin": "e39409027cd221678176927ef2281a0b8641a2ec2d27d14046bb372351848b22"
+    "quantize_hidden.cubin": "a41aab02687c50bc3eaa53f6cf43344938956bdb4b03d015ada08b6c177ff270",
+    "rank0/down_weighted_reduce.cubin": "b4f496a246a368dacaa473a6b5f2eca2986b8cb3500066eb14cfc0638bd4950c",
+    "rank0/gate_up_silu.cubin": "5bfe2be67f518347cfa655c1f7c4009c6278aa9557cfbb45e657fbfb55238939",
+    "rank1/down_weighted_reduce.cubin": "430bcf5b75b971738189fe4235b7797f236b1bcd93f9dddf62d4a0161c028d9a",
+    "rank1/gate_up_silu.cubin": "dcc034b7e34870e7efc7614e6ee0a4882c7796e242fa78d4b10fdfb5c58f2259",
+    "silu_mul_quantize.cubin": "d8c0cb7ab7995ed520996dc031f3eab8c95bf870b529bcf596cdfb5dbc42b461"
   }
 }
