@@ -89,13 +89,13 @@ class PreflightTests(unittest.TestCase):
         self.assertNotIn("secret", output.call_args.args[0])
 
     def test_nested_loader_cause_is_bounded_and_survives_wrapper(self):
-        inner = module.Layer3FactoryError("secret native detail /private/path")
+        inner = module.NativeTargetSlabFinalizeError("cuda_allocation_range")
         outer = module.CudaSlabLoadError("generic outer")
         outer.__cause__ = inner
         chain = module._typed_cause_chain(outer, "load")
         self.assertEqual(chain, (
             {"class": "slab_load", "stage": "accepted_loader"},
-            {"class": "layer3_factory", "stage": "native_finalize"},
+            {"class": "native_finalize", "stage": "cuda_allocation_range"},
         ))
         self.assertNotIn("secret", json.dumps(chain))
         self.assertNotIn("private", json.dumps(chain))
@@ -106,9 +106,18 @@ class PreflightTests(unittest.TestCase):
         module._emit_failure(counter, 0, "load", chain[-1])
         self.assertEqual(counter.records, [(1, {
             "rank": 0, "phase": "load", "outcome": "failure",
-            "failure.class": "layer3_factory",
-            "failure.stage": "native_finalize",
+            "failure.class": "native_finalize",
+            "failure.stage": "cuda_allocation_range",
         })])
+
+    def test_native_finalize_status_mapping_is_closed(self):
+        from qwen38_slab.layer3_factory import _native_finalize_stage
+        self.assertEqual(
+            tuple(_native_finalize_stage(value) for value in (31, 32, 33, 34, 35)),
+            ("cuda_device", "cuda_pointer", "cuda_allocation_range",
+             "cuda_ready_event", "publication_receipt"),
+        )
+        self.assertEqual(_native_finalize_stage(999), "native_status")
 
 
 if __name__ == "__main__":

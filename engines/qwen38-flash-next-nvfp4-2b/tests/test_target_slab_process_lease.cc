@@ -50,7 +50,8 @@ int main() {
         model::kTargetSlabPeakPinnedBytes, 1, 2, chunks,
         model::kTargetSlabChunks, output);
   };
-  if (retain(0x100000000000ULL, &first) != 3 || first) return 4;
+  const auto invalid_probe = retain(0x100000000000ULL, &first);
+  if ((invalid_probe < 31 || invalid_probe > 35) || first) return 4;
   if (model::TargetSlabStartupFactory::lease_from_handle(
           reinterpret_cast<void*>(0x1234)))
     return 5;

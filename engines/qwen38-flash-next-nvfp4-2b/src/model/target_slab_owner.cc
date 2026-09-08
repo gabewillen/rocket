@@ -96,14 +96,16 @@ extern "C" int qwen38_target_slab_retain_accepted_loader(
   cudaPointerAttributes attributes{};
   CUdeviceptr allocation_base = 0;
   std::size_t allocation_bytes = 0;
-  if (cudaSetDevice(device) != cudaSuccess ||
-      cudaPointerGetAttributes(
+  if (cudaSetDevice(device) != cudaSuccess) return 31;
+  if (cudaPointerGetAttributes(
           &attributes, reinterpret_cast<const void*>(device_base)) !=
-          cudaSuccess ||
-      cuMemGetAddressRange(&allocation_base, &allocation_bytes,
-                           static_cast<CUdeviceptr>(device_base)) != CUDA_SUCCESS ||
-      cudaEventQuery(reinterpret_cast<cudaEvent_t>(ready_event)) != cudaSuccess)
-    return 3;
+      cudaSuccess)
+    return 32;
+  if (cuMemGetAddressRange(&allocation_base, &allocation_bytes,
+                           static_cast<CUdeviceptr>(device_base)) != CUDA_SUCCESS)
+    return 33;
+  if (cudaEventQuery(reinterpret_cast<cudaEvent_t>(ready_event)) != cudaSuccess)
+    return 34;
   try {
     const TargetSlabPublication publication{
         reinterpret_cast<const std::uint8_t*>(device_base),
@@ -117,7 +119,7 @@ extern "C" int qwen38_target_slab_retain_accepted_loader(
     if (!validate_accepted_loader_publication(
             publication, probe, receipt_started_ns, receipt_completed_ns,
             chunk_receipts, chunk_receipt_count))
-      return 3;
+      return 35;
     const std::string receipt(receipt_sha256);
     std::lock_guard guard(g_retained_target_slab_lock);
     if (auto* prior = g_retained_target_slabs[rank]) {

@@ -21,7 +21,7 @@ from qwen38_slab.cuda_slab_loader import (  # noqa: E402
 )
 from qwen38_slab.layer3_factory import (  # noqa: E402
     CtypesNativeTargetSlabLeaseFactory, Layer3FactoryError,
-    native_target_slab_handoff,
+    NativeTargetSlabFinalizeError, native_target_slab_handoff,
 )
 
 SCHEMA = "rocket.qwen38.layer3-moe-owner-preflight.v1"
@@ -48,6 +48,8 @@ def _typed_cause_chain(error: BaseException, phase: str) -> tuple[dict[str, str]
             kind, stage = "slab_cleanup", "cuda_cleanup"
         elif isinstance(current, CudaSlabLoadError):
             kind, stage = "slab_load", "accepted_loader"
+        elif isinstance(current, NativeTargetSlabFinalizeError):
+            kind, stage = "native_finalize", current.stage
         elif isinstance(current, Layer3FactoryError):
             kind, stage = "layer3_factory", "native_finalize"
         elif isinstance(current, OSError):

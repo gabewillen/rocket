@@ -51,6 +51,23 @@ class Layer3FactoryError(RuntimeError):
     """A physical layer-3 launch plan could not be authenticated."""
 
 
+class NativeTargetSlabFinalizeError(Layer3FactoryError):
+    """Bounded native accepted-loader finalization failure."""
+
+    def __init__(self, stage: str):
+        self.stage = stage
+        super().__init__("native target slab finalization rejected")
+
+
+def _native_finalize_stage(result: int) -> str:
+    return {
+        1: "native_contract", 2: "native_replacement",
+        31: "cuda_device", 32: "cuda_pointer",
+        33: "cuda_allocation_range", 34: "cuda_ready_event",
+        35: "publication_receipt",
+    }.get(result, "native_status")
+
+
 def _failure_class(exc: Exception) -> str:
     if isinstance(exc, OSError):
         return "io"
@@ -192,7 +209,7 @@ class CtypesNativeTargetSlabLeaseFactory:
             chunk_array, len(chunks), ctypes.byref(handle),
         )
         if result != 0 or not handle.value:
-            raise Layer3FactoryError("native process-lifetime slab lease rejected")
+            raise NativeTargetSlabFinalizeError(_native_finalize_stage(result))
         return handle
 
 
@@ -775,7 +792,8 @@ def native_target_slab_handoff(
     )
 
 
-__all__ = ["Layer3FactoryError", "Layer3ExtentPlan", "Layer3PairReducePlan",
+__all__ = ["Layer3FactoryError", "NativeTargetSlabFinalizeError",
+           "Layer3ExtentPlan", "Layer3PairReducePlan",
            "Layer3PhysicalPlan", "Layer3RankPlan", "native_rank_descriptor",
            "NativeTargetSlabHandoff", "NativeTargetSlabFinalizer",
            "CtypesNativeTargetSlabLeaseFactory",
