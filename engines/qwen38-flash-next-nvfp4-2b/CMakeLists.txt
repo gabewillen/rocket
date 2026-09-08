@@ -620,6 +620,20 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
   set_target_properties(qwen38_target_layer3_moe_owner PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+
+  add_library(qwen38_target_layer3_moe_owner_preflight SHARED
+    src/moe/target_layer3_moe_owner_preflight.cc)
+  target_include_directories(qwen38_target_layer3_moe_owner_preflight PUBLIC src)
+  target_link_libraries(qwen38_target_layer3_moe_owner_preflight PRIVATE
+    qwen38_target_layer3_moe_owner qwen38_target_slab_owner CUDA::cudart)
+  target_compile_options(qwen38_target_layer3_moe_owner_preflight PRIVATE
+    -Wall -Wextra -Werror)
+  target_link_options(qwen38_target_layer3_moe_owner_preflight PRIVATE
+    -Wl,--exclude-libs,ALL)
+  set_target_properties(qwen38_target_layer3_moe_owner_preflight PROPERTIES
+    POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA
+    CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
 else()
   target_compile_definitions(qwen38_target_moe_b12x_aot PRIVATE
     ROCKET_QWEN38_TARGET_MOE_B12X_AOT=0)
@@ -1025,6 +1039,14 @@ add_test(NAME qwen38-gdn-prefill-projection-cpu-contract
   COMMAND qwen38-test-gdn-prefill-projection-contract)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+if(TARGET qwen38_target_layer3_moe_owner_preflight)
+  add_test(NAME qwen38-target-layer3-moe-owner-preflight-cpu-contract
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/runtime/test_qwen38_layer3_moe_owner_preflight.py)
+  set_tests_properties(qwen38-target-layer3-moe-owner-preflight-cpu-contract
+    PROPERTIES ENVIRONMENT
+      "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src;ROCKET_QWEN38_LAYER3_MOE_PREFLIGHT_LIBRARY=$<TARGET_FILE:qwen38_target_layer3_moe_owner_preflight>")
+endif()
 add_test(NAME qwen38-cuda-slab-loader-cpu-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_slab_loader.py)
