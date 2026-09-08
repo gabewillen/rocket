@@ -120,6 +120,16 @@ target_compile_options(qwen38_decode_execution PRIVATE -Wall -Wextra -Werror)
 # a shared library. Keep the relocation fix local to its owner.
 set_target_properties(qwen38_decode_execution PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(qwen38_target_layer3_generation STATIC
+  src/decode/target_layer3_generation.cu)
+target_include_directories(qwen38_target_layer3_generation PUBLIC src)
+target_link_libraries(qwen38_target_layer3_generation PUBLIC
+  qwen38_decode_execution CUDA::cudart)
+target_compile_options(qwen38_target_layer3_generation PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+set_target_properties(qwen38_target_layer3_generation PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+
 add_library(qwen38_native_hyperconnection_adapter STATIC
   src/hyperconnection/native_adapter.cc)
 target_include_directories(qwen38_native_hyperconnection_adapter PUBLIC src)
@@ -558,6 +568,17 @@ set_target_properties(qwen38-test-target-layer3-prefill PROPERTIES
   LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-target-layer3-prefill-contract
   COMMAND qwen38-test-target-layer3-prefill)
+
+add_executable(qwen38-test-target-layer3-generation
+  tests/test_target_layer3_generation.cc)
+target_link_libraries(qwen38-test-target-layer3-generation PRIVATE
+  qwen38_target_layer3_generation)
+target_compile_options(qwen38-test-target-layer3-generation PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-layer3-generation PROPERTIES
+  LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-target-layer3-generation-contract
+  COMMAND qwen38-test-target-layer3-generation)
 
 add_executable(qwen38-test-native-qsa-c-api
   tests/test_native_qsa_graph_c_api.cc)
