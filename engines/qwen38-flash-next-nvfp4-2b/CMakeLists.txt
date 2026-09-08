@@ -305,9 +305,25 @@ set_target_properties(qwen38_route_compaction_contract PROPERTIES
 add_library(qwen38_route_compaction STATIC
   src/moe/route_compaction.cu
   src/moe/fp8_routed_experts.cu)
+set(QWEN38_MTP_FP8_TRITON_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/vendor/mtp-fp8-triton-sm121")
+foreach(_kernel IN ITEMS
+    manifest.json
+    quantize_hidden.cubin
+    silu_mul_quantize.cubin
+    rank0/gate_up_silu.cubin
+    rank0/down_weighted_reduce.cubin
+    rank1/gate_up_silu.cubin
+    rank1/down_weighted_reduce.cubin)
+  if(NOT EXISTS "${QWEN38_MTP_FP8_TRITON_DIR}/${_kernel}")
+    message(FATAL_ERROR "missing AOT Triton kernel: ${_kernel}")
+  endif()
+endforeach()
 target_include_directories(qwen38_route_compaction PUBLIC src)
 target_link_libraries(qwen38_route_compaction PUBLIC
-  qwen38_route_compaction_contract CUDA::cudart)
+  qwen38_route_compaction_contract CUDA::cudart CUDA::cuda_driver)
+target_compile_definitions(qwen38_route_compaction PRIVATE
+  ROCKET_QWEN38_MTP_FP8_TRITON_DIR="${QWEN38_MTP_FP8_TRITON_DIR}")
 target_compile_options(qwen38_route_compaction PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
 set_target_properties(qwen38_route_compaction PROPERTIES

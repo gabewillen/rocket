@@ -120,15 +120,24 @@ int main() {
              routes, stream}) == moe::RouteCompactionOutcome::kOk);
 
   auto* hidden = allocate<__nv_bfloat16>(moe::kHidden);
-  auto* activated = allocate<__nv_bfloat16>(kRoutes * moe::kPhysicalIntermediate);
+  auto* quantized_hidden = allocate<std::uint8_t>(moe::kHidden);
+  auto* hidden_scale = allocate<float>(moe::kHidden / moe::kFp8Block);
+  auto* gate_up = allocate<__nv_bfloat16>(
+      kRoutes * 2 * moe::kPhysicalIntermediate);
+  auto* activated = allocate<std::uint8_t>(
+      kRoutes * moe::kPhysicalIntermediate);
+  auto* activated_scale = allocate<float>(
+      kRoutes * moe::kLogicalIntermediate / moe::kFp8Block);
   auto* output = allocate<float>(moe::kHidden);
   auto* summary = allocate<moe::RoutedExpertDeviceSummary>(1);
   assert(cudaMemset(hidden, 0, moe::kHidden * 2) == cudaSuccess);
-  assert(moe::enqueue_fp8_routed_experts({
+  moe::Fp8RoutedExperts consumer(0, 0);
+  assert(consumer.enqueue({
              shape, capacity, routes,
              {d_gate_ptrs, d_gate_scale_ptrs, d_up_ptrs, d_up_scale_ptrs,
               d_down_ptrs, d_down_scale_ptrs},
-             {hidden, activated, output, summary}, stream}) ==
+             {hidden, quantized_hidden, hidden_scale, gate_up, activated,
+              activated_scale, output, summary}, stream}) ==
          moe::RoutedExpertOutcome::kOk);
   assert(cudaStreamSynchronize(stream) == cudaSuccess);
   moe::RoutedExpertDeviceSummary snapshot{};
@@ -141,7 +150,9 @@ int main() {
                     cudaMemcpyDeviceToHost) == cudaSuccess);
   for (float value : host_output) assert(value == 0.0F);
 
-  cudaFree(summary); cudaFree(output); cudaFree(activated); cudaFree(hidden);
+  cudaFree(summary); cudaFree(output); cudaFree(activated_scale);
+  cudaFree(activated); cudaFree(gate_up); cudaFree(hidden_scale);
+  cudaFree(quantized_hidden); cudaFree(hidden);
   cudaFree(routes.summary); cudaFree(routes.expert_route_indices);
   cudaFree(routes.owner_route_slots); cudaFree(routes.owner_route_rows);
   cudaFree(routes.owner_route_weights); cudaFree(routes.owner_route_global_expert_ids);

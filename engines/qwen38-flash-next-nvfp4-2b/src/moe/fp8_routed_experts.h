@@ -5,6 +5,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <memory>
 
 #include "moe/route_compaction.h"
 
@@ -55,11 +56,17 @@ struct RoutedExpertDeviceSummary {
 };
 
 struct RoutedExpertBuffers {
-  // hidden is [capacity.rows,2560] BF16. activated is
-  // [capacity.routes,768] BF16. rank_output is [capacity.rows,2560] FP32 and
-  // is overwritten by the launch before weighted expert accumulation.
+  // All scratch is caller-owned and fixed at graph construction. hidden is
+  // [capacity.rows,2560] BF16; quantized_hidden is FP8 with FP32 inverse scales
+  // [capacity.rows,20]. gate_up is BF16 [capacity.routes,2,768]. activated is
+  // FP8 [capacity.routes,768] with FP32 inverse scales [capacity.routes,5].
+  // rank_output is [capacity.rows,2560] FP32 and is overwritten by each launch.
   const __nv_bfloat16* hidden;
-  __nv_bfloat16* activated;
+  std::uint8_t* quantized_hidden;
+  float* hidden_scale_inv;
+  __nv_bfloat16* gate_up;
+  std::uint8_t* activated;
+  float* activated_scale_inv;
   float* rank_output;
   RoutedExpertDeviceSummary* summary;
 };
@@ -79,8 +86,21 @@ struct RoutedExpertLaunch {
 // this path skips vLLM's second sort/pad pass. Inactive grid positions exit
 // before weight or activation reads. There is no allocation, synchronization,
 // device-to-host transfer, or host dependence on device counts.
-[[nodiscard]] RoutedExpertOutcome enqueue_fp8_routed_experts(
-    const RoutedExpertLaunch& launch) noexcept;
+class Fp8RoutedExperts final {
+ public:
+  Fp8RoutedExperts(int device, int rank,
+                   const char* module_directory = nullptr);
+  ~Fp8RoutedExperts();
+  Fp8RoutedExperts(const Fp8RoutedExperts&) = delete;
+  Fp8RoutedExperts& operator=(const Fp8RoutedExperts&) = delete;
+
+  [[nodiscard]] RoutedExpertOutcome enqueue(
+      const RoutedExpertLaunch& launch) const noexcept;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 struct RoutedExpertValidation {
   const RoutedExpertDeviceSummary& summary;

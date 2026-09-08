@@ -1,0 +1,30 @@
+{
+  "schema": "rocket.qwen38-mtp-fp8-triton-aot.v1",
+  "license": "Apache-2.0",
+  "target": "cuda-sm121-warp32",
+  "triton": "3.7.1",
+  "source_checkpoint": {
+    "schema": "rocket.qwen38-rank-slab.v1",
+    "artifact": "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4",
+    "revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+    "expert_abi": "fp8_e4m3_block_128x128"
+  },
+  "references": {
+    "vllm_pinned": "8e685d198",
+    "vllm_current_main": "869f78732b64454293d2ba42ae0008386fdaa6a6",
+    "vllm_files": [
+      "vllm/model_executor/layers/fused_moe/experts/triton_moe.py",
+      "vllm/model_executor/layers/fused_moe/fused_moe.py"
+    ],
+    "pinned_triton_moe_sha256": "1ace6e60427c94fc17f16490475637f6988f88e7e4796f58a752a753dd7fd397",
+    "pinned_fused_moe_sha256": "d5955a3460746b66740b024f470aeca79bbebd10872c327f765f2d7fcb805f28"
+  },
+  "artifacts": {
+    "quantize_hidden.cubin": "9a879af8f08890374eaf7f006299c6899fb43dfecf15d1a96ea1860d2729f8a8",
+    "rank0/down_weighted_reduce.cubin": "ea937033af8cf95f0e04a78ce56d202265454df486d95ba12490a3b1e19adc62",
+    "rank0/gate_up_silu.cubin": "dcd9640fb423867d4e735e77ca93fbf199e4227e179accbde7ec11cedbb51bd7",
+    "rank1/down_weighted_reduce.cubin": "087fb52fe6071c312e61d569155edb1ebac1edad4abb6cdd9069de455084fca6",
+    "rank1/gate_up_silu.cubin": "f6bc1a61f6e2169e29e2416c8a5c544e90f600f05f4d032e64cde097796ccb04",
+    "silu_mul_quantize.cubin": "e39409027cd221678176927ef2281a0b8641a2ec2d27d14046bb372351848b22"
+  }
+}
