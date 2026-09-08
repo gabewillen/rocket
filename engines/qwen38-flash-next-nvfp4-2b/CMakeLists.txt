@@ -836,6 +836,36 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
   set_target_properties(qwen38_target_k0_physical_layer_owners PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
 
+  add_library(qwen38_target_k0_physical_startup_contract STATIC
+    src/decode/target_k0_physical_startup_contract.cc)
+  target_include_directories(qwen38_target_k0_physical_startup_contract PUBLIC src)
+  target_link_libraries(qwen38_target_k0_physical_startup_contract PUBLIC
+    CUDA::cudart)
+  target_compile_options(qwen38_target_k0_physical_startup_contract PRIVATE
+    -Wall -Wextra -Werror)
+
+  add_library(qwen38_target_k0_physical_startup STATIC
+    src/decode/target_k0_physical_startup.cu)
+  target_include_directories(qwen38_target_k0_physical_startup PUBLIC src)
+  target_link_libraries(qwen38_target_k0_physical_startup PUBLIC
+    qwen38_target_k0_physical_startup_contract
+    qwen38_target_k0_physical_layer_owners qwen38_target_k0_startup
+    qwen38_native_token_io qwen38_mtp_executor qwen38_pair_reduce
+    CUDA::cudart)
+  target_compile_options(qwen38_target_k0_physical_startup PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+  set_target_properties(qwen38_target_k0_physical_startup PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+
+  add_executable(qwen38-test-target-k0-physical-startup
+    tests/test_target_k0_physical_startup.cc)
+  target_link_libraries(qwen38-test-target-k0-physical-startup PRIVATE
+    qwen38_target_k0_physical_startup_contract)
+  target_compile_options(qwen38-test-target-k0-physical-startup PRIVATE
+    -Wall -Wextra -Werror)
+  add_test(NAME qwen38-target-k0-physical-startup-cpu-contract
+    COMMAND qwen38-test-target-k0-physical-startup)
+
   add_library(qwen38_target_layer3_moe_owner_preflight SHARED
     src/moe/target_layer3_moe_owner_preflight.cc)
   target_include_directories(qwen38_target_layer3_moe_owner_preflight PUBLIC src)
