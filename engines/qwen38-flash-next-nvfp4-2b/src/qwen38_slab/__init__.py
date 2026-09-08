@@ -11,6 +11,12 @@ from .k0_composition import (
 )
 from .loader import DirectSlabLoader
 from .materialize import materialize
+from .target_moe import (
+    TargetMoeBinding,
+    TargetMoeError,
+    TargetMoeGeneration,
+    TargetMoeLayerParticipant,
+)
 from .whole_decoder import (
     DecoderSlabs,
     DraftArchitecture,
@@ -35,6 +41,10 @@ __all__ = [
     "PINNED_CONTRACT",
     "SlabContract",
     "SlabError",
+    "TargetMoeBinding",
+    "TargetMoeError",
+    "TargetMoeGeneration",
+    "TargetMoeLayerParticipant",
     "WholeDecoderColdLoader",
     "WholeDecoderError",
     "WholeDecoderExecutor",
