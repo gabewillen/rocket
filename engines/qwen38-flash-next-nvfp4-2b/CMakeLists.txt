@@ -219,6 +219,16 @@ set_target_properties(qwen38_target_layer_native_plan PROPERTIES
 target_link_libraries(qwen38_target_k0_startup PUBLIC
   qwen38_target_layer_native_plan)
 
+add_library(qwen38_target_layer0_boundary_comparator STATIC
+  src/decode/target_layer0_boundary_comparator.cc)
+target_include_directories(qwen38_target_layer0_boundary_comparator PUBLIC src)
+target_link_libraries(qwen38_target_layer0_boundary_comparator PUBLIC
+  rocket_qwen38_openssl3_crypto CUDA::cudart)
+target_compile_options(qwen38_target_layer0_boundary_comparator PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_layer0_boundary_comparator PROPERTIES
+  POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
+
 add_library(qwen38_target_layer_native_bindings STATIC
   src/decode/target_layer_native_bindings.cc)
 target_include_directories(qwen38_target_layer_native_bindings PUBLIC src)
@@ -1134,6 +1144,15 @@ target_link_libraries(qwen38-test-target-layer-native-plan PRIVATE
 target_compile_options(qwen38-test-target-layer-native-plan PRIVATE
   -Wall -Wextra -Werror)
 set_target_properties(qwen38-test-target-layer-native-plan PROPERTIES
+  LINKER_LANGUAGE CUDA)
+
+add_executable(qwen38-test-target-layer0-boundary-comparator
+  tests/test_target_layer0_boundary_comparator.cc)
+target_link_libraries(qwen38-test-target-layer0-boundary-comparator PRIVATE
+  qwen38_target_layer0_boundary_comparator)
+target_compile_options(qwen38-test-target-layer0-boundary-comparator PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-layer0-boundary-comparator PROPERTIES
   LINKER_LANGUAGE CUDA)
 
 add_executable(qwen38-test-target-layer3-native-bindings
