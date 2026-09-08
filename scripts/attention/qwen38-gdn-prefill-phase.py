@@ -101,7 +101,9 @@ def write_projection_fixture(root: pathlib.Path, tokens: int, hidden, qkvz_layer
         "provenance": "python-synthetic-seed-7",
         "tokens": tokens,
         "qkvz_mnk": [tokens, 8192, 2560],
-        "ba_mnk": [tokens, 64, 2560],
+        "ba_logical_mnk": [tokens, 48, 2560],
+        "ba_physical_mnk": [tokens, 64, 2560],
+        "ba_physical_n": 64,
         "layouts": {
             "hidden": {"shape": [tokens, 2560], "stride": [2560, 1], "dtype": "bfloat16"},
             "packed_a": {"shape": [tokens, 1280], "stride": [1280, 1], "dtype": "uint8"},
@@ -137,7 +139,25 @@ def import_projection_fixture(root: pathlib.Path, tokens: int,
     if (manifest.get("format") != "rocket-gdn-fp4-fixture-v1" or
             manifest.get("tokens") != tokens):
         raise RuntimeError("projection fixture contract changed")
+    ba_logical_mnk = manifest.get("ba_logical_mnk")
+    ba_physical_mnk = manifest.get("ba_physical_mnk")
+    if (ba_logical_mnk != [tokens, 48, 2560] or
+            not isinstance(ba_physical_mnk, list) or
+            ba_physical_mnk not in ([tokens, 48, 2560], [tokens, 64, 2560])):
+        raise RuntimeError("projection fixture BA geometry changed")
+    ba_physical_n = ba_physical_mnk[1]
     padded_m = ((tokens + 127) // 128) * 128
+    expected_layouts = {
+        "hidden": {"shape": [tokens, 2560], "stride": [2560, 1], "dtype": "bfloat16"},
+        "packed_a": {"shape": [tokens, 1280], "stride": [1280, 1], "dtype": "uint8"},
+        "sfa": {"shape": [padded_m, 160], "stride": [160, 1], "dtype": "uint8"},
+        "qkvz_b": {"shape": [8192, 1280], "stride": [1280, 1], "dtype": "uint8"},
+        "qkvz_sfb": {"shape": [8192, 160], "stride": [160, 1], "dtype": "uint8"},
+        "ba_b": {"shape": [ba_physical_n, 1280], "stride": [1280, 1], "dtype": "uint8"},
+        "ba_sfb": {"shape": [128, 160], "stride": [160, 1], "dtype": "uint8"},
+    }
+    if manifest.get("layouts") != expected_layouts:
+        raise RuntimeError("projection fixture layout changed")
     hidden = load_fixture_tensor(directory, manifest, "hidden.bin", torch.bfloat16,
                                  (tokens, 2560), device)
     qkvz_a = load_fixture_tensor(directory, manifest, "qkvz_a.bin", torch.uint8,
@@ -162,7 +182,8 @@ def import_projection_fixture(root: pathlib.Path, tokens: int,
     ba_layer = torch.nn.Module()
     ba_layer.output_size_per_partition = 48
     ba_layer.weight = torch.nn.Parameter(load_fixture_tensor(
-        directory, manifest, "ba_b.bin", torch.uint8, (64, 1280), device),
+        directory, manifest, "ba_b.bin", torch.uint8,
+        (ba_physical_n, 1280), device),
         requires_grad=False)
     ba_layer.weight_scale = torch.nn.Parameter(load_fixture_tensor(
         directory, manifest, "ba_sfb.bin", torch.uint8, (128, 160), device),
@@ -601,10 +622,19 @@ def run(tokens: int, warmup: int, iterations: int,
         projection_outputs.qkvz = method.apply(qkvz_layer, qkvz_input)
         projection_outputs.ba = method.apply(ba_layer, ba_input)
 
-    with Fp4DispatchTrace() as input_trace:
-        input_result = measure(
-            "nvfp4_input_projection", input_projection, warmup, iterations
-        )
+    try:
+        with Fp4DispatchTrace() as input_trace:
+            input_result = measure(
+                "nvfp4_input_projection", input_projection, warmup, iterations
+            )
+    except Exception as error:
+        if (fixture_manifest is not None and
+                fixture_manifest["ba_physical_mnk"][1] == 48):
+            raise RuntimeError(
+                "authenticated N48 BA fixture is ABI-incompatible with the exact "
+                "Python FlashInfer runner"
+            ) from error
+        raise
     attribute_projection_backend(
         input_result, method, input_trace,
         projection_contract(tokens, warmup, iterations),

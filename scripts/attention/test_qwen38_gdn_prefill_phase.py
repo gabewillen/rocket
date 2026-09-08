@@ -81,6 +81,9 @@ class GdnPrefillPhaseContract(unittest.TestCase):
             self.assertIn(f'"{name}"', source)
         self.assertIn('"format": "rocket-gdn-fp4-fixture-v1"', source)
         self.assertIn('"provenance": "python-synthetic-seed-7"', source)
+        self.assertIn('"ba_logical_mnk": [tokens, 48, 2560]', source)
+        self.assertIn('"ba_physical_mnk": [tokens, 64, 2560]', source)
+        self.assertIn("projection fixture BA geometry changed", source)
 
 
 if __name__ == "__main__":

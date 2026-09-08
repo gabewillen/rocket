@@ -195,4 +195,16 @@ void GdnFlashInferWheelGemm::run(cudaStream_t stream) {
                 impl_->workspace, impl_->workspace_bytes, stream, "");
 }
 
+void GdnFlashInferWheelGemm::bind_inputs(
+    const std::uint8_t* packed_a, const std::uint8_t* sfa,
+    const std::uint8_t* packed_b, const std::uint8_t* sfb) {
+  if (!impl_ || !impl_->runner || !packed_a || !sfa || !packed_b || !sfb) {
+    throw std::invalid_argument("FlashInfer wheel GDN rebind changed");
+  }
+  impl_->packed_a = packed_a;
+  impl_->sfa = sfa;
+  impl_->packed_b = packed_b;
+  impl_->sfb = sfb;
+}
+
 }  // namespace rocket::qwen38::linear_attention

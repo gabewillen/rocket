@@ -37,6 +37,8 @@ class GdnFlashInferWheelGemm final {
             const std::uint8_t* packed_a, const std::uint8_t* sfa,
             const std::uint8_t* packed_b, const std::uint8_t* sfb,
             const float* alpha, __nv_bfloat16* output);
+  void bind_inputs(const std::uint8_t* packed_a, const std::uint8_t* sfa,
+                   const std::uint8_t* packed_b, const std::uint8_t* sfb);
   void run(cudaStream_t stream);
 
  private:

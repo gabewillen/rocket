@@ -151,6 +151,7 @@ class GdnFlashInferCutlassContract(unittest.TestCase):
         ).read_text()
         self.assertIn("rocket-gdn-fp4-fixture-v1", smoke)
         self.assertIn("--prefill-projection-flashinfer-wheel-fixture", smoke)
+        self.assertIn("--prefill-projection-flashinfer-wheel-qkvz-cross", smoke)
         self.assertIn("capture_measure_python_scope", smoke)
         self.assertIn('\\"samples_us\\":[', smoke)
         self.assertIn("gdn_sha256_file(path.string())", smoke)
@@ -163,6 +164,24 @@ class GdnFlashInferCutlassContract(unittest.TestCase):
         self.assertIn("--import-projection-fixtures", profiler)
         self.assertIn("QuantizedActivation(qkvz_a, qkvz_sfa", profiler)
         self.assertIn("projection fixture identity mismatch", profiler)
+        self.assertIn('"ba_logical_mnk": [tokens, 48, 2560]', profiler)
+        self.assertIn('"ba_physical_mnk": [tokens, 64, 2560]', profiler)
+        self.assertIn(r'\"ba_physical_n\": 48', smoke)
+        self.assertIn('Entry{"ba_b.bin", projection.ba_weight(), 48ULL', smoke)
+
+    def test_qkvz_cross_reuses_runner_output_workspace_and_alpha(self) -> None:
+        smoke = (ENGINE / "bench/gdn_graph_smoke.cu").read_text()
+        wheel_header = (
+            ENGINE / "src/linear_attention/gdn_flashinfer_wheel.h"
+        ).read_text()
+        self.assertEqual(smoke.count("GdnFlashInferWheelGemm qkvz;"), 1)
+        self.assertIn("qkvz.bind_inputs(crossing.a, crossing.sfa", smoke)
+        self.assertIn('Crossing{"synthetic", "synthetic"', smoke)
+        self.assertIn('Crossing{"synthetic", "authenticated"', smoke)
+        self.assertIn('Crossing{"authenticated", "synthetic"', smoke)
+        self.assertIn('Crossing{"authenticated", "authenticated"', smoke)
+        self.assertIn(r'\"output_workspace_alpha_fixed\":true', smoke)
+        self.assertIn("bind_inputs", wheel_header)
 
 
 if __name__ == "__main__":

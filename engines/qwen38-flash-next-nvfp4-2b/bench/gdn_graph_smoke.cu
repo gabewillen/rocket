@@ -175,6 +175,44 @@ void load_fixture_file(const std::filesystem::path& path, DeviceBlob& device,
         "copy projection fixture to device");
 }
 
+int fixture_integer(const std::string& manifest, std::string_view key) {
+  const std::string prefix = "\"" + std::string(key) + "\": ";
+  const auto position = manifest.find(prefix);
+  if (position == std::string::npos)
+    throw std::runtime_error("projection fixture geometry missing");
+  std::size_t consumed = 0;
+  const int value = std::stoi(manifest.substr(position + prefix.size()), &consumed);
+  if (consumed == 0) throw std::runtime_error("projection fixture geometry changed");
+  return value;
+}
+
+std::string read_fixture_manifest(const std::filesystem::path& directory,
+                                  int tokens) {
+  std::ifstream input(directory / "manifest.json");
+  const std::string manifest((std::istreambuf_iterator<char>(input)), {});
+  if (!input || manifest.find("rocket-gdn-fp4-fixture-v1") == std::string::npos ||
+      manifest.find("\"tokens\": " + std::to_string(tokens)) == std::string::npos)
+    throw std::runtime_error("projection fixture manifest changed");
+  return manifest;
+}
+
+void load_hashed_fixture_file(const std::filesystem::path& directory,
+                              const std::string& manifest, const char* name,
+                              DeviceBlob& storage, std::size_t bytes) {
+  const auto path = directory / name;
+  const std::string digest =
+      rocket::qwen38::linear_attention::gdn_sha256_file(path.string());
+  const auto record = manifest.find("\"" + std::string(name) + "\"");
+  if (record == std::string::npos)
+    throw std::runtime_error("projection fixture file record missing");
+  const auto record_end = manifest.find('}', record);
+  const auto digest_position = manifest.find(digest, record);
+  if (record_end == std::string::npos || digest_position == std::string::npos ||
+      digest_position > record_end)
+    throw std::runtime_error("projection fixture hash mismatch");
+  load_fixture_file(path, storage, bytes);
+}
+
 void dump_projection_fixture(
     const std::filesystem::path& root, int tokens,
     const __nv_bfloat16* hidden,
@@ -197,7 +235,7 @@ void dump_projection_fixture(
             rocket::qwen38::linear_attention::prefill_sfa_bytes(tokens, kHidden)},
       Entry{"qkvz_b.bin", projection.qkvz_weight(), 8'192ULL * kHidden / 2},
       Entry{"qkvz_sfb.bin", projection.qkvz_sfb(), 8'192ULL * kHidden / 16},
-      Entry{"ba_b.bin", projection.ba_weight(), 64ULL * kHidden / 2},
+      Entry{"ba_b.bin", projection.ba_weight(), 48ULL * kHidden / 2},
       Entry{"ba_sfb.bin", projection.ba_sfb(), 128ULL * kHidden / 16},
       Entry{"alpha.bin", projection.projection_alpha(), sizeof(float)},
   };
@@ -208,7 +246,9 @@ void dump_projection_fixture(
            << "  \"provenance\": \"authenticated-rank0-layer0\",\n"
            << "  \"tokens\": " << tokens << ",\n"
            << "  \"qkvz_mnk\": [" << tokens << ", 8192, 2560],\n"
-           << "  \"ba_mnk\": [" << tokens << ", 64, 2560],\n"
+           << "  \"ba_logical_mnk\": [" << tokens << ", 48, 2560],\n"
+           << "  \"ba_physical_mnk\": [" << tokens << ", 48, 2560],\n"
+           << "  \"ba_physical_n\": 48,\n"
            << "  \"layouts\": {\"hidden\": {\"shape\": [" << tokens
            << ", 2560], \"stride\": [2560, 1], \"dtype\": \"bfloat16\"},"
            << " \"packed_a\": {\"shape\": [" << tokens
@@ -217,7 +257,7 @@ void dump_projection_fixture(
            << ", 160], \"stride\": [160, 1], \"dtype\": \"uint8\"},"
            << " \"qkvz_b\": {\"shape\": [8192, 1280], \"stride\": [1280, 1], \"dtype\": \"uint8\"},"
            << " \"qkvz_sfb\": {\"shape\": [8192, 160], \"stride\": [160, 1], \"dtype\": \"uint8\"},"
-           << " \"ba_b\": {\"shape\": [64, 1280], \"stride\": [1280, 1], \"dtype\": \"uint8\"},"
+           << " \"ba_b\": {\"shape\": [48, 1280], \"stride\": [1280, 1], \"dtype\": \"uint8\"},"
            << " \"ba_sfb\": {\"shape\": [128, 160], \"stride\": [160, 1], \"dtype\": \"uint8\"}},\n"
            << "  \"files\": {\n";
   for (std::size_t i = 0; i < entries.size(); ++i) {
@@ -280,16 +320,35 @@ void run_wheel_fixture(std::string_view wheel_shared_object,
   check(cudaStreamCreate(&stream), "create fixture stream");
   for (const int tokens : std::array<int, 2>{300, 8'192}) {
     const auto directory = root / ("tokens-" + std::to_string(tokens));
+    std::ifstream manifest_input(directory / "manifest.json");
+    const std::string manifest((std::istreambuf_iterator<char>(manifest_input)), {});
+    if (!manifest_input ||
+        manifest.find("rocket-gdn-fp4-fixture-v1") == std::string::npos ||
+        manifest.find("\"tokens\": " + std::to_string(tokens)) == std::string::npos)
+      throw std::runtime_error("projection fixture manifest changed");
+    const int ba_physical_n = fixture_integer(manifest, "ba_physical_n");
+    if (ba_physical_n != 48 && ba_physical_n != 64)
+      throw std::runtime_error("projection fixture BA ABI incompatible");
+    if (manifest.find("\"ba_logical_mnk\": [" + std::to_string(tokens) +
+                      ", 48, 2560]") == std::string::npos ||
+        manifest.find("\"ba_physical_mnk\": [" + std::to_string(tokens) +
+                      ", " + std::to_string(ba_physical_n) + ", 2560]") ==
+            std::string::npos ||
+        manifest.find("\"ba_b\": {\"shape\": [" +
+                      std::to_string(ba_physical_n) +
+                      ", 1280], \"stride\": [1280, 1]") == std::string::npos)
+      throw std::runtime_error("projection fixture BA layout changed");
     const std::size_t a_bytes = static_cast<std::size_t>(tokens) * kHidden / 2;
     const std::size_t sfa_bytes =
         rocket::qwen38::linear_attention::prefill_sfa_bytes(tokens, kHidden);
     DeviceBlob hidden(static_cast<std::size_t>(tokens) * kHidden * 2),
         qkvz_a(a_bytes), qkvz_sfa(sfa_bytes), ba_a(a_bytes),
         ba_sfa(sfa_bytes), qkvz_b(8'192ULL * kHidden / 2),
-        qkvz_sfb(8'192ULL * kHidden / 16), ba_b(64ULL * kHidden / 2),
+        qkvz_sfb(8'192ULL * kHidden / 16),
+        ba_b(static_cast<std::size_t>(ba_physical_n) * kHidden / 2),
         ba_sfb(128ULL * kHidden / 16), alpha(sizeof(float)),
         qkvz_out(static_cast<std::size_t>(tokens) * 8'192 * 2),
-        ba_out(static_cast<std::size_t>(tokens) * 64 * 2);
+        ba_out(static_cast<std::size_t>(tokens) * ba_physical_n * 2);
     struct FixtureInput { const char* name; DeviceBlob* storage; std::size_t bytes; };
     const std::array<FixtureInput, 10> files{{
         {"hidden.bin", &hidden, static_cast<std::size_t>(tokens) * kHidden * 2},
@@ -299,16 +358,11 @@ void run_wheel_fixture(std::string_view wheel_shared_object,
         {"ba_sfa.bin", &ba_sfa, sfa_bytes},
         {"qkvz_b.bin", &qkvz_b, 8'192ULL * kHidden / 2},
         {"qkvz_sfb.bin", &qkvz_sfb, 8'192ULL * kHidden / 16},
-        {"ba_b.bin", &ba_b, 64ULL * kHidden / 2},
+        {"ba_b.bin", &ba_b,
+         static_cast<std::size_t>(ba_physical_n) * kHidden / 2},
         {"ba_sfb.bin", &ba_sfb, 128ULL * kHidden / 16},
         {"alpha.bin", &alpha, sizeof(float)},
     }};
-    std::ifstream manifest_input(directory / "manifest.json");
-    const std::string manifest((std::istreambuf_iterator<char>(manifest_input)), {});
-    if (!manifest_input ||
-        manifest.find("rocket-gdn-fp4-fixture-v1") == std::string::npos ||
-        manifest.find("\"tokens\": " + std::to_string(tokens)) == std::string::npos)
-      throw std::runtime_error("projection fixture manifest changed");
     for (const auto& file : files) {
       const auto path = directory / file.name;
       const std::string digest =
@@ -331,7 +385,7 @@ void run_wheel_fixture(std::string_view wheel_shared_object,
               static_cast<std::uint8_t*>(qkvz_sfb.pointer),
               static_cast<float*>(alpha.pointer),
               static_cast<__nv_bfloat16*>(qkvz_out.pointer));
-    ba.init(wheel_shared_object, tokens, 64, kHidden,
+    ba.init(wheel_shared_object, tokens, ba_physical_n, kHidden,
             static_cast<std::uint8_t*>(ba_a.pointer),
             static_cast<std::uint8_t*>(ba_sfa.pointer),
             static_cast<std::uint8_t*>(ba_b.pointer),
@@ -343,7 +397,7 @@ void run_wheel_fixture(std::string_view wheel_shared_object,
     });
     std::cout << "{\"fixture_backend\":\"flashinfer_wheel_raw\","
               << "\"scope\":\"two_raw_gemms_no_quant_no_ba_slice\","
-              << "\"ba_logical_n\":48,\"ba_physical_n\":64,"
+              << "\"ba_logical_n\":48,\"ba_physical_n\":" << ba_physical_n << ","
               << "\"tokens\":" << tokens << ",\"p50_us\":" << timing.p50
               << ",\"p95_us\":" << timing.p95 << ",\"samples_us\":[";
     for (std::size_t i = 0; i < timing.samples.size(); ++i)
@@ -361,8 +415,146 @@ void run_wheel_fixture(std::string_view wheel_shared_object,
                              static_cast<std::size_t>(tokens) * 8'192 * 2)
               << ",\"ba_hash\":"
               << device_hash(ba_out.pointer,
-                             static_cast<std::size_t>(tokens) * 64 * 2)
+                             static_cast<std::size_t>(tokens) * ba_physical_n * 2)
               << ",\"graph_capture\":\"pass\"}\n";
+  }
+  cudaStreamDestroy(stream);
+}
+
+void print_raw_samples(const RawMeasurement& timing) {
+  std::cout << "\"p50_us\":" << timing.p50 << ",\"p95_us\":" << timing.p95
+            << ",\"samples_us\":[";
+  for (std::size_t i = 0; i < timing.samples.size(); ++i)
+    std::cout << (i ? "," : "") << timing.samples[i];
+  std::cout << "]";
+}
+
+void run_wheel_qkvz_cross(std::string_view wheel_shared_object,
+                          const std::filesystem::path& synthetic_root,
+                          const std::filesystem::path& authenticated_root) {
+  using rocket::qwen38::linear_attention::GdnFlashInferWheelGemm;
+  cudaStream_t stream = nullptr;
+  check(cudaStreamCreate(&stream), "create QKVZ crossing stream");
+  for (const int tokens : std::array<int, 2>{300, 8'192}) {
+    const auto synthetic_directory =
+        synthetic_root / ("tokens-" + std::to_string(tokens));
+    const auto authenticated_directory =
+        authenticated_root / ("tokens-" + std::to_string(tokens));
+    const std::string synthetic_manifest =
+        read_fixture_manifest(synthetic_directory, tokens);
+    const std::string authenticated_manifest =
+        read_fixture_manifest(authenticated_directory, tokens);
+    const std::string qkvz_geometry =
+        "\"qkvz_mnk\": [" + std::to_string(tokens) + ", 8192, 2560]";
+    const std::string sfa_geometry =
+        "\"sfa\": {\"shape\": [" +
+        std::to_string(((tokens + 127) / 128) * 128) +
+        ", 160], \"stride\": [160, 1]";
+    if (synthetic_manifest.find(qkvz_geometry) == std::string::npos ||
+        authenticated_manifest.find(qkvz_geometry) == std::string::npos ||
+        synthetic_manifest.find(sfa_geometry) == std::string::npos ||
+        authenticated_manifest.find(sfa_geometry) == std::string::npos)
+      throw std::runtime_error("QKVZ crossing geometry changed");
+    const std::size_t a_bytes = static_cast<std::size_t>(tokens) * kHidden / 2;
+    const std::size_t sfa_bytes =
+        rocket::qwen38::linear_attention::prefill_sfa_bytes(tokens, kHidden);
+    constexpr std::size_t b_bytes = 8'192ULL * kHidden / 2;
+    constexpr std::size_t sfb_bytes = 8'192ULL * kHidden / 16;
+    DeviceBlob synthetic_a(a_bytes), synthetic_sfa(sfa_bytes),
+        synthetic_b(b_bytes), synthetic_sfb(sfb_bytes),
+        authenticated_a(a_bytes), authenticated_sfa(sfa_bytes),
+        authenticated_b(b_bytes), authenticated_sfb(sfb_bytes),
+        alpha(sizeof(float)), authenticated_alpha(sizeof(float)),
+        output(static_cast<std::size_t>(tokens) * 8'192 * 2);
+    load_hashed_fixture_file(synthetic_directory, synthetic_manifest,
+                             "qkvz_a.bin", synthetic_a, a_bytes);
+    load_hashed_fixture_file(synthetic_directory, synthetic_manifest,
+                             "qkvz_sfa.bin", synthetic_sfa, sfa_bytes);
+    load_hashed_fixture_file(synthetic_directory, synthetic_manifest,
+                             "qkvz_b.bin", synthetic_b, b_bytes);
+    load_hashed_fixture_file(synthetic_directory, synthetic_manifest,
+                             "qkvz_sfb.bin", synthetic_sfb, sfb_bytes);
+    load_hashed_fixture_file(synthetic_directory, synthetic_manifest,
+                             "alpha.bin", alpha, sizeof(float));
+    load_hashed_fixture_file(authenticated_directory, authenticated_manifest,
+                             "qkvz_a.bin", authenticated_a, a_bytes);
+    load_hashed_fixture_file(authenticated_directory, authenticated_manifest,
+                             "qkvz_sfa.bin", authenticated_sfa, sfa_bytes);
+    load_hashed_fixture_file(authenticated_directory, authenticated_manifest,
+                             "qkvz_b.bin", authenticated_b, b_bytes);
+    load_hashed_fixture_file(authenticated_directory, authenticated_manifest,
+                             "qkvz_sfb.bin", authenticated_sfb, sfb_bytes);
+    load_hashed_fixture_file(authenticated_directory, authenticated_manifest,
+                             "alpha.bin", authenticated_alpha, sizeof(float));
+    if (!device_equal(alpha.pointer, authenticated_alpha.pointer, sizeof(float)))
+      throw std::runtime_error("QKVZ crossing alpha identity changed");
+
+    GdnFlashInferWheelGemm qkvz;
+    qkvz.init(wheel_shared_object, tokens, 8'192, kHidden,
+              static_cast<std::uint8_t*>(synthetic_a.pointer),
+              static_cast<std::uint8_t*>(synthetic_sfa.pointer),
+              static_cast<std::uint8_t*>(synthetic_b.pointer),
+              static_cast<std::uint8_t*>(synthetic_sfb.pointer),
+              static_cast<float*>(alpha.pointer),
+              static_cast<__nv_bfloat16*>(output.pointer));
+    struct Crossing {
+      const char* activation;
+      const char* weight;
+      const std::uint8_t* a;
+      const std::uint8_t* sfa;
+      const std::uint8_t* b;
+      const std::uint8_t* sfb;
+    };
+    const std::array crossings{
+        Crossing{"synthetic", "synthetic",
+                 static_cast<std::uint8_t*>(synthetic_a.pointer),
+                 static_cast<std::uint8_t*>(synthetic_sfa.pointer),
+                 static_cast<std::uint8_t*>(synthetic_b.pointer),
+                 static_cast<std::uint8_t*>(synthetic_sfb.pointer)},
+        Crossing{"synthetic", "authenticated",
+                 static_cast<std::uint8_t*>(synthetic_a.pointer),
+                 static_cast<std::uint8_t*>(synthetic_sfa.pointer),
+                 static_cast<std::uint8_t*>(authenticated_b.pointer),
+                 static_cast<std::uint8_t*>(authenticated_sfb.pointer)},
+        Crossing{"authenticated", "synthetic",
+                 static_cast<std::uint8_t*>(authenticated_a.pointer),
+                 static_cast<std::uint8_t*>(authenticated_sfa.pointer),
+                 static_cast<std::uint8_t*>(synthetic_b.pointer),
+                 static_cast<std::uint8_t*>(synthetic_sfb.pointer)},
+        Crossing{"authenticated", "authenticated",
+                 static_cast<std::uint8_t*>(authenticated_a.pointer),
+                 static_cast<std::uint8_t*>(authenticated_sfa.pointer),
+                 static_cast<std::uint8_t*>(authenticated_b.pointer),
+                 static_cast<std::uint8_t*>(authenticated_sfb.pointer)},
+    };
+    for (std::size_t index = 0; index < crossings.size(); ++index) {
+      const auto& crossing = crossings[index];
+      qkvz.bind_inputs(crossing.a, crossing.sfa, crossing.b, crossing.sfb);
+      const auto timing = capture_measure_python_scope(stream, [&] {
+        qkvz.run(stream);
+      });
+      std::cout << "{\"fixture_backend\":\"flashinfer_wheel_raw_qkvz_cross\","
+                << "\"tokens\":" << tokens << ",\"order_index\":" << index
+                << ",\"activation\":\"" << crossing.activation
+                << "\",\"weight\":\"" << crossing.weight << "\","
+                << "\"wheel_sha256\":\""
+                << rocket::qwen38::linear_attention::kGdnFlashInferWheelSha256
+                << "\",\"tactic_id\":-1,\"scheduler\":\"dp_static_persistent\","
+                << "\"swap_ab\":false,\"tile_mnk\":[128,128,256],"
+                << "\"synthetic_manifest_sha256\":\""
+                << rocket::qwen38::linear_attention::gdn_sha256_file(
+                       (synthetic_directory / "manifest.json").string())
+                << "\",\"authenticated_manifest_sha256\":\""
+                << rocket::qwen38::linear_attention::gdn_sha256_file(
+                       (authenticated_directory / "manifest.json").string())
+                << "\",";
+      print_raw_samples(timing);
+      std::cout << ",\"output_hash\":"
+                << device_hash(output.pointer,
+                               static_cast<std::size_t>(tokens) * 8'192 * 2)
+                << ",\"output_workspace_alpha_fixed\":true,"
+                << "\"graph_capture\":\"pass\"}\n";
+    }
   }
   cudaStreamDestroy(stream);
 }
@@ -531,7 +723,8 @@ int main(int argc, char** argv) try {
         "usage: qwen38-gdn-graph-smoke SLAB DEVICE "
         "[--prefill-projection|--prefill-projection-b12x|"
         "--prefill-projection-flashinfer-wheel SO [--dump-fixtures ROOT]|"
-        "--prefill-projection-flashinfer-wheel-fixture SO FIXTURE_ROOT]");
+        "--prefill-projection-flashinfer-wheel-fixture SO FIXTURE_ROOT|"
+        "--prefill-projection-flashinfer-wheel-qkvz-cross SO SYN_ROOT AUTH_ROOT]");
   if (argc == 4 && std::string(argv[3]) != "--prefill-projection" &&
       std::string(argv[3]) != "--prefill-projection-b12x")
     throw std::invalid_argument("unknown GDN graph smoke mode");
@@ -542,14 +735,21 @@ int main(int argc, char** argv) try {
       std::string(argv[3]) != "--prefill-projection-flashinfer-wheel-fixture")
     throw std::invalid_argument("unknown GDN fixture smoke mode");
   if (argc == 7 &&
-      (std::string(argv[3]) != "--prefill-projection-flashinfer-wheel" ||
-       std::string(argv[5]) != "--dump-fixtures"))
+      !((std::string(argv[3]) == "--prefill-projection-flashinfer-wheel" &&
+         std::string(argv[5]) == "--dump-fixtures") ||
+        std::string(argv[3]) ==
+            "--prefill-projection-flashinfer-wheel-qkvz-cross"))
     throw std::invalid_argument("unknown GDN fixture dump mode");
   const int device = std::stoi(argv[2]);
   check(cudaSetDevice(device), "cudaSetDevice");
   if (argc == 6 &&
       std::string(argv[3]) == "--prefill-projection-flashinfer-wheel-fixture") {
     run_wheel_fixture(argv[4], argv[5]);
+    return 0;
+  }
+  if (argc == 7 && std::string(argv[3]) ==
+                           "--prefill-projection-flashinfer-wheel-qkvz-cross") {
+    run_wheel_qkvz_cross(argv[4], argv[5], argv[6]);
     return 0;
   }
   const int fd = open(argv[1], O_RDONLY | O_CLOEXEC);
