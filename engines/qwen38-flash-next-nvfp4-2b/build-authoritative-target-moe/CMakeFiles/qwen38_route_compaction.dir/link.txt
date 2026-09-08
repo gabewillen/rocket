@@ -1,2 +1,0 @@
-/usr/bin/ar qc libqwen38_route_compaction.a CMakeFiles/qwen38_route_compaction.dir/src/moe/route_compaction.cu.o CMakeFiles/qwen38_route_compaction.dir/src/moe/fp8_routed_experts.cu.o
-/usr/bin/ranlib libqwen38_route_compaction.a

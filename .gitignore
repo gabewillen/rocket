@@ -9,5 +9,7 @@ scripts/hardware/gpu-capacity
 scripts/hardware/cpu-mem-contend
 
 engines/*/build/
+engines/*/build-*/
+**/__pycache__/
 compile_commands.json
 engines/*/third_party/

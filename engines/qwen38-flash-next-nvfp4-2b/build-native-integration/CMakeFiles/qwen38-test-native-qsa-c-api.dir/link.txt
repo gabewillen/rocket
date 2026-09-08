@@ -1,1 +1,0 @@
-/usr/bin/g++ @CMakeFiles/qwen38-test-native-qsa-c-api.dir/objects1.rsp CMakeFiles/qwen38-test-native-qsa-c-api.dir/cmake_device_link.o -o qwen38-test-native-qsa-c-api @CMakeFiles/qwen38-test-native-qsa-c-api.dir/linkLibs.rsp -L"/usr/local/cuda/targets/sbsa-linux/lib/stubs" -L"/usr/local/cuda/targets/sbsa-linux/lib"

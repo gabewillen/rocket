@@ -1,2 +1,0 @@
-/usr/bin/ar qc libqwen38_target_moe_b12x_aot.a CMakeFiles/qwen38_target_moe_b12x_aot.dir/src/moe/target_moe_b12x_aot.cc.o
-/usr/bin/ranlib libqwen38_target_moe_b12x_aot.a

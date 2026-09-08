@@ -1,1 +1,0 @@
- libqwen38_residual_rmsnorm.a "/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so" -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

@@ -1,2 +1,0 @@
-/usr/bin/ar qc libqwen38_mtp_executor.a CMakeFiles/qwen38_mtp_executor.dir/src/mtp/graph_runtime.cu.o CMakeFiles/qwen38_mtp_executor.dir/src/mtp/input_fusion.cu.o CMakeFiles/qwen38_mtp_executor.dir/src/mtp/nccl_winner_exchange.cu.o CMakeFiles/qwen38_mtp_executor.dir/src/mtp/native_executor.cu.o CMakeFiles/qwen38_mtp_executor.dir/src/mtp/state_arena.cu.o
-/usr/bin/ranlib libqwen38_mtp_executor.a

@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG "CMakeFiles/qwen38-test-gdn-verifier.dir/tests/test_gdn_verifier_contract.cc.o" -o qwen38-test-gdn-verifier  -Wl,-rpath,/usr/local/cuda-13.0/targets/sbsa-linux/lib /usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so 

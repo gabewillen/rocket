@@ -1,2 +1,0 @@
-/usr/bin/ar qc libqwen38_token_output.a CMakeFiles/qwen38_token_output.dir/src/output/token_output.cu.o
-/usr/bin/ranlib libqwen38_token_output.a

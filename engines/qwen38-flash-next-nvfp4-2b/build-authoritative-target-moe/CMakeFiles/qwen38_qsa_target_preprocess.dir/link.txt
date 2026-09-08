@@ -1,2 +1,0 @@
-/usr/bin/ar qc libqwen38_qsa_target_preprocess.a CMakeFiles/qwen38_qsa_target_preprocess.dir/src/attention/qsa_target_preprocess.cu.o
-/usr/bin/ranlib libqwen38_qsa_target_preprocess.a

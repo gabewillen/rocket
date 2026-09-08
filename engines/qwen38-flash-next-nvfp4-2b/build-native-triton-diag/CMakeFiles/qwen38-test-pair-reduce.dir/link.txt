@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -g -DNDEBUG "CMakeFiles/qwen38-test-pair-reduce.dir/tests/test_pair_reduce.cu.o" -o qwen38-test-pair-reduce   -L/usr/local/cuda/targets/sbsa-linux/lib/stubs  -L/usr/local/cuda/targets/sbsa-linux/lib  libqwen38_pair_reduce.a /usr/lib/aarch64-linux-gnu/libibverbs.so -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

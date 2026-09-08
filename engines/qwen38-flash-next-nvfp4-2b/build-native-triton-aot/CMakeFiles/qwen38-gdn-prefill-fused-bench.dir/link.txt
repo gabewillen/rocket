@@ -1,1 +1,0 @@
-/usr/bin/g++ @CMakeFiles/qwen38-gdn-prefill-fused-bench.dir/objects1.rsp CMakeFiles/qwen38-gdn-prefill-fused-bench.dir/cmake_device_link.o -o qwen38-gdn-prefill-fused-bench @CMakeFiles/qwen38-gdn-prefill-fused-bench.dir/linkLibs.rsp -L"/usr/local/cuda/targets/sbsa-linux/lib/stubs" -L"/usr/local/cuda/targets/sbsa-linux/lib"

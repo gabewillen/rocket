@@ -1,5 +1,0 @@
-qwen38-route-compaction-cpu-contract 11 0.00010136
-qwen38-fp8-routed-experts-cpu-contract 11 0.000101062
-qwen38-route-compaction-source-contract 7 0.00572202
-qwen38-fp8-routed-experts-source-contract 9 0.00531039
----

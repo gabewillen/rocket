@@ -1,1 +1,0 @@
-/usr/bin/g++ @CMakeFiles/qwen38-residual-rmsnorm-bench.dir/objects1.rsp CMakeFiles/qwen38-residual-rmsnorm-bench.dir/cmake_device_link.o -o qwen38-residual-rmsnorm-bench @CMakeFiles/qwen38-residual-rmsnorm-bench.dir/linkLibs.rsp -L"/usr/local/cuda/targets/sbsa-linux/lib/stubs" -L"/usr/local/cuda/targets/sbsa-linux/lib"

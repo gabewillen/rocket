@@ -1,1 +1,0 @@
- libqwen38_pair_reduce.a "/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so" "/usr/lib/aarch64-linux-gnu/libibverbs.so" -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

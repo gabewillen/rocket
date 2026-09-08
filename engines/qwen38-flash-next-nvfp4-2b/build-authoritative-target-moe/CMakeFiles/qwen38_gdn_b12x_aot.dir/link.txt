@@ -1,2 +1,0 @@
-/usr/bin/ar qc libqwen38_gdn_b12x_aot.a CMakeFiles/qwen38_gdn_b12x_aot.dir/src/linear_attention/gdn_b12x_aot.cc.o
-/usr/bin/ranlib libqwen38_gdn_b12x_aot.a

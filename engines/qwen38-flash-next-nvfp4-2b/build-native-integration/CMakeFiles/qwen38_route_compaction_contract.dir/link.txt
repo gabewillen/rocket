@@ -1,2 +1,0 @@
-/usr/bin/ar qc libqwen38_route_compaction_contract.a CMakeFiles/qwen38_route_compaction_contract.dir/src/moe/route_compaction.cc.o CMakeFiles/qwen38_route_compaction_contract.dir/src/moe/fp8_routed_experts.cc.o
-/usr/bin/ranlib libqwen38_route_compaction_contract.a

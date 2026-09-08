@@ -1,3 +1,0 @@
-/usr/bin/ar qc libqwen38_pair_reduce.a CMakeFiles/qwen38_pair_reduce.dir/src/pair_reduce/pair_reduce.cu.o CMakeFiles/qwen38_pair_reduce.dir/src/pair_reduce/rdma.cc.o
-/usr/bin/ar q libqwen38_pair_reduce.a CMakeFiles/qwen38_pair_reduce.dir/cmake_device_link.o
-/usr/bin/ranlib libqwen38_pair_reduce.a

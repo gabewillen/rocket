@@ -1,2 +1,0 @@
-/usr/bin/ar qc libqwen38_gdn_prefill_fused.a CMakeFiles/qwen38_gdn_prefill_fused.dir/src/linear_attention/gdn_prefill_fused.cu.o
-/usr/bin/ranlib libqwen38_gdn_prefill_fused.a

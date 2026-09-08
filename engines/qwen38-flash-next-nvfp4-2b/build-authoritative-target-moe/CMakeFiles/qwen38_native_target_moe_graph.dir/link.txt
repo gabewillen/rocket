@@ -1,2 +1,0 @@
-/usr/bin/ar qc libqwen38_native_target_moe_graph.a CMakeFiles/qwen38_native_target_moe_graph.dir/src/moe/native_target_moe_graph.cc.o
-/usr/bin/ranlib libqwen38_native_target_moe_graph.a

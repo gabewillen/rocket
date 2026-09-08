@@ -1,1 +1,0 @@
- libqwen38_token_output.a  "/usr/local/cuda-13.0/targets/sbsa-linux/lib/libculibos.a" -lcudadevrt -lcudart_static -lrt -lpthread -ldl 
