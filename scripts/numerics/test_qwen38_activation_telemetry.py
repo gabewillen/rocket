@@ -95,10 +95,18 @@ layer = type("Layer", (), {
 model = type("Model", (), {
     "layers": [layer], "config": type("Config", (), config)(),
 })()
-assert _rocket_router_cohort(torch.zeros((2, 512)), 10) is None
+assert _rocket_router_cohort(torch.zeros((2, 512)), 10, "layer.0.router.gate") is None
+os.environ["ROCKET_ROUTER_CACHE_BLOCK_SIZE"] = "3216"
+try:
+    _rocket_router_cohort(torch.zeros((2, 512)), 10, "layer.0.router.gate")
+except RuntimeError as error:
+    assert "sequences and verify_width" in str(error)
+else:
+    raise AssertionError("partial cache geometry metadata did not fail")
+os.environ.pop("ROCKET_ROUTER_CACHE_BLOCK_SIZE")
 os.environ["ROCKET_ROUTER_COHORT"] = "partial-metadata-must-fail"
 try:
-    _rocket_router_cohort(torch.zeros((2, 512)), 10)
+    _rocket_router_cohort(torch.zeros((2, 512)), 10, "layer.0.router.gate")
 except RuntimeError as error:
     assert "sequences and verify_width" in str(error)
 else:
@@ -113,29 +121,77 @@ os.environ.update({
 })
 metadata.query_start_loc = torch.tensor([0, 6, 12], dtype=torch.int32)
 metadata.num_actual_tokens = 12
-assert _rocket_router_cohort(torch.zeros((12, 512)), 10) is None
+assert _rocket_router_cohort(torch.zeros((12, 512)), 10, "layer.0.router.gate") is None
 os.environ.update({
     "ROCKET_ROUTER_COHORT": "contract-c16-k4",
     "ROCKET_ROUTER_SEQUENCES": "16",
 })
 try:
-    _rocket_router_cohort(torch.zeros((12, 512)), 10)
+    _rocket_router_cohort(torch.zeros((12, 512)), 10, "layer.0.router.gate")
 except RuntimeError as error:
-    assert "requires the full-prompt cache barrier" in str(error)
+    assert "requires the two-page cache barrier" in str(error)
 else:
     raise AssertionError("c16 telemetry admitted a missing cache barrier")
-os.environ["ROCKET_ROUTER_CACHE_BARRIER"] = "full-prompt-prefix-cache-v1"
+os.environ.update({
+    "ROCKET_ROUTER_CACHE_BARRIER": "two-cache-pages-v2",
+    "ROCKET_ROUTER_CACHE_BLOCK_SIZE": "3216",
+})
 try:
-    _rocket_router_cohort(torch.zeros((12, 512)), 10)
+    _rocket_router_cohort(torch.zeros((12, 512)), 10, "layer.0.router.gate")
 except RuntimeError as error:
     assert "post-gate prefill or oversized width" in str(error)
 else:
     raise AssertionError("c16 cache barrier admitted a post-gate prefill")
+metadata.query_start_loc = torch.arange(17, dtype=torch.int32)
+metadata.num_actual_tokens = 16
+assert _rocket_router_cohort(
+    torch.zeros((16, 512)), 10, "layer.0.router.gate"
+) is None
+try:
+    _rocket_router_cohort(torch.zeros((16, 512)), 10, "layer.0.router.gate")
+except RuntimeError as error:
+    assert "exactly once per layer" in str(error)
+else:
+    raise AssertionError("c16 admitted a second target-only prefill")
+_ROCKET_ROUTER_PREFILL_BARRIERS.clear()
+metadata.query_start_loc = torch.arange(16, dtype=torch.int32)
+metadata.num_actual_tokens = 15
+try:
+    _rocket_router_cohort(torch.zeros((15, 512)), 10, "layer.0.router.gate")
+except RuntimeError as error:
+    assert "must contain all 16 requests" in str(error)
+else:
+    raise AssertionError("c16 admitted a partial target-only prefill")
+_ROCKET_ROUTER_PREFILL_BARRIERS.clear()
+metadata.query_start_loc = torch.tensor(
+    [0, 2] + list(range(3, 18)), dtype=torch.int32
+)
+metadata.num_actual_tokens = 17
+try:
+    _rocket_router_cohort(torch.zeros((17, 512)), 10, "layer.0.router.gate")
+except RuntimeError as error:
+    assert "started before the all-request cache prefill" in str(error)
+else:
+    raise AssertionError("c16 admitted verifier rows before cached prefill")
+metadata.query_start_loc = torch.arange(17, dtype=torch.int32)
+metadata.num_actual_tokens = 16
+assert _rocket_router_cohort(
+    torch.zeros((16, 512)), 10, "layer.0.router.gate"
+) is None
+metadata.query_start_loc = torch.tensor(
+    [0, 2] + list(range(3, 18)), dtype=torch.int32
+)
+metadata.num_actual_tokens = 17
+record = _rocket_router_cohort(
+    torch.zeros((17, 512)), 10, "layer.0.router.gate"
+)
+assert record["request_widths"] == [2] + [1] * 15
 os.environ.update({
     "ROCKET_ROUTER_COHORT": "contract-c3-k4",
     "ROCKET_ROUTER_SEQUENCES": "3",
 })
 os.environ.pop("ROCKET_ROUTER_CACHE_BARRIER")
+os.environ.pop("ROCKET_ROUTER_CACHE_BLOCK_SIZE")
 metadata.query_start_loc = torch.tensor([0, 5, 8, 9], dtype=torch.int32)
 metadata.num_actual_tokens = 9
 _rocket_install_activation_telemetry(model)

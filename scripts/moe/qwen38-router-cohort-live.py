@@ -19,6 +19,7 @@ ROUTER_METADATA = (
     "ROCKET_ROUTER_COHORT",
     "ROCKET_ROUTER_SEQUENCES",
     "ROCKET_ROUTER_CACHE_BARRIER",
+    "ROCKET_ROUTER_CACHE_BLOCK_SIZE",
 )
 VERIFY_WIDTH = 5
 CAPTURE_CALLS = 4
@@ -100,6 +101,15 @@ def main() -> None:
 
     concurrency = args.concurrency
     cohort = f"forked-prefix-c{concurrency}-k4"
+    attention_block_size = int(engine.llm_engine.vllm_config.cache_config.block_size)
+    if concurrency == 16 and (
+        args.prefix_tokens != 6304
+        or args.divergence_tokens != 128
+        or attention_block_size != 3216
+    ):
+        raise RuntimeError(
+            "c16 requires prefix=6304, divergence=128, and cache block size=3216"
+        )
     prompts = []
     for stream in range(concurrency):
         divergence = (
@@ -119,7 +129,7 @@ def main() -> None:
         # Avoid the pinned hybrid-attention c16 failure on interleaved chunked
         # prefill and decode. Prime one complete prompt at a time while router
         # metadata is absent, then prove concurrent lookups hit each maximal
-        # scheduler-owned prefix before opening the measured decode-only gate.
+        # scheduler-owned prefix before opening the measured gate.
         measured_prompts = []
         for prompt in prompts:
             prime_outputs = engine.generate(prompt, warm_sampling, use_tqdm=False)
@@ -144,15 +154,24 @@ def main() -> None:
             raise RuntimeError("c16 cache barrier returned the wrong request count")
         for prompt, output in zip(prompts, barrier_outputs):
             prompt_tokens = len(prompt["prompt_token_ids"])
+            expected_cached_tokens = (
+                (prompt_tokens - 1) // attention_block_size * attention_block_size
+            )
             if (
                 len(output.outputs[0].token_ids) != 1
-                or output.num_cached_tokens != prompt_tokens - 1
+                or prompt_tokens != 6433
+                or expected_cached_tokens != 6432
+                or output.num_cached_tokens != expected_cached_tokens
             ):
                 raise RuntimeError(
-                    "c16 cache barrier requires the maximal prefix-cache hit"
+                    "c16 cache barrier requires the two-page prefix-cache hit: "
+                    f"request_id={output.request_id} "
+                    f"cached={output.num_cached_tokens} "
+                    f"expected={expected_cached_tokens} "
+                    f"block_size={attention_block_size}"
                 )
             cached_prompt_tokens.append(output.num_cached_tokens)
-        cache_barrier = "full-prompt-prefix-cache-v1"
+        cache_barrier = "two-cache-pages-v2"
 
     # Publish cohort metadata as one post-warmup transition. The c16 barrier
     # is included in the same transition, and any partial state is terminal in
@@ -166,6 +185,9 @@ def main() -> None:
     }
     if cache_barrier is not None:
         cohort_metadata["ROCKET_ROUTER_CACHE_BARRIER"] = cache_barrier
+        cohort_metadata["ROCKET_ROUTER_CACHE_BLOCK_SIZE"] = str(
+            attention_block_size
+        )
     os.environ.update(cohort_metadata)
     sampling = SamplingParams(
         temperature=0.0,
@@ -199,6 +221,11 @@ def main() -> None:
                         concurrency * args.divergence_tokens
                     ),
                     "cache_barrier": cache_barrier,
+                    "attention_block_size": attention_block_size,
+                    "cache_pages": 2 if concurrency == 16 else None,
+                    "cache_geometry": (
+                        "two_cache_pages" if concurrency == 16 else None
+                    ),
                     "cached_prompt_tokens": cached_prompt_tokens,
                 },
                 sort_keys=True,

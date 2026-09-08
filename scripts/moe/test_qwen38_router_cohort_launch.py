@@ -19,7 +19,7 @@ class LaunchContractTests(unittest.TestCase):
         self.manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
         self.plan = MODULE.build_plan(
             self.manifest, Path("/home/tester"), Path("/home/tester/calibration"),
-            50181, "d9643b0-r4",
+            50183, "geometry-r5",
         )
 
     def test_matches_captured_successful_entrypoint_and_bind_contract(self):
@@ -70,10 +70,10 @@ class LaunchContractTests(unittest.TestCase):
         for node, rank in (("head", 0), ("worker", 1)):
             argv = self.plan["nodes"][node]["docker_argv"]
             self.assertIn(f"--node-rank={rank}", argv)
-            self.assertIn("--master-port=50181", argv)
+            self.assertIn("--master-port=50183", argv)
             self.assertEqual(argv[-9:], [
                 "/work/qwen38-router-cohort-live.py", "--concurrency", "16",
-                "--decode", "24", "--prefix-tokens", "8192",
+                "--decode", "24", "--prefix-tokens", "6304",
                 "--divergence-tokens", "128",
             ])
 

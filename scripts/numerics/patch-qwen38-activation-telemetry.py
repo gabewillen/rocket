@@ -9,6 +9,7 @@ IMPORT_PATCH = "from itertools import islice\nimport json\nimport os\n\nimport t
 CLASS_ANCHOR = "class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):\n"
 HELPER = r'''_ROCKET_CALIBRATION_MAXIMA = {}
 _ROCKET_TELEMETRY_CALLS = {}
+_ROCKET_ROUTER_PREFILL_BARRIERS = set()
 _ROCKET_TELEMETRY_SCHEMA = "rocket.qwen38.activation-telemetry.v4"
 
 
@@ -136,7 +137,7 @@ def _rocket_query_widths(rows):
     return widths
 
 
-def _rocket_router_cohort(tensor, top_k):
+def _rocket_router_cohort(tensor, top_k, channel):
     expected_top_k = 10
     if top_k != expected_top_k:
         raise RuntimeError(
@@ -149,7 +150,15 @@ def _rocket_router_cohort(tensor, top_k):
     cohort = os.getenv("ROCKET_ROUTER_COHORT", "")
     rank_text = os.getenv("ROCKET_ROUTER_RANK", "")
     cache_barrier = os.getenv("ROCKET_ROUTER_CACHE_BARRIER", "")
-    if not cohort and not rank_text and sequences == 0 and verify_width == 0:
+    cache_block_size = int(os.getenv("ROCKET_ROUTER_CACHE_BLOCK_SIZE", "0"))
+    if (
+        not cohort
+        and not rank_text
+        and sequences == 0
+        and verify_width == 0
+        and not cache_barrier
+        and cache_block_size == 0
+    ):
         return None
     if sequences < 1 or verify_width < 1:
         raise RuntimeError(
@@ -162,12 +171,16 @@ def _rocket_router_cohort(tensor, top_k):
         raise RuntimeError("ROCKET_ROUTER_COHORT is required for router telemetry")
     if cache_barrier and sequences != 16:
         raise RuntimeError("router cache barrier is only valid for c16 telemetry")
-    if sequences == 16 and cache_barrier != "full-prompt-prefix-cache-v1":
-        raise RuntimeError("c16 router cohort requires the full-prompt cache barrier")
+    if sequences == 16 and (
+        cache_barrier != "two-cache-pages-v2" or cache_block_size != 3216
+    ):
+        raise RuntimeError(
+            "c16 router cohort requires the two-page cache barrier at block size 3216"
+        )
 
     widths = _rocket_query_widths(rows)
     if any(width > verify_width for width in widths):
-        if cache_barrier == "full-prompt-prefix-cache-v1":
+        if cache_barrier == "two-cache-pages-v2":
             raise RuntimeError(
                 "c16 cache barrier violated by post-gate prefill or oversized width"
             )
@@ -179,6 +192,24 @@ def _rocket_router_cohort(tensor, top_k):
         raise RuntimeError(
             f"router cohort scheduled {len(widths)} requests above c{sequences}"
         )
+    if sequences == 16:
+        barrier_key = (channel, cohort)
+        speculative_rows = sum(width - 1 for width in widths)
+        if speculative_rows == 0:
+            if len(widths) != sequences or any(width != 1 for width in widths):
+                raise RuntimeError(
+                    "c16 target-only cache prefill must contain all 16 requests"
+                )
+            if barrier_key in _ROCKET_ROUTER_PREFILL_BARRIERS:
+                raise RuntimeError(
+                    "c16 target-only cache prefill may occur exactly once per layer"
+                )
+            _ROCKET_ROUTER_PREFILL_BARRIERS.add(barrier_key)
+            return None
+        if barrier_key not in _ROCKET_ROUTER_PREFILL_BARRIERS:
+            raise RuntimeError(
+                "c16 verifier telemetry started before the all-request cache prefill"
+            )
     row_offsets = [0]
     for width in widths:
         row_offsets.append(row_offsets[-1] + width)
@@ -241,7 +272,7 @@ def _rocket_emit(name, kind, value, *, output_index=None, top_k=None):
         **summary,
     }
     if top_k is not None and tensor.ndim > 0 and tensor.shape[-1] > 0:
-        router_cohort = _rocket_router_cohort(tensor, top_k)
+        router_cohort = _rocket_router_cohort(tensor, top_k, name)
         if router_cohort is None:
             return
         cohort_key = (name, router_cohort["cohort"])

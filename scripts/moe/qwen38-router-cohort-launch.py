@@ -158,7 +158,7 @@ def build_plan(manifest: dict, home: Path, calibration: Path, port: int, suffix:
                 "--nproc-per-node=1", f"--node-rank={rank}",
                 "--master-addr=192.168.100.10", f"--master-port={port}",
                 "/work/qwen38-router-cohort-live.py", "--concurrency", "16",
-                "--decode", "24", "--prefix-tokens", "8192",
+                "--decode", "24", "--prefix-tokens", "6304",
                 "--divergence-tokens", "128",
             )
         )
@@ -245,8 +245,8 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--calibration-root", type=Path, default=Path.home() / "calibration")
     parser.add_argument("--remote", default="192.168.100.11")
-    parser.add_argument("--port", type=int, default=50181)
-    parser.add_argument("--suffix", default="d9643b0-r4")
+    parser.add_argument("--port", type=int, default=50183)
+    parser.add_argument("--suffix", default="geometry-r5")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))

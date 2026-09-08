@@ -2,14 +2,14 @@
   "schema": "rocket.qwen38.router-cohort-launch.v1",
   "image": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
   "entrypoint": "python3",
-  "run_label": "d9643b0",
+  "run_label": "geometry-v1",
   "driver": {
-    "path": "qwen38-router-cohort-v4-c16-20260908-01/qwen38-router-cohort-live-d9643b0.py",
-    "sha256": "15e687447d835356d90326b626bbfb7aa90dbd30399d2866f95f8d058559345c"
+    "path": "qwen38-router-cohort-v4-c16-20260908-01/qwen38-router-cohort-live-geometry-v1.py",
+    "sha256": "66299a1a3d0c6bbce31a75acd1efc538ba7996d36318f77a7dd7df22058ee497"
   },
   "model_telemetry": {
-    "path": "qwen38-router-cohort-v4-c16-20260908-01/artifacts/model_telemetry-barrier.py",
-    "sha256": "7cd73aef5facc31c62835d67c2f3cf30f1a84b3862d07f3ee7e1fed699f76542"
+    "path": "qwen38-router-cohort-v4-c16-20260908-01/artifacts/model_telemetry-geometry-v1.py",
+    "sha256": "1a40d6917cdb9f2b1c9f06238785cb59e72205beaf24817b955604acbbcf9e19"
   },
   "common_artifacts": {
     "config": {"path": "qwen38-router-cohort-k4-20260907-01/artifacts/config_nvfp4_patched.json", "sha256": "bbdb01bd22e7e92564097c60c6a4ff0a1826694067080863e6b4a9130a450685"},
