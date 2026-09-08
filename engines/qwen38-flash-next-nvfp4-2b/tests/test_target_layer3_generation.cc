@@ -24,13 +24,13 @@ int main() {
       .uses_mrope=false,
       .main_kv_dtype=attention::TargetQsaServingDtype::kBfloat16,
       .side_cache_dtype=attention::TargetQsaServingDtype::kBfloat16};
-  decode::NativeTargetLayer3GenerationOwner owner(1, state, &requested);
+  decode::NativeTargetQsaGenerationOwner owner(1, 3, state, &requested, 35);
   if (!owner.authenticated() || owner.rank() != 1 || owner.layer() != 3 ||
       owner.view(0, 1).generation != 1 ||
       owner.view(34, 35).expected_generation != 35)
     return 1;
   try {
-    owner.view(34, 34);
+    owner.view(34, 0);
     return 2;
   } catch (const std::logic_error&) {
   }

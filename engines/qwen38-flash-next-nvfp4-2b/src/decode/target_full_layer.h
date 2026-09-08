@@ -47,7 +47,7 @@ class TargetFullLayer final {
                   pair_reduce::OtelStageSink& telemetry);
 
   int rank() const noexcept { return rank_; }
-  int layer() const noexcept { return 3; }
+  int layer() const noexcept { return layer_; }
 
   TargetFullLayerResult execute(
       std::uint64_t generation, const attention::TargetQsaStateView& qsa_state,
@@ -71,6 +71,7 @@ class TargetFullLayer final {
   FullAttentionHyperConnection& hyperconnection_;
   pair_reduce::OtelStageSink& telemetry_;
   int rank_;
+  int layer_;
   std::uint64_t last_generation_ = 0;
   bool faulted_ = false;
 };

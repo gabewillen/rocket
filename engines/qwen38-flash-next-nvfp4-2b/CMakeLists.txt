@@ -147,6 +147,16 @@ target_compile_options(qwen38_decode_execution PRIVATE -Wall -Wextra -Werror)
 # a shared library. Keep the relocation fix local to its owner.
 set_target_properties(qwen38_decode_execution PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(qwen38_target_k0_layer_owner_inventory STATIC
+  src/decode/target_k0_layer_owner_inventory.cc)
+target_include_directories(qwen38_target_k0_layer_owner_inventory PUBLIC src)
+target_link_libraries(qwen38_target_k0_layer_owner_inventory PUBLIC
+  qwen38_decode_execution)
+target_compile_options(qwen38_target_k0_layer_owner_inventory PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_k0_layer_owner_inventory PROPERTIES
+  POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
+
 add_library(qwen38_target_layer3_native_plan STATIC
   src/decode/target_layer3_native_plan.cc)
 target_include_directories(qwen38_target_layer3_native_plan PUBLIC src)
@@ -811,6 +821,17 @@ target_link_libraries(qwen38-test-target-full-layer PRIVATE qwen38_decode_execut
 target_compile_options(qwen38-test-target-full-layer PRIVATE -Wall -Wextra -Werror)
 set_target_properties(qwen38-test-target-full-layer PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME qwen38-target-full-layer-contract COMMAND qwen38-test-target-full-layer)
+
+add_executable(qwen38-test-target-k0-layer-owner-inventory
+  tests/test_target_k0_layer_owner_inventory.cc)
+target_link_libraries(qwen38-test-target-k0-layer-owner-inventory PRIVATE
+  qwen38_target_k0_layer_owner_inventory)
+target_compile_options(qwen38-test-target-k0-layer-owner-inventory PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-k0-layer-owner-inventory PROPERTIES
+  LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-target-k0-layer-owner-inventory-cpu-contract
+  COMMAND qwen38-test-target-k0-layer-owner-inventory)
 
 add_executable(qwen38-test-target-layer3-prefill
   tests/test_target_layer3_prefill.cc)

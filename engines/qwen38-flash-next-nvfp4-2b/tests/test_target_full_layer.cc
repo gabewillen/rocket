@@ -26,9 +26,10 @@ struct Trace final : pr::OtelStageSink {
 };
 
 struct Graph final : decode::FullAttentionGraph {
-  explicit Graph(std::vector<std::string>& order) : order(order) {}
+  explicit Graph(std::vector<std::string>& order, int selected_layer = 3)
+      : order(order), selected_layer(selected_layer) {}
   int rank() const noexcept override { return 0; }
-  int layer() const noexcept override { return 3; }
+  int layer() const noexcept override { return selected_layer; }
   std::string_view checkpoint_revision() const noexcept override {
     return decode::kFullAttentionCheckpointRevision;
   }
@@ -41,13 +42,15 @@ struct Graph final : decode::FullAttentionGraph {
     return &partial;
   }
   std::vector<std::string>& order;
+  int selected_layer;
   __nv_bfloat16 partial{};
 };
 
 struct Moe final : decode::TargetMoeGraph {
-  explicit Moe(std::vector<std::string>& order) : order(order) {}
+  explicit Moe(std::vector<std::string>& order, int selected_layer = 3)
+      : order(order), selected_layer(selected_layer) {}
   int rank() const noexcept override { return 0; }
-  int layer() const noexcept override { return 3; }
+  int layer() const noexcept override { return selected_layer; }
   std::string_view checkpoint_revision() const noexcept override {
     return decode::kFullAttentionCheckpointRevision;
   }
@@ -70,6 +73,7 @@ struct Moe final : decode::TargetMoeGraph {
     return &partial;
   }
   std::vector<std::string>& order;
+  int selected_layer;
   __nv_bfloat16 partial{};
   bool fail = false;
 };
@@ -142,6 +146,20 @@ int main() {
         "combine", "fence"}, "layer-3 composition order changed");
     check(trace.stages.size() == 8 && trace.outcomes.back() == pr::Outcome::kOk,
           "bounded success telemetry changed");
+
+    for (int selected_layer = 3; selected_layer < 48; selected_layer += 4) {
+      std::vector<std::string> layer_order;
+      Graph layer_qsa(layer_order, selected_layer);
+      Moe layer_moe(layer_order, selected_layer);
+      Reducer layer_ar(layer_order, "attention_reduce");
+      Reducer layer_mr(layer_order, "moe_reduce");
+      Hc layer_hc(layer_order);
+      Trace layer_trace;
+      decode::TargetFullLayer qsa_layer(layer_qsa, layer_moe, layer_ar,
+                                        layer_mr, layer_hc, layer_trace);
+      check(qsa_layer.layer() == selected_layer,
+            "all-layer QSA composition identity changed");
+    }
 
     std::vector<std::string> failed_order;
     Graph failed_qsa(failed_order); Moe failed_moe(failed_order);
