@@ -312,6 +312,7 @@ class CudaRankSlabLoaderTests(unittest.TestCase):
         self.assertEqual(publication["ready_event"], loaded.ready_event.cuda_event)
         self.assertIs(publication["receipt"], loaded.receipt.target)
         self.assertEqual(publication["receipt_sha256"], capability[1])
+        self.assertEqual(publication["layout_sha256"], capability[2])
         self.assertEqual(publication["chunks_authenticated"], 1)
         self.assertTrue(self.owner.calls)
         target_owner = weakref.ref(loaded.slabs["rank0-target"])

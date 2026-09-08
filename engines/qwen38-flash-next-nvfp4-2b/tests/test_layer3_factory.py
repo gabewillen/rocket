@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import os
 import tempfile
 import unittest
@@ -22,6 +23,9 @@ from qwen38_slab.cuda_slab_loader import (
     ChunkTransferReceipt, LoadedRankSlabs, RankLoadReceipt,
     SlabTransferReceipt,
 )
+import qwen38_slab.cuda_slab_loader as cuda_loader_module
+import qwen38_slab.layer3_factory as layer3_factory_module
+from qwen38_slab.contract import canonical_bytes
 
 ARTIFACT = Path(
     "/home/glwillen/calibration/qwen38-rank-slabs-fc694/"
@@ -68,6 +72,54 @@ class ReadyEvent:
 
 
 class Layer3FactoryTests(unittest.TestCase):
+    def _generic_handoff_fixture(self):
+        size = 63_212_748_800
+        layout = "c" * 64
+        chunks = tuple(
+            ChunkTransferReceipt(index, size if index == 0 else 0, 1, 1, 1)
+            for index in range(236)
+        )
+        target = SlabTransferReceipt(
+            "rank0-target", size, size, 236, 236, 1, 2, chunks,
+        )
+        receipt_sha256 = hashlib.sha256(canonical_bytes({
+            "rank": 0, "slab_key": target.key,
+            "bytes_read": target.bytes_read, "h2d_bytes": target.h2d_bytes,
+            "direct_reads": target.direct_reads,
+            "h2d_copies": target.h2d_copies,
+            "started_ns": target.started_ns,
+            "completed_ns": target.completed_ns,
+            "chunks": [vars(chunk) for chunk in target.chunks],
+        })).hexdigest()
+        capability = cuda_loader_module._NativeHandoffCapability(
+            object(), receipt_sha256, layout,
+        )
+        loaded = LoadedRankSlabs(
+            MappingProxyType({
+                "rank0-target": TargetTensor(0x1234_0000, size),
+                "rank0-mtp": object(),
+            }),
+            RankLoadReceipt(
+                0, target,
+                SlabTransferReceipt(
+                    "rank0-mtp", 1, 1, 1, 1, 1, 2,
+                    (ChunkTransferReceipt(0, 1, 1, 1, 1),),
+                ),
+                1, 1, 2, 1,
+            ),
+            ReadyEvent(), capability,
+        )
+        descriptor = {
+            "schema": "rocket.qwen38.target-layer-native-descriptor.v1",
+            "rank": 0, "artifact_key": ARTIFACT.name,
+            "slab_key": "rank0-target", "slab_bytes": size,
+            "slab_publication_layout_sha256": layout,
+        }
+        return descriptor, loaded
+
+    def tearDown(self):
+        layer3_factory_module._PROCESS_LIFETIME_SLAB_OWNERS.clear()
+
     def test_native_handoff_accepts_only_layer3_or_all48_descriptor_schema(self):
         self.assertTrue(_accepted_native_descriptor_schema(
             "rocket.qwen38.layer3-native-plan.v1"))
@@ -75,6 +127,36 @@ class Layer3FactoryTests(unittest.TestCase):
             "rocket.qwen38.target-layer-native-descriptor.v1"))
         self.assertFalse(_accepted_native_descriptor_schema("unknown"))
         self.assertFalse(_accepted_native_descriptor_schema(None))
+
+    def test_generic_descriptor_handoff_uses_private_capability_and_receipt(self):
+        descriptor, loaded = self._generic_handoff_fixture()
+        handoff = native_target_slab_handoff(descriptor, loaded)
+        self.assertIs(handoff.owner, loaded)
+        self.assertEqual(handoff.layout_sha256,
+                         descriptor["slab_publication_layout_sha256"])
+        self.assertEqual(handoff.device_base, 0x1234_0000)
+
+    def test_generic_descriptor_handoff_rejects_forged_capability_receipt_and_layout(self):
+        descriptor, loaded = self._generic_handoff_fixture()
+        forged = LoadedRankSlabs(loaded.slabs, loaded.receipt, loaded.ready_event,
+                                 object())
+        with self.assertRaisesRegex(Layer3FactoryError, "identity"):
+            native_target_slab_handoff(descriptor, forged)
+
+        bad_receipt = LoadedRankSlabs(
+            loaded.slabs, loaded.receipt, loaded.ready_event,
+            cuda_loader_module._NativeHandoffCapability(
+                object(), "0" * 64,
+                descriptor["slab_publication_layout_sha256"],
+            ),
+        )
+        with self.assertRaisesRegex(Layer3FactoryError, "receipt"):
+            native_target_slab_handoff(descriptor, bad_receipt)
+
+        bad_layout = dict(descriptor)
+        bad_layout["slab_publication_layout_sha256"] = "d" * 64
+        with self.assertRaisesRegex(Layer3FactoryError, "layout"):
+            native_target_slab_handoff(bad_layout, loaded)
 
     @unittest.skipUnless(
         os.environ.get("ROCKET_QWEN38_TARGET_SLAB_OWNER_LIBRARY"),

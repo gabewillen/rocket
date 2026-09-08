@@ -749,13 +749,16 @@ def native_target_slab_handoff(
     """Alias the accepted CUDA loader's target allocation without copying it."""
 
     capability = accepted_native_handoff(loaded)
+    schema = descriptor.get("schema")
     if (
         not isinstance(loaded, LoadedRankSlabs)
         or capability is None
-        or not _accepted_native_descriptor_schema(descriptor.get("schema"))
+        or not _accepted_native_descriptor_schema(schema)
         or descriptor.get("artifact_key") != TARGET_ARTIFACT
-        or descriptor.get("manifest_sha256") != TARGET_MANIFEST_SHA256
     ):
+        raise Layer3FactoryError("native target slab handoff identity changed")
+    if (schema == NATIVE_PLAN_SCHEMA
+            and descriptor.get("manifest_sha256") != TARGET_MANIFEST_SHA256):
         raise Layer3FactoryError("native target slab handoff identity changed")
     rank = descriptor.get("rank")
     slab_key = descriptor.get("slab_key")
@@ -792,9 +795,11 @@ def native_target_slab_handoff(
         "completed_ns": receipt.completed_ns,
         "chunks": [vars(chunk) for chunk in receipt.chunks],
     })).hexdigest()
-    native_lease, receipt_sha256 = capability
+    native_lease, receipt_sha256, finalized_layout_sha256 = capability
     if receipt_sha256 != observed_receipt_sha256:
         raise Layer3FactoryError("native target slab receipt changed after load")
+    if descriptor.get("slab_publication_layout_sha256") != finalized_layout_sha256:
+        raise Layer3FactoryError("native target slab layout changed after finalization")
     prior = _PROCESS_LIFETIME_SLAB_OWNERS.get(rank)
     if prior is not None and (prior[0] is not loaded or prior[1] != receipt_sha256):
         raise Layer3FactoryError("process-lifetime target slab owner replaced")

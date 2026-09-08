@@ -165,6 +165,7 @@ class LoadedRankSlabs:
 class _NativeHandoffCapability:
     handle: object | None
     receipt_sha256: str
+    layout_sha256: str
 
 
 @dataclass
@@ -181,7 +182,9 @@ class NativeTargetSlabFinalizer(Protocol):
     def retain_accepted_loader(self, **publication: object) -> object: ...
 
 
-def accepted_native_handoff(loaded: LoadedRankSlabs) -> tuple[object, str] | None:
+def accepted_native_handoff(
+    loaded: LoadedRankSlabs,
+) -> tuple[object, str, str] | None:
     """Return the opaque capability minted inside ``_load_locked`` only."""
 
     capability = loaded.native_handoff_capability
@@ -189,7 +192,7 @@ def accepted_native_handoff(loaded: LoadedRankSlabs) -> tuple[object, str] | Non
         return None
     if capability.handle is None:
         return None
-    return capability.handle, capability.receipt_sha256
+    return capability.handle, capability.receipt_sha256, capability.layout_sha256
 
 
 @dataclass
@@ -384,7 +387,9 @@ class CudaRankSlabLoader:
                     receipt_sha256 = hashlib.sha256(
                         _canonical_bytes(receipt_payload)
                     ).hexdigest()
-                    capability = _NativeHandoffCapability(None, receipt_sha256)
+                    capability = _NativeHandoffCapability(
+                        None, receipt_sha256, str(self._target_layout_sha256)
+                    )
                     lifetime_owner = _ProcessLifetimeNativeSlabOwner(
                         published, pipelines, ready_event, capability
                     )
