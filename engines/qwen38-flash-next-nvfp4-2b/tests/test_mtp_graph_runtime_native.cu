@@ -54,14 +54,33 @@ class FakeWinnerExchange final : public mtp::WinnerExchangePort {
   float peer_value_;
   bool fault_ = false;
 };
+
+class NullNcclSink final : public mtp::NcclBootstrapOtelSink {
+ public:
+  void emit_span_and_log(
+      const mtp::NcclBootstrapTelemetryRecord&) noexcept override {}
+  void record_duration(
+      const mtp::NcclBootstrapTelemetryRecord&) noexcept override {}
+};
 }  // namespace
 
 int main() {
   try {
     bool missing_nccl_rejected = false;
     try {
-      mtp::NcclWinnerExchange unavailable(
-          reinterpret_cast<void*>(1), 0, "/rocket/missing/libnccl.so");
+      mtp::NcclCommunicatorConfig config;
+      config.rank = 0;
+      config.peer_rank = 1;
+      config.device = 0;
+      config.bootstrap_host = "127.0.0.1";
+      config.bootstrap_port = 18'839;
+      config.pair_reduce_bootstrap_port = 18'838;
+      config.timeout_ms = 100;
+      config.session_sha256.fill(1);
+      config.authentication_key.fill(2);
+      config.nccl_library = "/rocket/missing/libnccl.so";
+      NullNcclSink sink;
+      auto unavailable = mtp::make_nccl_winner_exchange(config, sink);
     } catch (const std::runtime_error&) {
       missing_nccl_rejected = true;
     }

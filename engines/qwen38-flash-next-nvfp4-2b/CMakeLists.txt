@@ -47,6 +47,7 @@ add_library(rocket_qwen38_openssl3_crypto SHARED IMPORTED GLOBAL)
 set_target_properties(rocket_qwen38_openssl3_crypto PROPERTIES
   IMPORTED_LOCATION "${ROCKET_QWEN38_CRYPTO}")
 find_package(CUDAToolkit 13.0 REQUIRED)
+find_package(Threads REQUIRED)
 
 # CUTLASS 4.8 is pinned by the measured GLM engine. Reuse that checkout for
 # the Qwen-only c16 Q/K/V path, while keeping its sm_121a code out of the
@@ -910,6 +911,16 @@ target_compile_options(qwen38_target_moe_b12x_native PRIVATE
 set_target_properties(qwen38_target_moe_b12x_native PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
+add_library(qwen38_nccl_communicator_owner STATIC
+  src/mtp/nccl_communicator_owner.cc)
+target_include_directories(qwen38_nccl_communicator_owner PUBLIC src)
+target_link_libraries(qwen38_nccl_communicator_owner PUBLIC
+  rocket_qwen38_openssl3_crypto ${CMAKE_DL_LIBS})
+target_compile_options(qwen38_nccl_communicator_owner PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_nccl_communicator_owner PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+
 add_library(qwen38_mtp_executor STATIC
   src/mtp/graph_runtime.cu
   src/mtp/input_fusion.cu
@@ -920,6 +931,7 @@ add_library(qwen38_mtp_executor STATIC
 target_include_directories(qwen38_mtp_executor PUBLIC src)
 target_link_libraries(qwen38_mtp_executor PUBLIC
   qwen38_hyperconnection qwen38_route_compaction qwen38_token_output
+  qwen38_nccl_communicator_owner
   CUDA::cudart CUDA::cublas
   ${CMAKE_DL_LIBS})
 target_compile_options(qwen38_mtp_executor PRIVATE
@@ -952,6 +964,13 @@ target_link_libraries(qwen38-residual-rmsnorm-bench PRIVATE qwen38_residual_rmsn
 add_executable(qwen38-token-output-bench bench/token_output_bench.cu)
 target_link_libraries(qwen38-token-output-bench PRIVATE qwen38_token_output)
 
+add_executable(qwen38-nccl-bootstrap-no-kernel
+  bench/nccl_bootstrap_no_kernel.cc)
+target_link_libraries(qwen38-nccl-bootstrap-no-kernel PRIVATE
+  qwen38_nccl_communicator_owner)
+target_compile_options(qwen38-nccl-bootstrap-no-kernel PRIVATE
+  -Wall -Wextra -Werror)
+
 enable_testing()
 add_test(NAME qwen38-target-layer3-oracle-cpu-contract
   COMMAND qwen38-target-layer3-oracle-auth)
@@ -977,6 +996,20 @@ target_compile_options(qwen38-test-pair-reduce PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
 )
 add_test(NAME qwen38-pair-reduce-contract COMMAND qwen38-test-pair-reduce)
+add_library(qwen38-fake-nccl-runtime SHARED tests/fake_nccl_runtime.cc)
+target_compile_options(qwen38-fake-nccl-runtime PRIVATE
+  -Wall -Wextra -Werror)
+add_executable(qwen38-test-nccl-communicator-owner
+  tests/test_nccl_communicator_owner.cc)
+target_link_libraries(qwen38-test-nccl-communicator-owner PRIVATE
+  qwen38_nccl_communicator_owner Threads::Threads ${CMAKE_DL_LIBS})
+target_compile_options(qwen38-test-nccl-communicator-owner PRIVATE
+  -Wall -Wextra -Werror)
+add_dependencies(qwen38-test-nccl-communicator-owner
+  qwen38-fake-nccl-runtime)
+add_test(NAME qwen38-nccl-communicator-owner-cpu-contract
+  COMMAND qwen38-test-nccl-communicator-owner
+          $<TARGET_FILE:qwen38-fake-nccl-runtime>)
 add_executable(qwen38-test-rdma-bootstrap-identity
   tests/test_rdma_bootstrap_identity.cc)
 target_link_libraries(qwen38-test-rdma-bootstrap-identity PRIVATE
