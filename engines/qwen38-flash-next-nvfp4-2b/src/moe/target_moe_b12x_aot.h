@@ -84,3 +84,19 @@ class TargetMoeB12xAot final {
 [[nodiscard]] bool target_moe_b12x_aot_compiled() noexcept;
 
 }  // namespace rocket::qwen38::moe
+
+extern "C" {
+
+// Stable validation/embedding ABI. Creation and destruction are outside the
+// hot path. Enqueue has the same no-allocation and borrowed-stream contract as
+// TargetMoeB12xAot::enqueue.
+int rocket_qwen38_target_moe_b12x_create(
+    int device, const rocket::qwen38::moe::TargetMoeB12xIdentity* identity,
+    const rocket::qwen38::moe::TargetMoeB12xWeights* weights,
+    void** handle) noexcept;
+int rocket_qwen38_target_moe_b12x_enqueue(
+    void* handle,
+    const rocket::qwen38::moe::TargetMoeB12xLaunch* launch) noexcept;
+void rocket_qwen38_target_moe_b12x_destroy(void* handle) noexcept;
+
+}
