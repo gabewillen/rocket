@@ -98,6 +98,42 @@ class ReducerTests(unittest.TestCase):
         )
         self.assertIn('"vllm.forward_context.attn_metadata.query_start_loc"', source)
 
+    def test_c16_primes_complete_prompts_and_proves_cache_before_gate(self):
+        source = LIVE.read_text(encoding="utf-8")
+        prompts = source.index("prompts = []")
+        sequential_prime = source.index("for prompt in prompts:")
+        concurrent_barrier = source.index(
+            "barrier_outputs = engine.generate(prompts, warm_sampling"
+        )
+        continuation = source.index("prompts = measured_prompts")
+        cached_check = source.index("output.num_cached_tokens != prompt_tokens - 1")
+        metadata = source.index("os.environ.update(cohort_metadata)")
+        measured = source.index("outputs = engine.generate(prompts, sampling")
+        self.assertLess(prompts, sequential_prime)
+        self.assertLess(sequential_prime, continuation)
+        self.assertLess(continuation, concurrent_barrier)
+        self.assertLess(sequential_prime, concurrent_barrier)
+        self.assertLess(concurrent_barrier, cached_check)
+        self.assertLess(cached_check, metadata)
+        self.assertLess(metadata, measured)
+        self.assertIn('if concurrency == 16:', source)
+        self.assertIn(
+            'cache_barrier = "full-prompt-prefix-cache-v1"', source
+        )
+        self.assertIn(
+            'cohort_metadata["ROCKET_ROUTER_CACHE_BARRIER"] = cache_barrier',
+            source,
+        )
+        self.assertIn(
+            '"prompt_tokens": len(prompts[0]["prompt_token_ids"])', source
+        )
+        self.assertIn(
+            '"primed_continuation_tokens": 1 if concurrency == 16 else 0', source
+        )
+        self.assertIn(
+            '"pool_with_c1_c8_prompt_distribution": concurrency != 16', source
+        )
+
     def test_decode_exceeds_observed_c2_three_call_terminal_by_full_iteration(self):
         self.assertEqual(LIVE_MODULE.VERIFY_WIDTH, 5)
         self.assertEqual(LIVE_MODULE.CAPTURE_CALLS, 4)

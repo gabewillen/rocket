@@ -18,6 +18,7 @@ ROUTER_METADATA = (
     "ROCKET_ROUTER_MAX_COHORTS",
     "ROCKET_ROUTER_COHORT",
     "ROCKET_ROUTER_SEQUENCES",
+    "ROCKET_ROUTER_CACHE_BARRIER",
 )
 VERIFY_WIDTH = 5
 CAPTURE_CALLS = 4
@@ -99,17 +100,6 @@ def main() -> None:
 
     concurrency = args.concurrency
     cohort = f"forked-prefix-c{concurrency}-k4"
-    # Publish cohort metadata as one post-warmup transition. Any partial state
-    # is terminal inside the telemetry hook.
-    os.environ.update(
-        {
-            "ROCKET_ROUTER_RANK": str(rank),
-            "ROCKET_ROUTER_VERIFY_WIDTH": str(VERIFY_WIDTH),
-            "ROCKET_ROUTER_MAX_COHORTS": str(CAPTURE_CALLS),
-            "ROCKET_ROUTER_COHORT": cohort,
-            "ROCKET_ROUTER_SEQUENCES": str(concurrency),
-        }
-    )
     prompts = []
     for stream in range(concurrency):
         divergence = (
@@ -122,6 +112,61 @@ def main() -> None:
         if len(divergence_ids) != args.divergence_tokens:
             raise RuntimeError("failed to construct the requested divergence")
         prompts.append({"prompt_token_ids": root_ids + divergence_ids})
+
+    cache_barrier = None
+    cached_prompt_tokens = []
+    if concurrency == 16:
+        # Avoid the pinned hybrid-attention c16 failure on interleaved chunked
+        # prefill and decode. Prime one complete prompt at a time while router
+        # metadata is absent, then prove concurrent lookups hit each maximal
+        # scheduler-owned prefix before opening the measured decode-only gate.
+        measured_prompts = []
+        for prompt in prompts:
+            prime_outputs = engine.generate(prompt, warm_sampling, use_tqdm=False)
+            if (
+                len(prime_outputs) != 1
+                or len(prime_outputs[0].outputs[0].token_ids) != 1
+            ):
+                raise RuntimeError("c16 full-prompt cache prime did not finish")
+            # vLLM intentionally caps a new request's prefix-cache hit at
+            # prompt_tokens - 1 so it can recompute logits. Append the sampled
+            # continuation to make that cap land exactly after the complete
+            # original prompt, leaving one target token for cached prefill.
+            measured_prompts.append(
+                {
+                    "prompt_token_ids": prompt["prompt_token_ids"]
+                    + list(prime_outputs[0].outputs[0].token_ids)
+                }
+            )
+        prompts = measured_prompts
+        barrier_outputs = engine.generate(prompts, warm_sampling, use_tqdm=False)
+        if len(barrier_outputs) != concurrency:
+            raise RuntimeError("c16 cache barrier returned the wrong request count")
+        for prompt, output in zip(prompts, barrier_outputs):
+            prompt_tokens = len(prompt["prompt_token_ids"])
+            if (
+                len(output.outputs[0].token_ids) != 1
+                or output.num_cached_tokens != prompt_tokens - 1
+            ):
+                raise RuntimeError(
+                    "c16 cache barrier requires the maximal prefix-cache hit"
+                )
+            cached_prompt_tokens.append(output.num_cached_tokens)
+        cache_barrier = "full-prompt-prefix-cache-v1"
+
+    # Publish cohort metadata as one post-warmup transition. The c16 barrier
+    # is included in the same transition, and any partial state is terminal in
+    # the telemetry hook.
+    cohort_metadata = {
+        "ROCKET_ROUTER_RANK": str(rank),
+        "ROCKET_ROUTER_VERIFY_WIDTH": str(VERIFY_WIDTH),
+        "ROCKET_ROUTER_MAX_COHORTS": str(CAPTURE_CALLS),
+        "ROCKET_ROUTER_COHORT": cohort,
+        "ROCKET_ROUTER_SEQUENCES": str(concurrency),
+    }
+    if cache_barrier is not None:
+        cohort_metadata["ROCKET_ROUTER_CACHE_BARRIER"] = cache_barrier
+    os.environ.update(cohort_metadata)
     sampling = SamplingParams(
         temperature=0.0,
         max_tokens=args.decode,
@@ -145,11 +190,16 @@ def main() -> None:
                     ),
                     "top_k": 10,
                     "decode": args.decode,
+                    "prompt_tokens": len(prompts[0]["prompt_token_ids"]),
+                    "primed_continuation_tokens": 1 if concurrency == 16 else 0,
+                    "pool_with_c1_c8_prompt_distribution": concurrency != 16,
                     "root_prefix_tokens": args.prefix_tokens,
                     "divergence_tokens": args.divergence_tokens,
                     "fresh_prefill_token_upper_bound": (
                         concurrency * args.divergence_tokens
                     ),
+                    "cache_barrier": cache_barrier,
+                    "cached_prompt_tokens": cached_prompt_tokens,
                 },
                 sort_keys=True,
             ),

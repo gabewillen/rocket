@@ -114,6 +114,28 @@ os.environ.update({
 metadata.query_start_loc = torch.tensor([0, 6, 12], dtype=torch.int32)
 metadata.num_actual_tokens = 12
 assert _rocket_router_cohort(torch.zeros((12, 512)), 10) is None
+os.environ.update({
+    "ROCKET_ROUTER_COHORT": "contract-c16-k4",
+    "ROCKET_ROUTER_SEQUENCES": "16",
+})
+try:
+    _rocket_router_cohort(torch.zeros((12, 512)), 10)
+except RuntimeError as error:
+    assert "requires the full-prompt cache barrier" in str(error)
+else:
+    raise AssertionError("c16 telemetry admitted a missing cache barrier")
+os.environ["ROCKET_ROUTER_CACHE_BARRIER"] = "full-prompt-prefix-cache-v1"
+try:
+    _rocket_router_cohort(torch.zeros((12, 512)), 10)
+except RuntimeError as error:
+    assert "post-gate prefill or oversized width" in str(error)
+else:
+    raise AssertionError("c16 cache barrier admitted a post-gate prefill")
+os.environ.update({
+    "ROCKET_ROUTER_COHORT": "contract-c3-k4",
+    "ROCKET_ROUTER_SEQUENCES": "3",
+})
+os.environ.pop("ROCKET_ROUTER_CACHE_BARRIER")
 metadata.query_start_loc = torch.tensor([0, 5, 8, 9], dtype=torch.int32)
 metadata.num_actual_tokens = 9
 _rocket_install_activation_telemetry(model)

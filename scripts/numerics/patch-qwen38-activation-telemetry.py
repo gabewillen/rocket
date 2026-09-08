@@ -148,6 +148,7 @@ def _rocket_router_cohort(tensor, top_k):
     verify_width = int(os.getenv("ROCKET_ROUTER_VERIFY_WIDTH", "0"))
     cohort = os.getenv("ROCKET_ROUTER_COHORT", "")
     rank_text = os.getenv("ROCKET_ROUTER_RANK", "")
+    cache_barrier = os.getenv("ROCKET_ROUTER_CACHE_BARRIER", "")
     if not cohort and not rank_text and sequences == 0 and verify_width == 0:
         return None
     if sequences < 1 or verify_width < 1:
@@ -159,9 +160,17 @@ def _rocket_router_cohort(tensor, top_k):
         raise RuntimeError(f"router cohort rank must be 0 or 1, got {rank}")
     if not cohort:
         raise RuntimeError("ROCKET_ROUTER_COHORT is required for router telemetry")
+    if cache_barrier and sequences != 16:
+        raise RuntimeError("router cache barrier is only valid for c16 telemetry")
+    if sequences == 16 and cache_barrier != "full-prompt-prefix-cache-v1":
+        raise RuntimeError("c16 router cohort requires the full-prompt cache barrier")
 
     widths = _rocket_query_widths(rows)
     if any(width > verify_width for width in widths):
+        if cache_barrier == "full-prompt-prefix-cache-v1":
+            raise RuntimeError(
+                "c16 cache barrier violated by post-gate prefill or oversized width"
+            )
         # Cohort prefill and mixed prefill/decode batches are outside the
         # verifier workload. Their scheduler-owned widths remain larger than
         # target plus the configured speculative width.
