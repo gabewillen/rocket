@@ -22,6 +22,13 @@ endif()
 
 find_library(ROCKET_QWEN38_IBVERBS ibverbs REQUIRED)
 find_library(ROCKET_QWEN38_NVML nvidia-ml REQUIRED)
+find_library(ROCKET_QWEN38_CRYPTO NAMES crypto libcrypto.so.3 REQUIRED)
+if(NOT ROCKET_QWEN38_CRYPTO MATCHES "libcrypto\\.so\\.3$")
+  message(FATAL_ERROR "Qwen target MoE materializer requires OpenSSL 3 libcrypto ABI")
+endif()
+add_library(rocket_qwen38_openssl3_crypto SHARED IMPORTED GLOBAL)
+set_target_properties(rocket_qwen38_openssl3_crypto PROPERTIES
+  IMPORTED_LOCATION "${ROCKET_QWEN38_CRYPTO}")
 find_package(CUDAToolkit 13.0 REQUIRED)
 
 # CUTLASS 4.8 is pinned by the measured GLM engine. Reuse that checkout for
@@ -128,6 +135,16 @@ target_link_libraries(qwen38_target_layer3_generation PUBLIC
 target_compile_options(qwen38_target_layer3_generation PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
 set_target_properties(qwen38_target_layer3_generation PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+
+add_library(qwen38_target_moe_n640_materializer STATIC
+  src/moe/target_moe_n640_materializer.cu)
+target_include_directories(qwen38_target_moe_n640_materializer PUBLIC src)
+target_link_libraries(qwen38_target_moe_n640_materializer PUBLIC
+  CUDA::cudart rocket_qwen38_openssl3_crypto)
+target_compile_options(qwen38_target_moe_n640_materializer PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+set_target_properties(qwen38_target_moe_n640_materializer PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
 
 add_library(qwen38_native_hyperconnection_adapter STATIC
@@ -684,6 +701,15 @@ target_compile_options(qwen38-test-target-moe-b12x-aot-contract PRIVATE
 add_test(NAME qwen38-target-moe-b12x-aot-cpu-contract
   COMMAND qwen38-test-target-moe-b12x-aot-contract)
 
+add_executable(qwen38-test-target-moe-n640-materializer
+  tests/test_target_moe_n640_materializer.cc)
+target_link_libraries(qwen38-test-target-moe-n640-materializer PRIVATE
+  qwen38_target_moe_n640_materializer)
+target_compile_options(qwen38-test-target-moe-n640-materializer PRIVATE
+  -Wall -Wextra -Werror)
+add_test(NAME qwen38-target-moe-n640-materializer-cpu-contract
+  COMMAND qwen38-test-target-moe-n640-materializer)
+
 if(TARGET qwen38_target_router_shared_c1)
   add_executable(qwen38-test-target-router-shared-c1-contract
     tests/test_target_router_shared_c1_contract.cc)
@@ -789,6 +815,9 @@ add_test(NAME qwen38-gdn-prefill-projection-cpu-contract
   COMMAND qwen38-test-gdn-prefill-projection-contract)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME qwen38-target-moe-n640-materializer-source-contract
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_target_moe_n640_materializer_source.py)
 add_test(NAME qwen38-route-compaction-source-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_route_compaction_source.py)
