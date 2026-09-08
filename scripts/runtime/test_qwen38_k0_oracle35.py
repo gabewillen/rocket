@@ -81,10 +81,24 @@ class Oracle35LauncherTests(unittest.TestCase):
             layer_port=18838, embedding_port=18839, nccl_port=18840,
             timeout_ms=120000,
         )
-        with self.assertRaisesRegex(RuntimeError, "native_status_1"):
+        with self.assertRaises(module.NativeRunStatusError) as raised:
             module._native_run(args, ctypes.c_void_p(0x1234),
                                (b"a" * 32, b"b" * 32,
                                 b"c" * 32, b"d" * 32))
+        self.assertEqual(raised.exception.stage, "validation")
+
+    def test_native_status_mapping_is_closed_and_bounded(self):
+        self.assertEqual(set(module.NATIVE_STATUS_STAGES), {
+            10, 20, 21, 22, 30, 31, 32, 40, 41, 42, 43, 50, 51, 255,
+        })
+        for status, stage in module.NATIVE_STATUS_STAGES.items():
+            error = module.NativeRunStatusError(status)
+            self.assertEqual(error.stage, stage)
+            self.assertEqual(module._typed_cause_chain(error, "native"), (
+                {"class": "native_run", "stage": stage},
+            ))
+        unknown = module.NativeRunStatusError(999)
+        self.assertEqual(unknown.stage, "unknown")
 
     def test_secret_requires_exact_32_bytes(self):
         with tempfile.TemporaryDirectory() as root:

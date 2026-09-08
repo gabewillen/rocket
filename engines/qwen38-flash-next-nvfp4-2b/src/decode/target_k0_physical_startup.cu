@@ -23,7 +23,12 @@ TargetK0PhysicalStartupOwner::create(
     std::shared_ptr<moe::TargetFullMoeOtelSink> moe_telemetry,
     std::shared_ptr<moe::TargetMoeStageOtelSink> stage_telemetry,
     std::shared_ptr<attention::TargetK0OracleQsaStateOtelSink>
-        state_telemetry) {
+        state_telemetry,
+    TargetK0PhysicalStartupStage* failure_stage) {
+  const auto mark = [failure_stage](TargetK0PhysicalStartupStage stage) {
+    if (failure_stage) *failure_stage = stage;
+  };
+  mark(TargetK0PhysicalStartupStage::kValidation);
   validate_target_k0_physical_startup_config(config);
   if (!winner_exchange || !lifecycle_telemetry || !moe_telemetry ||
       !stage_telemetry || !state_telemetry)
@@ -49,10 +54,13 @@ TargetK0PhysicalStartupOwner::create(
                    kTargetK0HyperHidden * sizeof(__nv_bfloat16)),
         "allocate K0 hidden B");
 
+  mark(TargetK0PhysicalStartupStage::kLayerPairReduceBootstrap);
   auto reductions = std::make_unique<TargetK0PairReduceOwner>(
       config.layer_reductions, *result->lifecycle_telemetry_);
+  mark(TargetK0PhysicalStartupStage::kEmbeddingPairReduceBootstrap);
   result->embedding_transport_ =
       std::make_unique<pair_reduce::RdmaTransport>(config.embedding_reduction);
+  mark(TargetK0PhysicalStartupStage::kComparatorStartupConstruction);
   auto roots = output::authenticate_token_io_artifact_roots(
       config.token_io_roots.tokenizer,
       config.token_io_roots.oracle_capture);
@@ -64,10 +72,12 @@ TargetK0PhysicalStartupOwner::create(
   if (result->prompt_tokens_.size() != 35)
     throw std::invalid_argument("K0 physical startup is oracle35 only");
 
+  mark(TargetK0PhysicalStartupStage::kTokenIoConstruction);
   auto token_io = output::NativeTokenIoOwner::create(
       config.device, config.rank, config.accepted_loader_lease_handle,
       *result->embedding_transport_, *result->winner_exchange_,
       *result->lifecycle_telemetry_, roots);
+  mark(TargetK0PhysicalStartupStage::kPhysicalLayerConstruction);
   auto plans = std::make_unique<TargetK0NativePlanInventory>(
       TargetK0NativePlanInventory::load(config.descriptor_directory));
   auto layers = TargetK0PhysicalLayerOwners::create(
@@ -75,6 +85,7 @@ TargetK0PhysicalStartupOwner::create(
       std::move(plans), config.qsa_sidecar_payload, reductions->schedule(),
       result->lifecycle_telemetry_, result->moe_telemetry_,
       result->stage_telemetry_, result->state_telemetry_);
+  mark(TargetK0PhysicalStartupStage::kComparatorStartupConstruction);
   result->startup_ = TargetK0StartupOwner::create(
       config.rank, std::move(reductions), std::move(comparator),
       std::move(token_io), std::move(layers), *result->lifecycle_telemetry_,

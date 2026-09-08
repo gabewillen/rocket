@@ -46,6 +46,25 @@ void publish(const decode::TargetK0BoundedTelemetrySnapshot& source,
   target.total_bytes = source.total_bytes;
 }
 
+int status_for(decode::TargetK0PhysicalStartupStage stage) noexcept {
+  using Stage = decode::TargetK0PhysicalStartupStage;
+  switch (stage) {
+    case Stage::kValidation:
+      return QWEN38_TARGET_K0_VALIDATION;
+    case Stage::kLayerPairReduceBootstrap:
+      return QWEN38_TARGET_K0_LAYER_PAIR_REDUCE_BOOTSTRAP;
+    case Stage::kEmbeddingPairReduceBootstrap:
+      return QWEN38_TARGET_K0_EMBEDDING_PAIR_REDUCE_BOOTSTRAP;
+    case Stage::kTokenIoConstruction:
+      return QWEN38_TARGET_K0_TOKEN_IO_CONSTRUCTION;
+    case Stage::kPhysicalLayerConstruction:
+      return QWEN38_TARGET_K0_PHYSICAL_LAYER_CONSTRUCTION;
+    case Stage::kComparatorStartupConstruction:
+      return QWEN38_TARGET_K0_COMPARATOR_STARTUP_CONSTRUCTION;
+  }
+  return QWEN38_TARGET_K0_UNKNOWN;
+}
+
 }  // namespace
 
 extern "C" int qwen38_target_k0_retain_accepted_loader(
@@ -89,6 +108,12 @@ extern "C" int qwen38_target_k0_oracle35_run(
   std::memset(result, 0, sizeof(*result));
   result->token = -1;
   std::shared_ptr<decode::TargetK0BoundedTelemetry> telemetry;
+  int failure_status = QWEN38_TARGET_K0_VALIDATION;
+  decode::TargetK0PhysicalStartupStage startup_stage =
+      decode::TargetK0PhysicalStartupStage::kValidation;
+  const auto resolved_status = [&]() noexcept {
+    return failure_status < 0 ? status_for(startup_stage) : failure_status;
+  };
   try {
     telemetry = std::make_shared<decode::TargetK0BoundedTelemetry>();
     if (!accepted_loader_lease_handle || !descriptor_directory ||
@@ -134,44 +159,48 @@ extern "C" int qwen38_target_k0_oracle35_run(
     nccl.timeout_ms = timeout_ms;
     nccl.session_sha256 = nccl_session;
     nccl.authentication_key = bytes(nccl_authentication_key);
+    failure_status = QWEN38_TARGET_K0_NCCL_BOOTSTRAP;
     auto winner = mtp::make_nccl_winner_exchange(nccl, *telemetry);
+    failure_status = -1;  // Startup owner reports its exact construction stage.
     auto owner = decode::TargetK0PhysicalStartupOwner::create(
         std::move(config), std::move(winner), telemetry, telemetry, telemetry,
-        telemetry);
+        telemetry, &startup_stage);
+    failure_status = QWEN38_TARGET_K0_PROMPT_EXECUTION;
     const auto generated = owner->execute_oracle35(
         1, "k0-oracle35", "oracle-05ea3af");
     result->token = generated.execution.token;
     result->rows = generated.execution.rows;
     result->final_generation = generated.execution.final_generation;
+    failure_status = QWEN38_TARGET_K0_CLEANUP;
     owner.reset();
     publish(telemetry->snapshot(), *result);
     return 0;
   } catch (const std::invalid_argument&) {
     if (telemetry) publish(telemetry->snapshot(), *result);
-    return 1;
+    return resolved_status();
   } catch (const mtp::NcclBootstrapContractError&) {
     if (telemetry) publish(telemetry->snapshot(), *result);
-    return 1;
+    return resolved_status();
   } catch (const mtp::NcclBootstrapTransportError&) {
     if (telemetry) publish(telemetry->snapshot(), *result);
-    return 2;
+    return resolved_status();
   } catch (const pair_reduce::PairReduceTransportError&) {
     if (telemetry) publish(telemetry->snapshot(), *result);
-    return 2;
+    return resolved_status();
   } catch (const mtp::NcclBootstrapAuthenticationError&) {
     if (telemetry) publish(telemetry->snapshot(), *result);
-    return 2;
+    return resolved_status();
   } catch (const mtp::NcclBootstrapCudaError&) {
     if (telemetry) publish(telemetry->snapshot(), *result);
-    return 3;
+    return resolved_status();
   } catch (const mtp::NcclBootstrapNcclError&) {
     if (telemetry) publish(telemetry->snapshot(), *result);
-    return 3;
+    return resolved_status();
   } catch (const mtp::NcclBootstrapLibraryError&) {
     if (telemetry) publish(telemetry->snapshot(), *result);
-    return 3;
+    return resolved_status();
   } catch (...) {
     if (telemetry) publish(telemetry->snapshot(), *result);
-    return 4;
+    return resolved_status();
   }
 }

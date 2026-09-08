@@ -34,6 +34,21 @@ from qwen38_slab.target_layer_descriptor import (  # noqa: E402
 
 SCHEMA = "rocket.qwen38.k0-oracle35-run.v1"
 EXPECTED_TOKEN = 248_046
+NATIVE_STATUS_STAGES = {
+    10: "validation", 20: "layer_pair_reduce_bootstrap",
+    21: "embedding_pair_reduce_bootstrap", 22: "nccl_bootstrap",
+    30: "token_io_construction", 31: "physical_layer_construction",
+    32: "comparator_startup_construction", 40: "source_waits",
+    41: "prompt_execution", 42: "terminal_fence",
+    43: "oracle_comparison", 50: "cleanup", 51: "quarantine",
+    255: "unknown",
+}
+
+
+class NativeRunStatusError(RuntimeError):
+    def __init__(self, status: int):
+        self.stage = NATIVE_STATUS_STAGES.get(status, "unknown")
+        super().__init__("native K0 run rejected")
 
 
 class _Owner:
@@ -86,6 +101,8 @@ def _typed_cause_chain(error: BaseException, phase: str) -> tuple[dict[str, str]
             kind, stage = "native_finalize", current.stage
         elif isinstance(current, Layer3FactoryError):
             kind, stage = "layer_factory", "native_finalize"
+        elif isinstance(current, NativeRunStatusError):
+            kind, stage = "native_run", current.stage
         elif isinstance(current, OSError):
             kind, stage = "io", "artifact_io"
         elif isinstance(current, TimeoutError):
@@ -179,7 +196,7 @@ def _native_run(args: argparse.Namespace, lease: object,
         *arrays, ctypes.byref(result),
     )
     if status:
-        raise RuntimeError(f"native_status_{status}")
+        raise NativeRunStatusError(status)
     return result
 
 

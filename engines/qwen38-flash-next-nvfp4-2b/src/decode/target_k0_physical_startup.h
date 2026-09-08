@@ -12,6 +12,15 @@
 
 namespace rocket::qwen38::decode {
 
+enum class TargetK0PhysicalStartupStage : std::uint8_t {
+  kValidation,
+  kLayerPairReduceBootstrap,
+  kEmbeddingPairReduceBootstrap,
+  kTokenIoConstruction,
+  kPhysicalLayerConstruction,
+  kComparatorStartupConstruction,
+};
+
 struct TargetK0PhysicalStartupConfig {
   int device = -1;
   int rank = -1;
@@ -45,7 +54,8 @@ class TargetK0PhysicalStartupOwner final {
       std::shared_ptr<moe::TargetFullMoeOtelSink> moe_telemetry,
       std::shared_ptr<moe::TargetMoeStageOtelSink> stage_telemetry,
       std::shared_ptr<attention::TargetK0OracleQsaStateOtelSink>
-          state_telemetry);
+          state_telemetry,
+      TargetK0PhysicalStartupStage* failure_stage = nullptr);
   ~TargetK0PhysicalStartupOwner();
 
   TargetK0PhysicalStartupOwner(const TargetK0PhysicalStartupOwner&) = delete;

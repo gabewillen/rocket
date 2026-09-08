@@ -19,11 +19,29 @@ struct Qwen38TargetK0Oracle35Result {
   std::uint64_t total_bytes;
 };
 
+enum Qwen38TargetK0Oracle35Status : int {
+  QWEN38_TARGET_K0_SUCCESS = 0,
+  QWEN38_TARGET_K0_VALIDATION = 10,
+  QWEN38_TARGET_K0_LAYER_PAIR_REDUCE_BOOTSTRAP = 20,
+  QWEN38_TARGET_K0_EMBEDDING_PAIR_REDUCE_BOOTSTRAP = 21,
+  QWEN38_TARGET_K0_NCCL_BOOTSTRAP = 22,
+  QWEN38_TARGET_K0_TOKEN_IO_CONSTRUCTION = 30,
+  QWEN38_TARGET_K0_PHYSICAL_LAYER_CONSTRUCTION = 31,
+  QWEN38_TARGET_K0_COMPARATOR_STARTUP_CONSTRUCTION = 32,
+  QWEN38_TARGET_K0_SOURCE_WAITS = 40,
+  QWEN38_TARGET_K0_PROMPT_EXECUTION = 41,
+  QWEN38_TARGET_K0_TERMINAL_FENCE = 42,
+  QWEN38_TARGET_K0_ORACLE_COMPARISON = 43,
+  QWEN38_TARGET_K0_CLEANUP = 50,
+  QWEN38_TARGET_K0_QUARANTINE = 51,
+  QWEN38_TARGET_K0_UNKNOWN = 255,
+};
+
 // Synchronous two-rank oracle35 entry point. Both processes must enter with
 // matching ports and per-session material. The accepted-loader lease and all
 // strings are borrowed until return. Session/authentication arrays are exactly
 // 32 bytes and are never retained or emitted. Status is a closed value:
-// 0 success, 1 contract, 2 transport/authentication, 3 CUDA/NCCL, 4 internal.
+// Values are from Qwen38TargetK0Oracle35Status only.
 int qwen38_target_k0_oracle35_run(
     int device, int rank, void* accepted_loader_lease_handle,
     const char* descriptor_directory, const char* qsa_sidecar_payload,
