@@ -183,6 +183,16 @@ class GdnFlashInferCutlassContract(unittest.TestCase):
         self.assertIn(r'\"output_workspace_alpha_fixed\":true', smoke)
         self.assertIn("bind_inputs", wheel_header)
 
+    def test_fixture_json_validation_is_format_independent_and_fail_closed(self) -> None:
+        smoke = (ENGINE / "bench/gdn_graph_smoke.cu").read_text()
+        self.assertIn("class JsonParser", smoke)
+        self.assertIn("projection fixture JSON duplicate key", smoke)
+        self.assertIn("exact_keys(manifest.root", smoke)
+        self.assertIn("validate_hashed_fixture_file", smoke)
+        self.assertIn("--validate-projection-fixtures", smoke)
+        self.assertNotIn("const std::string qkvz_geometry", smoke)
+        self.assertNotIn("const std::string sfa_geometry", smoke)
+
 
 if __name__ == "__main__":
     unittest.main()

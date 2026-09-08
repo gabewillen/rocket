@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -175,42 +177,274 @@ void load_fixture_file(const std::filesystem::path& path, DeviceBlob& device,
         "copy projection fixture to device");
 }
 
-int fixture_integer(const std::string& manifest, std::string_view key) {
-  const std::string prefix = "\"" + std::string(key) + "\": ";
-  const auto position = manifest.find(prefix);
-  if (position == std::string::npos)
-    throw std::runtime_error("projection fixture geometry missing");
-  std::size_t consumed = 0;
-  const int value = std::stoi(manifest.substr(position + prefix.size()), &consumed);
-  if (consumed == 0) throw std::runtime_error("projection fixture geometry changed");
-  return value;
+struct JsonValue {
+  enum class Kind { kNull, kBoolean, kInteger, kString, kArray, kObject };
+  Kind kind = Kind::kNull;
+  bool boolean = false;
+  std::int64_t integer = 0;
+  std::string string;
+  std::vector<JsonValue> array;
+  std::map<std::string, JsonValue> object;
+};
+
+class JsonParser {
+ public:
+  explicit JsonParser(std::string_view source) : source_(source) {}
+  JsonValue parse() {
+    auto value = parse_value();
+    whitespace();
+    if (position_ != source_.size()) fail();
+    return value;
+  }
+
+ private:
+  [[noreturn]] void fail() const {
+    throw std::runtime_error("projection fixture JSON changed");
+  }
+  void whitespace() {
+    while (position_ < source_.size() &&
+           std::isspace(static_cast<unsigned char>(source_[position_]))) ++position_;
+  }
+  bool take(char expected) {
+    whitespace();
+    if (position_ < source_.size() && source_[position_] == expected) {
+      ++position_;
+      return true;
+    }
+    return false;
+  }
+  std::string parse_string() {
+    if (!take('"')) fail();
+    std::string result;
+    while (position_ < source_.size()) {
+      const char character = source_[position_++];
+      if (character == '"') return result;
+      if (static_cast<unsigned char>(character) < 0x20) fail();
+      if (character != '\\') {
+        result.push_back(character);
+        continue;
+      }
+      if (position_ == source_.size()) fail();
+      const char escaped = source_[position_++];
+      switch (escaped) {
+        case '"': case '\\': case '/': result.push_back(escaped); break;
+        case 'b': result.push_back('\b'); break;
+        case 'f': result.push_back('\f'); break;
+        case 'n': result.push_back('\n'); break;
+        case 'r': result.push_back('\r'); break;
+        case 't': result.push_back('\t'); break;
+        default: fail();
+      }
+    }
+    fail();
+  }
+  JsonValue parse_value() {
+    whitespace();
+    if (position_ == source_.size()) fail();
+    if (source_[position_] == '"') {
+      JsonValue value; value.kind = JsonValue::Kind::kString;
+      value.string = parse_string(); return value;
+    }
+    if (source_[position_] == '{') return parse_object();
+    if (source_[position_] == '[') return parse_array();
+    if (source_.substr(position_, 4) == "null") {
+      position_ += 4; return {};
+    }
+    if (source_.substr(position_, 4) == "true" ||
+        source_.substr(position_, 5) == "false") {
+      JsonValue value; value.kind = JsonValue::Kind::kBoolean;
+      value.boolean = source_[position_] == 't';
+      position_ += value.boolean ? 4 : 5; return value;
+    }
+    const std::size_t begin = position_;
+    if (source_[position_] == '-') ++position_;
+    while (position_ < source_.size() &&
+           std::isdigit(static_cast<unsigned char>(source_[position_]))) ++position_;
+    if (begin == position_ || (source_[begin] == '-' && begin + 1 == position_)) fail();
+    JsonValue value; value.kind = JsonValue::Kind::kInteger;
+    try { value.integer = std::stoll(std::string(source_.substr(begin, position_ - begin))); }
+    catch (...) { fail(); }
+    return value;
+  }
+  JsonValue parse_array() {
+    if (!take('[')) fail();
+    JsonValue value; value.kind = JsonValue::Kind::kArray;
+    if (take(']')) return value;
+    do { value.array.push_back(parse_value()); } while (take(','));
+    if (!take(']')) fail();
+    return value;
+  }
+  JsonValue parse_object() {
+    if (!take('{')) fail();
+    JsonValue value; value.kind = JsonValue::Kind::kObject;
+    if (take('}')) return value;
+    do {
+      const std::string key = parse_string();
+      if (!take(':')) fail();
+      if (!value.object.emplace(key, parse_value()).second)
+        throw std::runtime_error("projection fixture JSON duplicate key");
+    } while (take(','));
+    if (!take('}')) fail();
+    return value;
+  }
+  std::string_view source_;
+  std::size_t position_ = 0;
+};
+
+const JsonValue& member(const JsonValue& value, std::string_view key) {
+  if (value.kind != JsonValue::Kind::kObject) throw std::runtime_error("projection fixture object changed");
+  const auto found = value.object.find(std::string(key));
+  if (found == value.object.end()) throw std::runtime_error("projection fixture member missing");
+  return found->second;
 }
 
-std::string read_fixture_manifest(const std::filesystem::path& directory,
-                                  int tokens) {
+void exact_keys(const JsonValue& value,
+                std::initializer_list<std::string_view> expected) {
+  if (value.kind != JsonValue::Kind::kObject || value.object.size() != expected.size())
+    throw std::runtime_error("projection fixture object keys changed");
+  for (const auto key : expected)
+    if (value.object.find(std::string(key)) == value.object.end())
+      throw std::runtime_error("projection fixture object key missing");
+}
+
+void exact_integers(const JsonValue& value,
+                    std::initializer_list<std::int64_t> expected) {
+  if (value.kind != JsonValue::Kind::kArray || value.array.size() != expected.size())
+    throw std::runtime_error("projection fixture integer array changed");
+  std::size_t index = 0;
+  for (const auto number : expected) {
+    if (value.array[index].kind != JsonValue::Kind::kInteger ||
+        value.array[index].integer != number)
+      throw std::runtime_error("projection fixture integer changed");
+    ++index;
+  }
+}
+
+void exact_layout(const JsonValue& layouts, std::string_view name,
+                  std::initializer_list<std::int64_t> shape,
+                  std::initializer_list<std::int64_t> stride,
+                  std::string_view dtype) {
+  const auto& layout = member(layouts, name);
+  exact_keys(layout, {"shape", "stride", "dtype"});
+  exact_integers(member(layout, "shape"), shape);
+  exact_integers(member(layout, "stride"), stride);
+  const auto& observed_dtype = member(layout, "dtype");
+  if (observed_dtype.kind != JsonValue::Kind::kString ||
+      observed_dtype.string != dtype)
+    throw std::runtime_error("projection fixture dtype changed");
+}
+
+struct FixtureManifest {
+  std::string raw;
+  JsonValue root;
+  int ba_physical_n = 0;
+};
+
+FixtureManifest read_fixture_manifest(const std::filesystem::path& directory,
+                                      int tokens) {
   std::ifstream input(directory / "manifest.json");
-  const std::string manifest((std::istreambuf_iterator<char>(input)), {});
-  if (!input || manifest.find("rocket-gdn-fp4-fixture-v1") == std::string::npos ||
-      manifest.find("\"tokens\": " + std::to_string(tokens)) == std::string::npos)
-    throw std::runtime_error("projection fixture manifest changed");
+  FixtureManifest manifest;
+  manifest.raw.assign(std::istreambuf_iterator<char>(input), {});
+  if (!input) throw std::runtime_error("projection fixture manifest changed");
+  manifest.root = JsonParser(manifest.raw).parse();
+  exact_keys(manifest.root, {"format", "provenance", "tokens", "qkvz_mnk",
+                             "ba_logical_mnk", "ba_physical_mnk",
+                             "ba_physical_n", "layouts", "files"});
+  const auto& format = member(manifest.root, "format");
+  const auto& token_value = member(manifest.root, "tokens");
+  if (format.kind != JsonValue::Kind::kString ||
+      format.string != "rocket-gdn-fp4-fixture-v1" ||
+      token_value.kind != JsonValue::Kind::kInteger || token_value.integer != tokens)
+    throw std::runtime_error("projection fixture identity changed");
+  exact_integers(member(manifest.root, "qkvz_mnk"), {tokens, 8192, 2560});
+  exact_integers(member(manifest.root, "ba_logical_mnk"), {tokens, 48, 2560});
+  const auto& physical_n = member(manifest.root, "ba_physical_n");
+  if (physical_n.kind != JsonValue::Kind::kInteger ||
+      (physical_n.integer != 48 && physical_n.integer != 64))
+    throw std::runtime_error("projection fixture BA ABI incompatible");
+  manifest.ba_physical_n = static_cast<int>(physical_n.integer);
+  exact_integers(member(manifest.root, "ba_physical_mnk"),
+                 {tokens, manifest.ba_physical_n, 2560});
+  const auto& provenance = member(manifest.root, "provenance");
+  if (provenance.kind != JsonValue::Kind::kString ||
+      (provenance.string != "python-synthetic-seed-7" &&
+       provenance.string != "authenticated-rank0-layer0"))
+    throw std::runtime_error("projection fixture provenance changed");
+  const auto& layouts = member(manifest.root, "layouts");
+  exact_keys(layouts, {"hidden", "packed_a", "sfa", "qkvz_b", "qkvz_sfb",
+                       "ba_b", "ba_sfb"});
+  exact_layout(layouts, "hidden", {tokens, 2560}, {2560, 1}, "bfloat16");
+  exact_layout(layouts, "packed_a", {tokens, 1280}, {1280, 1}, "uint8");
+  exact_layout(layouts, "sfa", {((tokens + 127) / 128) * 128, 160},
+               {160, 1}, "uint8");
+  exact_layout(layouts, "qkvz_b", {8192, 1280}, {1280, 1}, "uint8");
+  exact_layout(layouts, "qkvz_sfb", {8192, 160}, {160, 1}, "uint8");
+  exact_layout(layouts, "ba_b", {manifest.ba_physical_n, 1280}, {1280, 1},
+               "uint8");
+  exact_layout(layouts, "ba_sfb", {128, 160}, {160, 1}, "uint8");
+  exact_keys(member(manifest.root, "files"),
+             {"hidden.bin", "qkvz_a.bin", "qkvz_sfa.bin", "ba_a.bin",
+              "ba_sfa.bin", "qkvz_b.bin", "qkvz_sfb.bin", "ba_b.bin",
+              "ba_sfb.bin", "alpha.bin"});
   return manifest;
 }
 
-void load_hashed_fixture_file(const std::filesystem::path& directory,
-                              const std::string& manifest, const char* name,
-                              DeviceBlob& storage, std::size_t bytes) {
+void validate_hashed_fixture_file(const std::filesystem::path& directory,
+                                  const FixtureManifest& manifest,
+                                  const char* name, std::size_t bytes) {
   const auto path = directory / name;
+  if (!std::filesystem::is_regular_file(path) ||
+      std::filesystem::file_size(path) != bytes)
+    throw std::runtime_error("projection fixture byte count changed");
   const std::string digest =
       rocket::qwen38::linear_attention::gdn_sha256_file(path.string());
-  const auto record = manifest.find("\"" + std::string(name) + "\"");
-  if (record == std::string::npos)
-    throw std::runtime_error("projection fixture file record missing");
-  const auto record_end = manifest.find('}', record);
-  const auto digest_position = manifest.find(digest, record);
-  if (record_end == std::string::npos || digest_position == std::string::npos ||
-      digest_position > record_end)
+  const auto& record = member(member(manifest.root, "files"), name);
+  exact_keys(record, {"bytes", "sha256"});
+  const auto& byte_count = member(record, "bytes");
+  const auto& expected_digest = member(record, "sha256");
+  if (byte_count.kind != JsonValue::Kind::kInteger ||
+      byte_count.integer != static_cast<std::int64_t>(bytes) ||
+      expected_digest.kind != JsonValue::Kind::kString ||
+      expected_digest.string != digest)
     throw std::runtime_error("projection fixture hash mismatch");
+}
+
+void load_hashed_fixture_file(const std::filesystem::path& directory,
+                              const FixtureManifest& manifest, const char* name,
+                              DeviceBlob& storage, std::size_t bytes) {
+  validate_hashed_fixture_file(directory, manifest, name, bytes);
+  const auto path = directory / name;
   load_fixture_file(path, storage, bytes);
+}
+
+void validate_fixture_root(const std::filesystem::path& root) {
+  for (const int tokens : std::array<int, 2>{300, 8'192}) {
+    const auto directory = root / ("tokens-" + std::to_string(tokens));
+    const FixtureManifest manifest = read_fixture_manifest(directory, tokens);
+    const std::size_t a_bytes = static_cast<std::size_t>(tokens) * kHidden / 2;
+    const std::size_t sfa_bytes =
+        rocket::qwen38::linear_attention::prefill_sfa_bytes(tokens, kHidden);
+    struct FileSize { const char* name; std::size_t bytes; };
+    const std::array files{
+        FileSize{"hidden.bin", static_cast<std::size_t>(tokens) * kHidden * 2},
+        FileSize{"qkvz_a.bin", a_bytes}, FileSize{"qkvz_sfa.bin", sfa_bytes},
+        FileSize{"ba_a.bin", a_bytes}, FileSize{"ba_sfa.bin", sfa_bytes},
+        FileSize{"qkvz_b.bin", 8'192ULL * kHidden / 2},
+        FileSize{"qkvz_sfb.bin", 8'192ULL * kHidden / 16},
+        FileSize{"ba_b.bin",
+                 static_cast<std::size_t>(manifest.ba_physical_n) * kHidden / 2},
+        FileSize{"ba_sfb.bin", 128ULL * kHidden / 16},
+        FileSize{"alpha.bin", sizeof(float)},
+    };
+    for (const auto& file : files)
+      validate_hashed_fixture_file(directory, manifest, file.name, file.bytes);
+    std::cout << "fixture_validation=pass tokens=" << tokens
+              << " ba_physical_n=" << manifest.ba_physical_n
+              << " manifest_sha256="
+              << rocket::qwen38::linear_attention::gdn_sha256_file(
+                     (directory / "manifest.json").string())
+              << '\n';
+  }
 }
 
 void dump_projection_fixture(
@@ -320,24 +554,8 @@ void run_wheel_fixture(std::string_view wheel_shared_object,
   check(cudaStreamCreate(&stream), "create fixture stream");
   for (const int tokens : std::array<int, 2>{300, 8'192}) {
     const auto directory = root / ("tokens-" + std::to_string(tokens));
-    std::ifstream manifest_input(directory / "manifest.json");
-    const std::string manifest((std::istreambuf_iterator<char>(manifest_input)), {});
-    if (!manifest_input ||
-        manifest.find("rocket-gdn-fp4-fixture-v1") == std::string::npos ||
-        manifest.find("\"tokens\": " + std::to_string(tokens)) == std::string::npos)
-      throw std::runtime_error("projection fixture manifest changed");
-    const int ba_physical_n = fixture_integer(manifest, "ba_physical_n");
-    if (ba_physical_n != 48 && ba_physical_n != 64)
-      throw std::runtime_error("projection fixture BA ABI incompatible");
-    if (manifest.find("\"ba_logical_mnk\": [" + std::to_string(tokens) +
-                      ", 48, 2560]") == std::string::npos ||
-        manifest.find("\"ba_physical_mnk\": [" + std::to_string(tokens) +
-                      ", " + std::to_string(ba_physical_n) + ", 2560]") ==
-            std::string::npos ||
-        manifest.find("\"ba_b\": {\"shape\": [" +
-                      std::to_string(ba_physical_n) +
-                      ", 1280], \"stride\": [1280, 1]") == std::string::npos)
-      throw std::runtime_error("projection fixture BA layout changed");
+    const FixtureManifest manifest = read_fixture_manifest(directory, tokens);
+    const int ba_physical_n = manifest.ba_physical_n;
     const std::size_t a_bytes = static_cast<std::size_t>(tokens) * kHidden / 2;
     const std::size_t sfa_bytes =
         rocket::qwen38::linear_attention::prefill_sfa_bytes(tokens, kHidden);
@@ -363,20 +581,9 @@ void run_wheel_fixture(std::string_view wheel_shared_object,
         {"ba_sfb.bin", &ba_sfb, 128ULL * kHidden / 16},
         {"alpha.bin", &alpha, sizeof(float)},
     }};
-    for (const auto& file : files) {
-      const auto path = directory / file.name;
-      const std::string digest =
-          rocket::qwen38::linear_attention::gdn_sha256_file(path.string());
-      const auto record = manifest.find("\"" + std::string(file.name) + "\"");
-      if (record == std::string::npos)
-        throw std::runtime_error("projection fixture file record missing");
-      const auto record_end = manifest.find('}', record);
-      const auto digest_position = manifest.find(digest, record);
-      if (record_end == std::string::npos || digest_position == std::string::npos ||
-          digest_position > record_end)
-        throw std::runtime_error("projection fixture hash mismatch");
-      load_fixture_file(path, *file.storage, file.bytes);
-    }
+    for (const auto& file : files)
+      load_hashed_fixture_file(directory, manifest, file.name, *file.storage,
+                               file.bytes);
     GdnFlashInferWheelGemm qkvz, ba;
     qkvz.init(wheel_shared_object, tokens, 8'192, kHidden,
               static_cast<std::uint8_t*>(qkvz_a.pointer),
@@ -440,21 +647,10 @@ void run_wheel_qkvz_cross(std::string_view wheel_shared_object,
         synthetic_root / ("tokens-" + std::to_string(tokens));
     const auto authenticated_directory =
         authenticated_root / ("tokens-" + std::to_string(tokens));
-    const std::string synthetic_manifest =
+    const FixtureManifest synthetic_manifest =
         read_fixture_manifest(synthetic_directory, tokens);
-    const std::string authenticated_manifest =
+    const FixtureManifest authenticated_manifest =
         read_fixture_manifest(authenticated_directory, tokens);
-    const std::string qkvz_geometry =
-        "\"qkvz_mnk\": [" + std::to_string(tokens) + ", 8192, 2560]";
-    const std::string sfa_geometry =
-        "\"sfa\": {\"shape\": [" +
-        std::to_string(((tokens + 127) / 128) * 128) +
-        ", 160], \"stride\": [160, 1]";
-    if (synthetic_manifest.find(qkvz_geometry) == std::string::npos ||
-        authenticated_manifest.find(qkvz_geometry) == std::string::npos ||
-        synthetic_manifest.find(sfa_geometry) == std::string::npos ||
-        authenticated_manifest.find(sfa_geometry) == std::string::npos)
-      throw std::runtime_error("QKVZ crossing geometry changed");
     const std::size_t a_bytes = static_cast<std::size_t>(tokens) * kHidden / 2;
     const std::size_t sfa_bytes =
         rocket::qwen38::linear_attention::prefill_sfa_bytes(tokens, kHidden);
@@ -724,12 +920,14 @@ int main(int argc, char** argv) try {
         "[--prefill-projection|--prefill-projection-b12x|"
         "--prefill-projection-flashinfer-wheel SO [--dump-fixtures ROOT]|"
         "--prefill-projection-flashinfer-wheel-fixture SO FIXTURE_ROOT|"
-        "--prefill-projection-flashinfer-wheel-qkvz-cross SO SYN_ROOT AUTH_ROOT]");
+        "--prefill-projection-flashinfer-wheel-qkvz-cross SO SYN_ROOT AUTH_ROOT|"
+        "--validate-projection-fixtures ROOT]");
   if (argc == 4 && std::string(argv[3]) != "--prefill-projection" &&
       std::string(argv[3]) != "--prefill-projection-b12x")
     throw std::invalid_argument("unknown GDN graph smoke mode");
   if (argc == 5 &&
-      std::string(argv[3]) != "--prefill-projection-flashinfer-wheel")
+      std::string(argv[3]) != "--prefill-projection-flashinfer-wheel" &&
+      std::string(argv[3]) != "--validate-projection-fixtures")
     throw std::invalid_argument("unknown GDN graph smoke mode");
   if (argc == 6 &&
       std::string(argv[3]) != "--prefill-projection-flashinfer-wheel-fixture")
@@ -740,6 +938,10 @@ int main(int argc, char** argv) try {
         std::string(argv[3]) ==
             "--prefill-projection-flashinfer-wheel-qkvz-cross"))
     throw std::invalid_argument("unknown GDN fixture dump mode");
+  if (argc == 5 && std::string(argv[3]) == "--validate-projection-fixtures") {
+    validate_fixture_root(argv[4]);
+    return 0;
+  }
   const int device = std::stoi(argv[2]);
   check(cudaSetDevice(device), "cudaSetDevice");
   if (argc == 6 &&
