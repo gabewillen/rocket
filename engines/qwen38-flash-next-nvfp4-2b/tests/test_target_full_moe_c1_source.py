@@ -12,6 +12,12 @@ SOURCE = (
 
 
 class TargetFullMoeC1SourceContract(unittest.TestCase):
+    def test_participant_rejects_cross_layer_routed_identity(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn(
+            "weights.routed_identity.layer != identity.layer", source,
+        )
+
     def test_enqueue_orders_real_router_routed_and_shared_launches(self) -> None:
         source = SOURCE.read_text(encoding="utf-8")
         begin = source.index("TargetDenseOutcome TargetFullMoeC1::enqueue(")

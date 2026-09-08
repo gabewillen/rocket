@@ -98,6 +98,7 @@ TargetFullMoeC1::TargetFullMoeC1(
       !authenticate_target_moe_compact_runtime_identity(
           weights.routed_identity) ||
       weights.routed_identity.rank != identity.rank ||
+      weights.routed_identity.layer != identity.layer ||
       !weights.routed_stage || weights.routed_stage->rank() != identity.rank ||
       weights.routed_stage->layer() != identity.layer ||
       !weights.routed_stage_telemetry ||
