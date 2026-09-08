@@ -15,9 +15,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "engines/qwen38-flash-next-nvfp4-2b/src"))
 
-from qwen38_slab.cuda_slab_loader import CudaRankSlabLoader  # noqa: E402
+from qwen38_slab.cuda_slab_loader import (  # noqa: E402
+    CudaRankSlabLoader, CudaSlabCleanupIncompleteError, CudaSlabLoadError,
+    CudaSlabPublicationError,
+)
 from qwen38_slab.layer3_factory import (  # noqa: E402
-    CtypesNativeTargetSlabLeaseFactory, native_target_slab_handoff,
+    CtypesNativeTargetSlabLeaseFactory, Layer3FactoryError,
+    native_target_slab_handoff,
 )
 
 SCHEMA = "rocket.qwen38.layer3-moe-owner-preflight.v1"
@@ -30,6 +34,49 @@ class _Owner:
         if self.publication is not None:
             raise RuntimeError("duplicate slab publication")
         self.publication = (rank, slabs)
+
+
+def _typed_cause_chain(error: BaseException, phase: str) -> tuple[dict[str, str], ...]:
+    """Return at most four bounded failure classifications, never messages."""
+
+    chain = []
+    current: BaseException | None = error
+    while current is not None and len(chain) < 4:
+        if isinstance(current, CudaSlabPublicationError):
+            kind, stage = "slab_publication", "python_publish"
+        elif isinstance(current, CudaSlabCleanupIncompleteError):
+            kind, stage = "slab_cleanup", "cuda_cleanup"
+        elif isinstance(current, CudaSlabLoadError):
+            kind, stage = "slab_load", "accepted_loader"
+        elif isinstance(current, Layer3FactoryError):
+            kind, stage = "layer3_factory", "native_finalize"
+        elif isinstance(current, OSError):
+            kind, stage = "io", "artifact_io"
+        elif isinstance(current, TimeoutError):
+            kind, stage = "timeout", "supervisor"
+        elif isinstance(current, (ValueError, TypeError)):
+            kind, stage = "contract", phase
+        elif isinstance(current, RuntimeError):
+            kind, stage = "runtime", phase
+        else:
+            kind, stage = "unknown", phase
+        chain.append({"class": kind, "stage": stage})
+        current = current.__cause__
+    return tuple(chain)
+
+
+def _emit_failure(counter, rank: int, phase: str,
+                  terminal: dict[str, str]) -> None:
+    """Best-effort bounded OTEL publication for one terminal failure."""
+
+    try:
+        counter.add(1, {
+            "rank": rank, "phase": phase, "outcome": "failure",
+            "failure.class": terminal["class"],
+            "failure.stage": terminal["stage"],
+        })
+    except BaseException:
+        pass
 
 
 def _descriptor(path: Path, rank: int) -> dict[str, object]:
@@ -115,17 +162,15 @@ def worker(args: argparse.Namespace) -> int:
         }, sort_keys=True), flush=True)
         return 0
     except BaseException as exc:
-        try:
-            outcome_counter.add(1, {
-                "rank": args.rank, "phase": phase, "outcome": "failure",
-            })
-        except BaseException:
-            pass
+        cause_chain = _typed_cause_chain(exc, phase)
+        terminal = cause_chain[-1]
+        _emit_failure(outcome_counter, args.rank, phase, terminal)
         print(json.dumps({
             "schema": SCHEMA, "valid": False, "complete": False,
             "phase": phase, "rank": args.rank,
-            "failure_class": "timeout" if isinstance(exc, TimeoutError) else "contract",
-            "reason": str(exc)[:384],
+            "failure_class": terminal["class"],
+            "failure_stage": terminal["stage"],
+            "cause_chain": cause_chain,
             "elapsed_ns": time.perf_counter_ns() - started_ns,
             "kernel_launches": 0,
         }, sort_keys=True), flush=True)

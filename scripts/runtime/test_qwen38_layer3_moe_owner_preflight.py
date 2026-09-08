@@ -88,6 +88,28 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(record["phase"], "child_result")
         self.assertNotIn("secret", output.call_args.args[0])
 
+    def test_nested_loader_cause_is_bounded_and_survives_wrapper(self):
+        inner = module.Layer3FactoryError("secret native detail /private/path")
+        outer = module.CudaSlabLoadError("generic outer")
+        outer.__cause__ = inner
+        chain = module._typed_cause_chain(outer, "load")
+        self.assertEqual(chain, (
+            {"class": "slab_load", "stage": "accepted_loader"},
+            {"class": "layer3_factory", "stage": "native_finalize"},
+        ))
+        self.assertNotIn("secret", json.dumps(chain))
+        self.assertNotIn("private", json.dumps(chain))
+        class Counter:
+            def __init__(self): self.records = []
+            def add(self, value, attributes): self.records.append((value, attributes))
+        counter = Counter()
+        module._emit_failure(counter, 0, "load", chain[-1])
+        self.assertEqual(counter.records, [(1, {
+            "rank": 0, "phase": "load", "outcome": "failure",
+            "failure.class": "layer3_factory",
+            "failure.stage": "native_finalize",
+        })])
+
 
 if __name__ == "__main__":
     unittest.main()
