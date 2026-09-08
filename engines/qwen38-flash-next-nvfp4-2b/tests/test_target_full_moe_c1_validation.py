@@ -56,6 +56,9 @@ class TargetFullMoeC1ValidationContract(unittest.TestCase):
         self.assertIn("workspace_aligned_16", source)
         self.assertIn("hidden_bf16_contiguous", source)
         self.assertIn('"borrowed_explicit"', source)
+        self.assertIn('--routed-native-library', source)
+        self.assertIn("routed_library = ctypes.CDLL(routed_path)", source)
+        self.assertIn("routed_library.rocket_qwen38_target_moe_b12x_enqueue", source)
 
     def test_failure_telemetry_has_only_bounded_dimensions(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
