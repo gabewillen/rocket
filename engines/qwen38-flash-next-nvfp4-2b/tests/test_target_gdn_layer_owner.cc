@@ -31,6 +31,7 @@ int main() {
   static_assert(linear::gdn_bucket_rows(4) == 16);
   static_assert(linear::gdn_bucket_rows(-1) == 0);
   static_assert(linear::gdn_bucket_rows(5) == 0);
+  static_assert(linear::CutlassGdnGraph::decode_workspace_count() == 1);
 
   void* storage = nullptr;
   if (posix_memalign(&storage, 256, decode::kTargetGdnOwnerStorageBytes) != 0)

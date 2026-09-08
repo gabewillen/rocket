@@ -69,9 +69,11 @@ ROCKET_QWEN38_GDN_HOST_DEVICE constexpr std::size_t prefill_sfa_offset(
 }
 #undef ROCKET_QWEN38_GDN_HOST_DEVICE
 
-// Exact rank-local GDN-layer graph adapter. Construction copies authenticated weight
-// extents into graph-owned immutable storage before capture. No allocations or
-// pointer changes occur in launch().
+// Exact rank-local GDN-layer graph adapter. Construction copies authenticated
+// weight extents into graph-owned immutable storage before capture. Decode
+// buckets are single-owner and non-reentrant on one borrowed stream, so all 15
+// shape-specific projection plans share one max-sized sequential workspace. No
+// allocations or pointer changes occur in launch().
 class CutlassGdnGraph final : public decode::LinearAttentionGraph {
  public:
   CutlassGdnGraph(int device, int rank, int layer, GdnWeights weights);
@@ -94,6 +96,7 @@ class CutlassGdnGraph final : public decode::LinearAttentionGraph {
   bool has_captured_bucket(int m) const noexcept override {
     return allowed_m(m);
   }
+  static constexpr std::size_t decode_workspace_count() noexcept { return 1; }
   std::uint64_t logical_bytes_per_row(int m) const noexcept override;
   void launch(const __nv_bfloat16* block_input,
               __nv_bfloat16* conv_state, float* recurrent_state,

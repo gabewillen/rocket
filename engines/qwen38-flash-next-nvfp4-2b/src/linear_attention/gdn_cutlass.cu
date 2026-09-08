@@ -12,6 +12,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <memory>
@@ -315,31 +316,54 @@ __global__ void scale_projection(__nv_bfloat16* output, int n,
 }
 
 struct FixedGemm {
-  cutlass::DeviceAllocation<std::uint8_t> workspace;
+  cutlass::DeviceAllocation<std::uint8_t> owned_workspace;
   Gemm gemm;
+  void* bound_workspace = nullptr;
 
-  void init(int m, int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
-            const std::uint8_t* b, const std::uint8_t* sfb,
-            __nv_bfloat16* output) {
+  static typename Gemm::Arguments arguments(
+      int m, int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
+      const std::uint8_t* b, const std::uint8_t* sfb,
+      __nv_bfloat16* output) {
     StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
     StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
     StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
     LayoutSFA la = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
     LayoutSFB lb = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
-    typename Gemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1},
-        {reinterpret_cast<const ElementInput*>(a), sa,
-         reinterpret_cast<const ElementInput*>(b), sb,
-         reinterpret_cast<const ElementSF*>(sfa), la,
-         reinterpret_cast<const ElementSF*>(sfb), lb},
-        {{1.0F, 0.0F}, nullptr, sd, reinterpret_cast<ElementD*>(output), sd}};
+    return {cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1},
+            {reinterpret_cast<const ElementInput*>(a), sa,
+             reinterpret_cast<const ElementInput*>(b), sb,
+             reinterpret_cast<const ElementSF*>(sfa), la,
+             reinterpret_cast<const ElementSF*>(sfb), lb},
+            {{1.0F, 0.0F}, nullptr, sd, reinterpret_cast<ElementD*>(output),
+             sd}};
+  }
+
+  static std::size_t workspace_size(
+      int m, int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
+      const std::uint8_t* b, const std::uint8_t* sfb,
+      __nv_bfloat16* output) {
+    const auto args = arguments(m, n, k, a, sfa, b, sfb, output);
+    if (Gemm{}.can_implement(args) != cutlass::Status::kSuccess) {
+      throw std::runtime_error("CUTLASS fixed GDN shape is unsupported");
+    }
+    return Gemm::get_workspace_size(args);
+  }
+
+  void init(int m, int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
+            const std::uint8_t* b, const std::uint8_t* sfb,
+            __nv_bfloat16* output, void* shared_workspace = nullptr) {
+    auto args = arguments(m, n, k, a, sfa, b, sfb, output);
     if (gemm.can_implement(args) != cutlass::Status::kSuccess) {
       throw std::runtime_error("CUTLASS fixed GDN shape is unsupported");
     }
-    workspace.reset(Gemm::get_workspace_size(args));
-    if (gemm.initialize(args, workspace.get()) != cutlass::Status::kSuccess) {
+    if (!shared_workspace) {
+      owned_workspace.reset(Gemm::get_workspace_size(args));
+      shared_workspace = owned_workspace.get();
+    }
+    if (gemm.initialize(args, shared_workspace) != cutlass::Status::kSuccess) {
       throw std::runtime_error("CUTLASS fixed GDN initialization failed");
     }
+    bound_workspace = shared_workspace;
   }
 };
 
@@ -369,6 +393,7 @@ struct CutlassGdnGraph::Impl {
   std::uint8_t *output_packed = nullptr, *output_sfa = nullptr;
   std::uint8_t *output_weight = nullptr, *output_scale = nullptr;
   __nv_bfloat16 *qkvz = nullptr, *ba = nullptr, *projected = nullptr;
+  cutlass::DeviceAllocation<std::uint8_t> decode_workspace;
   std::array<FixedGemm, kMBucketCount> qkvz_gemms, ba_gemms, output_gemms;
   std::uint8_t *verify_input_packed = nullptr, *verify_input_sfa = nullptr;
   std::uint8_t *verify_output_packed = nullptr, *verify_output_sfa = nullptr;
@@ -487,17 +512,49 @@ CutlassGdnGraph::CutlassGdnGraph(int device, int rank, int layer,
          "copy output scale");
     cuda_check(cudaDeviceSynchronize(), "synchronize immutable GDN weights");
 
+    std::size_t decode_workspace_bytes = 0;
+    for (std::size_t bucket = 0; bucket < kMBucketCount; ++bucket) {
+      const int rows = gdn_bucket_rows(static_cast<int>(bucket));
+      decode_workspace_bytes = std::max(
+          decode_workspace_bytes,
+          FixedGemm::workspace_size(
+              rows, kQkvzN, kInputK, impl_->input_packed, impl_->input_sfa,
+              impl_->qkvz_weight, impl_->qkvz_scale, impl_->qkvz));
+      decode_workspace_bytes = std::max(
+          decode_workspace_bytes,
+          FixedGemm::workspace_size(
+              rows, kBaN, kInputK, impl_->input_packed, impl_->input_sfa,
+              impl_->ba_weight, impl_->ba_scale, impl_->ba));
+      decode_workspace_bytes = std::max(
+          decode_workspace_bytes,
+          FixedGemm::workspace_size(
+              rows, kOutputN, kOutputK, impl_->output_packed,
+              impl_->output_sfa, impl_->output_weight, impl_->output_scale,
+              impl_->projected));
+    }
+    impl_->decode_workspace.reset(decode_workspace_bytes);
     for (std::size_t bucket = 0; bucket < kMBucketCount; ++bucket) {
       const int rows = gdn_bucket_rows(static_cast<int>(bucket));
       impl_->qkvz_gemms[bucket].init(
           rows, kQkvzN, kInputK, impl_->input_packed, impl_->input_sfa,
-          impl_->qkvz_weight, impl_->qkvz_scale, impl_->qkvz);
+          impl_->qkvz_weight, impl_->qkvz_scale, impl_->qkvz,
+          impl_->decode_workspace.get());
       impl_->ba_gemms[bucket].init(
           rows, kBaN, kInputK, impl_->input_packed, impl_->input_sfa,
-          impl_->ba_weight, impl_->ba_scale, impl_->ba);
+          impl_->ba_weight, impl_->ba_scale, impl_->ba,
+          impl_->decode_workspace.get());
       impl_->output_gemms[bucket].init(
           rows, kOutputN, kOutputK, impl_->output_packed, impl_->output_sfa,
-          impl_->output_weight, impl_->output_scale, impl_->projected);
+          impl_->output_weight, impl_->output_scale, impl_->projected,
+          impl_->decode_workspace.get());
+      if (impl_->qkvz_gemms[bucket].bound_workspace !=
+              impl_->decode_workspace.get() ||
+          impl_->ba_gemms[bucket].bound_workspace !=
+              impl_->decode_workspace.get() ||
+          impl_->output_gemms[bucket].bound_workspace !=
+              impl_->decode_workspace.get()) {
+        throw std::logic_error("GDN decode workspace ownership changed");
+      }
     }
     impl_->core = std::make_unique<CorePlan>(
         device, weights.conv, weights.a_log, weights.dt_bias, weights.norm);
