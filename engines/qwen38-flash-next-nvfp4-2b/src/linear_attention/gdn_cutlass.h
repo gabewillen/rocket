@@ -98,7 +98,8 @@ class CutlassGdnGraph final : public decode::LinearAttentionGraph {
   void launch(const __nv_bfloat16* block_input,
               __nv_bfloat16* conv_state, float* recurrent_state,
               const std::int32_t* state_indices, int m,
-              cudaStream_t stream) override;
+              cudaStream_t stream,
+              decode::TargetK0ExecutionProgress* progress = nullptr) override;
   void launch_verifier(
       const __nv_bfloat16* position_major_input,
       __nv_bfloat16* dense_conv_state, float* dense_recurrent_state,

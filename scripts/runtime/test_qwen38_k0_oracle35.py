@@ -144,21 +144,24 @@ class Oracle35LauncherTests(unittest.TestCase):
 
     def test_execution_progress_mapping_is_closed_and_bounded(self):
         self.assertEqual(set(module.EXECUTION_STAGES), set(range(17)))
-        self.assertEqual(set(module.LAYER_EXECUTION_STAGES), set(range(9)))
+        self.assertEqual(set(module.LAYER_EXECUTION_STAGES), set(range(10)))
+        self.assertEqual(set(module.GDN_GRAPH_STAGES), set(range(11)))
         error = module.NativeRunStatusError(
             41, execution_stage=7, execution_row=34, execution_layer=47,
-            execution_layer_stage=7)
+            execution_layer_stage=8, gdn_graph_stage=9)
         self.assertEqual(error.execution_stage, "layer_execution")
         self.assertEqual(error.execution_row, 34)
         self.assertEqual(error.execution_layer, 47)
         self.assertEqual(error.execution_layer_stage, "moe_reduction")
+        self.assertEqual(error.gdn_graph_stage, "launch_check")
         unknown = module.NativeRunStatusError(
             41, execution_stage=17, execution_row=35, execution_layer=48,
-            execution_layer_stage=9)
+            execution_layer_stage=10, gdn_graph_stage=11)
         self.assertEqual((unknown.execution_stage, unknown.execution_row,
                           unknown.execution_layer,
-                          unknown.execution_layer_stage),
-                         ("unknown", -1, -1, "unknown"))
+                          unknown.execution_layer_stage,
+                          unknown.gdn_graph_stage),
+                         ("unknown", -1, -1, "unknown", "unknown"))
 
     def test_nested_slab_cause_is_bounded_and_published(self):
         inner = module.SlabError("private artifact path")
@@ -216,6 +219,7 @@ class Oracle35LauncherTests(unittest.TestCase):
             "moe_aot_cuda_failure",
             "execution_stage", "execution_row", "execution_layer",
             "execution_layer_stage",
+            "gdn_graph_stage",
         })
 
 

@@ -544,39 +544,69 @@ std::uint64_t CutlassGdnGraph::logical_bytes_per_row(int m) const noexcept {
 void CutlassGdnGraph::launch(
     const __nv_bfloat16* block_input, __nv_bfloat16* conv_state,
     float* recurrent_state, const std::int32_t* state_indices, int m,
-    cudaStream_t stream) {
+    cudaStream_t stream, decode::TargetK0ExecutionProgress* progress) {
   if (!block_input || !conv_state || !recurrent_state || !state_indices ||
       !allowed_m(m) || !stream) {
     throw decode::DecodeExecutionContractError(
         "fixed Qwen GDN graph arguments changed");
   }
+  decode::target_k0_enter_gdn_graph(
+      progress, decode::TargetK0GdnGraphStage::kInputQuantize);
   quantize_fixed<kInputK><<<kM, 256, 0, stream>>>(
       impl_->input_packed, impl_->input_sfa, block_input, 1.0F);
-  if (impl_->qkvz_gemm.gemm.run(stream) != cutlass::Status::kSuccess ||
-      impl_->ba_gemm.gemm.run(stream) != cutlass::Status::kSuccess) {
+  cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN input quantization");
+  decode::target_k0_enter_gdn_graph(
+      progress, decode::TargetK0GdnGraphStage::kQkvProjection);
+  const auto qkv_status = impl_->qkvz_gemm.gemm.run(stream);
+  cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN QKV projection launch");
+  auto ba_status = cutlass::Status::kSuccess;
+  if (qkv_status == cutlass::Status::kSuccess) {
+    decode::target_k0_enter_gdn_graph(
+        progress, decode::TargetK0GdnGraphStage::kBaProjection);
+    ba_status = impl_->ba_gemm.gemm.run(stream);
+    cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN BA projection launch");
+  }
+  if (qkv_status != cutlass::Status::kSuccess ||
+      ba_status != cutlass::Status::kSuccess) {
     throw std::runtime_error("fixed Qwen GDN input projection failed");
   }
+  decode::target_k0_enter_gdn_graph(
+      progress, decode::TargetK0GdnGraphStage::kInputScale);
   scale_projection<<<dim3((kQkvzN + 255) / 256, kM), 256, 0, stream>>>(
       impl_->qkvz, kQkvzN, kQkvN, impl_->globals.qkv.global_scale,
       impl_->globals.z.global_scale);
   scale_projection<<<dim3((kBaN + 255) / 256, kM), 256, 0, stream>>>(
       impl_->ba, kBaN, kBN, impl_->globals.b.global_scale,
       impl_->globals.a.global_scale);
+  cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN input scale launch");
+  decode::target_k0_enter_gdn_graph(progress,
+                                    decode::TargetK0GdnGraphStage::kCore);
   impl_->core->launch(
       impl_->qkvz, impl_->ba, conv_state,
       static_cast<std::size_t>(kConvStateRows) * kQkvWidth, recurrent_state,
       static_cast<std::size_t>(kValueHeads) * kHeadDim * kHeadDim,
       state_indices, m, stream);
+  cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN core launch");
+  decode::target_k0_enter_gdn_graph(
+      progress, decode::TargetK0GdnGraphStage::kOutputQuantize);
   quantize_fixed<kOutputK><<<kM, 256, 0, stream>>>(
       impl_->output_packed, impl_->output_sfa, impl_->core->output(),
       kOutputActivationGlobal);
+  cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN output quantization");
+  decode::target_k0_enter_gdn_graph(
+      progress, decode::TargetK0GdnGraphStage::kOutputProjection);
   if (impl_->output_gemm.gemm.run(stream) != cutlass::Status::kSuccess) {
     throw std::runtime_error("fixed Qwen GDN output projection failed");
   }
+  cuda_check(cudaPeekAtLastError(), "fixed Qwen GDN output projection launch");
+  decode::target_k0_enter_gdn_graph(
+      progress, decode::TargetK0GdnGraphStage::kOutputScale);
   scale_projection<<<dim3((kOutputN + 255) / 256, kM), 256, 0, stream>>>(
       impl_->projected, kOutputN, kOutputN,
       impl_->globals.output.global_scale * kOutputActivationGlobal,
       impl_->globals.output.global_scale * kOutputActivationGlobal);
+  decode::target_k0_enter_gdn_graph(progress,
+                                    decode::TargetK0GdnGraphStage::kLaunchCheck);
   cuda_check(cudaGetLastError(), "fixed Qwen GDN graph launch");
 }
 

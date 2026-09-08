@@ -33,11 +33,26 @@ enum class TargetK0LayerExecutionStage : std::uint8_t {
   kStatePreparation,
   kAttentionHyperconnection,
   kAttention,
+  kAttentionFence,
   kAttentionReduction,
   kMlpHyperconnection,
   kMoe,
   kMoeReduction,
   kFinalHyperconnection,
+};
+
+enum class TargetK0GdnGraphStage : std::uint8_t {
+  kNone,
+  kInputQuantize,
+  kQkvProjection,
+  kBaProjection,
+  kInputScale,
+  kCore,
+  kOutputQuantize,
+  kOutputProjection,
+  kOutputScale,
+  kLaunchCheck,
+  kOutputPublication,
 };
 
 struct TargetK0ExecutionProgress {
@@ -46,6 +61,7 @@ struct TargetK0ExecutionProgress {
   std::int32_t layer = -1;
   TargetK0LayerExecutionStage layer_stage =
       TargetK0LayerExecutionStage::kNone;
+  TargetK0GdnGraphStage gdn_graph_stage = TargetK0GdnGraphStage::kNone;
 };
 
 inline void target_k0_enter(
@@ -58,6 +74,7 @@ inline void target_k0_enter(
   progress->row = row;
   progress->layer = layer;
   progress->layer_stage = layer_stage;
+  progress->gdn_graph_stage = TargetK0GdnGraphStage::kNone;
 }
 
 inline void target_k0_enter_layer(TargetK0ExecutionProgress* progress,
@@ -73,6 +90,12 @@ inline void target_k0_enter_stage(TargetK0ExecutionProgress* progress,
   progress->stage = stage;
   progress->layer = -1;
   progress->layer_stage = TargetK0LayerExecutionStage::kNone;
+  progress->gdn_graph_stage = TargetK0GdnGraphStage::kNone;
+}
+
+inline void target_k0_enter_gdn_graph(TargetK0ExecutionProgress* progress,
+                                      TargetK0GdnGraphStage stage) noexcept {
+  if (progress) progress->gdn_graph_stage = stage;
 }
 
 }  // namespace rocket::qwen38::decode

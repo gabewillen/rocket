@@ -66,7 +66,8 @@ struct Graph final : decode::LinearAttentionGraph {
   }
   void launch(const __nv_bfloat16* input, __nv_bfloat16* convolution,
               float* recurrent, const std::int32_t* state_index, int m,
-              cudaStream_t stream) override {
+              cudaStream_t stream,
+              decode::TargetK0ExecutionProgress* = nullptr) override {
     check(input && convolution && recurrent && state_index && m == 1 && stream,
           "GDN graph arguments changed");
     order.emplace_back("gdn");

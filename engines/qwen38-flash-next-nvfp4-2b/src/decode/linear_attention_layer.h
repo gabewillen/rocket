@@ -48,7 +48,8 @@ class LinearAttentionGraph {
   virtual void launch(const __nv_bfloat16* block_input,
                       __nv_bfloat16* conv_state, float* recurrent_state,
                       const std::int32_t* state_indices, int m,
-                      cudaStream_t stream) = 0;
+                      cudaStream_t stream,
+                      TargetK0ExecutionProgress* progress = nullptr) = 0;
   virtual const __nv_bfloat16* projected_output() const noexcept = 0;
 };
 

@@ -133,6 +133,8 @@ extern "C" int qwen38_target_k0_oracle35_run(
     result->execution_layer = execution_progress.layer;
     result->execution_layer_stage =
         static_cast<std::int32_t>(execution_progress.layer_stage);
+    result->gdn_graph_stage =
+        static_cast<std::int32_t>(execution_progress.gdn_graph_stage);
     if (telemetry) publish(telemetry->snapshot(), *result);
   };
   try {

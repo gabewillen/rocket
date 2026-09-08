@@ -94,8 +94,12 @@ LinearAttentionResult LinearAttentionLayer::execute(
     start = Clock::now();
     target_k0_enter_layer(progress, TargetK0LayerExecutionStage::kAttention);
     graph_.launch(block_input, conv_state, recurrent_state, state_indices, m,
-                  stream);
+                  stream, progress);
+    target_k0_enter_layer(progress,
+                          TargetK0LayerExecutionStage::kAttentionFence);
     hyperconnection_.synchronize(stream);
+    target_k0_enter_gdn_graph(progress,
+                              TargetK0GdnGraphStage::kOutputPublication);
     const __nv_bfloat16* partial = graph_.projected_output();
     require(partial != nullptr, rank_, layer_,
             "GDN graph returned no projected output");

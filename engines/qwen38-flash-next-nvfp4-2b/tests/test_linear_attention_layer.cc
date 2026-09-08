@@ -58,7 +58,8 @@ class Graph final : public decode::LinearAttentionGraph {
   void launch(const __nv_bfloat16* block_input,
               __nv_bfloat16* conv_state, float* recurrent_state,
               const std::int32_t* state_indices, int m,
-              cudaStream_t stream) override {
+              cudaStream_t stream,
+              decode::TargetK0ExecutionProgress* = nullptr) override {
     check(block_input && conv_state && recurrent_state && state_indices &&
               m == 4 && stream == expected_stream,
           "linear graph launch contract drift");
