@@ -384,6 +384,16 @@ else()
     ROCKET_QWEN38_TARGET_MOE_B12X_AOT=0)
 endif()
 
+add_library(qwen38_target_moe_b12x_native SHARED
+  src/moe/target_moe_b12x_native_anchor.cc)
+target_include_directories(qwen38_target_moe_b12x_native PUBLIC src)
+target_link_libraries(qwen38_target_moe_b12x_native PRIVATE
+  qwen38_target_moe_b12x_aot CUDA::cudart)
+target_compile_options(qwen38_target_moe_b12x_native PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_moe_b12x_native PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+
 add_library(qwen38_mtp_executor STATIC
   src/mtp/graph_runtime.cu
   src/mtp/input_fusion.cu

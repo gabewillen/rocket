@@ -194,3 +194,38 @@ bool target_moe_b12x_aot_compiled() noexcept { return false; }
 #endif
 
 }  // namespace rocket::qwen38::moe
+
+extern "C" int rocket_qwen38_target_moe_b12x_create(
+    int device,
+    const rocket::qwen38::moe::TargetMoeB12xIdentity* identity,
+    const rocket::qwen38::moe::TargetMoeB12xWeights* weights,
+    void** handle) noexcept {
+  if (!identity || !weights || !handle || *handle)
+    return static_cast<int>(rocket::qwen38::moe::TargetMoeOutcome::kContractError);
+  try {
+    *handle = new rocket::qwen38::moe::TargetMoeB12xAot(
+        device, *identity, *weights);
+    return static_cast<int>(rocket::qwen38::moe::TargetMoeOutcome::kOk);
+  } catch (const std::invalid_argument&) {
+    *handle = nullptr;
+    return static_cast<int>(
+        rocket::qwen38::moe::TargetMoeOutcome::kContractError);
+  } catch (...) {
+    *handle = nullptr;
+    return static_cast<int>(rocket::qwen38::moe::TargetMoeOutcome::kCudaError);
+  }
+}
+
+extern "C" int rocket_qwen38_target_moe_b12x_enqueue(
+    void* handle,
+    const rocket::qwen38::moe::TargetMoeB12xLaunch* launch) noexcept {
+  if (!handle || !launch)
+    return static_cast<int>(rocket::qwen38::moe::TargetMoeOutcome::kContractError);
+  return static_cast<int>(
+      static_cast<rocket::qwen38::moe::TargetMoeB12xAot*>(handle)->enqueue(
+          *launch));
+}
+
+extern "C" void rocket_qwen38_target_moe_b12x_destroy(void* handle) noexcept {
+  delete static_cast<rocket::qwen38::moe::TargetMoeB12xAot*>(handle);
+}

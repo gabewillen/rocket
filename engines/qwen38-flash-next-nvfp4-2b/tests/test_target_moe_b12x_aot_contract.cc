@@ -12,6 +12,13 @@ int main() {
   static_assert(moe::kTargetMoePhysicalIntermediate == 768);
   static_assert(moe::kTargetMoeStateExperts == 257);
   static_assert(moe::kTargetMoeMaxRows == 10);
+  void* handle = nullptr;
+  if (rocket_qwen38_target_moe_b12x_create(0, nullptr, nullptr, &handle) !=
+          static_cast<int>(moe::TargetMoeOutcome::kContractError) ||
+      rocket_qwen38_target_moe_b12x_enqueue(nullptr, nullptr) !=
+          static_cast<int>(moe::TargetMoeOutcome::kContractError))
+    std::abort();
+  rocket_qwen38_target_moe_b12x_destroy(nullptr);
   if (moe::target_moe_b12x_aot_compiled()) return 0;
   try {
     moe::TargetMoeB12xAot unavailable(0, {}, {});
