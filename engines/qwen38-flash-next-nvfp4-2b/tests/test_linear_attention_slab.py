@@ -115,6 +115,17 @@ class LinearAttentionSlabTests(unittest.TestCase):
             launch.index('"clear inactive GDN rows"'),
         )
 
+    def test_recurrence_rounds_beta_to_bf16_like_pinned_vllm(self):
+        source = (
+            Path(__file__).parents[1] / "src" / "linear_attention" / "gdn_core.cu"
+        ).read_text()
+        helper = source[source.index("__device__ __forceinline__ float recurrent_beta") :]
+        self.assertIn(
+            "__bfloat162float(__float2bfloat16(sigmoid))",
+            helper[:500],
+        )
+        self.assertEqual(source.count("recurrent_beta(ba["), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

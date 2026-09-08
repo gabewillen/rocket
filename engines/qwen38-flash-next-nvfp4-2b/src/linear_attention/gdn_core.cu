@@ -53,6 +53,13 @@ __device__ __forceinline__ float block_sum(float value, float* warp_sums) {
   return result;
 }
 
+// Pinned vLLM FLA materializes sigmoid(beta) in the BF16 input dtype before
+// widening it for the FP32 recurrence update.
+__device__ __forceinline__ float recurrent_beta(__nv_bfloat16 value) {
+  const float sigmoid = 1.0F / (1.0F + __expf(-__bfloat162float(value)));
+  return __bfloat162float(__float2bfloat16(sigmoid));
+}
+
 __global__ void causal_conv_update(
     const __nv_bfloat16* qkvz, const __nv_bfloat16* weight,
     __nv_bfloat16* state, std::size_t slot_stride,
@@ -167,8 +174,7 @@ __global__ __launch_bounds__(kThreads) void recurrent_gdn(
 
   const float a = __bfloat162float(ba[row * (2 * kValueHeads) +
                                       kValueHeads + hv]);
-  const float beta = 1.0F /
-      (1.0F + __expf(-__bfloat162float(ba[row * (2 * kValueHeads) + hv])));
+  const float beta = recurrent_beta(ba[row * (2 * kValueHeads) + hv]);
   const float x = a + __bfloat162float(dt_bias[hv]);
   const float softplus = x <= 20.0F ? log1pf(__expf(x)) : x;
   // The authenticated serving slab preserves the checkpoint BF16 source.
@@ -227,8 +233,7 @@ __global__ __launch_bounds__(kThreads) void recurrent_gdn_verify(
     __syncthreads();
     const float a = __bfloat162float(
         ba[row * (2 * kValueHeads) + kValueHeads + hv]);
-    const float beta = 1.0F /
-        (1.0F + __expf(-__bfloat162float(ba[row * (2 * kValueHeads) + hv])));
+    const float beta = recurrent_beta(ba[row * (2 * kValueHeads) + hv]);
     const float x = a + __bfloat162float(dt_bias[hv]);
     const float softplus = x <= 20.0F ? log1pf(__expf(x)) : x;
     const float decay =
