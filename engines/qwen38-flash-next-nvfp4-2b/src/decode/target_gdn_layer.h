@@ -85,6 +85,7 @@ class TargetGdnLayer final {
 
   [[nodiscard]] int rank() const noexcept { return rank_; }
   [[nodiscard]] int layer() const noexcept { return layer_; }
+  [[nodiscard]] bool faulted() const noexcept { return faulted_; }
   [[nodiscard]] const HiddenPartialReducer* attention_reducer_identity()
       const noexcept {
     return &attention_reducer_;

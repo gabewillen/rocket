@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: Apache-2.0
+#include "decode/target_gdn_layer_owner.h"
+
+#include <cstdlib>
+#include <stdexcept>
+
+namespace decode = rocket::qwen38::decode;
+
+namespace {
+void check(bool value, const char* message) {
+  if (!value) throw std::runtime_error(message);
+}
+}  // namespace
+
+int main() {
+  static_assert(decode::kTargetGdnStateSlots == 2);
+  static_assert(decode::kTargetGdnConvSlotElements == 30'720);
+  static_assert(decode::kTargetGdnRecurrentSlotElements == 393'216);
+  static_assert(decode::kTargetGdnOwnerStorageBytes == 3'320'576);
+
+  void* storage = nullptr;
+  if (posix_memalign(&storage, 256, decode::kTargetGdnOwnerStorageBytes) != 0)
+    return 2;
+  try {
+    const auto binding = decode::bind_target_gdn_owner_storage(
+        storage, decode::kTargetGdnOwnerStorageBytes);
+    check(decode::valid_target_gdn_c1_state_extent(binding.state),
+          "GDN state binding changed");
+    check(decode::complete_target_gdn_c1_buffers(binding.buffers),
+          "GDN scratch binding changed");
+    check(binding.state.state_index == binding.mutable_state_index,
+          "GDN state-index ownership changed");
+    check(binding.state.convolution !=
+              reinterpret_cast<__nv_bfloat16*>(binding.state.recurrent) &&
+              binding.buffers.attention_input !=
+                  binding.buffers.post_attention_hidden,
+          "GDN storage aliases changed");
+    bool rejected = false;
+    try {
+      (void)decode::bind_target_gdn_owner_storage(
+          storage, decode::kTargetGdnOwnerStorageBytes - 1);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    check(rejected, "short GDN storage was accepted");
+  } catch (...) {
+    free(storage);
+    throw;
+  }
+  free(storage);
+  return 0;
+}
