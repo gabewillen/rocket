@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <stdexcept>
@@ -28,6 +29,8 @@ unsigned long OpenSSL_version_num();
 
 namespace rocket::qwen38::model {
 namespace {
+
+using Clock = std::chrono::steady_clock;
 
 #include "model/target_slab_contract.inc"
 
@@ -197,6 +200,7 @@ std::unique_ptr<TargetSlabDeviceOwner> TargetSlabDeviceOwner::load(
     phase = TargetSlabLoadPhase::kManifest;
     const auto metadata = authenticate_target_slab_metadata(artifact, rank);
     phase = TargetSlabLoadPhase::kOpen;
+    const auto opened = Clock::now();
     const int fd = open(metadata.payload.c_str(), O_RDONLY | O_DIRECT |
                                                      O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) throw IoError("target slab O_DIRECT open failed");
@@ -206,7 +210,6 @@ std::unique_ptr<TargetSlabDeviceOwner> TargetSlabDeviceOwner::load(
         !S_ISREG(payload_stat.st_mode) ||
         static_cast<std::uint64_t>(payload_stat.st_size) != kTargetSlabBytes)
       throw IoError("target slab O_DIRECT payload extent changed");
-
     phase = TargetSlabLoadPhase::kAllocate;
     cuda_require(cudaSetDevice(device), "target slab device selection failed");
     cuda_require(cudaMalloc(reinterpret_cast<void**>(&owner->allocation_),
@@ -258,9 +261,31 @@ std::unique_ptr<TargetSlabDeviceOwner> TargetSlabDeviceOwner::load(
                  "target slab publication event record failed");
     cuda_require(cudaEventSynchronize(owner->publication_event_),
                  "target slab publication fence failed");
+    phase = TargetSlabLoadPhase::kCleanup;
+    for (auto& event : owner->slot_events_) {
+      cuda_require(cudaEventDestroy(event),
+                   "target slab slot event cleanup failed");
+      event = nullptr;
+    }
+    cuda_require(cudaStreamDestroy(owner->stream_),
+                 "target slab private stream cleanup failed");
+    owner->stream_ = nullptr;
+    for (auto& allocation : owner->staging_allocations_) {
+      cuda_require(cudaFreeHost(allocation),
+                   "target slab pinned staging cleanup failed");
+      allocation = nullptr;
+    }
+    owner->staging_.fill(nullptr);
+    phase = TargetSlabLoadPhase::kPublish;
+    const auto open_to_publish_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - opened)
+            .count();
     owner->publication_ = {
-        owner->allocation_, kTargetSlabBytes, device, rank, kTargetSlabArtifactKey,
-        metadata.slab_key, kTargetSlabManifestSha256, metadata.layout_sha256};
+        owner->allocation_, owner->publication_event_, kTargetSlabBytes, device,
+        rank, kTargetSlabArtifactKey, metadata.slab_key,
+        kTargetSlabManifestSha256, metadata.layout_sha256,
+        static_cast<std::uint64_t>(open_to_publish_ns),
+        kTargetSlabChunks, kTargetSlabPeakPinnedBytes};
     emit(telemetry, TargetSlabLoadPhase::kPublish,
          TargetSlabFailureClass::kNone, rank,
          kTargetSlabChunks - 1, true);

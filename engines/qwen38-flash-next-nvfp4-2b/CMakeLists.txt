@@ -183,6 +183,11 @@ target_link_libraries(qwen38-target-slab-auth PRIVATE qwen38_target_slab_owner)
 target_compile_options(qwen38-target-slab-auth PRIVATE
   -Wall -Wextra -Werror)
 
+add_executable(qwen38-target-slab-load bench/target_slab_load.cc)
+target_link_libraries(qwen38-target-slab-load PRIVATE qwen38_target_slab_owner)
+target_compile_options(qwen38-target-slab-load PRIVATE
+  -Wall -Wextra -Werror)
+
 add_library(qwen38_native_hyperconnection_adapter STATIC
   src/hyperconnection/native_adapter.cc)
 target_include_directories(qwen38_native_hyperconnection_adapter PUBLIC src)

@@ -90,6 +90,47 @@ class TargetSlabOwnerContractTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
 
+    def test_physical_harness_is_guarded_and_samples_after_publication(self):
+        harness = (
+            ROOT
+            / "engines/qwen38-flash-next-nvfp4-2b/bench/target_slab_load.cc"
+        ).read_text()
+        publication = harness.index("owner->publication()")
+        sampling = harness.index("sample_matches(metadata.payload")
+        cleanup = harness.index("owner.reset()")
+        self.assertLess(publication, sampling)
+        self.assertLess(sampling, cleanup)
+        for field in (
+            "chunks_authenticated",
+            "peak_host_pinned_bytes",
+            "gpu_allocation_delta_bytes",
+            "gpu_cleanup_delta_bytes",
+            "open_to_publish_ns",
+            "cold_load_regression_guard_ns",
+            "cold_load_regression_guard_passed",
+            "publication_fence_completed",
+            "bytes_per_second",
+            "sample_offsets",
+            "samples_match",
+            "telemetry_overflow",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, harness)
+        self.assertNotIn("cudaDeviceSynchronize", harness)
+        self.assertIn("cudaEventQuery(view.ready_event)", harness)
+        self.assertGreaterEqual(harness.count("telemetry.count != 1"), 2)
+        self.assertIn("17'862'785'416ULL", harness)
+
+        source = (
+            ROOT
+            / "engines/qwen38-flash-next-nvfp4-2b/src/model/target_slab_owner.cc"
+        ).read_text()
+        opened = source.index("const auto opened = Clock::now()")
+        direct_open = source.index("O_RDONLY | O_DIRECT", opened)
+        publication = source.index("owner->publication_ =")
+        self.assertLess(opened, direct_open)
+        self.assertLess(direct_open, publication)
+
 
 if __name__ == "__main__":
     unittest.main()
