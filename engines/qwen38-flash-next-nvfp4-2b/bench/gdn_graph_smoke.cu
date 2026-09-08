@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Live-only proof for the authenticated rank-0/layer-0 fixed GDN graph.
 #include "linear_attention/gdn_cutlass.h"
+#include "linear_attention/gdn_flashinfer_cutlass.h"
 #include "linear_attention/gdn_flashinfer_wheel.h"
 #include "linear_attention/gdn_verifier.h"
 
@@ -11,6 +12,7 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -153,6 +155,59 @@ bool device_equal(const void* left, const void* right, std::size_t bytes) {
         "copy parity right input");
   return left_host == right_host;
 }
+
+struct Bf16Parity {
+  bool bitwise = true;
+  bool finite = true;
+  std::uint32_t max_ulp = 0;
+  float max_abs = 0.0F;
+};
+
+std::int32_t ordered_bf16(std::uint16_t bits) {
+  return bits & 0x8000U ? 0x8000 - static_cast<std::int32_t>(bits & 0x7fffU)
+                        : 0x8000 + static_cast<std::int32_t>(bits);
+}
+
+Bf16Parity device_bf16_parity(const __nv_bfloat16* actual,
+                              const __nv_bfloat16* expected,
+                              std::size_t elements) {
+  std::vector<__nv_bfloat16> actual_host(elements), expected_host(elements);
+  check(cudaMemcpy(actual_host.data(), actual, elements * sizeof(__nv_bfloat16),
+                   cudaMemcpyDeviceToHost),
+        "copy BF16 parity actual");
+  check(cudaMemcpy(expected_host.data(), expected,
+                   elements * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost),
+        "copy BF16 parity expected");
+  Bf16Parity result;
+  for (std::size_t index = 0; index < elements; ++index) {
+    std::uint16_t actual_bits = 0, expected_bits = 0;
+    std::memcpy(&actual_bits, &actual_host[index], sizeof(actual_bits));
+    std::memcpy(&expected_bits, &expected_host[index], sizeof(expected_bits));
+    result.bitwise = result.bitwise && actual_bits == expected_bits;
+    const float actual_value = __bfloat162float(actual_host[index]);
+    const float expected_value = __bfloat162float(expected_host[index]);
+    result.finite = result.finite && std::isfinite(actual_value) &&
+                    std::isfinite(expected_value);
+    result.max_abs =
+        std::max(result.max_abs, std::abs(actual_value - expected_value));
+    result.max_ulp = std::max(
+        result.max_ulp,
+        static_cast<std::uint32_t>(std::abs(ordered_bf16(actual_bits) -
+                                            ordered_bf16(expected_bits))));
+  }
+  return result;
+}
+
+struct ProjectionFailureTelemetry {
+  bool active = false;
+  const char* phase = "inactive";
+  const char* reason = "none";
+  const char* identity = "none";
+  std::array<int, 2> completed_tokens{};
+  int completed_count = 0;
+};
+
+ProjectionFailureTelemetry projection_failure;
 
 void write_device_file(const std::filesystem::path& path, const void* data,
                        std::size_t bytes) {
@@ -835,6 +890,16 @@ void run_prefill_projection(int device,
                             std::string_view fixture_dump_root = {}) {
   using rocket::qwen38::linear_attention::CutlassGdnPrefillProjection;
   using rocket::qwen38::linear_attention::GdnPrefillInputBackend;
+  projection_failure = {};
+  projection_failure.active = true;
+  projection_failure.phase = "initialization";
+  projection_failure.reason = "cuda_or_contract_failure";
+  projection_failure.identity =
+      backend == GdnPrefillInputBackend::kFlashInferCutlass
+          ? "flashinfer_cutlass45_per_column_qkvz"
+          : backend == GdnPrefillInputBackend::kFlashInferWheelBenchmark
+                ? "flashinfer_wheel_0.6.17_sm120f_fallback"
+                : "b12x";
   CutlassGdnPrefillProjection projection(device, weights, true, backend,
                                          wheel_shared_object);
   if (backend == GdnPrefillInputBackend::kFlashInferWheelBenchmark) {
@@ -859,6 +924,7 @@ void run_prefill_projection(int device,
   cudaStream_t stream = nullptr;
   check(cudaStreamCreate(&stream), "create prefill projection stream");
   for (const int tokens : std::array<int, 2>{300, 8'192}) {
+    projection_failure.phase = "parity_prepare";
     projection.launch_input_quantize(
         static_cast<__nv_bfloat16*>(hidden.pointer), tokens, stream);
     check(cudaStreamSynchronize(stream), "prepare projection phase timing");
@@ -866,6 +932,42 @@ void run_prefill_projection(int device,
       dump_projection_fixture(
           fixture_dump_root, tokens,
           static_cast<__nv_bfloat16*>(hidden.pointer), projection);
+    projection.launch_input(static_cast<__nv_bfloat16*>(hidden.pointer), tokens,
+                            stream);
+    projection.launch_reference_input(
+        static_cast<__nv_bfloat16*>(hidden.pointer), tokens, stream);
+    check(cudaStreamSynchronize(stream), "complete projection parity preflight");
+    const std::size_t packed_bytes =
+        static_cast<std::size_t>(tokens) * kHidden / 2;
+    const std::size_t sfa_bytes =
+        rocket::qwen38::linear_attention::prefill_sfa_bytes(tokens, kHidden);
+    const bool packed_parity =
+        device_equal(projection.input_packed(tokens),
+                     projection.reference_qkvz_packed(tokens), packed_bytes) &&
+        device_equal(projection.input_packed(tokens),
+                     projection.reference_ba_packed(tokens), packed_bytes);
+    const bool sfa_parity =
+        device_equal(projection.input_sfa(tokens),
+                     projection.reference_qkvz_sfa(tokens), sfa_bytes) &&
+        device_equal(projection.input_sfa(tokens),
+                     projection.reference_ba_sfa(tokens), sfa_bytes);
+    const Bf16Parity qkvz_numerical = device_bf16_parity(
+        projection.qkvz(tokens), projection.reference_qkvz(tokens),
+        static_cast<std::size_t>(tokens) * 8'192);
+    const bool qkvz_parity =
+        qkvz_numerical.finite &&
+        (qkvz_numerical.bitwise ||
+         (backend == GdnPrefillInputBackend::kFlashInferCutlass &&
+          qkvz_numerical.max_ulp <= 1));
+    const bool ba_parity = device_equal(
+        projection.ba(tokens), projection.reference_ba(tokens),
+        static_cast<std::size_t>(tokens) * 48 * 2);
+    if (!packed_parity || !sfa_parity || !qkvz_parity || !ba_parity) {
+      projection_failure.phase = "parity";
+      projection_failure.reason = "parity_rejected";
+      throw std::runtime_error("prefill projection parity rejected before timing");
+    }
+    projection_failure.phase = "timing";
     const auto quantize = capture_measure(stream, [&] {
       projection.launch_input_quantize(
           static_cast<__nv_bfloat16*>(hidden.pointer), tokens, stream);
@@ -906,31 +1008,6 @@ void run_prefill_projection(int device,
     const auto output_hash =
         device_hash(projection.output(tokens),
                     static_cast<std::size_t>(tokens) * kOut * 2);
-    projection.launch_input(static_cast<__nv_bfloat16*>(hidden.pointer), tokens,
-                            stream);
-    projection.launch_reference_input(
-        static_cast<__nv_bfloat16*>(hidden.pointer), tokens, stream);
-    check(cudaStreamSynchronize(stream), "complete projection parity paths");
-    const std::size_t packed_bytes =
-        static_cast<std::size_t>(tokens) * kHidden / 2;
-    const std::size_t sfa_bytes =
-        rocket::qwen38::linear_attention::prefill_sfa_bytes(tokens, kHidden);
-    const bool packed_parity =
-        device_equal(projection.input_packed(tokens),
-                     projection.reference_qkvz_packed(tokens), packed_bytes) &&
-        device_equal(projection.input_packed(tokens),
-                     projection.reference_ba_packed(tokens), packed_bytes);
-    const bool sfa_parity =
-        device_equal(projection.input_sfa(tokens),
-                     projection.reference_qkvz_sfa(tokens), sfa_bytes) &&
-        device_equal(projection.input_sfa(tokens),
-                     projection.reference_ba_sfa(tokens), sfa_bytes);
-    const bool qkvz_parity = device_equal(
-        projection.qkvz(tokens), projection.reference_qkvz(tokens),
-        static_cast<std::size_t>(tokens) * 8'192 * 2);
-    const bool ba_parity = device_equal(
-        projection.ba(tokens), projection.reference_ba(tokens),
-        static_cast<std::size_t>(tokens) * 48 * 2);
     std::cout << "prefill_backend="
               << (backend == GdnPrefillInputBackend::kB12x
                       ? "b12x"
@@ -963,20 +1040,28 @@ void run_prefill_projection(int device,
               << " packed_parity=" << (packed_parity ? "pass" : "fail")
               << " sfa_parity=" << (sfa_parity ? "pass" : "fail")
               << " qkvz_parity=" << (qkvz_parity ? "pass" : "fail")
+              << " qkvz_bitwise="
+              << (qkvz_numerical.bitwise ? "pass" : "different")
+              << " qkvz_max_ulp=" << qkvz_numerical.max_ulp
+              << " qkvz_max_abs=" << qkvz_numerical.max_abs
               << " ba_parity=" << (ba_parity ? "pass" : "fail")
               << " graph_capture=pass\n";
     std::cout << "{\"prefill_component_trace\":1,\"tokens\":" << tokens
               << ",\"physical_mnk\":{\"qkvz\":[" << tokens
               << ",8192,2560],\"ba\":[" << tokens
               << ",48,2560]},\"ba_logical_n\":48,\"ba_physical_n\":48,"
-              << "\"ba_slice\":false,\"alpha_semantics\":"
-              << "\"single_scalar_pointer_cannot_represent_split_scales\","
+              << "\"ba_slice\":false,\"qkvz_alpha_semantics\":\""
+              << (backend == GdnPrefillInputBackend::kFlashInferCutlass
+                      ? "immutable_per_column_two_region_epilogue"
+                      : "separate_two_region_scale_after_scalar_epilogue")
+              << "\","
               << "\"scales\":{\"qkv\":" << weights.qkv.global_scale
               << ",\"z\":" << weights.z.global_scale << ",\"b\":"
               << weights.b.global_scale << ",\"a\":"
               << weights.a.global_scale
-              << "},\"runner_alpha\":1.0,\"runner\":{\"wheel_sha256\":\""
-              << rocket::qwen38::linear_attention::kGdnFlashInferWheelSha256
+              << "},\"runner\":{\"identity\":\""
+              << projection_failure.identity << "\",\"source_revision\":\""
+              << rocket::qwen38::linear_attention::kGdnFlashInferCutlassRevision
               << "\",\"tactic\":-1,\"scheduler\":\"dp\","
               << "\"swap_ab\":false,\"cta\":[128,128,256],"
               << "\"cluster\":[1,1,1]},\"event_scope\":"
@@ -984,6 +1069,11 @@ void run_prefill_projection(int device,
               << "\"raw_and_composed_capture_replay_scale_only_prepared_eager\","
               << "\"host_wrapper_parameter_overhead\":\"excluded\","
               << "\"runner_parameter_binding\":\"construction_once_outside_events\","
+              << "\"component_scope\":\"raw_and_scale_are_scalar_oracle_for_per_column_backend\","
+              << "\"parity\":{\"accepted\":true,\"bitwise\":"
+              << (qkvz_numerical.bitwise ? "true" : "false")
+              << ",\"max_ulp\":" << qkvz_numerical.max_ulp
+              << ",\"max_abs\":" << qkvz_numerical.max_abs << "},"
               << "\"quantize\":{";
     print_raw_samples(quantize);
     std::cout << "},\"qkvz_raw\":{";
@@ -1001,8 +1091,11 @@ void run_prefill_projection(int device,
     std::cout << "},\"full_input\":{";
     print_raw_samples(input);
     std::cout << "},\"graph_capture\":\"pass\"}\n";
+    projection_failure.completed_tokens[projection_failure.completed_count++] =
+        tokens;
   }
   cudaStreamDestroy(stream);
+  projection_failure.active = false;
 }
 
 }  // namespace
@@ -1536,6 +1629,18 @@ int main(int argc, char** argv) try {
   if (qwen38_gdn_graph_destroy(graph)) throw std::runtime_error(qwen38_gdn_graph_last_error());
   return 0;
 } catch (const std::exception& error) {
+  if (projection_failure.active) {
+    std::cerr << "{\"prefill_projection_failure\":1,\"valid\":false,"
+              << "\"complete\":false,\"completed_cells_valid\":false,"
+              << "\"phase\":\""
+              << projection_failure.phase << "\",\"reason\":\""
+              << projection_failure.reason << "\",\"identity\":\""
+              << projection_failure.identity << "\",\"completed_tokens\":[";
+    for (int index = 0; index < projection_failure.completed_count; ++index)
+      std::cerr << (index ? "," : "")
+                << projection_failure.completed_tokens[index];
+    std::cerr << "]}\n";
+  }
   std::cerr << "gdn_graph_smoke: " << error.what() << '\n';
   return 1;
 }

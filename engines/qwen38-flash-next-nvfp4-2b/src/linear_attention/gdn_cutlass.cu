@@ -652,10 +652,12 @@ struct PrefillProjectionBucket {
   __nv_bfloat16* reference_qkvz = nullptr;
   __nv_bfloat16* reference_ba = nullptr;
   GdnFlashInferCutlassGemm qkvz_gemm;
+  GdnFlashInferCutlassPerColumnGemm qkvz_per_column_gemm;
   GdnFlashInferCutlassGemm ba_gemm;
   GdnFlashInferWheelGemm wheel_qkvz_gemm;
   GdnFlashInferWheelGemm wheel_ba_gemm;
   FixedGemm output_gemm;
+  GdnFlashInferCutlassGemm reference_qkvz_flashinfer_gemm;
   FixedGemm reference_qkvz_gemm;
   FixedGemm reference_ba_gemm;
 };
@@ -828,6 +830,11 @@ CutlassGdnPrefillProjection::CutlassGdnPrefillProjection(int device,
                                bucket->input_sfa, impl_->qkvz_weight,
                                impl_->qkvz_scale, impl_->projection_alpha,
                                bucket->qkvz);
+        bucket->qkvz_per_column_gemm.init(
+            tokens, kQkvzN, kInputK, kQkvN,
+            impl_->globals.qkv.global_scale, impl_->globals.z.global_scale,
+            bucket->input_packed, bucket->input_sfa, impl_->qkvz_weight,
+            impl_->qkvz_scale, bucket->qkvz);
         bucket->ba_gemm.init(tokens, kBaN, kInputK, bucket->input_packed,
                              bucket->input_sfa, impl_->ba_weight,
                              impl_->ba_scale, impl_->projection_alpha,
@@ -870,6 +877,13 @@ CutlassGdnPrefillProjection::CutlassGdnPrefillProjection(int device,
             tokens, kQkvzN, kInputK, bucket->reference_qkvz_packed,
             bucket->reference_qkvz_sfa, impl_->qkvz_weight,
             impl_->qkvz_scale, bucket->reference_qkvz);
+        if (input_backend == GdnPrefillInputBackend::kFlashInferCutlass) {
+          bucket->reference_qkvz_flashinfer_gemm.init(
+              tokens, kQkvzN, kInputK, bucket->reference_qkvz_packed,
+              bucket->reference_qkvz_sfa, impl_->qkvz_weight,
+              impl_->qkvz_scale, impl_->projection_alpha,
+              bucket->reference_qkvz);
+        }
         bucket->reference_ba_gemm.init(
             tokens, kBaN, kInputK, bucket->reference_ba_packed,
             bucket->reference_ba_sfa, impl_->ba_weight, impl_->ba_scale,
@@ -938,6 +952,15 @@ void CutlassGdnPrefillProjection::launch_qkvz_scale(int tokens,
 
 void CutlassGdnPrefillProjection::launch_qkvz(int tokens,
                                               cudaStream_t stream) {
+  auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  if (!bucket || !stream)
+    throw std::invalid_argument("prefill QKVZ projection contract changed");
+  if (impl_->input_backend == GdnPrefillInputBackend::kFlashInferCutlass) {
+    bucket->qkvz_per_column_gemm.run(stream);
+    cuda_check(cudaPeekAtLastError(),
+               "launch per-column prefill QKVZ projection");
+    return;
+  }
   launch_qkvz_raw(tokens, stream);
   launch_qkvz_scale(tokens, stream);
 }
@@ -985,8 +1008,12 @@ void CutlassGdnPrefillProjection::launch_reference_input(
   launch_prefill_input_quant(
       bucket->reference_qkvz_packed, bucket->reference_qkvz_sfa, hidden,
       tokens, impl_->projection_alpha, impl_->input_backend, stream);
-  if (bucket->reference_qkvz_gemm.gemm.run(stream) != cutlass::Status::kSuccess)
+  if (impl_->input_backend == GdnPrefillInputBackend::kFlashInferCutlass) {
+    bucket->reference_qkvz_flashinfer_gemm.run(stream);
+  } else if (bucket->reference_qkvz_gemm.gemm.run(stream) !=
+             cutlass::Status::kSuccess) {
     throw std::runtime_error("reference QKVZ projection failed");
+  }
   scale_projection<<<dim3((kQkvzN + 255) / 256, tokens), 256, 0, stream>>>(
       bucket->reference_qkvz, kQkvzN, kQkvN,
       impl_->globals.qkv.global_scale, impl_->globals.z.global_scale);

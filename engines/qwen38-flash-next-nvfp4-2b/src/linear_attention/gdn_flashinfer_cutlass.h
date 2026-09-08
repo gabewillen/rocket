@@ -40,4 +40,26 @@ class GdnFlashInferCutlassGemm final {
   Impl* impl_;
 };
 
+// QKVZ-only variant of the pinned runner. It owns an immutable device alpha
+// vector and applies the two family scale regions in the CUTLASS epilogue.
+class GdnFlashInferCutlassPerColumnGemm final {
+ public:
+  GdnFlashInferCutlassPerColumnGemm();
+  ~GdnFlashInferCutlassPerColumnGemm();
+  GdnFlashInferCutlassPerColumnGemm(
+      const GdnFlashInferCutlassPerColumnGemm&) = delete;
+  GdnFlashInferCutlassPerColumnGemm& operator=(
+      const GdnFlashInferCutlassPerColumnGemm&) = delete;
+
+  void init(int m, int n, int k, int split, float first_scale,
+            float second_scale, const std::uint8_t* packed_a,
+            const std::uint8_t* sfa, const std::uint8_t* packed_b,
+            const std::uint8_t* sfb, __nv_bfloat16* output);
+  void run(cudaStream_t stream);
+
+ private:
+  struct Impl;
+  Impl* impl_;
+};
+
 }  // namespace rocket::qwen38::linear_attention

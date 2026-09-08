@@ -216,7 +216,7 @@ class GdnFlashInferCutlassContract(unittest.TestCase):
             r'\"runner_parameter_binding\":\"construction_once_outside_events\"',
             smoke,
         )
-        self.assertIn(r'\"runner_alpha\":1.0', smoke)
+        self.assertIn(r'\"qkvz_alpha_semantics\":\"', smoke)
         self.assertIn(r'\"qkvz_raw\"', smoke)
         self.assertIn(r'\"qkvz_scale\"', smoke)
         self.assertIn(r'\"ba_raw\"', smoke)
@@ -224,6 +224,47 @@ class GdnFlashInferCutlassContract(unittest.TestCase):
         self.assertIn("operator_args.epilogue.thread.alpha_ptr", flashinfer)
         self.assertIn("float const* global_sf", flashinfer)
         self.assertIn("column < split ? first : second", source)
+
+    def test_qkvz_per_column_epilogue_hard_cuts_only_qkvz_scale(self) -> None:
+        smoke = (ENGINE / "bench/gdn_graph_smoke.cu").read_text()
+        graph = (ENGINE / "src/linear_attention/gdn_cutlass.cu").read_text()
+        imported = (
+            ENGINE / "src/linear_attention/gdn_flashinfer_cutlass.cu"
+        ).read_text()
+        header = (
+            ENGINE / "src/linear_attention/gdn_flashinfer_cutlass.h"
+        ).read_text()
+        self.assertIn("GdnFlashInferCutlassPerColumnGemm", header)
+        self.assertIn("PerColLinCombPerColBiasEltAct", imported)
+        self.assertIn("cutlass::epilogue::thread::Identity", imported)
+        self.assertIn("GdnQkvzPerColumnDevice", imported)
+        self.assertIn("std::fill_n(alpha.begin(), split, first_scale)", imported)
+        self.assertIn("qkvz_per_column_gemm.run(stream)", graph)
+        self.assertIn("launch_qkvz_raw(tokens, stream);\n  launch_qkvz_scale", graph)
+        qkvz_method = graph.split(
+            "void CutlassGdnPrefillProjection::launch_qkvz(int tokens", 1
+        )[1].split(
+            "void CutlassGdnPrefillProjection::launch_ba_raw", 1
+        )[0]
+        self.assertIn("kFlashInferCutlass", qkvz_method)
+        self.assertIn("return;", qkvz_method)
+        ba_method = graph.split(
+            "void CutlassGdnPrefillProjection::launch_ba(int tokens", 1
+        )[1].split(
+            "void CutlassGdnPrefillProjection::launch_reference_input", 1
+        )[0]
+        self.assertIn("launch_ba_raw(tokens, stream)", ba_method)
+        self.assertIn("launch_ba_scale(tokens, stream)", ba_method)
+        self.assertIn("qkvz_numerical.max_ulp <= 1", smoke)
+        self.assertLess(
+            smoke.index("prefill projection parity rejected before timing"),
+            smoke.index("const auto quantize = capture_measure"),
+        )
+        self.assertIn(r'\"prefill_projection_failure\":1', smoke)
+        self.assertIn(r'\"valid\":false', smoke)
+        self.assertIn(r'\"complete\":false', smoke)
+        self.assertIn(r'\"completed_cells_valid\":false', smoke)
+        self.assertIn("completed_tokens", smoke)
 
 
 if __name__ == "__main__":
