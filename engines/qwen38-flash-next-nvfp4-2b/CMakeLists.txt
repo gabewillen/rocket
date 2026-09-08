@@ -761,6 +761,19 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
   set_target_properties(qwen38_target_layer_moe_owner PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
 
+  add_library(qwen38_target_qsa_k0_layer_owner STATIC
+    src/decode/target_qsa_k0_layer_owner.cu)
+  target_include_directories(qwen38_target_qsa_k0_layer_owner PUBLIC src)
+  target_link_libraries(qwen38_target_qsa_k0_layer_owner PUBLIC
+    qwen38_target_layer_moe_owner qwen38_target_layer_native_bindings
+    qwen38_target_layer3_generation qwen38_native_qsa_graph
+    qwen38_hyperconnection qwen38_native_hyperconnection_adapter
+    qwen38_decode_execution CUDA::cudart)
+  target_compile_options(qwen38_target_qsa_k0_layer_owner PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+  set_target_properties(qwen38_target_qsa_k0_layer_owner PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+
   add_library(qwen38_target_layer3_moe_owner_preflight SHARED
     src/moe/target_layer3_moe_owner_preflight.cc)
   target_include_directories(qwen38_target_layer3_moe_owner_preflight PUBLIC src)
