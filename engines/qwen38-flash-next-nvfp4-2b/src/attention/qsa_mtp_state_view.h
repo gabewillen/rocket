@@ -6,11 +6,16 @@
 #include <cstdint>
 #include <stdexcept>
 
+#include "mtp/state_arena.h"
+
 namespace rocket::qwen38::attention {
 
 inline constexpr int kMtpQsaMainWidth = 256;
 inline constexpr int kMtpQsaIndexerWidth = 128;
 inline constexpr int kMtpQsaMropeAxes = 3;
+static_assert(kMtpQsaMainWidth == mtp::kQsaMainKvWidth);
+static_assert(kMtpQsaIndexerWidth == mtp::kQsaIndexerWidth);
+static_assert(kMtpQsaMropeAxes == mtp::kMropeAxes);
 
 // Borrowed row journal owned by the MTP StateArena. QSA writes each draft
 // step directly into these pointers. The arena remains the allocation and
@@ -50,6 +55,17 @@ class MtpQsaStateViewError : public std::invalid_argument {
   using std::invalid_argument::invalid_argument;
 };
 
+// Identity supplied by NativeExecutor at its typed MtpMiddleStagePort boundary.
+// It carries no pointers and cannot extend the StateArena allocation lifetime.
+struct MtpQsaArenaIdentity {
+  int sequences;
+  int depth;
+  int step;
+  bool uses_mrope;
+  std::uint64_t generation;
+  std::uint64_t expected_generation;
+};
+
 [[nodiscard]] constexpr bool allowed_mtp_qsa_rows(int rows) noexcept {
   return rows == 1 || rows == 2 || rows == 4 || rows == 8 || rows == 16;
 }
@@ -75,6 +91,32 @@ class MtpQsaStateViewError : public std::invalid_argument {
           state.compressed_slots,
           state.compressed_valid,
           state.rows};
+}
+
+// Adapt the pushed MTP StateArena ABI without copying causal state. Every
+// returned pointer aliases PrefixStateView and remains owned by StateArena.
+[[nodiscard]] inline MtpQsaWriteView bind_mtp_qsa_write_view(
+    mtp::PrefixStateView state, MtpQsaArenaIdentity identity) {
+  if (!allowed_mtp_qsa_rows(identity.sequences) || identity.depth < 1 ||
+      identity.depth > mtp::kStateMaxDepth || identity.step < 0 ||
+      identity.step >= identity.depth || identity.generation == 0 ||
+      identity.generation != identity.expected_generation) {
+    throw MtpQsaStateViewError(
+        "exact MTP QSA arena identity and generation are required");
+  }
+  return bind_mtp_qsa_write_view(
+      {state.main_key,
+       state.main_value,
+       state.raw_key,
+       state.compressed_key,
+       state.rope_positions,
+       state.main_slots,
+       state.raw_slots,
+       state.compressed_slots,
+       state.compressed_valid,
+       identity.sequences,
+       identity.uses_mrope},
+      identity.sequences, identity.uses_mrope);
 }
 
 }  // namespace rocket::qwen38::attention
