@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 import importlib.util
+import json
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
 
 
@@ -81,6 +85,39 @@ class TargetMoeB12xAotContract(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "TVM-FFI"):
                 MODULE.authenticate_exported_abi(header, object_file)
 
+    def test_real_manifest_recomputes_and_generates_ascii_identity(self) -> None:
+        default = pathlib.Path(
+            "/home/glwillen/calibration/qwen38-rank-slabs-fc694/"
+            "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/"
+            "manifest.json"
+        )
+        manifest_path = pathlib.Path(
+            os.environ.get("ROCKET_QWEN38_TARGET_SLAB_MANIFEST", default)
+        )
+        if not manifest_path.is_file():
+            self.skipTest("authenticated target slab manifest is not installed")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        canonical = dict(manifest)
+        claimed = canonical.pop("artifact_key")
+        recomputed = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.assertEqual(recomputed, claimed)
+        expected = MODULE.authenticate_artifact_manifest(manifest_path)
+        with tempfile.TemporaryDirectory() as directory:
+            header = MODULE.emit_artifact_key_header(pathlib.Path(directory), expected)
+            text = header.read_text(encoding="utf-8")
+        self.assertIn(f' = "{expected}";', text)
+        self.assertNotIn("std::array", text)
+
+        for position in range(64):
+            mutated = (
+                expected[:position]
+                + ("1" if expected[position] == "0" else "0")
+                + expected[position + 1:]
+            )
+            self.assertNotEqual(mutated, expected)
+
     def test_production_enqueue_has_no_ownership_or_host_transfer_calls(self) -> None:
         source = ADAPTER.read_text(encoding="utf-8")
         begin = source.index("TargetMoeOutcome TargetMoeB12xAot::enqueue(")
@@ -99,6 +136,11 @@ class TargetMoeB12xAotContract(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, hot_path)
         self.assertIn("launch.stream", hot_path)
+
+    def test_production_has_no_manual_digest_byte_list(self) -> None:
+        source = ADAPTER.read_text(encoding="utf-8")
+        self.assertNotRegex(source, r"0x[0-9a-fA-F]{2}")
+        self.assertIn("target_moe_artifact_key_ascii()", source)
 
 
 if __name__ == "__main__":

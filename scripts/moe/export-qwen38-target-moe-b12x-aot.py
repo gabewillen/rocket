@@ -25,6 +25,7 @@ PINNED_KERNEL_SHA256 = (
 PINNED_TVM_FFI_OBJECT_SHA256 = (
     "8cc49bdb4163b07338818bb7db482aea812d91cc1cbf3ef1eeecf0ee2756fef4"
 )
+ARTIFACT_KEY_HEADER = "target_moe_artifact_key.h"
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,39 @@ def authenticate_exported_abi(header: Path, object_file: Path) -> None:
         raise RuntimeError("target MoE exported C ABI changed")
     if b"TVMFFIEnvGetStream" in object_bytes or b"__tvm_ffi" in object_bytes:
         raise RuntimeError("target MoE export retained the TVM-FFI runtime ABI")
+
+
+def authenticate_artifact_manifest(path: Path) -> str:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("target MoE artifact manifest is unavailable") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("target MoE artifact manifest root changed")
+    canonical = dict(manifest)
+    claimed = canonical.pop("artifact_key", None)
+    observed = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if (
+        not isinstance(claimed, str)
+        or len(claimed) != 64
+        or any(ch not in "0123456789abcdef" for ch in claimed)
+        or observed != claimed
+    ):
+        raise RuntimeError("target MoE artifact manifest identity changed")
+    return claimed
+
+
+def emit_artifact_key_header(output_dir: Path, artifact_key: str) -> Path:
+    path = output_dir / ARTIFACT_KEY_HEADER
+    path.write_text(
+        "// Generated from the authenticated target slab manifest.\n"
+        "#pragma once\n"
+        f'inline constexpr char kRocketQwen38TargetMoeArtifactKey[] = "{artifact_key}";\n',
+        encoding="utf-8",
+    )
+    return path
 
 
 def authenticate_sources() -> tuple[Path, Path]:
@@ -233,8 +267,10 @@ def export(output_dir: Path, arch: str) -> dict[str, str]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--artifact-manifest", type=Path)
     parser.add_argument("--arch", default="sm_121a")
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--identity-only", action="store_true")
     args = parser.parse_args()
     manifest = {
         "abi": "rocket.qwen38.target-moe.b12x-aot.c1.v1",
@@ -251,6 +287,15 @@ def main() -> None:
         return
     if args.output is None or not args.output.is_dir():
         parser.error("--output must name an existing build directory")
+    if args.artifact_manifest is None:
+        parser.error("--artifact-manifest is required for an authenticated export")
+    artifact_key = authenticate_artifact_manifest(args.artifact_manifest)
+    identity_header = emit_artifact_key_header(args.output, artifact_key)
+    manifest["artifact_key"] = artifact_key
+    manifest["artifact_key_header_sha256"] = digest(identity_header)
+    if args.identity_only:
+        print(json.dumps(manifest, sort_keys=True))
+        return
     manifest["export"] = export(args.output, args.arch)
     (args.output / "target_moe_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"

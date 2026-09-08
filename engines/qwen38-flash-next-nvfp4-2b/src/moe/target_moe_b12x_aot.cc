@@ -7,18 +7,13 @@
 
 #if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
 #include "target_moe_b12x_c1.h"
+#include "target_moe_artifact_key.h"
 #endif
 
 namespace rocket::qwen38::moe {
 namespace {
 
 #if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
-constexpr std::array<std::uint8_t, 32> kArtifactSha256{
-    0xa9, 0xfc, 0xca, 0x02, 0x6a, 0x87, 0xad, 0x12,
-    0x85, 0xb9, 0x4f, 0xef, 0x19, 0x44, 0x48, 0xc5,
-    0x1b, 0x42, 0xd9, 0x75, 0x16, 0xf1, 0x62, 0x11,
-    0xc6, 0x1a, 0xe4, 0xc7, 0x70, 0xc6, 0xf0, 0xf4};
-
 #endif
 
 bool valid_launch(const TargetMoeB12xLaunch& launch) noexcept {
@@ -56,12 +51,42 @@ bool load_module(Module* module, int device, auto init, auto load) noexcept {
 
 }  // namespace
 
+bool parse_target_moe_artifact_key(
+    std::string_view ascii, std::array<std::uint8_t, 32>* bytes) noexcept {
+  if (!bytes || ascii.size() != 64) return false;
+  const auto nibble = [](char ch) -> int {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    return -1;
+  };
+  std::array<std::uint8_t, 32> parsed{};
+  for (std::size_t i = 0; i < parsed.size(); ++i) {
+    const int high = nibble(ascii[2 * i]);
+    const int low = nibble(ascii[2 * i + 1]);
+    if (high < 0 || low < 0) return false;
+    parsed[i] = static_cast<std::uint8_t>((high << 4) | low);
+  }
+  *bytes = parsed;
+  return true;
+}
+
+std::string_view target_moe_artifact_key_ascii() noexcept {
+#if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
+  return kRocketQwen38TargetMoeArtifactKey;
+#else
+  return {};
+#endif
+}
+
 TargetMoeCreateFailure diagnose_target_moe_b12x_create(
     int device, const TargetMoeB12xIdentity& identity,
     const TargetMoeB12xWeights& weights) noexcept {
   if (device < 0) return TargetMoeCreateFailure::kDevice;
 #if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
-  if (identity.artifact_sha256 != kArtifactSha256)
+  std::array<std::uint8_t, 32> artifact_sha256{};
+  if (!parse_target_moe_artifact_key(target_moe_artifact_key_ascii(),
+                                     &artifact_sha256) ||
+      identity.artifact_sha256 != artifact_sha256)
     return TargetMoeCreateFailure::kArtifactSha256;
 #endif
   if (!std::any_of(identity.layout_sha256.begin(), identity.layout_sha256.end(),
