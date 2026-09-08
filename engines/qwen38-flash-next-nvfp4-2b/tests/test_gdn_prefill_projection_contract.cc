@@ -46,5 +46,7 @@ int main() {
         1);
   check(linear::CutlassGdnPrefillProjection::
             reference_input_quantizations_per_launch() == 2);
+  check(linear::GdnPrefillInputBackend::kB12x !=
+        linear::GdnPrefillInputBackend::kCutlassControl);
   return 0;
 }

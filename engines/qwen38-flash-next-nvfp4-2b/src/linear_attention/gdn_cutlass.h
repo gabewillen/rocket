@@ -45,6 +45,11 @@ struct GdnWeights {
 inline constexpr int kPrefillInputQuantizationsPerLaunch = 1;
 inline constexpr int kPrefillReferenceInputQuantizationsPerLaunch = 2;
 
+enum class GdnPrefillInputBackend {
+  kCutlassControl,
+  kB12x,
+};
+
 #if defined(__CUDACC__)
 #define ROCKET_QWEN38_GDN_HOST_DEVICE __host__ __device__
 #else
@@ -111,7 +116,9 @@ class CutlassGdnGraph final : public decode::LinearAttentionGraph {
 class CutlassGdnPrefillProjection final {
  public:
   CutlassGdnPrefillProjection(int device, GdnWeights weights,
-                              bool enable_reference = false);
+                              bool enable_reference = false,
+                              GdnPrefillInputBackend input_backend =
+                                  GdnPrefillInputBackend::kCutlassControl);
   ~CutlassGdnPrefillProjection();
   CutlassGdnPrefillProjection(const CutlassGdnPrefillProjection&) = delete;
   CutlassGdnPrefillProjection& operator=(
