@@ -21,6 +21,10 @@ int main() {
   static_assert(attention::allowed_mtp_qsa_rows(16));
   static_assert(!attention::allowed_mtp_qsa_rows(3));
   static_assert(!attention::allowed_mtp_qsa_rows(128));
+  static_assert(attention::allowed_mtp_qsa_query_tokens(300));
+  static_assert(attention::allowed_mtp_qsa_query_tokens(8192));
+  static_assert(!attention::allowed_mtp_qsa_query_tokens(299));
+  static_assert(!attention::allowed_mtp_qsa_query_tokens(8193));
   constexpr int rows = 16;
   std::array<__nv_bfloat16, rows * attention::kMtpQsaMainWidth> main_key{};
   std::array<__nv_bfloat16, rows * attention::kMtpQsaMainWidth> main_value{};
@@ -53,7 +57,8 @@ int main() {
       raw_key.data(),           compressed_key.data(), rope.data(),
       main_slots.data(),        raw_slots.data(),      compressed_slots.data(),
       compressed_valid.data()};
-  const attention::MtpQsaArenaIdentity identity{rows, 4, 2, true, 17, 17};
+  const attention::MtpQsaArenaIdentity identity{
+      rows, 4, 300, 2, true, 17, 17};
   const auto arena_bound =
       attention::bind_mtp_qsa_write_view(arena_state, identity);
   check(arena_bound.key == arena_state.main_key);
@@ -66,12 +71,14 @@ int main() {
   check(arena_bound.compressed_slots == arena_state.compressed_slots);
   check(arena_bound.compressed_valid == arena_state.compressed_valid);
 
-  for (const auto invalid : std::array<attention::MtpQsaArenaIdentity, 5>{
-           attention::MtpQsaArenaIdentity{3, 4, 2, true, 17, 17},
-           attention::MtpQsaArenaIdentity{rows, 0, 0, true, 17, 17},
-           attention::MtpQsaArenaIdentity{rows, 4, 4, true, 17, 17},
-           attention::MtpQsaArenaIdentity{rows, 4, 2, true, 0, 0},
-           attention::MtpQsaArenaIdentity{rows, 4, 2, true, 17, 18}}) {
+  for (const auto invalid : std::array<attention::MtpQsaArenaIdentity, 7>{
+           attention::MtpQsaArenaIdentity{3, 4, 300, 2, true, 17, 17},
+           attention::MtpQsaArenaIdentity{rows, 0, 300, 0, true, 17, 17},
+           attention::MtpQsaArenaIdentity{rows, 4, 299, 2, true, 17, 17},
+           attention::MtpQsaArenaIdentity{rows, 4, 8193, 2, true, 17, 17},
+           attention::MtpQsaArenaIdentity{rows, 4, 300, 4, true, 17, 17},
+           attention::MtpQsaArenaIdentity{rows, 4, 300, 2, true, 0, 0},
+           attention::MtpQsaArenaIdentity{rows, 4, 300, 2, true, 17, 18}}) {
     bool identity_rejected = false;
     try {
       static_cast<void>(

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "mtp/native_executor.h"
 #include <cuda_runtime.h>
 #include <array>
@@ -48,8 +49,14 @@ class Middle final : public mtp::MtpMiddleStagePort { public:
     cudaMemsetAsync(a.reduced_embedding, 0, sequences_ * mtp::kFusionHidden * 4, s);
     cudaMemsetAsync(a.reduced_hidden, 0, sequences_ * mtp::kFusionHyperHidden * 4, s);
   }
-  void stage_attention(mtp::GraphArenaView, mtp::PrefixStateView, int,
-                       mtp::GraphKey, cudaStream_t) override {}
+  void stage_attention(mtp::GraphArenaView,
+                       rocket::qwen38::attention::MtpQsaWriteView state,
+                       int step, mtp::GraphKey key, cudaStream_t) override {
+    assert(state.rows == sequences_);
+    assert(step >= 0 && step < depth_);
+    assert(key.query_tokens == 300);
+    ++attention_calls_;
+  }
   void reduce_attention(mtp::GraphArenaView, int, mtp::GraphKey,
                         cudaStream_t) override {}
   void stage_moe(mtp::GraphArenaView, int, mtp::GraphKey, cudaStream_t) override {}
@@ -66,6 +73,7 @@ class Middle final : public mtp::MtpMiddleStagePort { public:
                     sequences_ * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s);
   }
   int sequences_, depth_; std::int32_t *tokens_ = nullptr, *routes_ = nullptr;
+  int attention_calls_ = 0;
   bool fault_routes_ = false;
 };
 class Sink final : public mtp::TelemetrySink { public:
@@ -76,8 +84,11 @@ class Sink final : public mtp::TelemetrySink { public:
 }
 
 int main() {
-  static_assert(mtp::allowed_graph_key({4,16}));
-  static_assert(!mtp::allowed_graph_key({5,16}));
+  static_assert(mtp::allowed_graph_key({4, 16, 300}));
+  static_assert(mtp::allowed_graph_key({4, 16, 8192}));
+  static_assert(!mtp::allowed_graph_key({4, 16, 299}));
+  static_assert(!mtp::allowed_graph_key({4, 16, 8193}));
+  static_assert(!mtp::allowed_graph_key({5, 16, 300}));
   constexpr int sequences = 2, depth = 2;
   mtp::NonexpertLayout l{}; std::uint64_t bytes = 0;
   bytes=append(l.pre_fc_norm_embedding,bytes,5120); bytes=append(l.pre_fc_norm_hidden,bytes,20480);
@@ -98,7 +109,7 @@ int main() {
   {
     mtp::StateArena failed_state(sequences,depth,false);
     Middle failed_middle(sequences,depth); failed_middle.fault_routes_=true;
-    mtp::NativeExecutor failed({depth,sequences},runtime,failed_middle,exchange,
+    mtp::NativeExecutor failed({depth, sequences, 300}, runtime, failed_middle, exchange,
                                failed_state,sink,stream);
     bool rejected=false;
     try { failed.draft(1); } catch (const mtp::NativeExecutorError&) { rejected=true; }
@@ -106,8 +117,14 @@ int main() {
     failed.commit(1);
     assert(failed.phase()==mtp::ExecutorPhase::kFaulted);
   }
-  mtp::NativeExecutor executor({depth,sequences},runtime,middle,exchange,state,sink,stream);
+  mtp::NativeExecutor executor(
+      {depth, sequences, 300}, runtime, middle, exchange, state, sink, stream);
+  bool stale_rejected = false;
+  try { static_cast<void>(executor.draft(2)); }
+  catch (const mtp::NativeExecutorError&) { stale_rejected = true; }
+  assert(stale_rejected && middle.attention_calls_ == 0);
   const auto draft=executor.draft(1); assert(draft.depth==depth && draft.sequences==sequences);
+  assert(middle.attention_calls_ == depth);
   std::array<std::int32_t,sequences> widths{1,3}; std::int32_t* dwidths=nullptr;
   cudaMalloc(&dwidths,sizeof(widths)); cudaMemcpy(dwidths,widths.data(),sizeof(widths),cudaMemcpyHostToDevice);
   executor.stage_accept(1,inactive,dwidths,{sequences,depth+1},stream);
