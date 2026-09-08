@@ -47,7 +47,7 @@ inline constexpr int kPrefillReferenceInputQuantizationsPerLaunch = 2;
 inline constexpr char kPrefillB12xQuantSourceRevision[] = "8e685d198";
 
 enum class GdnPrefillInputBackend {
-  kCutlassControl,
+  kFlashInferCutlass,
   kB12x,
 };
 
@@ -119,7 +119,7 @@ class CutlassGdnPrefillProjection final {
   CutlassGdnPrefillProjection(int device, GdnWeights weights,
                               bool enable_reference = false,
                               GdnPrefillInputBackend input_backend =
-                                  GdnPrefillInputBackend::kCutlassControl);
+                                  GdnPrefillInputBackend::kFlashInferCutlass);
   ~CutlassGdnPrefillProjection();
   CutlassGdnPrefillProjection(const CutlassGdnPrefillProjection&) = delete;
   CutlassGdnPrefillProjection& operator=(

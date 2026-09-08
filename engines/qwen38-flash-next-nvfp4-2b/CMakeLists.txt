@@ -34,6 +34,16 @@ if(NOT EXISTS "${ROCKET_QWEN38_CUTLASS_DIR}/include/cutlass/cutlass.h")
   message(FATAL_ERROR "CUTLASS 4.8 checkout missing at ${ROCKET_QWEN38_CUTLASS_DIR}")
 endif()
 
+set(ROCKET_QWEN38_FLASHINFER_91BDA04_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/vendor/flashinfer-91bda04"
+  CACHE PATH "Pinned FlashInfer 91bda04 CUTLASS runner slice")
+set(_gdn_flashinfer_template
+  "${ROCKET_QWEN38_FLASHINFER_91BDA04_DIR}/include/flashinfer/gemm/fp4_gemm_template_sm120.h")
+if(NOT EXISTS "${_gdn_flashinfer_template}")
+  message(FATAL_ERROR
+    "Pinned FlashInfer 91bda04 GDN CUTLASS runner is required at ${_gdn_flashinfer_template}")
+endif()
+
 add_library(qwen38_cutlass_qkv SHARED src/projection/cutlass_qkv.cu)
 target_include_directories(qwen38_cutlass_qkv PRIVATE
   src
@@ -159,17 +169,34 @@ else()
     ROCKET_QWEN38_GDN_B12X_AOT=0)
 endif()
 
+add_library(qwen38_gdn_flashinfer_cutlass STATIC
+  src/linear_attention/gdn_flashinfer_cutlass.cu)
+target_include_directories(qwen38_gdn_flashinfer_cutlass PUBLIC src PRIVATE
+  "${ROCKET_QWEN38_CUTLASS_DIR}/include"
+  "${ROCKET_QWEN38_CUTLASS_DIR}/tools/util/include"
+  "${ROCKET_QWEN38_FLASHINFER_91BDA04_DIR}/include")
+target_link_libraries(qwen38_gdn_flashinfer_cutlass PUBLIC CUDA::cudart)
+target_compile_options(qwen38_gdn_flashinfer_cutlass PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>)
+target_compile_definitions(qwen38_gdn_flashinfer_cutlass PRIVATE
+  ENABLE_BF16=1
+  CUTLASS_ENABLE_GDC_FOR_SM100=1)
+set_target_properties(qwen38_gdn_flashinfer_cutlass PROPERTIES
+  CUDA_ARCHITECTURES "121a"
+  CUDA_SEPARABLE_COMPILATION OFF
+  POSITION_INDEPENDENT_CODE ON)
+
 add_library(qwen38_gdn_graph SHARED
   src/linear_attention/gdn_cutlass.cu
-  src/linear_attention/gdn_verifier.cu
-)
+  src/linear_attention/gdn_verifier.cu)
 target_include_directories(qwen38_gdn_graph PUBLIC
   src
   "${ROCKET_QWEN38_CUTLASS_DIR}/include"
   "${ROCKET_QWEN38_CUTLASS_DIR}/tools/util/include"
 )
 target_link_libraries(qwen38_gdn_graph PUBLIC
-  qwen38_gdn_core qwen38_gdn_b12x_aot qwen38_decode_execution CUDA::cudart
+  qwen38_gdn_core qwen38_gdn_b12x_aot qwen38_gdn_flashinfer_cutlass
+  qwen38_decode_execution CUDA::cudart
 )
 target_compile_options(qwen38_gdn_graph PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>
@@ -412,6 +439,10 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME qwen38-gdn-b12x-aot-cpu-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gdn_b12x_aot_contract.py)
+
+add_test(NAME qwen38-gdn-flashinfer-cutlass-cpu-contract
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gdn_flashinfer_cutlass_contract.py)
 
 add_executable(qwen38-test-gdn-b12x-aot-contract
   tests/test_gdn_b12x_aot_contract.cc)

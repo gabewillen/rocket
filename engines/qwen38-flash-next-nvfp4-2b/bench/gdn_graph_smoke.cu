@@ -189,7 +189,7 @@ void run_prefill_projection(int device,
   using rocket::qwen38::linear_attention::CutlassGdnPrefillProjection;
   using rocket::qwen38::linear_attention::GdnPrefillInputBackend;
   const auto backend = use_b12x ? GdnPrefillInputBackend::kB12x
-                                : GdnPrefillInputBackend::kCutlassControl;
+                                : GdnPrefillInputBackend::kFlashInferCutlass;
   CutlassGdnPrefillProjection projection(device, weights, true, backend);
   DeviceBlob hidden(8'192ULL * kHidden * 2);
   DeviceBlob normalized(8'192ULL * kHeads * kDim * 2);
@@ -259,7 +259,8 @@ void run_prefill_projection(int device,
     const bool ba_parity = device_equal(
         projection.ba(tokens), projection.reference_ba(tokens),
         static_cast<std::size_t>(tokens) * 48 * 2);
-    std::cout << "prefill_backend=" << (use_b12x ? "b12x" : "cutlass_control")
+    std::cout << "prefill_backend="
+              << (use_b12x ? "b12x" : "flashinfer_cutlass_91bda04")
               << " prefill_tokens=" << tokens
               << " shared_input_quantizations=1 input_p50_us=" << input.first
               << " input_p95_us=" << input.second

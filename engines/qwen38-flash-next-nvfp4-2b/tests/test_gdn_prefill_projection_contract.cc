@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "linear_attention/gdn_cutlass.h"
+#include "linear_attention/gdn_flashinfer_cutlass.h"
 
 #include <cstdlib>
 #include <vector>
@@ -47,7 +48,14 @@ int main() {
   check(linear::CutlassGdnPrefillProjection::
             reference_input_quantizations_per_launch() == 2);
   check(linear::GdnPrefillInputBackend::kB12x !=
-        linear::GdnPrefillInputBackend::kCutlassControl);
+        linear::GdnPrefillInputBackend::kFlashInferCutlass);
+  check(std::string_view(linear::kGdnFlashInferCutlassRevision) ==
+        "91bda04c66f7cb851e1ab3b78b9fecea644b9844");
+  check(linear::kGdnFlashInferCutlassTileM == 128);
+  check(linear::kGdnFlashInferCutlassTileN == 128);
+  check(linear::kGdnFlashInferCutlassTileK == 256);
+  check(!linear::kGdnFlashInferCutlassSwapAb);
+  check(!linear::kGdnFlashInferCutlassStreamK);
   check(std::string_view(linear::kPrefillB12xQuantSourceRevision) ==
         "8e685d198");
   return 0;
