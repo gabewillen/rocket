@@ -1,0 +1,103 @@
+---
+title: "Per-column epilogue scaling halves QKVZ time at 8192 tokens"
+description: "A CUTLASS per-column epilogue removes 256 MiB of scale traffic and reduces the authenticated GDN input projection median from 2.87 ms to 1.64 ms on GB10."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, kernels, memory]
+verdict: accepted
+rocket: "#kernels"
+supersedes: posts/kernels/2026-09-08-qwen38-qkvz-scale-attribution
+---
+
+**Question.** Does an immutable two-region CUTLASS epilogue remove the QKVZ
+scale round trip while preserving the authenticated projection result and CUDA
+graph capture?
+
+| setup | |
+| --- | --- |
+| node | gx10-5e36, NVIDIA GB10; gx10-2a13 checked idle |
+| Rocket commit | `08fd721a43e405070a8ef572f1be83efa0fd9e68` |
+| executable SHA-256 | `3346e021556d4d58b096264c203e9183981d138e25ffe3fe2a7b1224f9d37825` |
+| runner | FlashInfer `91bda04c66f7cb851e1ab3b78b9fecea644b9844`, CUTLASS 4.5, fallback tactic -1, DP, CTA 128x128x256, cluster 1x1x1, `swap_ab=false` |
+| slab | rank 0 target, SHA-256 `1ccf21b0fae92cdd599869ea3f18a97327e10261dbd98b09b26b923049bbcc8b` |
+| timing | 10 graph warmups, 50 CUDA-event samples |
+| clocks | before: P8, 208 MHz, 3.33 W, 42 C; immediate after: P0, 2476 MHz, 56.36 W, 45 C |
+
+```bash
+set -euo pipefail
+cd /home/glwillen/Development/rocket-mtp-worktree/engines/qwen38-flash-next-nvfp4-2b
+test "$(git rev-parse HEAD)" = 08fd721a43e405070a8ef572f1be83efa0fd9e68
+test "$(sha256sum build-b12x/qwen38-gdn-graph-smoke | cut -d' ' -f1)" = 3346e021556d4d58b096264c203e9183981d138e25ffe3fe2a7b1224f9d37825
+test "$(sha256sum /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank0-target.slab | cut -d' ' -f1)" = 1ccf21b0fae92cdd599869ea3f18a97327e10261dbd98b09b26b923049bbcc8b
+test -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)"
+test -z "$(ssh spark2 nvidia-smi --query-compute-apps=pid --format=csv,noheader)"
+nvidia-smi --query-gpu=timestamp,name,uuid,pstate,clocks.current.sm,power.draw,temperature.gpu --format=csv,noheader
+build-b12x/qwen38-gdn-graph-smoke \
+  /home/glwillen/calibration/qwen38-rank-slabs-fc694/a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4/rank0-target.slab \
+  0 --prefill-projection 2>&1 | \
+  tee /var/tmp/rocket-gdn-qkvz-percol-08fd721.jsonl
+nvidia-smi --query-gpu=timestamp,name,uuid,pstate,clocks.current.sm,power.draw,temperature.gpu --format=csv,noheader
+```
+
+| tokens | metric | 47b4bf1 p50 | 47b4bf1 p95 | 08fd721 p50 | 08fd721 p95 | p50 speedup | p95 speedup | unit |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 300 | QKVZ composed | 64.768 | 66.976 | 51.616 | 51.744 | 1.25 | 1.29 | us |
+| 300 | full input projection | 87.200 | 87.712 | 73.504 | 75.808 | 1.19 | 1.16 | us |
+| 8192 | QKVZ composed | 2576.77 | 2599.42 | 1301.25 | 1512.13 | 1.98 | 1.72 | us |
+| 8192 | full input projection | 2870.85 | 3203.97 | 1636.10 | 1843.33 | 1.75 | 1.74 | us |
+
+| tokens | new component | p50 | p95 | p95 / p50 | unit |
+| ---: | --- | ---: | ---: | ---: | --- |
+| 300 | shared quantization | 10.688 | 10.816 | 1.012 | us |
+| 300 | fused QKVZ | 51.616 | 51.744 | 1.002 | us |
+| 300 | BA composed | 14.720 | 14.912 | 1.013 | us |
+| 300 | full input projection | 73.504 | 75.808 | 1.031 | us |
+| 8192 | shared quantization | 229.760 | 232.864 | 1.013 | us |
+| 8192 | fused QKVZ | 1301.25 | 1512.13 | 1.162 | us |
+| 8192 | BA composed | 51.904 | 53.728 | 1.035 | us |
+| 8192 | full input projection | 1636.10 | 1843.33 | 1.127 | us |
+
+| removed scale traffic | T300 | T8192 | unit |
+| --- | ---: | ---: | --- |
+| BF16 read plus write | 9,830,400 | 268,435,456 | B |
+
+Packed activation, SFA, QKVZ, and BA parity passed at both token counts. QKVZ
+was accepted by the unchanged finite BF16 gate of at most 1 ULP. The bitwise
+comparison differed with observed bounds `max_ulp=1` and `max_abs=64`. CUDA
+graph capture passed.
+
+The command output artifact SHA-256 is
+`d304f9cb1b4384fbdddd4970cc1a4f3eb04ecd376f6a62f8cace420795b4b7ee`.
+The raw samples are inline below.
+
+<details>
+<summary>T300 raw CUDA-event samples</summary>
+
+```json
+{"quantize_us":[11.488,10.56,10.688,10.72,10.72,10.592,10.688,10.784,10.72,10.752,10.624,10.656,10.816,10.816,10.848,10.688,10.656,9.792,10.752,10.816,10.688,10.656,10.656,10.784,10.784,10.752,10.592,10.592,9.12,10.432,10.784,10.784,9.824,10.592,10.784,10.656,10.592,10.656,10.752,9.824,10.752,10.752,10.688,10.656,9.792,10.784,10.784,10.656,10.592,9.792],"qkvz_us":[50.688,51.68,50.112,59.488,51.616,51.712,51.68,51.68,49.76,51.456,51.744,51.712,51.584,51.712,50.72,51.68,51.744,51.616,49.92,51.456,50.016,51.328,51.68,51.52,51.584,51.712,50.72,51.488,51.712,50.048,49.504,51.648,51.616,51.392,51.584,51.616,51.712,51.712,51.712,51.584,49.952,51.456,51.616,51.712,52.8,51.648,51.712,50.784,51.648,51.68],"ba_us":[14.496,14.784,14.784,14.88,14.976,14.176,14.56,14.912,14.752,14.72,14.784,14.208,14.496,14.88,14.848,14.656,14.208,14.496,14.88,14.784,14.72,14.144,14.624,14.88,14.784,14.72,14.72,14.176,14.592,14.848,14.752,14.688,14.176,14.56,14.912,14.752,14.72,14.88,14.848,14.848,14.72,15.04,14.72,14.208,14.592,14.816,14.88,14.688,14.176,14.56],"full_input_us":[72.8,73.216,73.184,73.376,72.992,75.232,73.12,73.312,75.136,73.504,72.928,73.152,72.992,73.216,73.152,72.96,73.632,74.816,75.232,73.312,73.92,74.208,73.28,73.088,75.712,74.016,73.984,73.568,75.808,73.76,74.144,72.832,74.24,73.44,73.312,75.072,73.248,75.264,73.184,74.24,74.08,73.184,73.568,72.832,73.248,73.888,75.936,74.368,73.632,75.968]}
+```
+
+</details>
+
+<details>
+<summary>T8192 raw CUDA-event samples</summary>
+
+```json
+{"quantize_us":[230.08,230.688,229.76,228.928,228.352,230.528,227.872,232.512,229.344,228.64,227.712,230.496,229.92,229.024,228.768,231.936,229.76,229.76,229.728,229.728,228.608,228.736,229.632,230.816,229.76,229.76,230.88,230.88,230.208,234.72,228.864,229.792,232.864,229.696,228.8,229.856,231.872,229.888,229.856,229.824,233.824,230.912,230.784,229.984,229.632,230.688,229.152,228.416,230.784,228.896],"qkvz_us":[1280.8,1283.46,1268.22,1307.17,1301.79,1301.15,1581.7,1498.34,1512.13,1374.88,1313.82,1311.39,1308.32,1272.26,1291.87,1293.79,1288.7,1307.1,1304.06,1304.35,1339.58,1680.93,1333.31,1494.82,1433.63,1263.1,1286.69,1310.72,1313.92,1292.96,1278.18,1288.51,1300.96,1283.46,1276.61,1324.64,1276.42,1304.22,1253.98,1297.95,1307.2,1324.29,1306.21,1310.18,1275.52,1301.25,1292.42,1287.52,1295.78,1274.75],"ba_us":[51.776,51.84,53.248,51.744,52.064,53.44,52.736,53.792,51.936,51.904,53.216,52.192,51.296,51.712,53.536,51.776,51.776,53.696,53.632,51.744,53.664,51.584,53.696,52,51.84,51.68,53.344,52.064,51.264,51.936,51.36,52.736,53.728,51.712,51.648,52.256,54.336,51.584,51.744,51.936,53.664,51.904,53.536,51.808,51.68,53.632,51.744,51.776,51.744,51.52],"full_input_us":[1621.95,1671.55,1625.54,1618.5,1624.61,1611.17,1632.8,1622.14,1704.7,1970.02,1843.33,1741.82,1635.55,1616.93,1634.3,1633.92,1601.54,1639.33,1627.58,1636.7,2056.8,1651.36,1823.17,1720.48,1636.93,1607.23,1620.51,1622.69,1621.57,1640.96,1658.27,1665.5,1611.17,1632.8,1636.7,1647.04,1636.1,1648.74,1651.36,1630.82,1665.6,1615.58,1609.89,1625.57,1636.93,1657.28,1615.36,1658.69,1647.97,1636.9]}
+```
+
+</details>
+
+**Verdict.** Accepted. The per-column epilogue removes the separate QKVZ
+scale pass and produces a 1.98x QKVZ median speedup at T8192 with the parity
+gate and graph capture intact.
+
+**Next.**
+
+- profile the T8192 QKVZ mainloop, which is 1301.25 us and 79.5% of the full input projection median
+- attribute the remaining 53.19 us between the sum of quantization, QKVZ, and BA medians and the 1636.10 us full-input median
+- leave BA unchanged; its 51.904 us median is 3.2% of the full input projection
+
+**Reopen if.**
+
+- a CUDA, firmware, GB10, FlashInfer, or CUTLASS release changes SM120 epilogue scheduling or BF16 conversion semantics
