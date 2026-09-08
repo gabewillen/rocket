@@ -113,6 +113,7 @@ target_compile_options(qwen38_qsa_target_preprocess PRIVATE
 set_target_properties(qwen38_qsa_target_preprocess PROPERTIES
   CUDA_ARCHITECTURES "121"
   CUDA_SEPARABLE_COMPILATION ON
+  CUDA_RESOLVE_DEVICE_SYMBOLS ON
   POSITION_INDEPENDENT_CODE ON)
 
 add_library(qwen38_pair_reduce STATIC
@@ -610,6 +611,7 @@ target_compile_options(qwen38_token_output PRIVATE
 )
 set_target_properties(qwen38_token_output PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
+  CUDA_RESOLVE_DEVICE_SYMBOLS ON
   POSITION_INDEPENDENT_CODE ON
 )
 
@@ -625,7 +627,8 @@ target_compile_options(qwen38_native_token_io PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror>
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
 set_target_properties(qwen38_native_token_io PROPERTIES
-  CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+  CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON
+  POSITION_INDEPENDENT_CODE ON)
 
 add_library(qwen38_native_token_io_preflight SHARED
   src/output/native_token_io_preflight.cc)
@@ -882,6 +885,19 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
     -Wall -Wextra -Werror)
   add_test(NAME qwen38-target-k0-physical-startup-cpu-contract
     COMMAND qwen38-test-target-k0-physical-startup)
+
+  add_library(qwen38_target_k0_oracle35_runtime SHARED
+    src/decode/target_k0_physical_c_api.cu)
+  target_include_directories(qwen38_target_k0_oracle35_runtime PUBLIC src)
+  target_link_libraries(qwen38_target_k0_oracle35_runtime PRIVATE
+    qwen38_target_k0_physical_startup qwen38_target_k0_bounded_telemetry
+    qwen38_mtp_executor qwen38_native_token_io qwen38_qsa_target_preprocess
+    qwen38_token_output qwen38_target_slab_owner CUDA::cudart)
+  target_compile_options(qwen38_target_k0_oracle35_runtime PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+  set_target_properties(qwen38_target_k0_oracle35_runtime PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    POSITION_INDEPENDENT_CODE ON)
 
   add_library(qwen38_target_layer3_moe_owner_preflight SHARED
     src/moe/target_layer3_moe_owner_preflight.cc)

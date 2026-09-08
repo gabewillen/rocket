@@ -28,6 +28,17 @@ void TargetK0BoundedTelemetry::emit(
   increment(counters_.moe_components, point.component);
 }
 
+void TargetK0BoundedTelemetry::emit_span_and_log(
+    const mtp::NcclBootstrapTelemetryRecord& record) noexcept {
+  increment(counters_.nccl_stages, record.stage);
+  increment(counters_.nccl_outcomes, record.outcome);
+}
+
+void TargetK0BoundedTelemetry::record_duration(
+    const mtp::NcclBootstrapTelemetryRecord&) noexcept {
+  ++counters_.duration_samples;
+}
+
 void TargetK0BoundedTelemetry::add_counter(
     const moe::TargetMoeStageOtelPoint& point) noexcept {
   increment(counters_.stage_counters, point.counter);

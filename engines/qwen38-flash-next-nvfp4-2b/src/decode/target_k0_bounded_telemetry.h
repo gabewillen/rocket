@@ -4,6 +4,7 @@
 #include "attention/target_k0_qsa_state_owner.h"
 #include "moe/target_full_moe_c1.h"
 #include "moe/target_moe_n640_device_stage.h"
+#include "mtp/nccl_communicator_owner.h"
 #include "pair_reduce/otel.h"
 
 #include <array>
@@ -16,6 +17,8 @@ struct TargetK0BoundedTelemetrySnapshot {
   std::array<std::uint64_t, 5> moe_components{};
   std::array<std::uint64_t, 4> stage_counters{};
   std::array<std::uint64_t, 4> state_outcomes{};
+  std::array<std::uint64_t, 9> nccl_stages{};
+  std::array<std::uint64_t, 7> nccl_outcomes{};
   std::uint64_t duration_samples = 0;
   std::uint64_t total_bytes = 0;
 };
@@ -28,13 +31,18 @@ class TargetK0BoundedTelemetry final
     : public pair_reduce::OtelStageSink,
       public moe::TargetFullMoeOtelSink,
       public moe::TargetMoeStageOtelSink,
-      public attention::TargetK0OracleQsaStateOtelSink {
+      public attention::TargetK0OracleQsaStateOtelSink,
+      public mtp::NcclBootstrapOtelSink {
  public:
   void emit_span_and_log(const pair_reduce::SpanRecord&) noexcept override;
   void record_duration(const pair_reduce::MetricPoint&) noexcept override;
   void emit(const moe::TargetFullMoeOtelPoint&) noexcept override;
   void add_counter(const moe::TargetMoeStageOtelPoint&) noexcept override;
   void emit(const attention::TargetK0OracleQsaStateOtelPoint&) noexcept override;
+  void emit_span_and_log(
+      const mtp::NcclBootstrapTelemetryRecord&) noexcept override;
+  void record_duration(
+      const mtp::NcclBootstrapTelemetryRecord&) noexcept override;
   [[nodiscard]] TargetK0BoundedTelemetrySnapshot snapshot() const noexcept;
 
  private:

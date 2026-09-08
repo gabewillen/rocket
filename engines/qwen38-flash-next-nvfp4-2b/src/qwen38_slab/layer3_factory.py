@@ -179,7 +179,10 @@ class NativeTargetSlabHandoff:
 class CtypesNativeTargetSlabLeaseFactory:
     """Native finalizer used only by ``CudaRankSlabLoader._load_locked``."""
 
-    def __init__(self, library: Path):
+    def __init__(
+        self, library: Path, *,
+        retain_symbol: str = "qwen38_target_slab_retain_accepted_loader",
+    ):
         class _ChunkReceipt(ctypes.Structure):
             _fields_ = (
                 ("index", ctypes.c_uint64), ("bytes", ctypes.c_uint64),
@@ -189,7 +192,12 @@ class CtypesNativeTargetSlabLeaseFactory:
             )
         self._chunk_receipt = _ChunkReceipt
         self._native = ctypes.CDLL(str(library))
-        self._retain = self._native.qwen38_target_slab_retain_accepted_loader
+        if retain_symbol not in (
+            "qwen38_target_slab_retain_accepted_loader",
+            "qwen38_target_k0_retain_accepted_loader",
+        ):
+            raise NativeTargetSlabFinalizeError("native_status")
+        self._retain = getattr(self._native, retain_symbol)
         self._retain.argtypes = (
             ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
             ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p,
