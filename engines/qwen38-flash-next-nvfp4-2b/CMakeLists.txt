@@ -352,6 +352,12 @@ target_link_libraries(qwen38-residual-rmsnorm-bench PRIVATE qwen38_residual_rmsn
 add_executable(qwen38-token-output-bench bench/token_output_bench.cu)
 target_link_libraries(qwen38-token-output-bench PRIVATE qwen38_token_output)
 
+add_executable(qwen38-route-compaction-bench bench/route_compaction_bench.cu)
+target_link_libraries(qwen38-route-compaction-bench PRIVATE
+  qwen38_route_compaction CUDA::cudart)
+target_compile_options(qwen38-route-compaction-bench PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+
 enable_testing()
 add_test(NAME qwen38-qsa-expand-smoke COMMAND qwen38-qsa-expand-smoke)
 add_executable(qwen38-test-pair-reduce tests/test_pair_reduce.cu)
