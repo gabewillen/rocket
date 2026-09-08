@@ -167,6 +167,27 @@ target_compile_options(qwen38_target_layer3_native_plan PRIVATE
 set_target_properties(qwen38_target_layer3_native_plan PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
+add_library(qwen38_target_layer_native_plan STATIC
+  src/decode/target_layer_native_plan.cc)
+target_include_directories(qwen38_target_layer_native_plan PUBLIC src)
+target_link_libraries(qwen38_target_layer_native_plan PUBLIC
+  rocket_qwen38_openssl3_crypto qwen38_decode_execution)
+target_compile_options(qwen38_target_layer_native_plan PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_layer_native_plan PROPERTIES
+  POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
+
+add_library(qwen38_target_layer_native_bindings STATIC
+  src/decode/target_layer_native_bindings.cc)
+target_include_directories(qwen38_target_layer_native_bindings PUBLIC src)
+target_link_libraries(qwen38_target_layer_native_bindings PUBLIC
+  qwen38_target_layer_native_plan qwen38_target_moe_n640_device_stage
+  qwen38_target_slab_owner)
+target_compile_options(qwen38_target_layer_native_bindings PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_layer_native_bindings PROPERTIES
+  POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
+
 add_library(qwen38_target_layer3_generation STATIC
   src/decode/target_layer3_generation.cu)
 target_include_directories(qwen38_target_layer3_generation PUBLIC src)
@@ -640,6 +661,18 @@ if(ROCKET_QWEN38_TARGET_MOE_B12X_AOT_DIR)
   target_compile_options(qwen38_target_layer3_moe_owner PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
   set_target_properties(qwen38_target_layer3_moe_owner PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+
+  add_library(qwen38_target_layer_moe_owner STATIC
+    src/moe/target_layer_moe_owner.cu)
+  target_include_directories(qwen38_target_layer_moe_owner PUBLIC src)
+  target_link_libraries(qwen38_target_layer_moe_owner PUBLIC
+    qwen38_target_layer_native_bindings qwen38_native_target_moe_graph
+    qwen38_target_moe_n640_device_stage qwen38_target_full_moe_c1
+    qwen38_target_moe_b12x_aot qwen38_target_router_shared_c1 CUDA::cudart)
+  target_compile_options(qwen38_target_layer_moe_owner PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+  set_target_properties(qwen38_target_layer_moe_owner PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
 
   add_library(qwen38_target_layer3_moe_owner_preflight SHARED

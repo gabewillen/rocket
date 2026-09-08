@@ -33,6 +33,16 @@ class TargetLayerDescriptorError(RuntimeError):
     pass
 
 
+def _strides(shape: object) -> list[int]:
+    values = list(shape) if isinstance(shape, (list, tuple)) else []
+    stride = 1
+    result = []
+    for dimension in reversed(values):
+        result.append(stride)
+        stride *= int(dimension)
+    return list(reversed(result))
+
+
 def _extent(item: object, *, storage: str = "target_slab") -> dict[str, object]:
     if not isinstance(item, dict):
         raise TargetLayerDescriptorError("target layer extent is absent")
@@ -41,6 +51,7 @@ def _extent(item: object, *, storage: str = "target_slab") -> dict[str, object]:
         "length_bytes": item["length_bytes"], "shape": item["shape"],
         "dtype": item["dtype"], "layout": item["layout"],
         "abi": item["abi"], "storage": storage,
+        "strides": _strides(item["shape"]),
     }
 
 
@@ -122,7 +133,7 @@ def _moe(entries: Mapping[str, object], rank: int,
         "name": item.name, "offset_bytes": item.offset,
         "length_bytes": item.length, "shape": list(item.shape),
         "dtype": item.dtype, "layout": item.layout, "abi": item.abi,
-        "storage": "target_slab",
+        "storage": "target_slab", "strides": _strides(item.shape),
     } for item in selected]
 
 
@@ -181,7 +192,8 @@ def target_layer_descriptor(artifact: Path, sidecar: Path, rank: int,
                 scalar_bits[family] = raw.hex()
         finally:
             os.close(fd)
-    extents.extend(_moe(entries, rank, layer))
+    moe_extents = _moe(entries, rank, layer)
+    extents.extend(moe_extents)
     extents.sort(key=lambda item: str(item["name"]))
     if len({item["name"] for item in extents}) != len(extents):
         raise TargetLayerDescriptorError("target layer extent names overlap")
@@ -195,6 +207,15 @@ def target_layer_descriptor(artifact: Path, sidecar: Path, rank: int,
             canonical_bytes(publication)).hexdigest(),
         "indexer_sidecar_key": SIDECAR_ARTIFACT if kind == "qsa" else "",
         "attention_projection_global_le_hex": scalar_bits,
+        "moe_layout_sha256": hashlib.sha256(canonical_bytes([
+            {
+                "name": item["name"], "offset": item["offset_bytes"],
+                "length": item["length_bytes"], "shape": item["shape"],
+                "dtype": item["dtype"], "layout": item["layout"],
+                "abi": item["abi"],
+            }
+            for item in moe_extents
+        ])).hexdigest(),
         "extents": extents,
     }
     descriptor["native_binding_inventory_sha256"] = hashlib.sha256(
@@ -208,6 +229,7 @@ def descriptor_identity(descriptor: Mapping[str, object]) -> dict[str, object]:
     return {key: descriptor[key] for key in (
         "rank", "layer", "attention_kind", "descriptor_sha256",
         "native_binding_inventory_sha256", "slab_publication_layout_sha256",
+        "moe_layout_sha256",
     )}
 
 
@@ -224,13 +246,15 @@ def load_descriptor_allowlist(path: Path) -> tuple[Mapping[str, object], ...]:
         if not isinstance(item, dict) or set(item) != {
             "rank", "layer", "attention_kind", "descriptor_sha256",
             "native_binding_inventory_sha256", "slab_publication_layout_sha256",
+            "moe_layout_sha256",
         }:
             raise TargetLayerDescriptorError("target layer allowlist shape changed")
         rank, layer = item["rank"], item["layer"]
         expected_kind = "qsa" if isinstance(layer, int) and layer % 4 == 3 else "gdn"
         digests = (item["descriptor_sha256"],
                    item["native_binding_inventory_sha256"],
-                   item["slab_publication_layout_sha256"])
+                   item["slab_publication_layout_sha256"],
+                   item["moe_layout_sha256"])
         if (
             rank not in (0, 1) or isinstance(layer, bool)
             or not isinstance(layer, int) or not 0 <= layer < 48

@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: Apache-2.0
+#include "decode/target_layer_native_bindings.h"
+
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
+namespace rocket::qwen38::decode {
+namespace {
+
+[[noreturn]] void fail(std::string_view reason) {
+  throw std::invalid_argument("target layer native weight binding: " +
+                              std::string(reason));
+}
+
+const TargetLayerNativeExtent& extent(
+    const TargetLayerNativePlan& plan, std::string_view suffix,
+    std::uint64_t bytes) {
+  const std::string name = "model.language_model.layers." +
+                           std::to_string(plan.layer) + "." +
+                           std::string(suffix);
+  const auto found = std::find_if(
+      plan.extents.begin(), plan.extents.end(),
+      [&](const auto& item) { return item.name == name; });
+  if (found == plan.extents.end() || found->storage != "target_slab" ||
+      found->length_bytes != bytes)
+    fail("required extent changed: " + name);
+  return *found;
+}
+
+const TargetLayerNativeExtent& typed_extent(
+    const TargetLayerNativePlan& plan, std::string_view suffix,
+    std::uint64_t bytes, std::string_view dtype, std::string_view layout,
+    std::initializer_list<std::uint64_t> shape,
+    std::initializer_list<std::uint64_t> strides) {
+  const auto& item = extent(plan, suffix, bytes);
+  constexpr std::string_view abi =
+      "modelopt_nvfp4_group16_cutlass_sm121_sfb";
+  if (item.dtype != dtype || item.layout != layout || item.abi != abi ||
+      item.shape != std::vector<std::uint64_t>(shape) ||
+      item.strides != std::vector<std::uint64_t>(strides))
+    fail("routed source dtype, layout, shape, stride, or ABI changed");
+  return item;
+}
+
+template <class T>
+const T* address(const std::uint8_t* base,
+                 const TargetLayerNativeExtent& item) {
+  const auto value = reinterpret_cast<std::uintptr_t>(base);
+  if (!value || item.offset_bytes >
+                    std::numeric_limits<std::uintptr_t>::max() - value)
+    fail("device address overflow");
+  return reinterpret_cast<const T*>(
+      value + static_cast<std::uintptr_t>(item.offset_bytes));
+}
+
+}  // namespace
+
+TargetLayerNativeMoeWeights bind_target_layer_native_moe_weights(
+    const TargetLayerNativePlan& plan,
+    const model::TargetSlabPublication& slab) {
+  validate_target_layer_native_plan_binding(plan);
+  if ((plan.rank != 0 && plan.rank != 1) || plan.peer_rank != 1 - plan.rank ||
+      !slab.device_base || !slab.ready_event || slab.bytes != plan.slab_bytes ||
+      slab.device < 0 || slab.rank != plan.rank ||
+      slab.artifact_key != model::kTargetSlabArtifactKey ||
+      slab.artifact_key != plan.artifact_key ||
+      slab.slab_key != plan.slab_key ||
+      slab.manifest_sha256 != model::kTargetSlabManifestSha256 ||
+      slab.layout_sha256 != plan.slab_publication_layout_sha256 ||
+      slab.open_to_publish_ns == 0 ||
+      slab.chunks_authenticated != model::kTargetSlabChunks ||
+      slab.peak_host_pinned_bytes != model::kTargetSlabPeakPinnedBytes)
+    fail("MoE slab publication identity changed");
+  const auto target = [&](std::string_view name, std::uint64_t bytes) {
+    return extent(plan, name, bytes);
+  };
+  const auto* base = slab.device_base;
+  TargetLayerNativeMoeWeights result{};
+  result.router = {
+      address<std::uint8_t>(base, target("mlp.gate.weight", 655'360)),
+      address<std::uint8_t>(base, target("mlp.gate.weight_scale", 81'920)),
+      address<float>(base, target("mlp.gate.weight_scale_2", 4))};
+  result.shared = {
+      address<__nv_bfloat16>(base,
+          target("mlp.shared_expert.gate_proj.weight", 1'638'400)),
+      address<__nv_bfloat16>(base,
+          target("mlp.shared_expert.up_proj.weight", 1'638'400)),
+      address<__nv_bfloat16>(base,
+          target("mlp.shared_expert.down_proj.weight", 1'638'400)),
+      address<__nv_bfloat16>(base,
+          target("mlp.shared_expert_gate.weight", 5'120))};
+  const int first = plan.rank * moe::kTargetMoeLocalExperts;
+  for (int local = 0; local < moe::kTargetMoeLocalExperts; ++local) {
+    const auto root = "mlp.experts." + std::to_string(first + local) + ".";
+    const auto packed = [&](std::string_view projection) {
+      return address<std::uint8_t>(base, typed_extent(
+          plan, root + std::string(projection) + ".weight", 819'200,
+          "U8", "checkpoint",
+          projection == "down_proj"
+              ? std::initializer_list<std::uint64_t>{2'560, 320}
+              : std::initializer_list<std::uint64_t>{640, 1'280},
+          projection == "down_proj"
+              ? std::initializer_list<std::uint64_t>{320, 1}
+              : std::initializer_list<std::uint64_t>{1'280, 1}));
+    };
+    const auto scale = [&](std::string_view projection) {
+      return address<std::uint8_t>(base, typed_extent(
+          plan, root + std::string(projection) + ".weight_scale", 102'400,
+          "F8_E4M3", "cutlass_sm121_sfb", {102'400}, {1}));
+    };
+    const auto scalar = [&](std::string_view projection,
+                            std::string_view leaf) {
+      return address<float>(base, typed_extent(
+          plan, root + std::string(projection) + "." + std::string(leaf),
+          4, "F32", "checkpoint", {}, {}));
+    };
+    result.routed_source[local] = {
+        packed("up_proj"), scale("up_proj"),
+        scalar("up_proj", "input_scale"),
+        scalar("up_proj", "weight_scale_2"),
+        packed("gate_proj"), scale("gate_proj"),
+        scalar("gate_proj", "input_scale"),
+        scalar("gate_proj", "weight_scale_2"),
+        packed("down_proj"), scale("down_proj"),
+        scalar("down_proj", "input_scale"),
+        scalar("down_proj", "weight_scale_2")};
+  }
+  result.routed_identity = moe::TargetMoeCompactRuntimeIdentity{
+      plan.rank, plan.descriptor_sha256,
+      plan.native_binding_inventory_sha256,
+      plan.slab_publication_layout_sha256,
+      "modelopt_nvfp4_group16_cutlass_sm121_sfb",
+      std::string(moe::kTargetMoeDeviceStageAbi),
+      "route_position_iota10_unique_positive_remote_zero_v1"};
+  return result;
+}
+
+}  // namespace rocket::qwen38::decode
