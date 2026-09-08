@@ -5,15 +5,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
+import pathlib
 import statistics
+import subprocess
 from types import SimpleNamespace
 from typing import Callable
 
 import torch
 import flashinfer
 import vllm
+from flashinfer.autotuner import AutoTuner
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
@@ -33,13 +38,249 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[math.ceil(len(ordered) * fraction) - 1]
 
 
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def tensor_identity(tensor: torch.Tensor) -> dict[str, object]:
+    contiguous = tensor.detach().contiguous()
+    payload = contiguous.reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
+    return {
+        "shape": list(tensor.shape),
+        "stride": list(tensor.stride()),
+        "dtype": str(tensor.dtype),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "bytes": len(payload),
+    }
+
+
+def loaded_shared_object_identity(basename: str) -> dict[str, object]:
+    """Return one loaded artifact identity, failing on absent/ambiguous matches."""
+    matches: set[pathlib.Path] = set()
+    for line in pathlib.Path("/proc/self/maps").read_text(encoding="utf-8").splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) == 6 and pathlib.Path(fields[5]).name == basename:
+            matches.add(pathlib.Path(fields[5]))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected one loaded {basename}, found {sorted(map(str, matches))}"
+        )
+    path = matches.pop()
+    return {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "bytes": path.stat().st_size,
+    }
+
+
+def sm120_cutlass_tactic(tactic: object) -> dict[str, object]:
+    """Decode the pinned FlashInfer 0.6.17 SM120 tactic table."""
+    tiles = (
+        (128, 32, 128),
+        (128, 32, 256),
+        (128, 64, 128),
+        (128, 64, 256),
+        (128, 128, 128),
+        (128, 128, 256),
+        (256, 128, 128),
+        (128, 256, 128),
+    )
+    if tactic == -1:
+        return {
+            "id": -1,
+            "tile_mnk": [128, 128, 256],
+            "scheduler": "dp_static_persistent",
+            "swap_ab": False,
+            "cluster": [1, 1, 1],
+            "source": "FlashInfer-0.6.17-fallback",
+        }
+    if not isinstance(tactic, int) or not 0 <= tactic < len(tiles) * 4:
+        raise RuntimeError(f"unrecognized FlashInfer SM120 FP4 tactic {tactic!r}")
+    tile = tiles[tactic // 4]
+    variant = tactic % 4
+    return {
+        "id": tactic,
+        "tile_mnk": list(tile),
+        "scheduler": "stream_k" if variant >= 2 else "dp_static_persistent",
+        "swap_ab": variant in (0, 2),
+        "cluster": [1, 1, 1],
+        "source": "FlashInfer-0.6.17-getConfigs",
+    }
+
+
+class Fp4DispatchTrace:
+    """Observe FlashInfer's actual runner/tactic choice without changing it."""
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+        self._tuner = AutoTuner.get()
+        self._original = self._tuner.choose_one
+
+    def __enter__(self) -> "Fp4DispatchTrace":
+        def traced_choose_one(custom_op, runners, tuning_config, inputs, **kwargs):
+            runner, tactic = self._original(
+                custom_op, runners, tuning_config, inputs, **kwargs
+            )
+            if custom_op == "fp4_gemm":
+                shapes = tuple(self._tuner._get_input_sizes(inputs))
+                runner_keys = [
+                    AutoTuner._get_cache_key(
+                        custom_op,
+                        candidate,
+                        shapes,
+                        tuning_config,
+                        candidate.get_cache_key_extras(inputs),
+                    )
+                    for candidate in runners
+                ]
+                memory_hit = any(
+                    key in self._tuner.profiling_cache for key in runner_keys
+                )
+                loaded_hit = any(
+                    key.file_key in self._tuner._file_configs for key in runner_keys
+                )
+                cache_hit, cached_runner, cached_tactic, _ = self._tuner.search_cache(
+                    custom_op, runners, shapes, tuning_config, inputs=inputs
+                )
+                runner_index = runners.index(runner)
+                if cached_runner != runner_index or cached_tactic != tactic:
+                    raise RuntimeError("FlashInfer dispatch changed during attribution")
+                bundled_enabled = (
+                    os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
+                )
+                if memory_hit:
+                    cache_source = "process_memory"
+                elif loaded_hit:
+                    cache_source = "explicit_loaded_config"
+                elif cache_hit and bundled_enabled:
+                    cache_source = "bundled_package_config"
+                elif not cache_hit and tactic == -1:
+                    cache_source = "miss_fallback"
+                else:
+                    raise RuntimeError("unattributable FlashInfer cache-chain result")
+                tensors = []
+                for value in inputs:
+                    if isinstance(value, torch.Tensor):
+                        tensors.append({
+                            "shape": list(value.shape),
+                            "stride": list(value.stride()),
+                            "dtype": str(value.dtype),
+                            "data_ptr_mod_128": value.data_ptr() % 128,
+                        })
+                    else:
+                        tensors.append(None)
+                self.records.append({
+                    "runner": (
+                        f"{type(runner).__module__}.{type(runner).__qualname__}"
+                    ),
+                    "runner_index": runner_index,
+                    "tactic": sm120_cutlass_tactic(tactic),
+                    "cache_chain_result": cache_source,
+                    "tuning_mode": bool(self._tuner.is_tuning_mode),
+                    "bundled_cache_enabled": bundled_enabled,
+                    "inputs": tensors,
+                })
+            return runner, tactic
+
+        self._tuner.choose_one = traced_choose_one
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        del self._tuner.choose_one
+
+    def summary(self) -> list[dict[str, object]]:
+        unique: dict[str, dict[str, object]] = {}
+        counts: dict[str, int] = {}
+        for record in self.records:
+            key = json.dumps(record, sort_keys=True)
+            unique[key] = record
+            counts[key] = counts.get(key, 0) + 1
+        result = []
+        for key, record in unique.items():
+            result.append({**record, "python_dispatch_calls": counts[key]})
+        return result
+
+
+def gpu_clock_power_snapshot() -> dict[str, object]:
+    fields = "clocks.current.graphics,clocks.current.memory,power.draw,power.limit"
+    command = [
+        "nvidia-smi", "--id=0", f"--query-gpu={fields}",
+        "--format=csv,noheader,nounits",
+    ]
+    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    values = [value.strip() for value in completed.stdout.strip().split(",")]
+    if len(values) != 4:
+        raise RuntimeError(f"unexpected nvidia-smi clock/power output: {values}")
+    return {
+        "graphics_clock_mhz": values[0],
+        "memory_clock_mhz": values[1],
+        "power_draw_w": values[2],
+        "power_limit_w": values[3],
+        "controlled": False,
+        "scope": "post_measurement_snapshot",
+    }
+
+
+def projection_contract(tokens: int, warmup: int, iterations: int) -> dict[str, object]:
+    return {
+        "version": 1,
+        "engine": "vllm",
+        "executable": "python:qwen38-gdn-prefill-phase.py",
+        "scope": "one_cuda_graph_replay_of_two_sequential_modelopt_apply_calls",
+        "logical_mnk": [[tokens, 8192, 2560], [tokens, 48, 2560]],
+        "physical_mnk": [[tokens, 8192, 2560], [tokens, 64, 2560]],
+        "activation_quantizations": 2,
+        "gemms": 2,
+        "quant_backend": "vllm.scaled_fp4_quant:flashinfer-cutlass",
+        "includes": ["qkvz_dynamic_quant", "qkvz_gemm", "ba_dynamic_quant", "ba_gemm"],
+        "excludes": ["weight_preparation", "autotuning", "host_dispatch", "output_projection"],
+        "eager_warmups": warmup,
+        "capture_calls": 1,
+        "post_capture_replays_before_samples": 1,
+        "samples": iterations,
+        "timer": "cuda_events_around_graph_replay",
+        "p50": "statistics.median",
+        "p95": "sorted[ceil(samples*0.95)-1]",
+        "gpu_clocks": "unlocked",
+        "weights": "synthetic_random_packed_nvfp4_with_unit_scales",
+    }
+
+
+def projection_data_identity(hidden, qkvz_layer, ba_layer) -> dict[str, object]:
+    """Name synthetic comparator data so it cannot be equated with slab data."""
+    return {
+        "hidden_bf16": tensor_identity(hidden),
+        "qkvz_weight_packed": tensor_identity(qkvz_layer.weight),
+        "qkvz_weight_scale_swizzled": tensor_identity(qkvz_layer.weight_scale),
+        "qkvz_alpha": tensor_identity(qkvz_layer.alpha),
+        "ba_weight_packed_padded_n64": tensor_identity(ba_layer.weight),
+        "ba_weight_scale_swizzled_padded_n128": tensor_identity(ba_layer.weight_scale),
+        "ba_alpha": tensor_identity(ba_layer.alpha),
+    }
+
+
 def attribute_projection_backend(
-    result: dict[str, object], method: object
+    result: dict[str, object], method: object, trace: Fp4DispatchTrace,
+    contract: dict[str, object],
 ) -> None:
-    """Attach the selected vLLM linear kernel to a projection measurement."""
+    """Attach observed dispatch and measurement scope to a projection result."""
     kernel = method.kernel
     kernel_type = type(kernel)
-    result["nvfp4_kernel"] = f"{kernel_type.__module__}.{kernel_type.__qualname__}"
+    result["vllm_kernel_class"] = (
+        f"{kernel_type.__module__}.{kernel_type.__qualname__}"
+    )
+    dispatches = trace.summary()
+    if not dispatches:
+        raise RuntimeError("no FlashInfer FP4 dispatch observed")
+    result["flashinfer_dispatches"] = dispatches
+    result["flashinfer_artifact"] = loaded_shared_object_identity(
+        "fp4_gemm_cutlass_sm120.so"
+    )
+    result["comparator_contract"] = contract
 
 
 def measure(
@@ -70,6 +311,8 @@ def measure(
         "p50_us": statistics.median(samples),
         "p95_us": percentile(samples, 0.95),
         "graph_capture": "pass",
+        "samples_us": samples,
+        "gpu_clock_power": gpu_clock_power_snapshot(),
     }
 
 
@@ -230,10 +473,17 @@ def run(tokens: int, warmup: int, iterations: int) -> list[dict[str, object]]:
         projection_outputs.qkvz = method.apply(qkvz_layer, hidden)
         projection_outputs.ba = method.apply(ba_layer, hidden)
 
-    input_result = measure(
-        "nvfp4_input_projection", input_projection, warmup, iterations
+    with Fp4DispatchTrace() as input_trace:
+        input_result = measure(
+            "nvfp4_input_projection", input_projection, warmup, iterations
+        )
+    attribute_projection_backend(
+        input_result, method, input_trace,
+        projection_contract(tokens, warmup, iterations),
     )
-    attribute_projection_backend(input_result, method)
+    input_result["data_identity"] = projection_data_identity(
+        hidden, qkvz_layer, ba_layer
+    )
 
     norm_input = torch.randn(tokens * 24, 128, dtype=torch.bfloat16,
                              device=device)
@@ -262,10 +512,22 @@ def run(tokens: int, warmup: int, iterations: int) -> list[dict[str, object]]:
     def output_projection() -> None:
         projection_outputs.output = method.apply(output_layer, flattened_norm)
 
-    output_result = measure(
-        "nvfp4_output_projection", output_projection, warmup, iterations
+    with Fp4DispatchTrace() as output_trace:
+        output_result = measure(
+            "nvfp4_output_projection", output_projection, warmup, iterations
+        )
+    output_contract = projection_contract(tokens, warmup, iterations)
+    output_contract.update({
+        "scope": "one_cuda_graph_replay_of_one_modelopt_apply_call",
+        "logical_mnk": [[tokens, 2560, 3072]],
+        "physical_mnk": [[tokens, 2560, 3072]],
+        "activation_quantizations": 1,
+        "gemms": 1,
+        "includes": ["output_dynamic_quant", "output_gemm"],
+    })
+    attribute_projection_backend(
+        output_result, method, output_trace, output_contract
     )
-    attribute_projection_backend(output_result, method)
 
     inactive_state = torch.empty_like(final_state)
 
@@ -302,6 +564,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
     args = parser.parse_args()
+    script_path = pathlib.Path(__file__).resolve()
     print(
         json.dumps(
             {
@@ -310,6 +573,9 @@ def main() -> None:
                 "gpu": torch.cuda.get_device_name(0),
                 "flashinfer": flashinfer.__version__,
                 "vllm": vllm.__version__,
+                "profiler_path": str(script_path),
+                "profiler_sha256": sha256_file(script_path),
+                "container_hostname": os.uname().nodename,
             },
             sort_keys=True,
         )

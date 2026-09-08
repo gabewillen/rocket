@@ -3,45 +3,49 @@
 
 import ast
 import pathlib
-import types
 import unittest
 
 
 SCRIPT = pathlib.Path(__file__).with_name("qwen38-gdn-prefill-phase.py")
 
 
-def load_attribution_function():
+def load_functions(*names):
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), filename=str(SCRIPT))
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "attribute_projection_backend"
-    )
-    module = ast.Module(body=[function], type_ignores=[])
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    module = ast.Module(body=functions, type_ignores=[])
     ast.fix_missing_locations(module)
     namespace: dict[str, object] = {}
     exec(compile(module, str(SCRIPT), "exec"), namespace)
-    return namespace["attribute_projection_backend"]
+    return tuple(namespace[name] for name in names)
 
 
 class GdnPrefillPhaseContract(unittest.TestCase):
-    def test_projection_result_names_concrete_selected_kernel(self) -> None:
-        kernel_type = type(
-            "FlashInferCutlassNvFp4LinearKernel",
-            (),
-            {"__module__": "vllm.model_executor.kernels.linear.nvfp4.flashinfer"},
-        )
-        result: dict[str, object] = {}
-        method = types.SimpleNamespace(kernel=kernel_type())
+    def test_projection_contract_names_scope_and_counts(self) -> None:
+        (contract,) = load_functions("projection_contract")
+        result = contract(300, 5, 50)
+        self.assertEqual(result["engine"], "vllm")
+        self.assertEqual(result["physical_mnk"], [[300, 8192, 2560], [300, 64, 2560]])
+        self.assertEqual(result["activation_quantizations"], 2)
+        self.assertEqual(result["gemms"], 2)
+        self.assertEqual(result["timer"], "cuda_events_around_graph_replay")
+        self.assertEqual(result["gpu_clocks"], "unlocked")
 
-        load_attribution_function()(result, method)
+    def test_sm120_tactic_table_decodes_fallback_and_tactic_22(self) -> None:
+        (decode,) = load_functions("sm120_cutlass_tactic")
+        self.assertEqual(decode(-1)["tile_mnk"], [128, 128, 256])
+        self.assertEqual(decode(-1)["scheduler"], "dp_static_persistent")
+        self.assertFalse(decode(-1)["swap_ab"])
+        self.assertEqual(decode(22)["tile_mnk"], [128, 128, 256])
+        self.assertEqual(decode(22)["scheduler"], "stream_k")
+        self.assertTrue(decode(22)["swap_ab"])
 
-        self.assertEqual(
-            result["nvfp4_kernel"],
-            "vllm.model_executor.kernels.linear.nvfp4.flashinfer."
-            "FlashInferCutlassNvFp4LinearKernel",
-        )
+    def test_unknown_tactic_fails_closed(self) -> None:
+        (decode,) = load_functions("sm120_cutlass_tactic")
+        with self.assertRaises(RuntimeError):
+            decode(32)
 
     def test_both_projection_measurements_are_attributed(self) -> None:
         tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), filename=str(SCRIPT))
@@ -58,6 +62,14 @@ class GdnPrefillPhaseContract(unittest.TestCase):
             if call.args and isinstance(call.args[0], ast.Name)
         }
         self.assertEqual(attributed_results, {"input_result", "output_result"})
+
+    def test_results_preserve_samples_and_power_snapshot(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"samples_us": samples', source)
+        self.assertIn('"gpu_clock_power": gpu_clock_power_snapshot()', source)
+        self.assertIn('input_result["data_identity"]', source)
+        self.assertIn('"profiler_sha256": sha256_file(script_path)', source)
+        self.assertNotIn('result["nvfp4_kernel"]', source)
 
 
 if __name__ == "__main__":
