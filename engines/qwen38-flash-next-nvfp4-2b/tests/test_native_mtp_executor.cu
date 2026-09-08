@@ -33,11 +33,34 @@ class Exchange final : public mtp::WinnerExchangePort { public:
 class Middle final : public mtp::MtpMiddleStagePort { public:
   Middle(int sequences, int depth) : sequences_(sequences), depth_(depth) {
     assert(cudaMalloc(&tokens_, sequences * (depth + 1) * sizeof(std::int32_t)) == cudaSuccess);
-    assert(cudaMalloc(&routes_, sequences * 8 * sizeof(std::int32_t)) == cudaSuccess);
+    const int routes = sequences * rocket::qwen38::moe::kTopK;
+    assert(cudaMalloc(&routes_, routes * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMalloc(&weights_, routes * sizeof(float)) == cudaSuccess);
+    assert(cudaMalloc(&source_generation_, sizeof(std::uint64_t)) == cudaSuccess);
+    assert(cudaMalloc(&active_experts_, 256 * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMalloc(&local_to_active_, 256 * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMalloc(&row_counts_, 256 * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMalloc(&route_offsets_, 257 * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMalloc(&route_cursors_, 256 * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMalloc(&owner_ids_, routes * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMalloc(&owner_weights_, routes * sizeof(float)) == cudaSuccess);
+    assert(cudaMalloc(&owner_rows_, routes * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMalloc(&owner_slots_, routes * sizeof(std::uint8_t)) == cudaSuccess);
+    assert(cudaMalloc(&route_indices_, routes * sizeof(std::int32_t)) == cudaSuccess);
+    std::vector<std::int32_t> ids(routes);
+    for (int i = 0; i < routes; ++i) ids[i] = i % rocket::qwen38::moe::kTopK;
     assert(cudaMemset(tokens_, 0, sequences * (depth + 1) * sizeof(std::int32_t)) == cudaSuccess);
-    assert(cudaMemset(routes_, 0, sequences * 8 * sizeof(std::int32_t)) == cudaSuccess);
+    assert(cudaMemcpy(routes_, ids.data(), routes * sizeof(std::int32_t),
+                      cudaMemcpyHostToDevice) == cudaSuccess);
+    assert(cudaMemset(weights_, 0, routes * sizeof(float)) == cudaSuccess);
   }
-  ~Middle() { cudaFree(routes_); cudaFree(tokens_); }
+  ~Middle() {
+    cudaFree(route_indices_); cudaFree(owner_slots_); cudaFree(owner_rows_);
+    cudaFree(owner_weights_); cudaFree(owner_ids_); cudaFree(route_cursors_);
+    cudaFree(route_offsets_); cudaFree(row_counts_); cudaFree(local_to_active_);
+    cudaFree(active_experts_); cudaFree(source_generation_); cudaFree(weights_);
+    cudaFree(routes_); cudaFree(tokens_);
+  }
   const std::int32_t* prepare(mtp::GraphArenaView a, mtp::StateArena&,
                               mtp::GraphKey, cudaStream_t s) override {
     cudaMemsetAsync(a.embedding, 0, sequences_ * mtp::kFusionHidden * 2, s);
@@ -59,13 +82,44 @@ class Middle final : public mtp::MtpMiddleStagePort { public:
   }
   void reduce_attention(mtp::GraphArenaView, int, mtp::GraphKey,
                         cudaStream_t) override {}
-  void stage_moe(mtp::GraphArenaView, int, mtp::GraphKey, cudaStream_t) override {}
+  mtp::MtpRouterOutput stage_router(mtp::GraphArenaView, int, mtp::GraphKey,
+                                    std::uint64_t generation,
+                                    cudaStream_t stream) override {
+    source_generation_host_ = stale_routes_ ? generation + 1 : generation;
+    cudaMemcpyAsync(source_generation_, &source_generation_host_,
+                    sizeof(source_generation_host_),
+                    cudaMemcpyHostToDevice, stream);
+    if (fault_routes_) return {};
+    return {
+        .global_expert_ids = routes_,
+        .routing_weights = weights_,
+        .source_generation = source_generation_,
+        .capacity = {.experts = 256, .rows = sequences_,
+                     .routes = sequences_ * rocket::qwen38::moe::kTopK},
+        .compacted = {
+            .active_global_expert_ids = active_experts_,
+            .local_to_active = local_to_active_,
+            .expert_row_counts = row_counts_,
+            .expert_route_offsets = route_offsets_,
+            .expert_route_cursors = route_cursors_,
+            .owner_route_global_expert_ids = owner_ids_,
+            .owner_route_weights = owner_weights_,
+            .owner_route_rows = owner_rows_,
+            .owner_route_slots = owner_slots_,
+            .expert_route_indices = route_indices_,
+            .summary = nullptr,
+        },
+    };
+  }
+  void stage_moe(mtp::GraphArenaView,
+                 const rocket::qwen38::moe::RouteCompactionBuffers& compacted,
+                 int, mtp::GraphKey, cudaStream_t) override {
+    assert(compacted.summary != nullptr);
+    ++moe_calls_;
+  }
   void reduce_moe(mtp::GraphArenaView a, int, mtp::GraphKey, cudaStream_t s) override {
     cudaMemsetAsync(a.reduced_moe_output, 0,
                     sequences_ * mtp::kFusionHidden * sizeof(float), s);
-  }
-  const std::int32_t* router_expert_ids(int) const noexcept override {
-    return fault_routes_ ? nullptr : routes_;
   }
   void advance(mtp::GraphArenaView, mtp::StateArena&, int step, mtp::GraphKey,
                const std::int32_t* proposals, cudaStream_t s) override {
@@ -73,13 +127,26 @@ class Middle final : public mtp::MtpMiddleStagePort { public:
                     sequences_ * sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s);
   }
   int sequences_, depth_; std::int32_t *tokens_ = nullptr, *routes_ = nullptr;
-  int attention_calls_ = 0;
+  float* weights_ = nullptr;
+  std::uint64_t* source_generation_ = nullptr;
+  std::uint64_t source_generation_host_ = 0;
+  std::int32_t *active_experts_ = nullptr, *local_to_active_ = nullptr;
+  std::int32_t *row_counts_ = nullptr, *route_offsets_ = nullptr;
+  std::int32_t *route_cursors_ = nullptr, *owner_ids_ = nullptr;
+  float* owner_weights_ = nullptr;
+  std::int32_t *owner_rows_ = nullptr, *route_indices_ = nullptr;
+  std::uint8_t* owner_slots_ = nullptr;
+  int attention_calls_ = 0, moe_calls_ = 0;
   bool fault_routes_ = false;
+  bool stale_routes_ = false;
 };
 class Sink final : public mtp::TelemetrySink { public:
   void record_phase(const mtp::PhaseMetric& m) noexcept override { phases.push_back(m); }
   void record_expert_usage(const mtp::ExpertUsageMetric& m) noexcept override { experts.push_back(m); }
+  void add_counter(const rocket::qwen38::moe::RouteCompactionOtelPoint& point)
+      noexcept override { routes.push_back(point); }
   std::vector<mtp::PhaseMetric> phases; std::vector<mtp::ExpertUsageMetric> experts;
+  std::vector<rocket::qwen38::moe::RouteCompactionOtelPoint> routes;
 };
 }
 
@@ -117,6 +184,20 @@ int main() {
     failed.commit(1);
     assert(failed.phase()==mtp::ExecutorPhase::kFaulted);
   }
+  {
+    mtp::StateArena stale_state(sequences,depth,false);
+    Middle stale_middle(sequences,depth); stale_middle.stale_routes_=true;
+    mtp::NativeExecutor stale({depth, sequences, 300}, runtime, stale_middle,
+                              exchange, stale_state, sink, stream);
+    static_cast<void>(stale.draft(1));
+    assert(cudaStreamSynchronize(stream)==cudaSuccess);
+    bool rejected=false;
+    try { stale.validate_after_fence(1); }
+    catch (const mtp::NativeExecutorError&) { rejected=true; }
+    assert(rejected);
+    stale.commit(1);
+    assert(stale.phase()==mtp::ExecutorPhase::kFaulted);
+  }
   mtp::NativeExecutor executor(
       {depth, sequences, 300}, runtime, middle, exchange, state, sink, stream);
   bool stale_rejected = false;
@@ -128,8 +209,11 @@ int main() {
   std::array<std::int32_t,sequences> widths{1,3}; std::int32_t* dwidths=nullptr;
   cudaMalloc(&dwidths,sizeof(widths)); cudaMemcpy(dwidths,widths.data(),sizeof(widths),cudaMemcpyHostToDevice);
   executor.stage_accept(1,inactive,dwidths,{sequences,depth+1},stream);
-  assert(cudaStreamSynchronize(stream)==cudaSuccess); executor.commit(1);
+  assert(cudaStreamSynchronize(stream)==cudaSuccess);
+  executor.validate_after_fence(1); executor.commit(1);
   executor.export_telemetry_after_fence(1); assert(sink.experts.size()==depth);
+  assert(sink.routes.size() >= static_cast<std::size_t>(depth * 3));
+  assert(middle.moe_calls_ == depth);
   assert(executor.phase()==mtp::ExecutorPhase::kReady);
   cudaFree(dwidths); cudaFree(inactive); cudaStreamDestroy(stream); cudaFree(slab); cudaFree(target);
   return 0;

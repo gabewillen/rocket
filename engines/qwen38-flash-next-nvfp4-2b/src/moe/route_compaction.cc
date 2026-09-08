@@ -32,6 +32,27 @@ bool valid_route(RoutePair route) noexcept {
 
 }  // namespace
 
+RouteCompactionOutcome validate_route_compaction_summary(
+    const RouteCompactionValidation& validation) noexcept {
+  const auto& summary = validation.summary;
+  const auto requested_generation = validation.requested_generation;
+  const auto shape = validation.shape;
+  if (!allowed_shape(shape) || requested_generation == 0)
+    return RouteCompactionOutcome::kContractError;
+  if (summary.outcome != RouteCompactionOutcome::kOk) return summary.outcome;
+  if (summary.generation != requested_generation)
+    return RouteCompactionOutcome::kStaleGeneration;
+  if (summary.active_experts < 0 || summary.active_experts > kLocalExperts ||
+      summary.active_rows < 0 || summary.active_rows > shape.rows ||
+      summary.active_routes < 0 ||
+      summary.active_routes > shape.rows * kTopK ||
+      summary.active_weight_bytes !=
+          static_cast<std::uint64_t>(summary.active_experts) *
+              kNvfp4BytesPerExpert)
+    return RouteCompactionOutcome::kContractError;
+  return RouteCompactionOutcome::kOk;
+}
+
 CpuRouteCompactionResult compact_owner_routes_reference(
     const CpuRouteCompactionInput& input) {
   if (!allowed_shape(input.shape) || !allowed_capacity(input.capacity) ||
@@ -134,20 +155,14 @@ void export_route_compaction_otel_after_fence(
   const auto& snapshot = export_request.snapshot;
   const auto shape = export_request.shape;
   auto& sink = export_request.sink;
-  RouteCompactionOutcome outcome = snapshot.outcome;
+  RouteCompactionOutcome outcome = validate_route_compaction_summary(
+      {.summary = snapshot,
+       .requested_generation = export_request.requested_generation,
+       .shape = shape});
   std::uint64_t experts = 0;
   std::uint64_t rows = 0;
   std::uint64_t bytes = 0;
-  if (!allowed_shape(shape) || snapshot.active_experts < 0 ||
-      snapshot.active_experts > kLocalExperts || snapshot.active_rows < 0 ||
-      snapshot.active_rows > shape.rows || snapshot.active_routes < 0 ||
-      snapshot.active_routes > shape.rows * kTopK ||
-      (snapshot.outcome == RouteCompactionOutcome::kOk &&
-       (snapshot.generation == 0 || snapshot.active_weight_bytes !=
-          static_cast<std::uint64_t>(snapshot.active_experts) *
-              kNvfp4BytesPerExpert))) {
-    outcome = RouteCompactionOutcome::kContractError;
-  } else if (outcome == RouteCompactionOutcome::kOk) {
+  if (outcome == RouteCompactionOutcome::kOk) {
     experts = static_cast<std::uint64_t>(snapshot.active_experts);
     rows = static_cast<std::uint64_t>(snapshot.active_rows);
     bytes = snapshot.active_weight_bytes;

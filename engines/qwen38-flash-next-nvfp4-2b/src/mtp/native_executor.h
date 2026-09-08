@@ -4,16 +4,16 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include "attention/qsa_mtp_state_view.h"
 #include "decode/decoder_verifier.h"
+#include "moe/route_compaction.h"
 #include "mtp/graph_runtime.h"
 #include "mtp/state_arena.h"
 
 namespace rocket::qwen38::mtp {
-inline constexpr int kMaxDepth = 7, kMaxSequences = 16, kLocalExperts = 256,
-                     kRouterTopK = 8;
-inline constexpr std::uint64_t kNvidiaFp8BytesPerLocalExpert = 4'915'800;
+inline constexpr int kMaxDepth = 7, kMaxSequences = 16;
 enum class Phase : std::uint8_t { kInputFusion, kAttention, kAttentionReduce,
   kRoutedAndSharedMoe, kMoeReduce, kFinalHyperconnection, kLogits,
   kProposalSample, kCount };
@@ -34,16 +34,31 @@ struct PhaseMetric { Phase phase; Outcome outcome; int depth; int sequences;
   std::uint64_t duration_ns; };
 struct ExpertUsageMetric { Outcome outcome; int depth; int sequences;
   int draft_step; int unique_local_experts; std::uint64_t resident_expert_bytes; };
-class TelemetrySink { public: virtual ~TelemetrySink() = default;
+class TelemetrySink : public moe::RouteCompactionOtelSink { public:
+  ~TelemetrySink() override = default;
   virtual void record_phase(const PhaseMetric&) noexcept = 0;
   virtual void record_expert_usage(const ExpertUsageMetric&) noexcept = 0; };
 struct DeviceDraftView { const std::int32_t* verification_tokens = nullptr;
   int depth = 0; int sequences = 0; std::uint64_t generation = 0; };
 
+// Borrowed output of one router stage. The producer writes source_generation
+// on the executor stream. NativeExecutor supplies the requested-generation
+// pointer and summary, so the middle stage cannot publish either identity.
+struct MtpRouterOutput {
+  const std::int32_t* global_expert_ids = nullptr;
+  const float* routing_weights = nullptr;
+  const std::uint64_t* source_generation = nullptr;
+  moe::RouteCompactionCapacity capacity{};
+  moe::RouteCompactionBuffers compacted{};
+};
+
 // Required native QSA/MoE and PairReduce boundary. Calls are single-writer and
 // enqueue only on the borrowed caller stream. QSA receives a borrowed write
 // view which aliases StateArena for the duration of the call. Implementations
 // may write fixed runtime/StateArena storage, never active accepted state.
+// stage_router publishes borrowed route storage plus its device generation;
+// stage_moe consumes the compacted buffers later on the same stream. A throw or
+// incomplete binding faults the enclosing transaction before publication.
 class MtpMiddleStagePort { public: virtual ~MtpMiddleStagePort() = default;
   virtual const std::int32_t* prepare(GraphArenaView, StateArena&, GraphKey,
                                       cudaStream_t) = 0;
@@ -51,9 +66,11 @@ class MtpMiddleStagePort { public: virtual ~MtpMiddleStagePort() = default;
   virtual void stage_attention(GraphArenaView, attention::MtpQsaWriteView, int,
                                GraphKey, cudaStream_t) = 0;
   virtual void reduce_attention(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
-  virtual void stage_moe(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
+  virtual MtpRouterOutput stage_router(GraphArenaView, int, GraphKey,
+                                       std::uint64_t, cudaStream_t) = 0;
+  virtual void stage_moe(GraphArenaView, const moe::RouteCompactionBuffers&,
+                         int, GraphKey, cudaStream_t) = 0;
   virtual void reduce_moe(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
-  virtual const std::int32_t* router_expert_ids(int) const noexcept = 0;
   virtual void advance(GraphArenaView, StateArena&, int, GraphKey,
                        const std::int32_t*, cudaStream_t) = 0; };
 class NativeExecutorError : public std::runtime_error { public:
@@ -75,16 +92,24 @@ class NativeExecutor final : public decode::AcceptedStateParticipant {
   void export_telemetry_after_fence(std::uint64_t) noexcept;
   void discard(std::uint64_t) noexcept override;
   ExecutorPhase phase() const noexcept { return phase_; }
-  GraphKey key() const noexcept { return key_; }
+ GraphKey key() const noexcept { return key_; }
  private:
+  struct CudaDeleter {
+    void operator()(void* pointer) const noexcept;
+  };
+  template <typename T>
+  using DeviceOwner = std::unique_ptr<T, CudaDeleter>;
   GraphKey key_; MtpGraphRuntime& runtime_; MtpMiddleStagePort& middle_;
   WinnerExchangePort& exchange_; StateArena& state_; TelemetrySink& telemetry_;
   cudaStream_t stream_;
   std::array<std::array<cudaEvent_t, static_cast<int>(Phase::kCount) + 1>, 7> events_{};
-  std::uint32_t* expert_masks_device_ = nullptr;
-  std::array<std::array<std::uint32_t, 8>, 7> expert_masks_host_{};
+  DeviceOwner<std::uint64_t> requested_generation_device_;
+  DeviceOwner<moe::RouteCompactionDeviceSummary> route_summaries_device_;
+  std::array<moe::RouteCompactionDeviceSummary, kMaxDepth>
+      route_summaries_host_{};
   ExecutorPhase phase_ = ExecutorPhase::kReady;
   std::uint64_t active_generation_ = 0, pending_generation_ = 0;
+  std::uint64_t routes_validated_generation_ = 0;
   const std::int32_t* verification_tokens_ = nullptr;
 };
 }  // namespace rocket::qwen38::mtp

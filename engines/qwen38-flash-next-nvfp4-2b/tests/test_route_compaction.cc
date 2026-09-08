@@ -166,6 +166,39 @@ void check_failures() {
             .summary.outcome == moe::RouteCompactionOutcome::kContractError);
 }
 
+void check_post_fence_summary_validation() {
+  const moe::RouteCompactionShape shape{.rank = 0, .sequences = 16, .rows = 16};
+  moe::RouteCompactionDeviceSummary summary{
+      .generation = 9,
+      .active_weight_bytes = 19 * moe::kNvfp4BytesPerExpert,
+      .active_experts = 19,
+      .active_rows = 16,
+      .active_routes = 80,
+      .outcome = moe::RouteCompactionOutcome::kOk,
+  };
+  check(moe::validate_route_compaction_summary(
+            {.summary = summary, .requested_generation = 9, .shape = shape}) ==
+        moe::RouteCompactionOutcome::kOk);
+  check(moe::validate_route_compaction_summary(
+            {.summary = summary, .requested_generation = 10, .shape = shape}) ==
+        moe::RouteCompactionOutcome::kStaleGeneration);
+  summary.generation = 10;
+  summary.active_experts = 257;
+  check(moe::validate_route_compaction_summary(
+            {.summary = summary, .requested_generation = 10, .shape = shape}) ==
+        moe::RouteCompactionOutcome::kContractError);
+  summary.active_experts = 19;
+  summary.active_weight_bytes = 0;
+  check(moe::validate_route_compaction_summary(
+            {.summary = summary, .requested_generation = 10, .shape = shape}) ==
+        moe::RouteCompactionOutcome::kContractError);
+  summary.active_weight_bytes = 19 * moe::kNvfp4BytesPerExpert;
+  summary.outcome = moe::RouteCompactionOutcome::kOverflow;
+  check(moe::validate_route_compaction_summary(
+            {.summary = summary, .requested_generation = 10, .shape = shape}) ==
+        moe::RouteCompactionOutcome::kOverflow);
+}
+
 class CaptureSink final : public moe::RouteCompactionOtelSink {
  public:
   void add_counter(const moe::RouteCompactionOtelPoint& point) noexcept override {
@@ -187,6 +220,7 @@ void check_otel_cardinality() {
   CaptureSink sink;
   moe::export_route_compaction_otel_after_fence({
       .snapshot = summary,
+      .requested_generation = 9,
       .shape = {.rank = 1, .sequences = 8, .rows = 8},
       .sink = sink,
   });
@@ -207,6 +241,7 @@ void check_otel_cardinality() {
   corrupt.active_experts = 257;
   moe::export_route_compaction_otel_after_fence({
       .snapshot = corrupt,
+      .requested_generation = 9,
       .shape = {.rank = 1, .sequences = 8, .rows = 8},
       .sink = corrupt_sink,
   });
@@ -214,6 +249,20 @@ void check_otel_cardinality() {
   for (const auto& point : corrupt_sink.points) {
     check(point.attributes.outcome ==
               moe::RouteCompactionOutcome::kContractError &&
+          point.value == 0);
+  }
+
+  CaptureSink stale_sink;
+  moe::export_route_compaction_otel_after_fence({
+      .snapshot = summary,
+      .requested_generation = 10,
+      .shape = {.rank = 1, .sequences = 8, .rows = 8},
+      .sink = stale_sink,
+  });
+  check(stale_sink.points.size() == 3);
+  for (const auto& point : stale_sink.points) {
+    check(point.attributes.outcome ==
+              moe::RouteCompactionOutcome::kStaleGeneration &&
           point.value == 0);
   }
 }
@@ -226,6 +275,7 @@ int main() {
   check_success_and_order();
   check_empty_owner_prefix();
   check_failures();
+  check_post_fence_summary_validation();
   check_otel_cardinality();
   return 0;
 }

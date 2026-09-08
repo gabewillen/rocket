@@ -235,6 +235,8 @@ MtpGraphRuntime::~MtpGraphRuntime() { delete impl_; }
 
 GraphArenaView MtpGraphRuntime::arena() const noexcept { return impl_->arena; }
 
+int MtpGraphRuntime::rank() const noexcept { return impl_->binding.rank; }
+
 void MtpGraphRuntime::launch_input_local(int m, cudaStream_t stream) {
   if (!stream) throw std::invalid_argument("MTP input-local stream changed");
   check(cudaGraphLaunch(impl_->input_local[bucket_index(m)], stream),

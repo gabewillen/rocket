@@ -83,6 +83,7 @@ class MtpGraphRuntime final {
   MtpGraphRuntime& operator=(const MtpGraphRuntime&) = delete;
 
   [[nodiscard]] GraphArenaView arena() const noexcept;
+  [[nodiscard]] int rank() const noexcept;
   void launch_input_local(int m, cudaStream_t stream);
   void launch_input_finish(int m, cudaStream_t stream);
   void launch_final_local(int m, cudaStream_t stream);

@@ -128,6 +128,18 @@ struct RouteCompactionLaunch {
 [[nodiscard]] RouteCompactionOutcome enqueue_route_compaction(
     const RouteCompactionLaunch& launch) noexcept;
 
+// Validates the device result after the enclosing stream fence. Generation is
+// compared with the transaction requested by NativeExecutor. Counts and bytes
+// must describe one reachable prefix for the fixed launch shape.
+struct RouteCompactionValidation {
+  const RouteCompactionDeviceSummary& summary;
+  std::uint64_t requested_generation;
+  RouteCompactionShape shape;
+};
+
+[[nodiscard]] RouteCompactionOutcome validate_route_compaction_summary(
+    const RouteCompactionValidation& validation) noexcept;
+
 struct CpuRouteCompactionInput {
   RouteCompactionShape shape;
   RouteCompactionCapacity capacity;
@@ -180,13 +192,15 @@ class RouteCompactionOtelSink {
 
 struct RouteCompactionOtelExport {
   const RouteCompactionDeviceSummary& snapshot;
+  std::uint64_t requested_generation;
   RouteCompactionShape shape;
   RouteCompactionOtelSink& sink;
 };
 
 // active_weight_bytes is the authenticated NVFP4 payload of active experts,
 // not an HBM counter. Called after the enclosing stream fence with a
-// caller-owned host snapshot.
+// caller-owned host snapshot. requested_generation is the executor-owned
+// transaction identity used to classify a stale producer.
 // Counter identity has at most 3 * 5 * 2 * 5 = 150 series. Active values and
 // generation are measurements and never OTEL attributes.
 void export_route_compaction_otel_after_fence(
