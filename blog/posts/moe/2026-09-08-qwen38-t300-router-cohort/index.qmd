@@ -1,0 +1,89 @@
+---
+title: "Fresh T300 c16 routes through up to 106 local experts"
+description: "A two-node Qwen3.8 T300 c16 verifier cohort selects 22 to 106 local experts per rank-layer-call and moves 60,825,952 to 293,070,496 routed bytes."
+date: 2026-09-08
+author: "agent"
+categories: [experiment, moe, memory, telemetry, scheduler]
+verdict: accepted
+rocket: "#fuel"
+---
+
+**Question.** What local expert union and slab traffic does a fresh 300-token
+c16 workload produce across four Qwen3.8 K4 verifier calls?
+
+| setup | |
+| --- | --- |
+| nodes | gx10-5e36 head and gx10-2a13 worker, GB10, 6.17.13-rocket64k, 64 KiB pages |
+| checkpoint | `nvidia/Qwen3.8-Flash-Next-NVFP4` at `fc694b54fb0174e0913e6adf86691ef85a4ead47` |
+| Rocket commit | `ce0e0a379c0de27ae09591569d3478273be9d366` |
+| vLLM | `v0.1.dev20073+g8e685d198`, image `sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a` |
+| runtime | TP2, EP, MTP K4, FP8 KV, eager mode, 262,144-token context |
+| workload | 16 fresh 300-token prompts, 24 generated tokens each, prefix cache disabled |
+| telemetry | schema v4, scheduler-owned `query_start_loc`, router top-10, 48 layers, both ranks |
+
+This measurement required a Qwen3.8-specific post-router hook because adaptive
+MTP schedules request widths independently and the standard runtime does not
+report row-major expert unions or their slab bytes.
+
+```bash
+/home/glwillen/calibration/qwen38-router-cohort-v4-c16-20260908-01/qwen38-router-cohort-launch-ce0e0a3.py \
+  --manifest /home/glwillen/calibration/qwen38-router-cohort-v4-c16-20260908-01/qwen38-router-cohort-launch-v4-ce0e0a3.json \
+  --port 50189 --suffix t300-r1 --execute
+
+python3 scripts/moe/qwen38-router-cohort-reduce.py \
+  /home/glwillen/calibration/qwen38-router-cohort-v4-c16-20260908-01/logs/head-c16-d24-t300-r1.log \
+  /home/glwillen/calibration/qwen38-router-cohort-v4-c16-20260908-01/logs/worker-c16-d24-t300-r1.log \
+  > /home/glwillen/calibration/qwen38-router-cohort-v4-c16-20260908-01/summary-c16-d24-t300-r1.json
+
+jq -c '.cases[] | {rank,layers:(.layers|length),raw_calls:([.layers[].samples[].call]|unique),cohort_calls:([.layers[].samples[].cohort_call]|unique),widths:([.layers[].samples[].request_widths]|unique),union:.union_unique_local_experts,routed_bytes:.routed_slab_bytes,shared_bytes:.layers[0].samples[0].shared_slab_bytes}' \
+  /home/glwillen/calibration/qwen38-router-cohort-v4-c16-20260908-01/summary-c16-d24-t300-r1.json
+```
+
+```text
+{"rank":0,"layers":48,"raw_calls":[10,11,12,13],"cohort_calls":[1,2,3,4],"widths":[[5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5]],"union":{"max":105,"median":60.0,"min":22,"pstdev":16.723234081950842},"routed_bytes":{"max":290305680,"median":165888960.0,"min":60825952},"shared_bytes":4920320}
+{"rank":1,"layers":48,"raw_calls":[10,11,12,13],"cohort_calls":[1,2,3,4],"widths":[[5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5]],"union":{"max":106,"median":64.0,"min":27,"pstdev":15.586755278253607},"routed_bytes":{"max":293070496,"median":176948224.0,"min":74650032},"shared_bytes":4920320}
+```
+
+| rank | samples | local union min / median / max | union population SD | routed bytes min / median / max | shared bytes |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 192 | 22 / 60 / 105 experts | 16.72 experts | 60,825,952 / 165,888,960 / 290,305,680 B | 4,920,320 B |
+| 1 | 192 | 27 / 64 / 106 experts | 15.59 experts | 74,650,032 / 176,948,224 / 293,070,496 B | 4,920,320 B |
+
+The gated phase began with one 4,800-row target-only prefill, 300 rows for each
+of 16 requests. The hook consumed that barrier without assigning a cohort call
+ID. Every layer then admitted raw calls 10 through 13 as cohort calls 1 through
+4, each with 16 target rows and 64 speculative rows. Missing, partial, mixed,
+duplicate, or post-barrier target-only schedules fail the run.
+
+```bash
+sha256sum \
+  /home/glwillen/calibration/qwen38-router-cohort-v4-c16-20260908-01/logs/{head,worker}-c16-d24-t300-r1.log \
+  /home/glwillen/calibration/qwen38-router-cohort-v4-c16-20260908-01/{head,worker}-container-inspect-t300-r1.json \
+  /home/glwillen/calibration/qwen38-router-cohort-v4-c16-20260908-01/summary-c16-d24-t300-r1.json
+```
+
+```text
+1f139dc1ff7165e23d682c3e7b7679a17c318ce0c602385e1f85dd9b3a30f3e1  head-c16-d24-t300-r1.log
+562f00cadec8accf33e102a40888d5da50e0ba0dc3f25f770f8700cc0227a35e  worker-c16-d24-t300-r1.log
+f4f778556e85091e6ba7048454bc75b553a8d21c63a8ac8df0ef74c2053fd3b0  head-container-inspect-t300-r1.json
+8edb73268f71737ba3ad446e9ff8da6e3365552e9c8d6eca86b60855737ac672  worker-container-inspect-t300-r1.json
+47734734c7db2769b3ac3c6172aa8c37a55f58757f43f974b86bf70c96dc8d60  summary-c16-d24-t300-r1.json
+```
+
+One run supplied 192 rank-layer-call samples per rank. The table reports
+within-run population variation. Run-to-run variance was not measured.
+
+**Verdict.** Accepted for the fresh T300 c16 router-sizing control. This result
+does not claim throughput, quality, or long-prompt cache behavior. T8192 c16
+remains open, and T300 is not a substitute for its prompt distribution or
+worker-side hybrid-cache publication path.
+
+**Next.**
+
+- finish end-to-end decoder integration before another router experiment
+- reproduce T8192 cache publication through the worker-faithful scheduler path
+
+**Reopen if.**
+
+- an upstream vLLM, checkpoint, CUDA, firmware, or GB10 revision changes MTP
+  request scheduling, router top-10 selection, or TP2 expert placement
