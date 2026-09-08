@@ -13,8 +13,10 @@ from unittest.mock import patch
 
 from qwen38_slab.gdn_chunk_prefill import (
     ATTENTION_SCALE,
+    GDN_PREFILL_LAYERS,
     FLASHINFER_GDN_CHUNK_IDENTITY,
     GDN_PREFILL_ACCURACY_IDENTITY,
+    AuthenticatedGdnPrefillSchedule,
     AuthenticatedGdnChunkPrefillAdapter,
     FlashInferSm121GdnChunkBackend,
     GdnChunkPrefillError,
@@ -111,10 +113,70 @@ class Backend:
         return value.output, value.final_state
 
 
+class FailingBackend(Backend):
+    def launch(self, value):
+        self.calls.append(value)
+        raise GdnChunkPrefillError("injected bounded failure")
+
+
 class GdnChunkPrefillTests(unittest.TestCase):
     def test_flashinfer_remains_the_accuracy_implementation(self):
         self.assertEqual(
             GDN_PREFILL_ACCURACY_IDENTITY, FLASHINFER_GDN_CHUNK_IDENTITY
+        )
+
+    def test_all_gdn_layers_accept_m35_and_m87_state_handoff(self):
+        for rows in (35, 87):
+            tracer = Tracer()
+            backends = {layer: Backend() for layer in GDN_PREFILL_LAYERS}
+            schedule = AuthenticatedGdnPrefillSchedule(
+                rank=0, rows=rows, backends=backends, tracer=tracer
+            )
+            self.assertEqual(schedule.layers, GDN_PREFILL_LAYERS)
+            value = tensors(rows)
+            output, final_state = schedule.execute_layer(0, value)
+            self.assertIs(output, value.output)
+            self.assertIs(final_state, value.final_state)
+            self.assertIs(backends[0].calls[0].initial_state, value.initial_state)
+            self.assertIs(backends[0].calls[0].final_state, value.final_state)
+
+    def test_gdn_schedule_rejects_incomplete_or_duplicate_inventory(self):
+        tracer = Tracer()
+        incomplete = {layer: Backend() for layer in GDN_PREFILL_LAYERS[:-1]}
+        with self.assertRaises(GdnChunkPrefillError):
+            AuthenticatedGdnPrefillSchedule(
+                rank=0, rows=35, backends=incomplete, tracer=tracer
+            )
+        self.assertEqual(tracer.spans[-1].attributes["outcome"], "error")
+        self.assertEqual(
+            tracer.spans[-1].attributes["schedule.phase"], "construction"
+        )
+        shared = Backend()
+        duplicate = {layer: shared for layer in GDN_PREFILL_LAYERS}
+        with self.assertRaises(GdnChunkPrefillError):
+            AuthenticatedGdnPrefillSchedule(
+                rank=0, rows=35, backends=duplicate, tracer=tracer
+            )
+
+    def test_gdn_schedule_failure_publishes_bounded_telemetry(self):
+        tracer = Tracer()
+        backends = {layer: Backend() for layer in GDN_PREFILL_LAYERS}
+        backends[0] = FailingBackend()
+        schedule = AuthenticatedGdnPrefillSchedule(
+            rank=1, rows=35, backends=backends, tracer=tracer
+        )
+        with self.assertRaises(GdnChunkPrefillError):
+            schedule.execute_layer(0, tensors())
+        self.assertEqual(
+            tracer.spans[-1].attributes,
+            {
+                "execution.domain": "chunk_prefill",
+                "schedule.phase": "execution",
+                "rank": 1,
+                "layer": 0,
+                "rows": 35,
+                "outcome": "error",
+            },
         )
 
     def test_real_tensor_bundle_owns_tensors_and_runs_supported_backend(self):
@@ -249,6 +311,7 @@ class GdnChunkPrefillTests(unittest.TestCase):
             tracer.spans[-1].attributes,
             {
                 "execution.domain": "chunk_prefill",
+                "schedule.phase": "execution",
                 "rank": 0,
                 "layer": 0,
                 "rows": 35,

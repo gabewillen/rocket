@@ -34,6 +34,7 @@ VALUE_HEADS = 24
 HEAD_DIM = 128
 ATTENTION_SCALE = HEAD_DIM**-0.5
 REAL_TENSOR_BUNDLE_SCHEMA = "rocket.qwen38.gdn-prefill-tensors.v1"
+GDN_PREFILL_LAYERS = tuple(layer for layer in range(48) if layer % 4 != 3)
 
 
 class GdnChunkPrefillError(RuntimeError):
@@ -321,6 +322,7 @@ class AuthenticatedGdnChunkPrefillAdapter:
             "rocket.qwen38.gdn.chunk_prefill"
         ) as span:
             span.set_attribute("execution.domain", "chunk_prefill")
+            span.set_attribute("schedule.phase", "execution")
             span.set_attribute("rank", self._rank)
             span.set_attribute("layer", self._layer)
             span.set_attribute("rows", rows if rows in ORACLE_PREFILL_ROWS else -1)
@@ -369,6 +371,92 @@ class AuthenticatedGdnChunkPrefillAdapter:
         _validate_tensor(tensors.cu_seqlens, shape=(2,), dtype="int64")
         if tensors.output is tensors.q or tensors.final_state is tensors.initial_state:
             raise GdnChunkPrefillError("GDN chunk-prefill output alias changed")
+
+
+class AuthenticatedGdnPrefillSchedule:
+    """Own the 36 pinned FlashInfer GDN ports for one authenticated TP rank.
+
+    Projected tensors and recurrent state are borrowed for each same-stream,
+    externally serialized call. The projection owner must authenticate the
+    tensor provenance before entering this schedule. M35 and M87 are separate
+    complete chunks; this owner never expands a one-row packed-decode tensor.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        rows: int,
+        backends: dict[int, GdnChunkPrefillBackend],
+        tracer: OtelTracer,
+    ) -> None:
+        with tracer.start_as_current_span(
+            "rocket.qwen38.gdn.prefill_schedule"
+        ) as span:
+            span.set_attribute("execution.domain", "chunk_prefill")
+            span.set_attribute("schedule.phase", "construction")
+            span.set_attribute("rank", rank if rank in (0, 1) else -1)
+            span.set_attribute("rows", rows if rows in ORACLE_PREFILL_ROWS else -1)
+            try:
+                if rank not in (0, 1) or rows not in ORACLE_PREFILL_ROWS:
+                    raise GdnChunkPrefillError(
+                        "GDN prefill schedule identity changed"
+                    )
+                if tuple(sorted(backends)) != GDN_PREFILL_LAYERS:
+                    raise GdnChunkPrefillError(
+                        "GDN prefill schedule inventory changed"
+                    )
+                if len({id(backend) for backend in backends.values()}) != len(
+                    backends
+                ):
+                    raise GdnChunkPrefillError(
+                        "GDN prefill schedule ownership changed"
+                    )
+                if any(
+                    backend.implementation_identity
+                    != GDN_PREFILL_ACCURACY_IDENTITY
+                    for backend in backends.values()
+                ):
+                    raise GdnChunkPrefillError(
+                        "GDN prefill schedule backend changed"
+                    )
+                self._rank = rank
+                self._rows = rows
+                self._owners = {
+                    layer: AuthenticatedGdnChunkPrefillAdapter(
+                        rank, layer, backends[layer], tracer
+                    )
+                    for layer in GDN_PREFILL_LAYERS
+                }
+            except BaseException:
+                span.set_attribute("outcome", "error")
+                raise
+            span.set_attribute("outcome", "success")
+
+    @property
+    def layers(self) -> tuple[int, ...]:
+        return tuple(self._owners)
+
+    def execute_layer(
+        self, layer: int, tensors: GdnChunkPrefillTensors
+    ) -> tuple[object, object]:
+        owner = self._owners.get(layer)
+        if owner is None or tuple(getattr(tensors.q, "shape", ()))[:1] != (
+            self._rows,
+        ):
+            raise GdnChunkPrefillError("GDN prefill schedule request changed")
+        return owner.execute(tensors)
+
+
+def make_flashinfer_gdn_prefill_schedule(
+    *, rank: int, rows: int, tracer: OtelTracer
+) -> AuthenticatedGdnPrefillSchedule:
+    return AuthenticatedGdnPrefillSchedule(
+        rank=rank,
+        rows=rows,
+        backends={layer: FlashInferSm121GdnChunkBackend() for layer in GDN_PREFILL_LAYERS},
+        tracer=tracer,
+    )
 
 
 class _ProofSpan:
@@ -551,6 +639,30 @@ def execute_authenticated_real_tensor_bundle(
             close()
 
 
+def execute_authenticated_scheduled_bundle(bundle: Path) -> dict[str, object]:
+    """Authenticate one bundle, then execute it through the all-GDN schedule."""
+    import torch
+
+    rank, layer, tensors = load_authenticated_real_tensor_bundle(bundle, torch)
+    tracer = _ProofTracer()
+    schedule = make_flashinfer_gdn_prefill_schedule(
+        rank=rank, rows=int(tensors.q.shape[0]), tracer=tracer
+    )
+    output, final_state = schedule.execute_layer(layer, tensors)
+    torch.cuda.synchronize(0)
+    return {
+        "status": "success",
+        "implementation": GDN_PREFILL_ACCURACY_IDENTITY,
+        "schedule_layers": len(schedule.layers),
+        "rank": rank,
+        "layer": layer,
+        "rows": int(tensors.q.shape[0]),
+        "output_sha256": _tensor_sha256(output, torch),
+        "final_state_sha256": _tensor_sha256(final_state, torch),
+        "telemetry": tracer.attributes,
+    }
+
+
 def compare_native_real_tensor_bundle(
     bundle: Path, native_library: Path
 ) -> dict[str, object]:
@@ -622,9 +734,14 @@ def executable_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tensor-bundle", required=True, type=Path)
     parser.add_argument("--native-library", type=Path)
     parser.add_argument("--compare-flashinfer", action="store_true")
+    parser.add_argument("--scheduled-flashinfer", action="store_true")
     args = parser.parse_args(argv)
     try:
-        if args.compare_flashinfer:
+        if args.scheduled_flashinfer:
+            if args.native_library is not None or args.compare_flashinfer:
+                raise GdnChunkPrefillError("GDN scheduled mode changed")
+            result = execute_authenticated_scheduled_bundle(args.tensor_bundle)
+        elif args.compare_flashinfer:
             if args.native_library is None:
                 raise GdnChunkPrefillError(
                     "native library is required for GDN comparison"
@@ -664,9 +781,13 @@ __all__ = [
     "PINNED_VLLM_COMMIT",
     "NATIVE_GDN_M35_IDENTITY",
     "GDN_PREFILL_ACCURACY_IDENTITY",
+    "GDN_PREFILL_LAYERS",
+    "AuthenticatedGdnPrefillSchedule",
     "NativeGdnM35PrefillBackend",
     "VALUE_HEADS",
     "execute_authenticated_real_tensor_bundle",
+    "execute_authenticated_scheduled_bundle",
+    "make_flashinfer_gdn_prefill_schedule",
     "compare_native_real_tensor_bundle",
     "executable_main",
     "load_authenticated_real_tensor_bundle",
