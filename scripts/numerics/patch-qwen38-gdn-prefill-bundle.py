@@ -84,10 +84,13 @@ _ROCKET_GDN_PREFILL_CHUNKS = []
 _ROCKET_GDN_PREFILL_INITIAL_STATE = None
 
 
-def _rocket_capture_gdn_prefill_bundle(q, k, v, log_decay, beta, initial_state):
+def _rocket_capture_gdn_prefill_bundle(prefix, q, k, v, log_decay, beta,
+                                       initial_state):
     global _ROCKET_GDN_PREFILL_BUNDLE_CAPTURED
     global _ROCKET_GDN_PREFILL_INITIAL_STATE
     if os.getenv("ROCKET_QWEN38_K0_GDN_CAPTURE_ACTIVE") != "1":
+        return
+    if ".layers.0." not in prefix:
         return
     if _ROCKET_GDN_PREFILL_BUNDLE_CAPTURED:
         return
@@ -95,6 +98,12 @@ def _rocket_capture_gdn_prefill_bundle(q, k, v, log_decay, beta, initial_state):
     rank = get_tensor_model_parallel_rank()
     if rank != 0:
         return
+    q = q.squeeze(0).contiguous()
+    k = k.squeeze(0).contiguous()
+    v = v.squeeze(0).contiguous()
+    log_decay = log_decay.squeeze(0).contiguous().to(torch.float32)
+    beta = beta.squeeze(0).contiguous().to(torch.float32)
+    initial_state = initial_state.to(torch.float32)
     rows = q.shape[0]
     expected = {
         "q": ((rows, 8, 128), torch.bfloat16),
@@ -159,14 +168,17 @@ def _rocket_capture_gdn_prefill_bundle(q, k, v, log_decay, beta, initial_state):
     source = replace_once(source, "logger = init_logger(__name__)\n", helper + "\nlogger = init_logger(__name__)\n")
     source = replace_once(
         source,
-        "    if cu_seqlens is not None:\n"
-        "        cu_seqlens = cu_seqlens.to(torch.int64)\n"
-        "    result = chunk_gated_delta_rule_fi(\n",
-        "    if cu_seqlens is not None:\n"
-        "        cu_seqlens = cu_seqlens.to(torch.int64)\n"
-        "    _rocket_capture_gdn_prefill_bundle(\n"
-        "        q, k, v, fi_g, fi_beta, fi_state)\n"
-        "    result = chunk_gated_delta_rule_fi(\n",
+        "            (\n"
+        "                core_attn_out_non_spec,\n"
+        "                last_recurrent_state,\n"
+        "            ) = self.chunk_gated_delta_rule(\n",
+        "            _rocket_capture_gdn_prefill_bundle(\n"
+        "                self.prefix, query_non_spec, key_non_spec,\n"
+        "                value_non_spec, g_non_spec, beta_non_spec, initial_state)\n"
+        "            (\n"
+        "                core_attn_out_non_spec,\n"
+        "                last_recurrent_state,\n"
+        "            ) = self.chunk_gated_delta_rule(\n",
     )
     args.output.write_text(source)
 
