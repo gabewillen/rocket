@@ -27,7 +27,8 @@ void require_identity(const Layer3RopeIdentity& identity) {
       identity.config_sha256 != kLayer3RopeConfigSha256 ||
       identity.vllm_revision != kLayer3RopeVllmRevision ||
       (identity.rank != 0 && identity.rank != 1) ||
-      identity.layer != kLayer3RopeLayer || identity.first_position != 0 ||
+      identity.layer < 0 || identity.layer >= 48 || identity.layer % 4 != 3 ||
+      identity.first_position != 0 ||
       identity.rows != kLayer3RopeRows ||
       identity.rotary_dim != kLayer3RopeColumns ||
       std::bit_cast<std::uint32_t>(identity.rope_theta) !=
@@ -47,11 +48,18 @@ void check(cudaError_t status, const char* phase) {
 }  // namespace
 
 Layer3RopeIdentity layer3_rope_identity(int rank) {
+  return target_qsa_rope_identity(rank, kLayer3RopeLayer);
+}
+
+Layer3RopeIdentity target_qsa_rope_identity(int rank, int layer) {
   if (rank != 0 && rank != 1)
     throw std::invalid_argument(
         "layer3_rope valid=0 complete=0 phase=identity reason=rank");
+  if (layer < 0 || layer >= 48 || layer % 4 != 3)
+    throw std::invalid_argument(
+        "layer3_rope valid=0 complete=0 phase=identity reason=layer");
   return {kLayer3RopeCheckpointRevision, kLayer3RopeConfigSha256,
-          kLayer3RopeVllmRevision, rank, kLayer3RopeLayer, 0,
+          kLayer3RopeVllmRevision, rank, layer, 0,
           kLayer3RopeRows, kLayer3RopeColumns, kLayer3RopeTheta, false};
 }
 

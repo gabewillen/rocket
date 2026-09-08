@@ -17,6 +17,15 @@ void require(bool condition) {
 int main() {
   const auto rank0 = attention::layer3_rope_identity(0);
   const auto rank1 = attention::layer3_rope_identity(1);
+  for (int layer = 3; layer < 48; layer += 4) {
+    const auto identity = attention::target_qsa_rope_identity(0, layer);
+    require(identity.layer == layer && identity.rank == 0);
+  }
+  try {
+    (void)attention::target_qsa_rope_identity(0, 4);
+    require(false);
+  } catch (const std::invalid_argument&) {
+  }
   require(rank0.rank == 0 && rank1.rank == 1 && rank0.layer == 3 &&
           rank0.first_position == 0 && rank0.rows == 35 &&
           rank0.rotary_dim == 64 && !rank0.uses_mrope);

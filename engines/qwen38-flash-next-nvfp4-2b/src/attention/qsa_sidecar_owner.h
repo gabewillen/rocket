@@ -17,6 +17,7 @@ inline constexpr std::string_view kQsaSidecarArtifactKey =
 inline constexpr std::size_t kQsaSidecarBytes = 39'321'600;
 inline constexpr std::size_t kQsaIndexerLayer3Offset = 0;
 inline constexpr std::size_t kQsaIndexerLayer3Bytes = 3'276'800;
+inline constexpr int kQsaSidecarLayers = 12;
 
 struct QsaSidecarIdentity {
   std::string_view artifact_key;
@@ -36,6 +37,8 @@ struct QsaSidecarPublication {
 };
 
 QsaSidecarIdentity layer3_qsa_sidecar_identity(int rank);
+QsaSidecarIdentity target_qsa_sidecar_identity(int rank, int layer);
+std::size_t target_qsa_sidecar_offset(int layer);
 std::vector<std::uint8_t> authenticate_qsa_sidecar_host(
     const std::filesystem::path& payload, const QsaSidecarIdentity& identity);
 
@@ -53,7 +56,7 @@ class QsaSidecarDeviceOwner final {
   const std::uint8_t* payload() const noexcept { return payload_; }
   const __nv_bfloat16* index_qk_proj() const noexcept {
     return reinterpret_cast<const __nv_bfloat16*>(
-        payload_ + kQsaIndexerLayer3Offset);
+        payload_ + target_qsa_sidecar_offset(identity_.layer));
   }
   const QsaSidecarIdentity& identity() const noexcept { return identity_; }
   // The returned reference and every borrowed field share this owner's
