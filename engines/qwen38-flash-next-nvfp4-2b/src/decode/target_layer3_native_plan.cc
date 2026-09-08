@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -64,14 +67,26 @@ constexpr std::string_view kLayer02 =
     "6503eeeb3c70c9c1c163aca08dcdb4e1df7ca997699f2f20946265a72069d2fe";
 constexpr std::string_view kLayer03 =
     "aa2d2a1454f0654ea2082d12e7e3284cad9304a7ede124303f99c52bbf9cddbe";
-constexpr std::array<std::string_view, 2> kLayouts{
+constexpr std::array<std::string_view, 2> kMoeLayouts{
     "ebf6db24c257c3516f7ff8c94bb2ba70d692c62c4cbf1b2577ebe99a3f56875b",
     "6e20c303b336f980e94e7aa3d897009ac527e1810279c09c8cbab1bd7867f841"};
+constexpr std::array<std::string_view, 2> kSlabPublicationLayouts{
+    "4f03ccc90c9020ff2e87f044867f2ac9896ac20c0d97c85055beef0b125ce6d6",
+    "afd718cf00b6fffa61336ac53e744209750b1c9bd0399622f73cf99cb81de2e9"};
 constexpr std::array<std::string_view, 2> kExtentInventories{
     "0d5ad9150c7632ecab86abd320ddea486971db79453c919a4ec8f42ccb6e49b6",
     "9e2a66e4f78d2ac6d13cc2afea164f8c3f4b7329a98f84279015f739c3027cdf"};
 constexpr std::string_view kBufferInventory =
     "7e48bcfb21f1f5f1136754a635215318696878f599c75a3a01e6a4dc45f7cc45";
+constexpr std::array<std::string_view, 2> kProjectionGlobalInventories{
+    "e9196b3e9efed6cc5cdcfc27a2d4aee0c0a81ac088ef2e73ccb8dad04bee5b7d",
+    "44ef127172e3c065479e9dbbcf47686a21b9151cdb316cbd5486fca3a6115668"};
+constexpr std::array<std::string_view, 4> kProjectionFamilies{"q", "k", "v", "o"};
+constexpr std::array<std::string_view, 2> kNativeBindingInventories{
+    "0f88201c81e6ace3991969dc397fca345773b7a28f317e08a6727c7903ee30c5",
+    "5d6a7b322e1a78059f7abea9d9b6a20a1e7c76263713b5e6dff940d9247e3d93"};
+constexpr std::array<std::uint32_t, 4> kProjectionGlobalBits{
+    0x39ac30c3U, 0x395e79e7U, 0x399cf3cfU, 0x39d55555U};
 
 [[noreturn]] void fail(std::string_view reason) {
   throw std::invalid_argument("layer-3 native plan: " + std::string(reason));
@@ -119,6 +134,29 @@ bool hex64(std::string_view value) {
   return value.size() == 64 && std::all_of(value.begin(), value.end(), [](char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
   });
+}
+
+int hex_nibble(char value) noexcept {
+  if (value >= '0' && value <= '9') return value - '0';
+  if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+  return -1;
+}
+
+float little_endian_float(std::string_view value) {
+  if (value.size() != 8) fail("projection scalar encoding changed");
+  std::array<std::uint8_t, 4> bytes{};
+  for (std::size_t index = 0; index < bytes.size(); ++index) {
+    const int high = hex_nibble(value[2 * index]);
+    const int low = hex_nibble(value[2 * index + 1]);
+    if (high < 0 || low < 0) fail("projection scalar encoding changed");
+    bytes[index] = static_cast<std::uint8_t>((high << 4) | low);
+  }
+  float result = 0.0F;
+  static_assert(sizeof(result) == bytes.size());
+  std::memcpy(&result, bytes.data(), bytes.size());
+  if (!std::isfinite(result) || result <= 0.0F)
+    fail("projection scalar value changed");
+  return result;
 }
 
 std::string sha256(std::string_view value) {
@@ -276,7 +314,85 @@ void validate_fixed_contract(json_object* root) {
            {"pair_reduce_bootstrap", 3}, {"oracle_comparator", 1}}})
     if (uint_field(abis, name) != version) fail("native ABI version changed");
 }
+
+struct ProjectionGlobalEvidence {
+  std::string extent_name;
+  std::string source_chunk_sha256;
+  float value;
+  bool extent_matched = false;
+};
+
+std::array<ProjectionGlobalEvidence, 4> projection_globals(
+    json_object* root, std::string_view raw, std::uint64_t rank) {
+  if (rank > 1) fail("projection scalar rank changed");
+  const auto claimed = string_field(root, "qsa_projection_globals_sha256");
+  if (claimed != kProjectionGlobalInventories[rank] ||
+      sha256(canonical_value(raw, "qsa_projection_globals")) != claimed)
+    fail("projection scalar inventory changed");
+  auto* globals = field(root, "qsa_projection_globals", kJsonObject);
+  if (json_object_object_length(globals) != 4)
+    fail("projection scalar family inventory changed");
+  std::array<ProjectionGlobalEvidence, 4> result;
+  for (std::size_t index = 0; index < result.size(); ++index) {
+    const std::string family(kProjectionFamilies[index]);
+    auto* item = field(globals, family.c_str(), kJsonObject);
+    if (json_object_object_length(item) != 4 ||
+        string_field(item, "dtype") != "F32")
+      fail("projection scalar evidence changed");
+    const std::string expected = "model.language_model.layers.3.self_attn." +
+                                 family + "_proj.weight_scale_2";
+    result[index] = {
+        string_field(item, "extent_name"),
+        string_field(item, "source_chunk_sha256"),
+        little_endian_float(string_field(item, "value_le_hex")), false};
+    if (result[index].extent_name != expected ||
+        !hex64(result[index].source_chunk_sha256))
+      fail("projection scalar source identity changed");
+  }
+  return result;
+}
 }  // namespace
+
+void validate_target_layer3_native_plan_binding(
+    const TargetLayer3NativePlan& plan) {
+  if ((plan.rank != 0 && plan.rank != 1) || plan.peer_rank != 1 - plan.rank ||
+      plan.layer != 3 || plan.slab_bytes != kTargetSlabBytes ||
+      plan.artifact_key != kArtifact ||
+      plan.slab_key != "rank" + std::to_string(plan.rank) + "-target" ||
+      plan.layout_sha256 != kMoeLayouts[plan.rank] ||
+      plan.slab_publication_layout_sha256 !=
+          kSlabPublicationLayouts[plan.rank] ||
+      plan.extents.size() != 3'108)
+    fail("mutable binding identity changed");
+  for (std::size_t index = 0; index < plan.qsa_projection_globals.size(); ++index)
+    if (std::bit_cast<std::uint32_t>(plan.qsa_projection_globals[index]) !=
+        kProjectionGlobalBits[index])
+      fail("mutable projection scalar changed");
+  std::string canonical = "[";
+  for (std::size_t index = 0; index < plan.extents.size(); ++index) {
+    const auto& item = plan.extents[index];
+    const auto safe = [](std::string_view text) {
+      return std::all_of(text.begin(), text.end(), [](char value) {
+        return (value >= 'a' && value <= 'z') ||
+               (value >= 'A' && value <= 'Z') ||
+               (value >= '0' && value <= '9') || value == '.' ||
+               value == '_' || value == '-';
+      });
+    };
+    if (!safe(item.name) || !safe(item.storage))
+      fail("mutable extent text changed");
+    if (index) canonical.push_back(',');
+    canonical += "{\"length_bytes\":" + std::to_string(item.length_bytes) +
+                 ",\"name\":\"" + item.name + "\",\"offset_bytes\":" +
+                 std::to_string(item.offset_bytes) + ",\"storage\":\"" +
+                 item.storage + "\"}";
+  }
+  canonical.push_back(']');
+  const auto expected = kNativeBindingInventories[plan.rank];
+  if (plan.native_binding_inventory_sha256 != expected ||
+      sha256(canonical) != expected)
+    fail("mutable native binding inventory changed");
+}
 
 TargetLayer3NativePlan load_target_layer3_native_plan(
     const std::filesystem::path& path) {
@@ -297,7 +413,7 @@ TargetLayer3NativePlan load_target_layer3_native_plan(
       json_tokener_get_parse_end(tokener.value) != raw.size())
     fail("descriptor JSON is invalid or has trailing bytes");
   if (!root.value || json_object_get_type(root.value) != kJsonObject ||
-      json_object_object_length(root.value) != 22)
+      json_object_object_length(root.value) != 26)
     fail("top-level inventory changed");
   const auto claimed = string_field(root.value, "descriptor_sha256");
   const std::string needle = "\"descriptor_sha256\":\"" + claimed + "\",";
@@ -322,6 +438,9 @@ TargetLayer3NativePlan load_target_layer3_native_plan(
     fail("rank identity changed");
   result.rank = static_cast<int>(rank);
   result.peer_rank = static_cast<int>(peer_rank);
+  auto scalar_evidence = projection_globals(root.value, raw, rank);
+  for (std::size_t index = 0; index < scalar_evidence.size(); ++index)
+    result.qsa_projection_globals[index] = scalar_evidence[index].value;
   if ((result.rank != 0 && result.rank != 1) ||
       result.peer_rank != 1 - result.rank)
     fail("rank identity changed");
@@ -330,12 +449,18 @@ TargetLayer3NativePlan load_target_layer3_native_plan(
   result.layer = 3;
   result.slab_bytes = uint_field(root.value, "slab_bytes");
   result.descriptor_sha256 = claimed;
+  result.native_binding_inventory_sha256 =
+      string_field(root.value, "native_binding_inventory_sha256");
   result.artifact_key = string_field(root.value, "artifact_key");
   result.slab_key = string_field(root.value, "slab_key");
   result.layout_sha256 = string_field(root.value, "layout_sha256");
+  result.slab_publication_layout_sha256 =
+      string_field(root.value, "slab_publication_layout_sha256");
   if (result.slab_key != "rank" + std::to_string(result.rank) + "-target" ||
       result.slab_bytes != kTargetSlabBytes ||
-      result.layout_sha256 != kLayouts[static_cast<std::size_t>(result.rank)] ||
+      result.layout_sha256 != kMoeLayouts[static_cast<std::size_t>(result.rank)] ||
+      result.slab_publication_layout_sha256 !=
+          kSlabPublicationLayouts[static_cast<std::size_t>(result.rank)] ||
       string_field(root.value, "extent_inventory_sha256") !=
           kExtentInventories[static_cast<std::size_t>(result.rank)] ||
       extent_inventory != kExtentInventories[static_cast<std::size_t>(result.rank)] ||
@@ -368,6 +493,13 @@ TargetLayer3NativePlan load_target_layer3_native_plan(
         extent.length_bytes > bound - extent.offset_bytes)
       fail("extent storage bounds changed");
     validate_shape(item, extent.length_bytes);
+    ProjectionGlobalEvidence* scalar = nullptr;
+    for (auto& evidence : scalar_evidence)
+      if (extent.name == evidence.extent_name) scalar = &evidence;
+    if (scalar && (extent.length_bytes != 4 ||
+                   string_field(item, "dtype") != "F32" ||
+                   extent.storage != "target_slab"))
+      fail("projection scalar extent changed");
     auto* chunks = field(item, "source_chunks", kJsonArray);
     if (json_object_array_length(chunks) == 0) fail("extent source is missing");
     std::vector<std::pair<std::uint64_t, std::uint64_t>> source_ranges;
@@ -377,6 +509,9 @@ TargetLayer3NativePlan load_target_layer3_native_plan(
           json_object_object_length(chunk) != 3 ||
           !hex64(string_field(chunk, "sha256")))
         fail("source chunk identity changed");
+      const auto chunk_sha256 = string_field(chunk, "sha256");
+      if (scalar && chunk_sha256 == scalar->source_chunk_sha256)
+        scalar->extent_matched = true;
       const auto offset = uint_field(chunk, "offset_bytes");
       const auto length = uint_field(chunk, "length_bytes");
       if (!length || offset > bound || length > bound - offset ||
@@ -397,6 +532,9 @@ TargetLayer3NativePlan load_target_layer3_native_plan(
                                extent.offset_bytes + extent.length_bytes});
     result.extents.push_back(std::move(extent));
   }
+  if (std::any_of(scalar_evidence.begin(), scalar_evidence.end(),
+                  [](const auto& value) { return !value.extent_matched; }))
+    fail("projection scalar extent evidence is missing");
   for (auto& storage : ranges) {
     std::sort(storage.begin(), storage.end());
     for (std::size_t i = 1; i < storage.size(); ++i)
@@ -404,6 +542,7 @@ TargetLayer3NativePlan load_target_layer3_native_plan(
         fail("extent overlap changed");
   }
   validate_buffers(root.value);
+  validate_target_layer3_native_plan_binding(result);
   return result;
 }
 

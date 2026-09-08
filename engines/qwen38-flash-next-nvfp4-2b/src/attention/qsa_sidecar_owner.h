@@ -26,6 +26,15 @@ struct QsaSidecarIdentity {
   int layer;
 };
 
+struct QsaSidecarPublication {
+  // Borrowed device storage. The pointer and the identity string_view remain
+  // valid only while the publishing QsaSidecarDeviceOwner remains alive.
+  const std::uint8_t* device_base;
+  std::size_t bytes;
+  int device;
+  QsaSidecarIdentity identity;
+};
+
 QsaSidecarIdentity layer3_qsa_sidecar_identity(int rank);
 std::vector<std::uint8_t> authenticate_qsa_sidecar_host(
     const std::filesystem::path& payload, const QsaSidecarIdentity& identity);
@@ -47,11 +56,17 @@ class QsaSidecarDeviceOwner final {
         payload_ + kQsaIndexerLayer3Offset);
   }
   const QsaSidecarIdentity& identity() const noexcept { return identity_; }
+  // The returned reference and every borrowed field share this owner's
+  // lifetime. Callers must not retain them after owner destruction.
+  const QsaSidecarPublication& publication() const noexcept {
+    return publication_;
+  }
 
  private:
   int device_ = -1;
   std::uint8_t* payload_ = nullptr;
   QsaSidecarIdentity identity_{};
+  QsaSidecarPublication publication_{};
 };
 
 }  // namespace rocket::qwen38::attention

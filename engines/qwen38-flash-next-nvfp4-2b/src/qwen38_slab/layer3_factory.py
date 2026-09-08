@@ -6,13 +6,16 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import os
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
 from .contract import PINNED_CONTRACT, SCHEMA, canonical_bytes
+from .cuda_slab_loader import LoadedRankSlabs
 from .qsa_weights import RankQsaWeights, load_qsa_weights
 from .routed_moe import OwnerLocalMoeSlab, load_owner_local_moe
 from .layer3_runtime import ARENA_SPECS
@@ -102,6 +105,30 @@ class Layer3PhysicalPlan:
     replicated_hc_shape: tuple[int, int]
     ranks: tuple[Layer3RankPlan, Layer3RankPlan]
     pair_reduce: tuple[Layer3PairReducePlan, Layer3PairReducePlan]
+
+
+@dataclass(frozen=True)
+class NativeTargetSlabHandoff:
+    """Owner-retaining, zero-copy startup handoff to the native factory.
+
+    ``owner`` keeps the Torch tensor and readiness event alive for every native
+    borrower. Native execution receives only the remaining scalar fields once;
+    it must not call Python or Torch after that handoff.
+    """
+
+    owner: LoadedRankSlabs
+    device_base: int
+    ready_event: int
+    bytes: int
+    device: int
+    rank: int
+    artifact_key: str
+    slab_key: str
+    manifest_sha256: str
+    layout_sha256: str
+    open_to_publish_ns: int
+    chunks_authenticated: int
+    peak_host_pinned_bytes: int
 
 
 def _sha256(path: Path) -> str:
@@ -401,6 +428,62 @@ def _buffer(name: str, shape: Sequence[int], dtype: str) -> dict[str, object]:
     }
 
 
+def _qsa_projection_globals(item: Layer3RankPlan) -> dict[str, object]:
+    """Authenticate and carry the four host scalar inputs to native init."""
+
+    by_name = {extent.name: extent for extent in item.extents}
+    prefix = f"model.language_model.layers.{LAYER}.self_attn."
+    result = {}
+    cached_chunks: dict[tuple[int, int, str], bytes] = {}
+    fd = os.open(item.qsa.slab_path, os.O_RDONLY)
+    try:
+        for family in ("q", "k", "v", "o"):
+            name = f"{prefix}{family}_proj.weight_scale_2"
+            extent = by_name.get(name)
+            if (
+                extent is None or extent.storage != "target_slab"
+                or extent.dtype != "F32" or extent.shape != (1,)
+                or extent.strides != (1,) or extent.length != 4
+                or len(extent.source_chunks) != 1
+            ):
+                raise Layer3FactoryError(
+                    f"layer-3 {family} projection scalar extent changed"
+                )
+            chunk = extent.source_chunks[0]
+            key = (chunk.offset, chunk.length, chunk.sha256)
+            payload = cached_chunks.get(key)
+            if payload is None:
+                payload = os.pread(fd, chunk.length, chunk.offset)
+                if (
+                    len(payload) != chunk.length
+                    or hashlib.sha256(payload).hexdigest() != chunk.sha256
+                ):
+                    raise Layer3FactoryError(
+                        f"layer-3 {family} projection scalar source changed"
+                    )
+                cached_chunks[key] = payload
+            relative = extent.offset - chunk.offset
+            raw = payload[relative:relative + extent.length]
+            if len(raw) != 4:
+                raise Layer3FactoryError(
+                    f"layer-3 {family} projection scalar read was short"
+                )
+            value = struct.unpack("<f", raw)[0]
+            if not math.isfinite(value) or value <= 0.0:
+                raise Layer3FactoryError(
+                    f"layer-3 {family} projection scalar changed"
+                )
+            result[family] = {
+                "extent_name": name,
+                "dtype": "F32",
+                "value_le_hex": raw.hex(),
+                "source_chunk_sha256": chunk.sha256,
+            }
+    finally:
+        os.close(fd)
+    return result
+
+
 def native_rank_descriptor(plan: Layer3PhysicalPlan, rank: int) -> Mapping[str, object]:
     """Canonical native handoff. It contains no device pointers."""
 
@@ -408,6 +491,11 @@ def native_rank_descriptor(plan: Layer3PhysicalPlan, rank: int) -> Mapping[str, 
         raise Layer3FactoryError("layer-3 native descriptor rank changed")
     item = plan.ranks[rank]
     pair = plan.pair_reduce[rank]
+    manifest = json.loads((item.qsa.slab_path.parent / "manifest.json").read_bytes())
+    slab_manifest = manifest["slabs"][f"rank{rank}-target"]
+    slab_publication_layout = hashlib.sha256(canonical_bytes({
+        key: slab_manifest[key] for key in ("file", "bytes", "chunks")
+    })).hexdigest()
     extents = [
         {
             "name": extent.name, "offset_bytes": extent.offset,
@@ -481,18 +569,21 @@ def native_rank_descriptor(plan: Layer3PhysicalPlan, rank: int) -> Mapping[str, 
         _buffer("moe_injection", (1, 4), "bfloat16"),
         _buffer("reduced_moe", (1, HIDDEN), "float32"),
     ]
+    qsa_projection_globals = _qsa_projection_globals(item)
     descriptor = {
         "schema": NATIVE_PLAN_SCHEMA, "rank": rank, "peer_rank": 1 - rank,
         "layer": LAYER, "artifact_key": TARGET_ARTIFACT,
         "manifest_sha256": TARGET_MANIFEST_SHA256,
         "slab_key": f"rank{rank}-target", "slab_bytes": item.qsa.slab_bytes,
         "layout_sha256": item.moe.layout_sha256,
+        "slab_publication_layout_sha256": slab_publication_layout,
         "indexer_sidecar_key": INDEXER_SIDECAR,
         "oracle_manifest_sha256": plan.oracle_manifest_sha256,
         "oracle_layer02_sha256": LAYER02_SHA256,
         "oracle_layer03_sha256": LAYER03_SHA256,
         "replay_rows": list(plan.replay_rows), "compare_row": plan.compare_row,
         "extents": extents,
+        "qsa_projection_globals": qsa_projection_globals,
         "buffers": {
             "qsa_arena": qsa_arena, "qsa_state": qsa_state,
             "target_moe_workspace": moe_workspace,
@@ -515,8 +606,18 @@ def native_rank_descriptor(plan: Layer3PhysicalPlan, rank: int) -> Mapping[str, 
     descriptor["extent_inventory_sha256"] = hashlib.sha256(
         canonical_bytes(extents)
     ).hexdigest()
+    descriptor["native_binding_inventory_sha256"] = hashlib.sha256(
+        canonical_bytes([
+            {key: extent[key] for key in
+             ("name", "offset_bytes", "length_bytes", "storage")}
+            for extent in extents
+        ])
+    ).hexdigest()
     descriptor["buffer_inventory_sha256"] = hashlib.sha256(
         canonical_bytes(descriptor["buffers"])
+    ).hexdigest()
+    descriptor["qsa_projection_globals_sha256"] = hashlib.sha256(
+        canonical_bytes(qsa_projection_globals)
     ).hexdigest()
     descriptor["descriptor_sha256"] = hashlib.sha256(
         canonical_bytes(descriptor)
@@ -524,6 +625,57 @@ def native_rank_descriptor(plan: Layer3PhysicalPlan, rank: int) -> Mapping[str, 
     return MappingProxyType(descriptor)
 
 
+def native_target_slab_handoff(
+    descriptor: Mapping[str, object], loaded: LoadedRankSlabs,
+) -> NativeTargetSlabHandoff:
+    """Alias the accepted CUDA loader's target allocation without copying it."""
+
+    if (
+        not isinstance(loaded, LoadedRankSlabs)
+        or descriptor.get("schema") != NATIVE_PLAN_SCHEMA
+        or descriptor.get("artifact_key") != TARGET_ARTIFACT
+        or descriptor.get("manifest_sha256") != TARGET_MANIFEST_SHA256
+    ):
+        raise Layer3FactoryError("native target slab handoff identity changed")
+    rank = descriptor.get("rank")
+    slab_key = descriptor.get("slab_key")
+    if rank not in (0, 1) or loaded.receipt.rank != rank or slab_key != f"rank{rank}-target":
+        raise Layer3FactoryError("native target slab handoff rank changed")
+    target = loaded.slabs.get(slab_key)
+    pointer = int(getattr(target, "data_ptr", lambda: 0)())
+    elements = int(getattr(target, "numel", lambda: 0)())
+    dtype = str(getattr(target, "dtype", ""))
+    device_text = str(getattr(target, "device", ""))
+    event = loaded.ready_event
+    event_handle = int(getattr(event, "cuda_event", 0))
+    try:
+        device = int(device_text.split(":", 1)[1])
+    except (IndexError, ValueError) as exc:
+        raise Layer3FactoryError("native target slab CUDA device changed") from exc
+    receipt = loaded.receipt.target
+    expected_bytes = int(descriptor.get("slab_bytes", 0))
+    if (
+        pointer <= 0 or elements != expected_bytes or "uint8" not in dtype
+        or not device_text.startswith("cuda:") or event_handle <= 0
+        or receipt.key != slab_key or receipt.bytes_read != expected_bytes
+        or receipt.h2d_bytes != expected_bytes or receipt.direct_reads != 236
+        or receipt.h2d_copies != 236 or len(receipt.chunks) != 236
+        or receipt.completed_ns <= receipt.started_ns
+    ):
+        raise Layer3FactoryError("native target slab publication changed")
+    return NativeTargetSlabHandoff(
+        owner=loaded, device_base=pointer, ready_event=event_handle,
+        bytes=expected_bytes, device=device, rank=rank,
+        artifact_key=TARGET_ARTIFACT, slab_key=slab_key,
+        manifest_sha256=TARGET_MANIFEST_SHA256,
+        layout_sha256=str(descriptor["slab_publication_layout_sha256"]),
+        open_to_publish_ns=receipt.completed_ns - receipt.started_ns,
+        chunks_authenticated=receipt.direct_reads,
+        peak_host_pinned_bytes=4 * (268_435_456 + 65_536 - 1),
+    )
+
+
 __all__ = ["Layer3FactoryError", "Layer3ExtentPlan", "Layer3PairReducePlan",
            "Layer3PhysicalPlan", "Layer3RankPlan", "native_rank_descriptor",
+           "NativeTargetSlabHandoff", "native_target_slab_handoff",
            "prepare_layer3_physical_plan", "public_plan"]

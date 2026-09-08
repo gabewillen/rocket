@@ -140,6 +140,7 @@ QsaSidecarDeviceOwner::QsaSidecarDeviceOwner(
       throw std::runtime_error("QSA sidecar H2D publication failed");
     cudaEventDestroy(published);
     cudaStreamDestroy(stream);
+    publication_ = {payload_, host.size(), device_, identity_};
   } catch (...) {
     if (published) cudaEventDestroy(published);
     if (stream) cudaStreamDestroy(stream);
@@ -152,6 +153,7 @@ QsaSidecarDeviceOwner::QsaSidecarDeviceOwner(
 QsaSidecarDeviceOwner::~QsaSidecarDeviceOwner() {
   if (device_ >= 0) cudaSetDevice(device_);
   if (payload_) cudaFree(payload_);
+  publication_ = {};
 }
 
 }  // namespace rocket::qwen38::attention

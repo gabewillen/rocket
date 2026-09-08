@@ -25,6 +25,9 @@ int main(int argc, char** argv) {
     if (plan.rank != rank || plan.peer_rank != 1 - rank || plan.layer != 3 ||
         plan.extents.size() != 3108 || plan.descriptor_sha256.size() != 64)
       throw std::runtime_error("native plan publication changed");
+    for (float value : plan.qsa_projection_globals)
+      if (!(value > 0.0F))
+        throw std::runtime_error("native QSA projection scalar changed");
     std::printf("rank=%d extents=%zu descriptor_sha256=%s\n", plan.rank,
                 plan.extents.size(), plan.descriptor_sha256.c_str());
     return 0;

@@ -4,12 +4,18 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import MappingProxyType
 
 from qwen38_slab.layer3_factory import (
     Layer3FactoryError,
+    native_target_slab_handoff,
     prepare_layer3_physical_plan,
     native_rank_descriptor,
     public_plan,
+)
+from qwen38_slab.cuda_slab_loader import (
+    ChunkTransferReceipt, LoadedRankSlabs, RankLoadReceipt,
+    SlabTransferReceipt,
 )
 
 ARTIFACT = Path(
@@ -37,6 +43,23 @@ class Tracer:
     def __init__(self): self.spans = []
     def start_as_current_span(self, name):
         span = Span(); self.spans.append(span); return span
+
+
+class TargetTensor:
+    copies = 0
+    dtype = "torch.uint8"
+    device = "cuda:0"
+    def __init__(self, pointer, elements):
+        self.pointer = pointer; self.elements = elements
+    def data_ptr(self): return self.pointer
+    def numel(self): return self.elements
+    def copy_(self, *args, **kwargs):
+        type(self).copies += 1
+        raise AssertionError("handoff must not copy")
+
+
+class ReadyEvent:
+    cuda_event = 0xABC0
 
 
 class Layer3FactoryTests(unittest.TestCase):
@@ -77,15 +100,62 @@ class Layer3FactoryTests(unittest.TestCase):
             self.assertEqual(descriptor["rank"], rank)
             self.assertEqual(len(descriptor["extents"]), 3_108)
             self.assertEqual(len(descriptor["descriptor_sha256"]), 64)
+            self.assertEqual(len(descriptor["slab_publication_layout_sha256"]), 64)
             self.assertTrue(all(item["source_chunks"]
                                 for item in descriptor["extents"]))
             self.assertEqual(descriptor["native_abis"]["pair_reduce_bootstrap"], 3)
+            globals_ = descriptor["qsa_projection_globals"]
+            self.assertEqual(set(globals_), {"q", "k", "v", "o"})
+            self.assertTrue(all(value["dtype"] == "F32"
+                                and len(value["value_le_hex"]) == 8
+                                and len(value["source_chunk_sha256"]) == 64
+                                for value in globals_.values()))
         self.assertNotEqual(descriptors[0]["descriptor_sha256"],
                             descriptors[1]["descriptor_sha256"])
         self.assertEqual(tracer.spans[-1].attributes, {
             "phase": "prepare", "outcome": "success",
             "failure.class": "none",
         })
+
+    @unittest.skipUnless(
+        ARTIFACT.is_dir() and SIDECAR.is_dir() and ORACLE.is_dir(),
+        "authenticated layer-3 artifacts are unavailable",
+    )
+    def test_native_handoff_retains_owner_aliases_source_and_never_copies(self):
+        plan = prepare_layer3_physical_plan(
+            artifact=ARTIFACT, indexer_sidecar=SIDECAR,
+            oracle_capture=ORACLE, tracer=Tracer(),
+        )
+        descriptor = native_rank_descriptor(plan, 0)
+        size = descriptor["slab_bytes"]
+        tensor = TargetTensor(0x1234_0000, size)
+        chunks = tuple(
+            ChunkTransferReceipt(index, size if index == 0 else 0, 1, 1, 1)
+            for index in range(236)
+        )
+        target = SlabTransferReceipt(
+            "rank0-target", size, size, 236, 236, 1, 2, chunks,
+        )
+        mtp = SlabTransferReceipt(
+            "rank0-mtp", 1, 1, 1, 1, 1, 2,
+            (ChunkTransferReceipt(0, 1, 1, 1, 1),),
+        )
+        loaded = LoadedRankSlabs(
+            MappingProxyType({"rank0-target": tensor, "rank0-mtp": object()}),
+            RankLoadReceipt(0, target, mtp, 1, 1, 2, 1), ReadyEvent(),
+        )
+        TargetTensor.copies = 0
+        handoff = native_target_slab_handoff(descriptor, loaded)
+        self.assertIs(handoff.owner, loaded)
+        self.assertEqual(handoff.device_base, tensor.data_ptr())
+        self.assertEqual(handoff.ready_event, ReadyEvent.cuda_event)
+        self.assertEqual(handoff.chunks_authenticated, 236)
+        self.assertEqual(TargetTensor.copies, 0)
+        with self.assertRaisesRegex(Layer3FactoryError, "publication"):
+            native_target_slab_handoff(
+                descriptor,
+                LoadedRankSlabs(loaded.slabs, loaded.receipt, None),
+            )
 
 
 if __name__ == "__main__":

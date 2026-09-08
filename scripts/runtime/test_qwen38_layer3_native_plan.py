@@ -65,6 +65,19 @@ def main() -> int:
     value = copy.deepcopy(source)
     value["pair_reduce"]["rails"][0] += "\0evil"
     mutations["escaped_nul_array_string"] = value
+    value = copy.deepcopy(source)
+    value["qsa_projection_globals"]["q"]["value_le_hex"] = "0000803f"
+    value["qsa_projection_globals_sha256"] = hashlib.sha256(
+        canonical(value["qsa_projection_globals"]).encode()
+    ).hexdigest()
+    mutations["projection_scalar_value"] = value
+    value = copy.deepcopy(source)
+    scalar = value["qsa_projection_globals"]["q"]
+    scalar["source_chunk_sha256"] = "0" * 64
+    value["qsa_projection_globals_sha256"] = hashlib.sha256(
+        canonical(value["qsa_projection_globals"]).encode()
+    ).hexdigest()
+    mutations["projection_scalar_source"] = value
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         for name, mutation in mutations.items():

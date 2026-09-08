@@ -210,6 +210,17 @@ target_link_libraries(qwen38-target-slab-load PRIVATE qwen38_target_slab_owner)
 target_compile_options(qwen38-target-slab-load PRIVATE
   -Wall -Wextra -Werror)
 
+add_library(qwen38_target_layer3_native_bindings STATIC
+  src/decode/target_layer3_native_bindings.cc)
+target_include_directories(qwen38_target_layer3_native_bindings PUBLIC src)
+target_link_libraries(qwen38_target_layer3_native_bindings PUBLIC
+  qwen38_target_layer3_native_plan qwen38_target_slab_owner
+  qwen38_qsa_sidecar_owner qwen38_decode_execution CUDA::cudart)
+target_compile_options(qwen38_target_layer3_native_bindings PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_layer3_native_bindings PROPERTIES
+  POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
+
 add_library(qwen38_native_hyperconnection_adapter STATIC
   src/hyperconnection/native_adapter.cc)
 target_include_directories(qwen38_native_hyperconnection_adapter PUBLIC src)
@@ -676,6 +687,15 @@ target_link_libraries(qwen38-test-target-layer3-native-plan PRIVATE
   qwen38_target_layer3_native_plan)
 target_compile_options(qwen38-test-target-layer3-native-plan PRIVATE
   -Wall -Wextra -Werror)
+
+add_executable(qwen38-test-target-layer3-native-bindings
+  tests/test_target_layer3_native_bindings.cc)
+target_link_libraries(qwen38-test-target-layer3-native-bindings PRIVATE
+  qwen38_target_layer3_native_bindings)
+target_compile_options(qwen38-test-target-layer3-native-bindings PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-target-layer3-native-bindings PROPERTIES
+  LINKER_LANGUAGE CUDA)
 
 add_executable(qwen38-test-target-layer3-generation
   tests/test_target_layer3_generation.cc)

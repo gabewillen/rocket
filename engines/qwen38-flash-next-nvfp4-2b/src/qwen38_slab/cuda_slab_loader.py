@@ -40,6 +40,8 @@ class _Tensor(Protocol):
 
 
 class _Event(Protocol):
+    @property
+    def cuda_event(self) -> int: ...
     def record(self, stream: "_Stream") -> None: ...
     def synchronize(self) -> None: ...
 
@@ -132,6 +134,9 @@ class LoadedRankSlabs:
 
     slabs: Mapping[str, _Tensor]
     receipt: RankLoadReceipt
+    # A retained, already-synchronized target-stream event. It is a lifetime
+    # token for one-time native control-plane handoff, not a second load fence.
+    ready_event: _Event | None = None
 
 
 @dataclass
@@ -262,7 +267,13 @@ class CudaRankSlabLoader:
                 )
                 self._record_metrics(receipt)
                 span.set_attribute("outcome", "success")
-                return LoadedRankSlabs(published, receipt)
+                last_target_slot = (len(target.chunks) - 1) % len(
+                    pipelines[target.key].events
+                )
+                return LoadedRankSlabs(
+                    published, receipt,
+                    pipelines[target.key].events[last_target_slot],
+                )
             except BaseException as exc:
                 span.set_attribute("outcome", "failure")
                 span.record_exception(exc)

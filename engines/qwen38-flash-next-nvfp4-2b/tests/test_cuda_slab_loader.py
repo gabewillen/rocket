@@ -54,7 +54,13 @@ class FakeStream:
 
 
 class FakeEvent:
-    def __init__(self): self.recorded = False
+    next_handle = 1
+    def __init__(self):
+        self.recorded = False
+        self._handle = type(self).next_handle
+        type(self).next_handle += 1
+    @property
+    def cuda_event(self): return self._handle
     def record(self, stream): self.recorded = True
     def synchronize(self):
         if not self.recorded: raise ValueError("unrecorded event")
@@ -171,6 +177,9 @@ class CudaRankSlabLoaderTests(unittest.TestCase):
         self.assertEqual(loaded.receipt.target.h2d_copies, 1)
         self.assertEqual(loaded.receipt.mtp.h2d_copies, 1)
         self.assertEqual(FakeTensor.copies, 2)
+        self.assertIsNotNone(loaded.ready_event)
+        self.assertTrue(loaded.ready_event.recorded)
+        self.assertGreater(loaded.ready_event.cuda_event, 0)
         self.assertEqual(loaded.receipt.target.chunks[0].bytes, 65_536)
         self.assertGreater(loaded.receipt.target.chunks[0].direct_read_ns, 0)
         self.assertGreater(loaded.receipt.target.chunks[0].sha256_ns, 0)
