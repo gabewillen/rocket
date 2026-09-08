@@ -160,6 +160,7 @@ class _NativeResult(ctypes.Structure):
         ("layer_boundary_reference_first_mismatches", ctypes.c_uint32 * 6),
         ("layer_boundary_reference_compared", ctypes.c_uint8 * 6),
         ("layer_boundary_reference_exact", ctypes.c_uint8 * 6),
+        ("oracle_domain_skip_counts", ctypes.c_uint32 * 5),
     )
 
 
@@ -340,6 +341,7 @@ def _layer_boundary_diagnostics(result: _NativeResult) -> tuple[dict[str, int | 
 
 def _snapshot(result: _NativeResult) -> dict[str, object]:
     return {
+        "execution_domain": "packed_decode_rows",
         "token": result.token, "rows": result.rows,
         "final_generation": result.final_generation,
         "lifecycle_outcomes": list(result.lifecycle_outcomes),
@@ -369,6 +371,7 @@ def _snapshot(result: _NativeResult) -> dict[str, object]:
         "startup_construction_stage": STARTUP_CONSTRUCTION_STAGES.get(
             result.startup_construction_stage, "unknown"),
         "layer_boundary_diagnostics": _layer_boundary_diagnostics(result),
+        "oracle_domain_skip_counts": list(result.oracle_domain_skip_counts),
     }
 
 

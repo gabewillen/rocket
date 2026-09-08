@@ -106,6 +106,14 @@ struct Comparator final : decode::TargetK0OracleComparator {
   }
   bool authenticated() const noexcept override { return true; }
   std::int32_t expected_input_token(int) const override { return 13; }
+  bool supports_strict_comparison(
+      decode::TargetK0Boundary boundary,
+      decode::TargetK0ExecutionDomain domain) const noexcept override {
+    if (boundary == decode::TargetK0Boundary::kEmbedding ||
+        boundary == decode::TargetK0Boundary::kToken)
+      return true;
+    return domain == decode::TargetK0ExecutionDomain::kChunkPrefill;
+  }
   void compare(decode::TargetK0Boundary boundary, int row, int layer,
                const void* values, std::size_t elements,
                cudaStream_t stream) override {
@@ -163,12 +171,18 @@ int main() {
           executor.phase() == decode::TargetK0ExecutorPhase::kCompleted &&
           reducer.calls == 35 * 96 && token_io.waits == 1 &&
           token_io.embeds == 35 && token_io.finishes == 1 &&
-          comparator.boundaries == 35 * 49 + 2 && comparator.tokens == 1 &&
+          comparator.boundaries == 35 && comparator.tokens == 1 &&
           sink.last == pr::Outcome::kOk);
     check(progress.stage == decode::TargetK0ExecutionStage::kComplete &&
           progress.row == 34 && progress.layer == -1 &&
           progress.layer_stage ==
-              decode::TargetK0LayerExecutionStage::kNone);
+              decode::TargetK0LayerExecutionStage::kNone &&
+          progress.oracle_domain_skip_counts[static_cast<std::size_t>(
+              decode::TargetK0Boundary::kLayer)] == 35 * 48 &&
+          progress.oracle_domain_skip_counts[static_cast<std::size_t>(
+              decode::TargetK0Boundary::kFinalNorm)] == 1 &&
+          progress.oracle_domain_skip_counts[static_cast<std::size_t>(
+              decode::TargetK0Boundary::kLocalLogits)] == 1);
     for (const auto& layer : owners)
       check(layer->waits == 1 && layer->rows == 35);
 

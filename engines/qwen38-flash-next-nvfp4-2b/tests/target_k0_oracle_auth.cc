@@ -88,7 +88,16 @@ int main(int argc, char** argv) {
     check(comparator.authenticated() && comparator.rank() == 0 &&
           comparator.rows() == 35 &&
           comparator.expected_input_token(0) == 7734 &&
-          comparator.expected_input_token(34) == 13);
+          comparator.expected_input_token(34) == 13 &&
+          comparator.supports_strict_comparison(
+              decode::TargetK0Boundary::kEmbedding,
+              decode::TargetK0ExecutionDomain::kPackedDecodeRows) &&
+          !comparator.supports_strict_comparison(
+              decode::TargetK0Boundary::kLayer,
+              decode::TargetK0ExecutionDomain::kPackedDecodeRows) &&
+          comparator.supports_strict_comparison(
+              decode::TargetK0Boundary::kLayer,
+              decode::TargetK0ExecutionDomain::kChunkPrefill));
     auto stream = reinterpret_cast<cudaStream_t>(0x1);
     decode::TargetK0LayerBoundaryEvidence boundary_evidence;
     std::vector<float> reduced(decode::kTargetK0Hidden, 0.0F);

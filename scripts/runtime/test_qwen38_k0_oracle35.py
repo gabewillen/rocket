@@ -231,7 +231,12 @@ class Oracle35LauncherTests(unittest.TestCase):
             "gdn_graph_stage",
             "startup_construction_stage",
             "layer_boundary_diagnostics",
+            "execution_domain", "oracle_domain_skip_counts",
         })
+        self.assertEqual(module._snapshot(result)["execution_domain"],
+                         "packed_decode_rows")
+        self.assertEqual(module._snapshot(result)[
+            "oracle_domain_skip_counts"], [0, 0, 0, 0, 0])
         self.assertEqual(module._snapshot(result)[
             "layer_boundary_diagnostics"], ())
 

@@ -423,6 +423,15 @@ std::int32_t NativeTargetK0OracleComparator::expected_input_token(int row) const
   return impl_->tokens[static_cast<std::size_t>(row)];
 }
 
+bool NativeTargetK0OracleComparator::supports_strict_comparison(
+    TargetK0Boundary boundary,
+    TargetK0ExecutionDomain execution_domain) const noexcept {
+  if (boundary == TargetK0Boundary::kEmbedding ||
+      boundary == TargetK0Boundary::kToken)
+    return true;
+  return execution_domain == TargetK0ExecutionDomain::kChunkPrefill;
+}
+
 void NativeTargetK0OracleComparator::compare(
     TargetK0Boundary boundary, int row, int layer, const void* device_values,
     std::size_t elements, cudaStream_t stream) {

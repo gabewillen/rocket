@@ -6,6 +6,22 @@
 namespace rocket::qwen38::decode {
 namespace {
 
+constexpr TargetK0ExecutionDomain kExecutionDomain =
+    TargetK0ExecutionDomain::kPackedDecodeRows;
+
+void compare_if_compatible(TargetK0OracleComparator& comparator,
+                           TargetK0Boundary boundary, int row, int layer,
+                           const void* values, std::size_t elements,
+                           cudaStream_t stream,
+                           TargetK0ExecutionProgress* progress) {
+  if (comparator.supports_strict_comparison(boundary, kExecutionDomain)) {
+    comparator.compare(boundary, row, layer, values, elements, stream);
+    return;
+  }
+  target_k0_note_oracle_domain_skip(
+      progress, static_cast<std::uint8_t>(boundary));
+}
+
 TargetK0AttentionKind expected_attention(int layer) noexcept {
   return is_qsa_layer(layer) ? TargetK0AttentionKind::kQsa
                              : TargetK0AttentionKind::kGdn;
@@ -87,9 +103,9 @@ TargetK0ExecutionResult TargetK0Executor::execute_prefill(
                           stream_);
       target_k0_enter(progress, TargetK0ExecutionStage::kEmbeddingComparison,
                       static_cast<int>(row));
-      comparator_.compare(TargetK0Boundary::kEmbedding,
-                          static_cast<int>(row), -1, arena_.hidden_a,
-                          kTargetK0Hidden, stream_);
+      compare_if_compatible(comparator_, TargetK0Boundary::kEmbedding,
+                            static_cast<int>(row), -1, arena_.hidden_a,
+                            kTargetK0Hidden, stream_, progress);
       bytes += kTargetK0Hidden * sizeof(__nv_bfloat16);
 
       const __nv_bfloat16* input = arena_.hidden_a;
@@ -101,9 +117,9 @@ TargetK0ExecutionResult TargetK0Executor::execute_prefill(
                                     progress);
         target_k0_enter(progress, TargetK0ExecutionStage::kLayerComparison,
                         static_cast<int>(row), layer);
-        comparator_.compare(TargetK0Boundary::kLayer,
-                            static_cast<int>(row), layer, output,
-                            kTargetK0HyperHidden, stream_);
+        compare_if_compatible(comparator_, TargetK0Boundary::kLayer,
+                              static_cast<int>(row), layer, output,
+                              kTargetK0HyperHidden, stream_, progress);
         bytes += kTargetK0HyperHidden * sizeof(__nv_bfloat16);
         input = output;
         output = output == arena_.hidden_a ? arena_.hidden_b : arena_.hidden_a;
@@ -128,14 +144,16 @@ TargetK0ExecutionResult TargetK0Executor::execute_prefill(
       throw std::logic_error("K0 token output changed");
     target_k0_enter(progress, TargetK0ExecutionStage::kFinalNormComparison,
                     static_cast<int>(prompt_tokens.size() - 1));
-    comparator_.compare(TargetK0Boundary::kFinalNorm,
-                        static_cast<int>(prompt_tokens.size() - 1), -1,
-                        output.final_hidden_bf16, kTargetK0Hidden, stream_);
+    compare_if_compatible(
+        comparator_, TargetK0Boundary::kFinalNorm,
+        static_cast<int>(prompt_tokens.size() - 1), -1,
+        output.final_hidden_bf16, kTargetK0Hidden, stream_, progress);
     target_k0_enter(progress, TargetK0ExecutionStage::kLogitsComparison,
                     static_cast<int>(prompt_tokens.size() - 1));
-    comparator_.compare(TargetK0Boundary::kLocalLogits,
-                        static_cast<int>(prompt_tokens.size() - 1), -1,
-                        output.local_logits, kTargetK0LocalVocab, stream_);
+    compare_if_compatible(
+        comparator_, TargetK0Boundary::kLocalLogits,
+        static_cast<int>(prompt_tokens.size() - 1), -1,
+        output.local_logits, kTargetK0LocalVocab, stream_, progress);
     target_k0_enter(progress, TargetK0ExecutionStage::kTokenComparison,
                     static_cast<int>(prompt_tokens.size() - 1));
     comparator_.compare_token(output.global_token);

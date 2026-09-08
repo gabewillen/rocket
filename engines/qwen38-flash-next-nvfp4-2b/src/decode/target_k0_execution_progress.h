@@ -108,7 +108,14 @@ struct TargetK0ExecutionProgress {
   TargetK0GdnGraphStage gdn_graph_stage = TargetK0GdnGraphStage::kNone;
   TargetK0LayerBoundaryObserver* boundary_observer = nullptr;
   TargetK0LayerBoundaryEvidence boundary_evidence{};
+  std::array<std::uint32_t, 5> oracle_domain_skip_counts{};
 };
+
+inline void target_k0_note_oracle_domain_skip(
+    TargetK0ExecutionProgress* progress, std::uint8_t boundary) noexcept {
+  if (progress && boundary < progress->oracle_domain_skip_counts.size())
+    ++progress->oracle_domain_skip_counts[boundary];
+}
 
 inline void target_k0_enter(
     TargetK0ExecutionProgress* progress, TargetK0ExecutionStage stage,

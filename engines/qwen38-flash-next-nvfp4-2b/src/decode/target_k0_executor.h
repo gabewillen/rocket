@@ -33,6 +33,10 @@ enum class TargetK0Boundary : std::uint8_t {
   kLocalLogits,
   kToken,
 };
+enum class TargetK0ExecutionDomain : std::uint8_t {
+  kChunkPrefill,
+  kPackedDecodeRows,
+};
 enum class TargetK0ExecutorPhase : std::uint8_t {
   kReady,
   kActive,
@@ -105,6 +109,9 @@ class TargetK0OracleComparator {
   virtual std::string_view manifest_sha256() const noexcept = 0;
   virtual bool authenticated() const noexcept = 0;
   virtual std::int32_t expected_input_token(int row) const = 0;
+  virtual bool supports_strict_comparison(
+      TargetK0Boundary boundary,
+      TargetK0ExecutionDomain execution_domain) const noexcept = 0;
   // Synchronous comparison boundary. The comparator owns any D2H staging and
   // fence. `layer` is 0..47 only for kLayer and -1 otherwise.
   virtual void compare(TargetK0Boundary boundary, int row, int layer,

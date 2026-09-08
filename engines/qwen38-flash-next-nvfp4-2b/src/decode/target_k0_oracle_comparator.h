@@ -37,6 +37,9 @@ class NativeTargetK0OracleComparator final : public TargetK0OracleComparator,
   std::string_view manifest_sha256() const noexcept override;
   bool authenticated() const noexcept override;
   std::int32_t expected_input_token(int row) const override;
+  bool supports_strict_comparison(
+      TargetK0Boundary boundary,
+      TargetK0ExecutionDomain execution_domain) const noexcept override;
   void compare(TargetK0Boundary boundary, int row, int layer,
                const void* device_values, std::size_t elements,
                cudaStream_t stream) override;
