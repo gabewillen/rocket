@@ -1183,6 +1183,11 @@ add_test(NAME qwen38-layer3-factory-accepted-loader-cpu-contract
 set_tests_properties(qwen38-layer3-factory-accepted-loader-cpu-contract
   PROPERTIES ENVIRONMENT
     "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src;ROCKET_QWEN38_TARGET_SLAB_OWNER_LIBRARY=$<TARGET_FILE:qwen38_target_slab_owner>")
+add_test(NAME qwen38-target-layer-descriptor-cpu-contract
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_target_layer_descriptor.py)
+set_tests_properties(qwen38-target-layer-descriptor-cpu-contract
+  PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/src")
 add_test(NAME qwen38-target-moe-n640-materializer-source-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_target_moe_n640_materializer_source.py)
