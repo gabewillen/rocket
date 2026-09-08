@@ -46,6 +46,12 @@ int main(int argc, char** argv) {
   static_assert(std::is_base_of_v<decode::TargetK0TokenIoPort,
                                   output::NativeTokenIoOwner>);
   static_assert(!std::is_copy_constructible_v<output::NativeTokenIoOwner>);
+  static_assert(output::token_io_allocation_covers_publication(
+      63'214'452'736ULL, 63'212'748'800ULL));
+  static_assert(output::token_io_allocation_covers_publication(
+      63'212'748'800ULL, 63'212'748'800ULL));
+  static_assert(!output::token_io_allocation_covers_publication(
+      63'212'748'799ULL, 63'212'748'800ULL));
   if (argc == 1) {
     bool rejected = false;
     try {

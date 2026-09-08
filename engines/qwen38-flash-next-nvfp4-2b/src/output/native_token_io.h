@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -21,6 +22,11 @@ namespace rocket::qwen38::output {
 inline constexpr std::string_view kTokenIoOracleManifestSha256 =
     "05ea3af1c4694a9c035ce2fe9ce006acc58881df0fe86771b1846f4bd8e5f48b";
 inline constexpr std::string_view kTokenIoTokenizerClass = "Qwen2Tokenizer";
+
+[[nodiscard]] constexpr bool token_io_allocation_covers_publication(
+    std::size_t allocation_bytes, std::size_t publication_bytes) noexcept {
+  return allocation_bytes >= publication_bytes;
+}
 
 struct TokenIoArtifactRoots {
   std::filesystem::path tokenizer;

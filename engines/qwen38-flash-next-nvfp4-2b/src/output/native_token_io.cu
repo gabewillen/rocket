@@ -79,7 +79,8 @@ void validate_physical_lease(
   if (attributes.type != cudaMemoryTypeDevice || attributes.device != device ||
       allocation_base !=
           reinterpret_cast<CUdeviceptr>(publication.device_base) ||
-      allocation_bytes != publication.bytes ||
+      !token_io_allocation_covers_publication(allocation_bytes,
+                                              publication.bytes) ||
       cudaEventQuery(publication.ready_event) != cudaSuccess)
     throw std::invalid_argument("K0 token I/O slab pointer/event probe changed");
 }
