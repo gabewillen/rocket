@@ -90,6 +90,16 @@ bool same_file(int expected_fd, const char* path) {
 
 }  // namespace
 
+std::string gdn_sha256_file(std::string_view selected_path) {
+  const std::string path(selected_path);
+  ScopedFd artifact(open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+  if (artifact.get() < 0) {
+    throw std::runtime_error("open hash input: " +
+                             std::string(std::strerror(errno)));
+  }
+  return sha256sum(artifact.get());
+}
+
 struct GdnFlashInferWheelGemm::Impl {
   int m = 0;
   int n = 0;

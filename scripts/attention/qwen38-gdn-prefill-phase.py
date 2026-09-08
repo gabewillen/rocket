@@ -24,6 +24,9 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
     ModelOptNvFp4LinearMethod,
 )
+from vllm._custom_ops import scaled_fp4_quant
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Dynamic
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
 from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
     layer_norm_fwd,
@@ -56,6 +59,120 @@ def tensor_identity(tensor: torch.Tensor) -> dict[str, object]:
         "sha256": hashlib.sha256(payload).hexdigest(),
         "bytes": len(payload),
     }
+
+
+def fixture_tensor_bytes(tensor: torch.Tensor) -> bytes:
+    return tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
+
+
+def write_projection_fixture(root: pathlib.Path, tokens: int, hidden, qkvz_layer,
+                             ba_layer) -> None:
+    directory = root / f"tokens-{tokens}"
+    directory.mkdir(parents=True, exist_ok=False)
+    qkvz_a, qkvz_sfa = scaled_fp4_quant(
+        hidden, qkvz_layer.input_global_scale_inv,
+        is_sf_swizzled_layout=True, backend="flashinfer-cutlass",
+        padded_n=hidden.shape[-1],
+    )
+    ba_a, ba_sfa = scaled_fp4_quant(
+        hidden, ba_layer.input_global_scale_inv,
+        is_sf_swizzled_layout=True, backend="flashinfer-cutlass",
+        padded_n=hidden.shape[-1],
+    )
+    tensors = {
+        "hidden.bin": hidden,
+        "qkvz_a.bin": qkvz_a,
+        "qkvz_sfa.bin": qkvz_sfa.view(torch.uint8),
+        "ba_a.bin": ba_a,
+        "ba_sfa.bin": ba_sfa.view(torch.uint8),
+        "qkvz_b.bin": qkvz_layer.weight,
+        "qkvz_sfb.bin": qkvz_layer.weight_scale.view(torch.uint8),
+        "ba_b.bin": ba_layer.weight,
+        "ba_sfb.bin": ba_layer.weight_scale.view(torch.uint8),
+        "alpha.bin": qkvz_layer.alpha,
+    }
+    files = {}
+    for name, tensor in tensors.items():
+        payload = fixture_tensor_bytes(tensor)
+        (directory / name).write_bytes(payload)
+        files[name] = {"bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+    manifest = {
+        "format": "rocket-gdn-fp4-fixture-v1",
+        "provenance": "python-synthetic-seed-7",
+        "tokens": tokens,
+        "qkvz_mnk": [tokens, 8192, 2560],
+        "ba_mnk": [tokens, 64, 2560],
+        "layouts": {
+            "hidden": {"shape": [tokens, 2560], "stride": [2560, 1], "dtype": "bfloat16"},
+            "packed_a": {"shape": [tokens, 1280], "stride": [1280, 1], "dtype": "uint8"},
+            "sfa": {"shape": [((tokens + 127) // 128) * 128, 160],
+                    "stride": [160, 1], "dtype": "uint8"},
+            "qkvz_b": {"shape": [8192, 1280], "stride": [1280, 1], "dtype": "uint8"},
+            "qkvz_sfb": {"shape": [8192, 160], "stride": [160, 1], "dtype": "uint8"},
+            "ba_b": {"shape": [64, 1280], "stride": [1280, 1], "dtype": "uint8"},
+            "ba_sfb": {"shape": [128, 160], "stride": [160, 1], "dtype": "uint8"},
+        },
+        "files": files,
+    }
+    (directory / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def load_fixture_tensor(directory: pathlib.Path, manifest: dict[str, object],
+                        name: str, dtype: torch.dtype, shape: tuple[int, ...],
+                        device: torch.device) -> torch.Tensor:
+    payload = (directory / name).read_bytes()
+    record = manifest["files"][name]
+    if len(payload) != record["bytes"] or hashlib.sha256(payload).hexdigest() != record["sha256"]:
+        raise RuntimeError(f"projection fixture identity mismatch: {name}")
+    raw = torch.frombuffer(bytearray(payload), dtype=torch.uint8).clone()
+    return raw.view(dtype).reshape(shape).to(device)
+
+
+def import_projection_fixture(root: pathlib.Path, tokens: int,
+                              device: torch.device):
+    directory = root / f"tokens-{tokens}"
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    if (manifest.get("format") != "rocket-gdn-fp4-fixture-v1" or
+            manifest.get("tokens") != tokens):
+        raise RuntimeError("projection fixture contract changed")
+    padded_m = ((tokens + 127) // 128) * 128
+    hidden = load_fixture_tensor(directory, manifest, "hidden.bin", torch.bfloat16,
+                                 (tokens, 2560), device)
+    qkvz_a = load_fixture_tensor(directory, manifest, "qkvz_a.bin", torch.uint8,
+                                 (tokens, 1280), device)
+    qkvz_sfa = load_fixture_tensor(directory, manifest, "qkvz_sfa.bin", torch.uint8,
+                                   (padded_m, 160), device)
+    ba_a = load_fixture_tensor(directory, manifest, "ba_a.bin", torch.uint8,
+                               (tokens, 1280), device)
+    ba_sfa = load_fixture_tensor(directory, manifest, "ba_sfa.bin", torch.uint8,
+                                 (padded_m, 160), device)
+    qkvz_layer = torch.nn.Module()
+    qkvz_layer.output_size_per_partition = 8192
+    qkvz_layer.weight = torch.nn.Parameter(load_fixture_tensor(
+        directory, manifest, "qkvz_b.bin", torch.uint8, (8192, 1280), device),
+        requires_grad=False)
+    qkvz_layer.weight_scale = torch.nn.Parameter(load_fixture_tensor(
+        directory, manifest, "qkvz_sfb.bin", torch.uint8, (8192, 160), device),
+        requires_grad=False)
+    qkvz_layer.alpha = torch.nn.Parameter(load_fixture_tensor(
+        directory, manifest, "alpha.bin", torch.float32, (), device),
+        requires_grad=False)
+    ba_layer = torch.nn.Module()
+    ba_layer.output_size_per_partition = 48
+    ba_layer.weight = torch.nn.Parameter(load_fixture_tensor(
+        directory, manifest, "ba_b.bin", torch.uint8, (64, 1280), device),
+        requires_grad=False)
+    ba_layer.weight_scale = torch.nn.Parameter(load_fixture_tensor(
+        directory, manifest, "ba_sfb.bin", torch.uint8, (128, 160), device),
+        requires_grad=False)
+    ba_layer.alpha = qkvz_layer.alpha
+    qkvz_qa = QuantizedActivation(qkvz_a, qkvz_sfa, torch.bfloat16,
+                                  torch.Size((tokens, 2560)), kNvfp4Dynamic)
+    ba_qa = QuantizedActivation(ba_a, ba_sfa, torch.bfloat16,
+                                torch.Size((tokens, 2560)), kNvfp4Dynamic)
+    return qkvz_layer, ba_layer, qkvz_qa, ba_qa, hidden, manifest
 
 
 def loaded_shared_object_identity(basename: str) -> dict[str, object]:
@@ -339,7 +456,9 @@ def nvfp4_layer(method: ModelOptNvFp4LinearMethod, inputs: int, outputs: int):
     return layer
 
 
-def run(tokens: int, warmup: int, iterations: int) -> list[dict[str, object]]:
+def run(tokens: int, warmup: int, iterations: int,
+        fixture_dump: pathlib.Path | None = None,
+        fixture_import: pathlib.Path | None = None) -> list[dict[str, object]]:
     torch.manual_seed(7)
     device = torch.device("cuda")
     q = torch.randn(tokens, 8, 128, dtype=torch.bfloat16, device=device)
@@ -463,15 +582,24 @@ def run(tokens: int, warmup: int, iterations: int) -> list[dict[str, object]]:
 
     config = ModelOptNvFp4Config("NVFP4", True, None, [], 16)
     method = ModelOptNvFp4LinearMethod(config)
-    qkvz_layer = nvfp4_layer(method, 2560, 8192)
-    ba_layer = nvfp4_layer(method, 2560, 48)
+    fixture_manifest = None
+    if fixture_import is None:
+        qkvz_layer = nvfp4_layer(method, 2560, 8192)
+        ba_layer = nvfp4_layer(method, 2560, 48)
+    else:
+        qkvz_layer, ba_layer, qkvz_input, ba_input, hidden, fixture_manifest = (
+            import_projection_fixture(fixture_import, tokens, device)
+        )
     output_layer = nvfp4_layer(method, 3072, 2560)
-    hidden = torch.randn(tokens, 2560, dtype=torch.bfloat16, device=device)
+    if fixture_import is None:
+        hidden = torch.randn(tokens, 2560, dtype=torch.bfloat16, device=device)
+    qkvz_input = hidden if fixture_import is None else qkvz_input
+    ba_input = hidden if fixture_import is None else ba_input
     projection_outputs = SimpleNamespace(qkvz=None, ba=None, output=None)
 
     def input_projection() -> None:
-        projection_outputs.qkvz = method.apply(qkvz_layer, hidden)
-        projection_outputs.ba = method.apply(ba_layer, hidden)
+        projection_outputs.qkvz = method.apply(qkvz_layer, qkvz_input)
+        projection_outputs.ba = method.apply(ba_layer, ba_input)
 
     with Fp4DispatchTrace() as input_trace:
         input_result = measure(
@@ -481,9 +609,20 @@ def run(tokens: int, warmup: int, iterations: int) -> list[dict[str, object]]:
         input_result, method, input_trace,
         projection_contract(tokens, warmup, iterations),
     )
-    input_result["data_identity"] = projection_data_identity(
-        hidden, qkvz_layer, ba_layer
-    )
+    if fixture_import is None:
+        input_result["data_identity"] = projection_data_identity(
+            hidden, qkvz_layer, ba_layer
+        )
+        if fixture_dump is not None:
+            write_projection_fixture(fixture_dump, tokens, hidden, qkvz_layer, ba_layer)
+    else:
+        input_result["fixture_manifest"] = fixture_manifest
+        input_result["comparator_contract"].update({
+            "scope": "one_cuda_graph_replay_of_two_prequantized_modelopt_apply_calls",
+            "activation_quantizations": 0,
+            "includes": ["qkvz_gemm", "ba_gemm"],
+            "weights": fixture_manifest["provenance"],
+        })
 
     norm_input = torch.randn(tokens * 24, 128, dtype=torch.bfloat16,
                              device=device)
@@ -563,6 +702,9 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, nargs="+", default=[300, 8192])
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
+    fixtures = parser.add_mutually_exclusive_group()
+    fixtures.add_argument("--dump-projection-fixtures", type=pathlib.Path)
+    fixtures.add_argument("--import-projection-fixtures", type=pathlib.Path)
     args = parser.parse_args()
     script_path = pathlib.Path(__file__).resolve()
     print(
@@ -581,7 +723,10 @@ def main() -> None:
         )
     )
     for tokens in args.tokens:
-        for result in run(tokens, args.warmup, args.iterations):
+        for result in run(
+            tokens, args.warmup, args.iterations,
+            args.dump_projection_fixtures, args.import_projection_fixtures,
+        ):
             print(json.dumps(result, sort_keys=True))
 
 

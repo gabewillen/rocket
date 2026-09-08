@@ -1020,6 +1020,26 @@ const std::uint8_t* CutlassGdnPrefillProjection::input_sfa(
   return bucket ? bucket->input_sfa : nullptr;
 }
 
+const std::uint8_t* CutlassGdnPrefillProjection::qkvz_weight() const noexcept {
+  return impl_ ? impl_->qkvz_weight : nullptr;
+}
+
+const std::uint8_t* CutlassGdnPrefillProjection::qkvz_sfb() const noexcept {
+  return impl_ ? impl_->qkvz_scale : nullptr;
+}
+
+const std::uint8_t* CutlassGdnPrefillProjection::ba_weight() const noexcept {
+  return impl_ ? impl_->ba_weight : nullptr;
+}
+
+const std::uint8_t* CutlassGdnPrefillProjection::ba_sfb() const noexcept {
+  return impl_ ? impl_->ba_scale : nullptr;
+}
+
+const float* CutlassGdnPrefillProjection::projection_alpha() const noexcept {
+  return impl_ ? impl_->projection_alpha : nullptr;
+}
+
 const std::uint8_t* CutlassGdnPrefillProjection::reference_qkvz_packed(
     int tokens) const noexcept {
   const auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;

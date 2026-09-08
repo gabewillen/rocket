@@ -143,6 +143,27 @@ class GdnFlashInferCutlassContract(unittest.TestCase):
         self.assertIn("src/linear_attention/gdn_flashinfer_wheel.cc", cmake)
         self.assertIn("${CMAKE_DL_LIBS}", cmake)
 
+    def test_cross_runtime_fixture_is_hashed_and_byte_preserving(self) -> None:
+        smoke = (ENGINE / "bench/gdn_graph_smoke.cu").read_text()
+        header = (ENGINE / "src/linear_attention/gdn_cutlass.h").read_text()
+        profiler = (
+            ENGINE.parent.parent / "scripts/attention/qwen38-gdn-prefill-phase.py"
+        ).read_text()
+        self.assertIn("rocket-gdn-fp4-fixture-v1", smoke)
+        self.assertIn("--prefill-projection-flashinfer-wheel-fixture", smoke)
+        self.assertIn("capture_measure_python_scope", smoke)
+        self.assertIn('\\"samples_us\\":[', smoke)
+        self.assertIn("gdn_sha256_file(path.string())", smoke)
+        for getter in (
+            "qkvz_weight()", "qkvz_sfb()", "ba_weight()", "ba_sfb()",
+            "projection_alpha()",
+        ):
+            self.assertIn(getter, header)
+        self.assertIn("--dump-projection-fixtures", profiler)
+        self.assertIn("--import-projection-fixtures", profiler)
+        self.assertIn("QuantizedActivation(qkvz_a, qkvz_sfa", profiler)
+        self.assertIn("projection fixture identity mismatch", profiler)
+
 
 if __name__ == "__main__":
     unittest.main()

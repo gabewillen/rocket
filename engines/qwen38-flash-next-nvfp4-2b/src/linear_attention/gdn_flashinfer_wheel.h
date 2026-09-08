@@ -5,6 +5,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace rocket::qwen38::linear_attention {
@@ -17,6 +18,8 @@ inline constexpr char kGdnFlashInferWheelCudaCompiler[] = "13.0.88";
 inline constexpr char kGdnFlashInferWheelArchitecture[] = "sm_120f";
 inline constexpr char kGdnFlashInferWheelCutlassRevision[] =
     "b46b16d003484063bca4ed365e44095c4c6ed633";
+
+std::string gdn_sha256_file(std::string_view path);
 
 // Diagnostic-only adapter for the exact FlashInfer 0.6.17 sm_120f wheel
 // artifact measured by the standalone comparator. FlashInfer and its runner

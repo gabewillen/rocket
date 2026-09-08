@@ -145,6 +145,11 @@ class CutlassGdnPrefillProjection final {
   [[nodiscard]] const __nv_bfloat16* output(int tokens) const noexcept;
   [[nodiscard]] const std::uint8_t* input_packed(int tokens) const noexcept;
   [[nodiscard]] const std::uint8_t* input_sfa(int tokens) const noexcept;
+  [[nodiscard]] const std::uint8_t* qkvz_weight() const noexcept;
+  [[nodiscard]] const std::uint8_t* qkvz_sfb() const noexcept;
+  [[nodiscard]] const std::uint8_t* ba_weight() const noexcept;
+  [[nodiscard]] const std::uint8_t* ba_sfb() const noexcept;
+  [[nodiscard]] const float* projection_alpha() const noexcept;
   [[nodiscard]] const std::uint8_t* reference_qkvz_packed(
       int tokens) const noexcept;
   [[nodiscard]] const std::uint8_t* reference_qkvz_sfa(

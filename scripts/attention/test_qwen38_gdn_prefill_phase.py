@@ -71,6 +71,17 @@ class GdnPrefillPhaseContract(unittest.TestCase):
         self.assertIn('"profiler_sha256": sha256_file(script_path)', source)
         self.assertNotIn('result["nvfp4_kernel"]', source)
 
+    def test_fixture_contract_preserves_distinct_linear_inputs(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        for name in (
+            "hidden.bin", "qkvz_a.bin", "qkvz_sfa.bin", "ba_a.bin",
+            "ba_sfa.bin", "qkvz_b.bin", "qkvz_sfb.bin", "ba_b.bin",
+            "ba_sfb.bin", "alpha.bin",
+        ):
+            self.assertIn(f'"{name}"', source)
+        self.assertIn('"format": "rocket-gdn-fp4-fixture-v1"', source)
+        self.assertIn('"provenance": "python-synthetic-seed-7"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
