@@ -55,6 +55,22 @@ class TargetQsaPreprocessSourceTests(unittest.TestCase):
         self.assertNotIn("cudaMemcpy", launch)
         self.assertNotIn("cudaDeviceSynchronize", launch)
 
+    def test_concrete_graph_composes_the_full_c1_chain(self):
+        source = (ENGINE / "src/attention/native_qsa_graph.cc").read_text()
+        launch = source.split("void NativeQsaFullAttentionGraph::launch", 1)[1]
+        for operation in (
+            "qwen38_target_qsa_project_qkv_c1",
+            "launch_target_qsa_preprocess_c1",
+            "qwen38_target_qsa_select_c1",
+            "qwen38_target_qsa_attention_c1",
+            "qwen38_target_qsa_project_output_c1",
+        ):
+            self.assertIn(operation, launch)
+        self.assertNotIn("cudaMalloc", launch)
+        self.assertNotIn("cudaMemcpy", launch)
+        self.assertNotIn("Synchronize", launch)
+        self.assertIn("validate_target_qsa_state_view", launch)
+
 
 if __name__ == "__main__":
     unittest.main()

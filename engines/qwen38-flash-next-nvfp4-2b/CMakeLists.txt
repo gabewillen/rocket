@@ -118,6 +118,16 @@ target_compile_options(qwen38_decode_execution PRIVATE -Wall -Wextra -Werror)
 # a shared library. Keep the relocation fix local to its owner.
 set_target_properties(qwen38_decode_execution PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+add_library(qwen38_native_qsa_graph STATIC
+  src/attention/native_qsa_graph.cc)
+target_include_directories(qwen38_native_qsa_graph PUBLIC src)
+target_link_libraries(qwen38_native_qsa_graph PUBLIC
+  qwen38_decode_execution qwen38_qsa_target_preprocess qwen38_cutlass_qkv
+  CUDA::cudart)
+target_compile_options(qwen38_native_qsa_graph PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38_native_qsa_graph PROPERTIES
+  POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA)
+
 add_library(qwen38_layer_pair_reduce SHARED src/decode/pair_reduce_c_api.cc)
 target_include_directories(qwen38_layer_pair_reduce PUBLIC src)
 target_link_libraries(qwen38_layer_pair_reduce PRIVATE qwen38_pair_reduce CUDA::cudart)
