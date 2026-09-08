@@ -21,6 +21,8 @@ inline constexpr std::size_t kTargetSlabChunks = 236;
 inline constexpr std::size_t kTargetSlabPageBytes = 65'536;
 inline constexpr std::size_t kTargetSlabChunkBytes = 268'435'456;
 inline constexpr std::size_t kTargetSlabRingDepth = 4;
+inline constexpr std::size_t kTargetSlabPeakPinnedBytes =
+    kTargetSlabRingDepth * (kTargetSlabChunkBytes + kTargetSlabPageBytes - 1);
 
 struct TargetSlabChunk {
   std::uint64_t offset;
@@ -67,6 +69,9 @@ class TargetSlabTelemetrySink {
 
 struct TargetSlabPublication {
   const std::uint8_t* device_base;
+  // Owner-borrowed, already-complete readiness event. Consumers may query it;
+  // TargetSlabDeviceOwner retains and destroys it.
+  cudaEvent_t ready_event;
   std::size_t bytes;
   int device;
   int rank;
@@ -74,6 +79,9 @@ struct TargetSlabPublication {
   std::string_view slab_key;
   std::string_view manifest_sha256;
   std::string_view layout_sha256;
+  std::uint64_t open_to_publish_ns;
+  std::size_t chunks_authenticated;
+  std::size_t peak_host_pinned_bytes;
 };
 
 struct TargetSlabMetadata {
