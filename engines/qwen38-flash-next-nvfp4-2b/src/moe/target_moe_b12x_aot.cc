@@ -102,7 +102,8 @@ TargetMoeCreateFailure diagnose_target_moe_b12x_create(
   if (!weights.down_scale) return TargetMoeCreateFailure::kDownScale;
   if (!weights.input_global_scale)
     return TargetMoeCreateFailure::kInputGlobalScale;
-  if (!weights.w1_alpha) return TargetMoeCreateFailure::kW1Alpha;
+  if (!weights.folded_w1_alpha)
+    return TargetMoeCreateFailure::kFoldedW1Alpha;
   if (!weights.w2_alpha) return TargetMoeCreateFailure::kW2Alpha;
   if (!weights.down_input_scale)
     return TargetMoeCreateFailure::kDownInputScale;
@@ -180,7 +181,7 @@ TargetMoeOutcome TargetMoeB12xAot::enqueue(
   qwen38_target_moe_b12x_c1_Tensor_input_global_scale_t input_scale{
       const_cast<float*>(impl_->weights.input_global_scale)};
   qwen38_target_moe_b12x_c1_Tensor_alpha_t alpha{
-      const_cast<float*>(impl_->weights.w1_alpha)};
+      const_cast<float*>(impl_->weights.folded_w1_alpha)};
   qwen38_target_moe_b12x_c1_Tensor_down_alpha_t down_alpha{
       const_cast<float*>(impl_->weights.w2_alpha)};
   qwen38_target_moe_b12x_c1_Tensor_global_scale_t global_scale{

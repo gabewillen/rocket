@@ -30,6 +30,33 @@ class TargetFullMoeC1ValidationContract(unittest.TestCase):
         self.assertNotIn("torch.zeros", source)
         self.assertNotIn("synthetic", source.lower())
 
+    def test_harness_folds_fc1_input_scale_once_for_native_static_views(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "folded_w1_alpha = (views.w1_alpha * source_weights.input_scale).contiguous()",
+            source,
+        )
+        self.assertIn("ROUTED.pointer(folded_w1_alpha)", source)
+        self.assertNotIn("ROUTED.pointer(views.w1_alpha)", source)
+
+    def test_component_comparator_distinguishes_routed_failure_classes(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        for component in (
+            '"routed_partial"', '"shared_gate_activation"',
+            '"shared_up"', '"shared_gate_scalar"',
+            '"shared_gated_partial"', '"final_add"',
+            '"zero_routed"', '"single_expert"',
+        ):
+            self.assertIn(component, source)
+        self.assertIn('"canaries_intact"', source)
+        self.assertIn("local_ids_match", source)
+        self.assertIn("local_weights_max_abs", source)
+        self.assertIn("physical_intermediate", source)
+        self.assertIn("workspace_geometry_exact", source)
+        self.assertIn("workspace_aligned_16", source)
+        self.assertIn("hidden_bf16_contiguous", source)
+        self.assertIn('"borrowed_explicit"', source)
+
     def test_failure_telemetry_has_only_bounded_dimensions(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         begin = source.index("def emit_failure")

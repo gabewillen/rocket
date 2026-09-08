@@ -14,7 +14,7 @@ ARTIFACT_SHA256 = "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f
 CREATE_FAILURE_FIELDS = (
     "none", "device", "artifact_sha256", "layout_sha256", "rank", "layer",
     "w13_packed", "w13_scale", "down_packed", "down_scale",
-    "input_global_scale", "w1_alpha", "w2_alpha", "down_input_scale",
+    "input_global_scale", "folded_w1_alpha", "w2_alpha", "down_input_scale",
 )
 
 
@@ -30,7 +30,7 @@ class Identity(ctypes.Structure):
 class Weights(ctypes.Structure):
     _fields_ = [(name, ctypes.c_void_p) for name in (
         "w13_packed", "w13_scale", "down_packed", "down_scale",
-        "input_global_scale", "w1_alpha", "w2_alpha", "down_input_scale",
+        "input_global_scale", "folded_w1_alpha", "w2_alpha", "down_input_scale",
     )]
 
 
@@ -169,6 +169,9 @@ def main() -> None:
         source_weights.w2_alpha, physical_n, 2560,
         activation_precision="fp4", quant_mode="nvfp4",
     )
+    folded_w1_alpha = (
+        views.w1_alpha * source_weights.input_scale
+    ).contiguous()
     workspace = moe_dispatch.allocate_sm120_static_workspace(
         state_E=256, weight_E=256, max_rows=10, k=2560, n=physical_n,
         num_topk=10, device=source_weights.w1_weight.device,
@@ -197,7 +200,7 @@ def main() -> None:
     native_weights = Weights(
         pointer(views.w13_fp4), pointer(views._w13_sf_storage),
         pointer(views.down_fp4), pointer(views._down_sf_storage),
-        pointer(source_weights.input_scale), pointer(views.w1_alpha),
+        pointer(source_weights.input_scale), pointer(folded_w1_alpha),
         pointer(views.w2_alpha), pointer(down_scale),
     )
     native_workspace = Workspace(
