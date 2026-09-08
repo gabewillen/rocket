@@ -31,7 +31,7 @@ class StateCapacityTest(unittest.TestCase):
         cls.config = CONFIG.read_bytes()
         cls.kwargs = dict(
             revision=MODULE.REVISION, context=262144, concurrency=16, tp=2,
-            block_size=16, kernel_block_alignment=16, kv_dtype="fp8_e4m3",
+            block_size=16, kernel_block_alignment=16, kv_dtype="bfloat16",
             mamba_cache_dtype="bfloat16", mamba_ssm_dtype="float32",
             speculative_tokens=3, mamba_cache_mode="align", host_page=65536,
             image_id=MODULE.IMAGE_ID,
@@ -56,8 +56,10 @@ class StateCapacityTest(unittest.TestCase):
         self.assertEqual(rows["target.linear.conv"]["logical_shape_per_layer_per_stream"], [6, 5120])
         self.assertEqual(rows["target.linear.recurrent"]["logical_shape_per_layer_per_stream"], [24, 128, 128])
         self.assertEqual(rows["target.ple.conv"]["logical_shape_per_layer_per_stream"], [12, 10240])
-        self.assertEqual(plan["serving"]["effective_block_size_tokens"], 3200)
-        self.assertEqual(plan["serving"]["sequence_pages"], 82)
+        self.assertEqual(plan["serving"]["effective_block_size_tokens"], 1600)
+        self.assertEqual(plan["serving"]["sequence_pages"], 164)
+        self.assertEqual(rows["target.full_attention.kv"]["serving_dtype"], "bfloat16")
+        self.assertEqual(rows["mtp.full_attention.kv"]["serving_dtype"], "bfloat16")
 
     def test_align_mode_separates_logical_from_allocated_state(self) -> None:
         rows = {row["id"]: row for row in self.plan()["families"]}
@@ -91,6 +93,9 @@ class StateCapacityTest(unittest.TestCase):
             MODULE.build_plan(self.config + b"\n", **self.kwargs)
         bad = dict(self.kwargs, mamba_ssm_dtype="bfloat16")
         with self.assertRaisesRegex(MODULE.PlanError, "recurrent state"):
+            MODULE.build_plan(self.config, **bad)
+        bad = dict(self.kwargs, kv_dtype="fp8_e4m3")
+        with self.assertRaisesRegex(MODULE.PlanError, "working QSA kernel"):
             MODULE.build_plan(self.config, **bad)
 
     def test_source_contract_checks_hashes_and_semantic_anchors(self) -> None:

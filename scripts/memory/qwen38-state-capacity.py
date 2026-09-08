@@ -45,6 +45,15 @@ SOURCE_CONTRACT = {
         "sha256": "e3460b06cd7ed309e47ad5dfd3d4250890539b912385503133bd98a003f73ba8",
         "anchors": ("class QSAKeyStateCache", "class QSACompressedKeyCache", "span = self.compress_ratio + vllm_config.num_speculative_tokens"),
     },
+    "qsa.py": {
+        "path": "vllm/models/qwen3_8_flash_next/nvidia/qsa.py",
+        "sha256": "748addc85efaa8f7df940d1245bc900192f92e1f17af8fa774625758600751cb",
+        "anchors": (
+            "supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [\"auto\", \"bfloat16\"]",
+            "Qwen3.8-Flash-Next QSA requires a BF16 main KV cache",
+            "QSA does not support KV quantization",
+        ),
+    },
     "mamba_utils.py": {
         "path": "vllm/model_executor/layers/mamba/mamba_utils.py",
         "sha256": "e168adae4ac9a951f2566aa5fd84a4615aed97d1fbca3787be9acf9cc192c3eb",
@@ -249,8 +258,10 @@ def build_plan(
         raise PlanError("source/model dtype must be explicitly bfloat16")
     if cfg.get("mamba_ssm_dtype") != "float32" or mamba_ssm_dtype != "float32":
         raise PlanError("recurrent state must remain explicit float32")
-    if kv_dtype != "fp8_e4m3" or mamba_cache_dtype != "bfloat16":
-        raise PlanError("serving contract requires FP8-e4m3 KV and BF16 convolution state")
+    # The pinned QSA kernel rejects quantized K/V and accepts BF16 only.
+    # FP8 was an earlier capacity-planning input, not a working serving ABI.
+    if kv_dtype != "bfloat16" or mamba_cache_dtype != "bfloat16":
+        raise PlanError("working QSA kernel requires BF16 K/V and convolution state")
 
     layer_types = cfg.get("layer_types")
     if not isinstance(layer_types, list) or len(layer_types) != require_int(cfg, "num_hidden_layers"):
