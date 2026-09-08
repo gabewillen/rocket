@@ -44,6 +44,7 @@ struct GdnWeights {
 
 inline constexpr int kPrefillInputQuantizationsPerLaunch = 1;
 inline constexpr int kPrefillReferenceInputQuantizationsPerLaunch = 2;
+inline constexpr char kPrefillB12xQuantSourceRevision[] = "8e685d198";
 
 enum class GdnPrefillInputBackend {
   kCutlassControl,

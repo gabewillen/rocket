@@ -48,5 +48,7 @@ int main() {
             reference_input_quantizations_per_launch() == 2);
   check(linear::GdnPrefillInputBackend::kB12x !=
         linear::GdnPrefillInputBackend::kCutlassControl);
+  check(std::string_view(linear::kPrefillB12xQuantSourceRevision) ==
+        "8e685d198");
   return 0;
 }

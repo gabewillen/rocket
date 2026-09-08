@@ -155,6 +155,140 @@ __global__ void quantize_fixed(std::uint8_t* packed, std::uint8_t* scales,
   }
 }
 
+struct alignas(32) PackedBf16x16 {
+  __nv_bfloat162 values[8];
+};
+
+struct PackedE2m1x16 {
+  std::uint32_t lo;
+  std::uint32_t hi;
+};
+
+__device__ __forceinline__ float reciprocal_approximate_ftz(float value) {
+  float result;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
+  return result;
+}
+
+__device__ __forceinline__ void load_bf16x16(PackedBf16x16& value,
+                                              const void* address,
+                                              bool valid) {
+  auto* words = reinterpret_cast<std::uint32_t*>(&value);
+  asm volatile(
+      "{\n"
+      " .reg .pred p;\n"
+      " setp.ne.u32 p, %8, 0;\n"
+      " mov.u32 %0, 0; mov.u32 %1, 0; mov.u32 %2, 0; mov.u32 %3, 0;\n"
+      " mov.u32 %4, 0; mov.u32 %5, 0; mov.u32 %6, 0; mov.u32 %7, 0;\n"
+      " @p ld.global.cg.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%9];\n"
+      "}\n"
+      : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3]),
+        "=r"(words[4]), "=r"(words[5]), "=r"(words[6]), "=r"(words[7])
+      : "r"(static_cast<int>(valid)), "l"(address));
+}
+
+__device__ __forceinline__ PackedE2m1x16 pack_e2m1x16(float2 (&values)[8]) {
+  PackedE2m1x16 result;
+  asm volatile(
+      "{\n"
+      " .reg .b8 b0; .reg .b8 b1; .reg .b8 b2; .reg .b8 b3;\n"
+      " .reg .b8 b4; .reg .b8 b5; .reg .b8 b6; .reg .b8 b7;\n"
+      " cvt.rn.satfinite.e2m1x2.f32 b0, %3, %2;\n"
+      " cvt.rn.satfinite.e2m1x2.f32 b1, %5, %4;\n"
+      " cvt.rn.satfinite.e2m1x2.f32 b2, %7, %6;\n"
+      " cvt.rn.satfinite.e2m1x2.f32 b3, %9, %8;\n"
+      " cvt.rn.satfinite.e2m1x2.f32 b4, %11, %10;\n"
+      " cvt.rn.satfinite.e2m1x2.f32 b5, %13, %12;\n"
+      " cvt.rn.satfinite.e2m1x2.f32 b6, %15, %14;\n"
+      " cvt.rn.satfinite.e2m1x2.f32 b7, %17, %16;\n"
+      " mov.b32 %0, {b0,b1,b2,b3}; mov.b32 %1, {b4,b5,b6,b7};\n"
+      "}\n"
+      : "=r"(result.lo), "=r"(result.hi)
+      : "f"(values[0].x), "f"(values[0].y), "f"(values[1].x),
+        "f"(values[1].y), "f"(values[2].x), "f"(values[2].y),
+        "f"(values[3].x), "f"(values[3].y), "f"(values[4].x),
+        "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
+        "f"(values[6].x), "f"(values[6].y), "f"(values[7].x),
+        "f"(values[7].y));
+  return result;
+}
+
+// Fixed-K specialization of vLLM scaled_fp4_quant at g8e685d198. GB10 has
+// 20 SMs and the source kernel caps occupancy at four blocks per SM.
+__global__ __launch_bounds__(512, 3) void quantize_prefill_b12x(
+    std::uint8_t* packed, std::uint8_t* scales,
+    const __nv_bfloat16* input, int tokens, const float* global_scale_ptr) {
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
+  constexpr int kValuesPerThread = 16;
+  constexpr int kScaleColumns = kInputK / kValuesPerThread;
+  const int column = blockIdx.y * blockDim.x + threadIdx.x;
+  const int padded_rows = ((tokens + 127) / 128) * 128;
+  const float global_scale = global_scale_ptr ? *global_scale_ptr : 1.0F;
+  for (int row = blockIdx.x; row < padded_rows; row += gridDim.x) {
+    if (column >= kScaleColumns) continue;
+    const bool valid = row < tokens;
+    PackedBf16x16 source;
+    load_bf16x16(source, input + row * kInputK + column * kValuesPerThread,
+                 valid);
+    auto local_max = __habs2(source.values[0]);
+#pragma unroll
+    for (int index = 1; index < 8; ++index)
+      local_max = __hmax2(local_max, __habs2(source.values[index]));
+    const float vector_max = static_cast<float>(__hmax(local_max.x, local_max.y));
+    float scale_value =
+        global_scale * (vector_max * reciprocal_approximate_ftz(6.0F));
+    __nv_fp8_e4m3 scale_fp8(scale_value);
+    scales[prefill_sfa_offset(row, column, kScaleColumns)] =
+        reinterpret_cast<const std::uint8_t&>(scale_fp8);
+    scale_value = static_cast<float>(scale_fp8);
+    const float output_scale =
+        scale_value != 0.0F
+            ? reciprocal_approximate_ftz(
+                  scale_value * reciprocal_approximate_ftz(global_scale))
+            : 0.0F;
+    float2 converted[8];
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+      converted[index] = __bfloat1622float2(source.values[index]);
+      converted[index].x *= output_scale;
+      converted[index].y *= output_scale;
+    }
+    if (valid) {
+      const auto result = pack_e2m1x16(converted);
+      reinterpret_cast<std::uint64_t*>(packed)[
+          static_cast<std::size_t>(row) * (kInputK / 16) + column] =
+          (static_cast<std::uint64_t>(result.hi) << 32) | result.lo;
+    }
+  }
+}
+
+void launch_prefill_input_quant(std::uint8_t* packed, std::uint8_t* scales,
+                                const __nv_bfloat16* input, int tokens,
+                                const float* global_scale,
+                                GdnPrefillInputBackend backend,
+                                cudaStream_t stream) {
+  if (backend == GdnPrefillInputBackend::kB12x) {
+    constexpr int kGb10Sms = 20;
+    constexpr int kBlocksPerSm = 4;
+    cudaLaunchAttribute attribute{};
+    attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute.val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(kGb10Sms * kBlocksPerSm, 1);
+    config.blockDim = dim3(kInputK / 16);
+    config.stream = stream;
+    config.attrs = &attribute;
+    config.numAttrs = 1;
+    cuda_check(cudaLaunchKernelEx(&config, quantize_prefill_b12x, packed,
+                                  scales, input, tokens, global_scale),
+               "launch vLLM B12X input quantization");
+  } else {
+    quantize_fixed<kInputK><<<tokens, 256, 0, stream>>>(packed, scales, input,
+                                                        1.0F);
+  }
+}
+
 __global__ void fuse_ba_scales(const std::uint8_t* b,
                                const std::uint8_t* a,
                                std::uint8_t* fused) {
@@ -733,8 +867,9 @@ void CutlassGdnPrefillProjection::launch_input_quantize(
   auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
   if (!bucket || !hidden || !stream)
     throw std::invalid_argument("prefill input quantization contract changed");
-  quantize_fixed<kInputK><<<tokens, 256, 0, stream>>>(
-      bucket->input_packed, bucket->input_sfa, hidden, 1.0F);
+  launch_prefill_input_quant(bucket->input_packed, bucket->input_sfa, hidden,
+                             tokens, impl_->b12x_alpha,
+                             impl_->input_backend, stream);
   cuda_check(cudaPeekAtLastError(), "launch prefill input quantization");
 }
 
@@ -781,16 +916,17 @@ void CutlassGdnPrefillProjection::launch_reference_input(
   auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
   if (!bucket || !impl_->reference_enabled || !hidden || !stream)
     throw std::invalid_argument("prefill reference projection contract changed");
-  quantize_fixed<kInputK><<<tokens, 256, 0, stream>>>(
+  launch_prefill_input_quant(
       bucket->reference_qkvz_packed, bucket->reference_qkvz_sfa, hidden,
-      1.0F);
+      tokens, impl_->b12x_alpha, impl_->input_backend, stream);
   if (bucket->reference_qkvz_gemm.gemm.run(stream) != cutlass::Status::kSuccess)
     throw std::runtime_error("reference QKVZ projection failed");
   scale_projection<<<dim3((kQkvzN + 255) / 256, tokens), 256, 0, stream>>>(
       bucket->reference_qkvz, kQkvzN, kQkvN,
       impl_->globals.qkv.global_scale, impl_->globals.z.global_scale);
-  quantize_fixed<kInputK><<<tokens, 256, 0, stream>>>(
-      bucket->reference_ba_packed, bucket->reference_ba_sfa, hidden, 1.0F);
+  launch_prefill_input_quant(
+      bucket->reference_ba_packed, bucket->reference_ba_sfa, hidden, tokens,
+      impl_->b12x_alpha, impl_->input_backend, stream);
   if (bucket->reference_ba_gemm.gemm.run(stream) != cutlass::Status::kSuccess)
     throw std::runtime_error("reference BA projection failed");
   scale_projection<<<dim3((kBaN + 255) / 256, tokens), 256, 0, stream>>>(
