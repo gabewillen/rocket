@@ -122,7 +122,7 @@ __global__ void compact_owner_routes(RouteCompactionKernelArgs args) {
   *output.summary = {
       .generation = requested_generation,
       .active_weight_bytes =
-          static_cast<std::uint64_t>(active_experts) * kNvfp4BytesPerExpert,
+          static_cast<std::uint64_t>(active_experts) * kFp8BytesPerExpert,
       .active_experts = active_experts,
       .active_rows = active_rows,
       .active_routes = active_routes,

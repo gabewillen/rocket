@@ -47,8 +47,8 @@ RouteCompactionOutcome validate_route_compaction_summary(
       summary.active_routes < 0 ||
       summary.active_routes > shape.rows * kTopK ||
       summary.active_weight_bytes !=
-          static_cast<std::uint64_t>(summary.active_experts) *
-              kNvfp4BytesPerExpert)
+              static_cast<std::uint64_t>(summary.active_experts) *
+              kFp8BytesPerExpert)
     return RouteCompactionOutcome::kContractError;
   return RouteCompactionOutcome::kOk;
 }
@@ -145,7 +145,7 @@ CpuRouteCompactionResult compact_owner_routes_reference(
       static_cast<std::int32_t>(result.owner_route_global_expert_ids.size());
   result.summary.active_weight_bytes =
       static_cast<std::uint64_t>(result.summary.active_experts) *
-      kNvfp4BytesPerExpert;
+      kFp8BytesPerExpert;
   result.summary.outcome = RouteCompactionOutcome::kOk;
   return result;
 }

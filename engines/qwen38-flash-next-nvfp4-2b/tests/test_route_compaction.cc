@@ -66,7 +66,7 @@ void check_success_and_order() {
         static_cast<int>(first.active_global_expert_ids.size()));
   check(first.summary.active_weight_bytes ==
         static_cast<std::uint64_t>(first.summary.active_experts) *
-            moe::kNvfp4BytesPerExpert);
+            moe::kFp8BytesPerExpert);
 
   std::size_t owner_route = 0;
   std::vector<std::int32_t> first_seen;
@@ -170,7 +170,7 @@ void check_post_fence_summary_validation() {
   const moe::RouteCompactionShape shape{.rank = 0, .sequences = 16, .rows = 16};
   moe::RouteCompactionDeviceSummary summary{
       .generation = 9,
-      .active_weight_bytes = 19 * moe::kNvfp4BytesPerExpert,
+      .active_weight_bytes = 19 * moe::kFp8BytesPerExpert,
       .active_experts = 19,
       .active_rows = 16,
       .active_routes = 80,
@@ -192,7 +192,7 @@ void check_post_fence_summary_validation() {
   check(moe::validate_route_compaction_summary(
             {.summary = summary, .requested_generation = 10, .shape = shape}) ==
         moe::RouteCompactionOutcome::kContractError);
-  summary.active_weight_bytes = 19 * moe::kNvfp4BytesPerExpert;
+  summary.active_weight_bytes = 19 * moe::kFp8BytesPerExpert;
   summary.outcome = moe::RouteCompactionOutcome::kOverflow;
   check(moe::validate_route_compaction_summary(
             {.summary = summary, .requested_generation = 10, .shape = shape}) ==
@@ -211,7 +211,7 @@ void check_otel_cardinality() {
   static_assert(3 * 5 * 2 * 5 == 150);
   const moe::RouteCompactionDeviceSummary summary{
       .generation = 9,
-      .active_weight_bytes = 19 * moe::kNvfp4BytesPerExpert,
+      .active_weight_bytes = 19 * moe::kFp8BytesPerExpert,
       .active_experts = 19,
       .active_rows = 8,
       .active_routes = 40,
@@ -230,7 +230,7 @@ void check_otel_cardinality() {
   check(sink.points[1].counter == moe::RouteCompactionCounter::kActiveRows &&
         sink.points[1].value == 8);
   check(sink.points[2].counter == moe::RouteCompactionCounter::kActiveWeightBytes &&
-        sink.points[2].value == 19 * moe::kNvfp4BytesPerExpert);
+        sink.points[2].value == 19 * moe::kFp8BytesPerExpert);
   for (const auto& point : sink.points) {
     check(point.attributes.outcome == moe::RouteCompactionOutcome::kOk &&
           point.attributes.rank == 1 && point.attributes.sequence_bucket == 8);

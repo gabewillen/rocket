@@ -14,6 +14,10 @@ void require_route_enqueue(moe::RouteCompactionOutcome outcome) {
   if (outcome == moe::RouteCompactionOutcome::kOk) return;
   throw NativeExecutorError("MTP route compaction enqueue contract changed");
 }
+void require_expert_enqueue(moe::RoutedExpertOutcome outcome) {
+  if (outcome == moe::RoutedExpertOutcome::kOk) return;
+  throw NativeExecutorError("MTP routed expert enqueue contract changed");
+}
 }  // namespace
 
 void NativeExecutor::CudaDeleter::operator()(void* pointer) const noexcept {
@@ -41,6 +45,11 @@ NativeExecutor::NativeExecutor(GraphKey key, MtpGraphRuntime& runtime,
                      kMaxDepth * sizeof(moe::RouteCompactionDeviceSummary)),
           "allocate route summaries");
     route_summaries_device_.reset(route_summaries);
+    moe::RoutedExpertDeviceSummary* expert_summaries = nullptr;
+    check(cudaMalloc(&expert_summaries,
+                     kMaxDepth * sizeof(moe::RoutedExpertDeviceSummary)),
+          "allocate routed expert summaries");
+    expert_summaries_device_.reset(expert_summaries);
   } catch (...) {
     for (const auto& row : events_)
       for (const auto event : row) if (event) cudaEventDestroy(event);
@@ -96,7 +105,12 @@ DeviceDraftView NativeExecutor::draft(std::uint64_t generation) {
           .output = router.compacted,
           .stream = stream_,
       }));
-      middle_.stage_moe(arena, router.compacted, step, key_, stream_);
+      check(cudaMemsetAsync(expert_summaries_device_.get() + step, 0,
+                            sizeof(moe::RoutedExpertDeviceSummary), stream_),
+            "clear routed expert publication");
+      require_expert_enqueue(middle_.stage_moe(
+          arena, router.compacted, expert_summaries_device_.get() + step, step,
+          key_, stream_));
       check(cudaEventRecord(events_[step][4], stream_), "record MoE end");
       middle_.reduce_moe(arena, step, key_, stream_);
       check(cudaEventRecord(events_[step][5], stream_), "record MoE reduce end");
@@ -149,6 +163,10 @@ void NativeExecutor::validate_after_fence(std::uint64_t generation) {
                    key_.depth * sizeof(moe::RouteCompactionDeviceSummary),
                    cudaMemcpyDeviceToHost),
         "read route summaries after fence");
+  check(cudaMemcpy(expert_summaries_host_.data(), expert_summaries_device_.get(),
+                   key_.depth * sizeof(moe::RoutedExpertDeviceSummary),
+                   cudaMemcpyDeviceToHost),
+        "read routed expert summaries after fence");
   const moe::RouteCompactionShape shape{
       runtime_.rank(), key_.sequences, key_.sequences};
   for (int step = 0; step < key_.depth; ++step) {
@@ -164,6 +182,13 @@ void NativeExecutor::validate_after_fence(std::uint64_t generation) {
          .shape = shape});
     if (outcome != moe::RouteCompactionOutcome::kOk)
       throw NativeExecutorError("MTP route compaction publication rejected");
+    moe::export_routed_expert_otel_after_fence(
+        expert_summaries_host_[step], generation, shape, telemetry_);
+    if (moe::validate_routed_expert_summary(
+            {.summary = expert_summaries_host_[step],
+             .requested_generation = generation,
+             .shape = shape}) != moe::RoutedExpertOutcome::kOk)
+      throw NativeExecutorError("MTP routed expert publication rejected");
   }
   routes_validated_generation_ = generation;
 }

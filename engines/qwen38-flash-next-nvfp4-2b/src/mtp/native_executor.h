@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include "attention/qsa_mtp_state_view.h"
 #include "decode/decoder_verifier.h"
+#include "moe/fp8_routed_experts.h"
 #include "moe/route_compaction.h"
 #include "mtp/graph_runtime.h"
 #include "mtp/state_arena.h"
@@ -34,7 +35,8 @@ struct PhaseMetric { Phase phase; Outcome outcome; int depth; int sequences;
   std::uint64_t duration_ns; };
 struct ExpertUsageMetric { Outcome outcome; int depth; int sequences;
   int draft_step; int unique_local_experts; std::uint64_t resident_expert_bytes; };
-class TelemetrySink : public moe::RouteCompactionOtelSink { public:
+class TelemetrySink : public moe::RouteCompactionOtelSink,
+                      public moe::RoutedExpertOtelSink { public:
   ~TelemetrySink() override = default;
   virtual void record_phase(const PhaseMetric&) noexcept = 0;
   virtual void record_expert_usage(const ExpertUsageMetric&) noexcept = 0; };
@@ -57,8 +59,10 @@ struct MtpRouterOutput {
 // view which aliases StateArena for the duration of the call. Implementations
 // may write fixed runtime/StateArena storage, never active accepted state.
 // stage_router publishes borrowed route storage plus its device generation;
-// stage_moe consumes the compacted buffers later on the same stream. A throw or
-// incomplete binding faults the enclosing transaction before publication.
+// stage_moe consumes the compacted buffers later on the same stream and must
+// enqueue the fixed FP8 routed-expert consumer into the supplied summary. The
+// executor clears that summary first, so an omitted publication fails closed.
+// A throw or incomplete binding faults the transaction before publication.
 class MtpMiddleStagePort { public: virtual ~MtpMiddleStagePort() = default;
   virtual const std::int32_t* prepare(GraphArenaView, StateArena&, GraphKey,
                                       cudaStream_t) = 0;
@@ -68,8 +72,9 @@ class MtpMiddleStagePort { public: virtual ~MtpMiddleStagePort() = default;
   virtual void reduce_attention(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
   virtual MtpRouterOutput stage_router(GraphArenaView, int, GraphKey,
                                        std::uint64_t, cudaStream_t) = 0;
-  virtual void stage_moe(GraphArenaView, const moe::RouteCompactionBuffers&,
-                         int, GraphKey, cudaStream_t) = 0;
+  virtual moe::RoutedExpertOutcome stage_moe(
+      GraphArenaView, const moe::RouteCompactionBuffers&,
+      moe::RoutedExpertDeviceSummary*, int, GraphKey, cudaStream_t) = 0;
   virtual void reduce_moe(GraphArenaView, int, GraphKey, cudaStream_t) = 0;
   virtual void advance(GraphArenaView, StateArena&, int, GraphKey,
                        const std::int32_t*, cudaStream_t) = 0; };
@@ -105,8 +110,11 @@ class NativeExecutor final : public decode::AcceptedStateParticipant {
   std::array<std::array<cudaEvent_t, static_cast<int>(Phase::kCount) + 1>, 7> events_{};
   DeviceOwner<std::uint64_t> requested_generation_device_;
   DeviceOwner<moe::RouteCompactionDeviceSummary> route_summaries_device_;
+  DeviceOwner<moe::RoutedExpertDeviceSummary> expert_summaries_device_;
   std::array<moe::RouteCompactionDeviceSummary, kMaxDepth>
       route_summaries_host_{};
+  std::array<moe::RoutedExpertDeviceSummary, kMaxDepth>
+      expert_summaries_host_{};
   ExecutorPhase phase_ = ExecutorPhase::kReady;
   std::uint64_t active_generation_ = 0, pending_generation_ = 0;
   std::uint64_t routes_validated_generation_ = 0;

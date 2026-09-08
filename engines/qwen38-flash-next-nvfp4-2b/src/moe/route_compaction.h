@@ -18,11 +18,17 @@ inline constexpr int kMaxVerifyWidth = 8;
 inline constexpr int kMaxRows = kMaxSequences * kMaxVerifyWidth;
 inline constexpr int kMaxRoutes = kMaxRows * kTopK;
 inline constexpr std::uint64_t kHidden = 2'560;
-inline constexpr std::uint64_t kIntermediate = 640;
-inline constexpr std::uint64_t kNvfp4BytesPerExpert =
-    3 * kHidden * kIntermediate / 2 +
-    3 * kHidden * kIntermediate / 16 + 3 * 2 * sizeof(float);
-static_assert(kNvfp4BytesPerExpert == 2'764'824);
+inline constexpr std::uint64_t kLogicalIntermediate = 640;
+inline constexpr std::uint64_t kPhysicalIntermediate = 768;
+inline constexpr std::uint64_t kFp8Block = 128;
+// The authenticated MTP slab keeps three independent FP8 E4M3 matrices and
+// one BF16 inverse scale per 128x128 block. Physical intermediate padding is
+// workspace only and is not present in the slab payload.
+inline constexpr std::uint64_t kFp8BytesPerExpert =
+    3 * kHidden * kLogicalIntermediate +
+    3 * (kHidden / kFp8Block) * (kLogicalIntermediate / kFp8Block) *
+        sizeof(std::uint16_t);
+static_assert(kFp8BytesPerExpert == 4'915'800);
 
 enum class RouteCompactionOutcome : std::uint32_t {
   kOk,
@@ -197,7 +203,7 @@ struct RouteCompactionOtelExport {
   RouteCompactionOtelSink& sink;
 };
 
-// active_weight_bytes is the authenticated NVFP4 payload of active experts,
+// active_weight_bytes is the authenticated FP8 block-128 payload of active experts,
 // not an HBM counter. Called after the enclosing stream fence with a
 // caller-owned host snapshot. requested_generation is the executor-owned
 // transaction identity used to classify a stale producer.

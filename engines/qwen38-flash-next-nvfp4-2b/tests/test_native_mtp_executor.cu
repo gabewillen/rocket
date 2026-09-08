@@ -111,11 +111,30 @@ class Middle final : public mtp::MtpMiddleStagePort { public:
         },
     };
   }
-  void stage_moe(mtp::GraphArenaView,
+  rocket::qwen38::moe::RoutedExpertOutcome stage_moe(
+                 mtp::GraphArenaView,
                  const rocket::qwen38::moe::RouteCompactionBuffers& compacted,
-                 int, mtp::GraphKey, cudaStream_t) override {
+                 rocket::qwen38::moe::RoutedExpertDeviceSummary* summary,
+                 int, mtp::GraphKey, cudaStream_t stream) override {
     assert(compacted.summary != nullptr);
+    if (fault_moe_)
+      return rocket::qwen38::moe::RoutedExpertOutcome::kContractError;
+    if (omit_moe_publication_)
+      return rocket::qwen38::moe::RoutedExpertOutcome::kOk;
+    const rocket::qwen38::moe::RoutedExpertDeviceSummary published{
+        .generation = stale_moe_ ? source_generation_host_ + 1
+                                 : source_generation_host_,
+        .active_weight_bytes = 10 * rocket::qwen38::moe::kFp8BytesPerExpert,
+        .fc1_tiles = static_cast<std::uint32_t>(sequences_ * 10 * 5),
+        .fc2_tiles = static_cast<std::uint32_t>(sequences_ * 10 * 20),
+        .active_experts = 10,
+        .active_routes = sequences_ * 10,
+        .outcome = rocket::qwen38::moe::RoutedExpertOutcome::kOk,
+    };
+    cudaMemcpyAsync(summary, &published, sizeof(published),
+                    cudaMemcpyHostToDevice, stream);
     ++moe_calls_;
+    return rocket::qwen38::moe::RoutedExpertOutcome::kOk;
   }
   void reduce_moe(mtp::GraphArenaView a, int, mtp::GraphKey, cudaStream_t s) override {
     cudaMemsetAsync(a.reduced_moe_output, 0,
@@ -139,14 +158,21 @@ class Middle final : public mtp::MtpMiddleStagePort { public:
   int attention_calls_ = 0, moe_calls_ = 0;
   bool fault_routes_ = false;
   bool stale_routes_ = false;
+  bool fault_moe_ = false;
+  bool stale_moe_ = false;
+  bool omit_moe_publication_ = false;
 };
 class Sink final : public mtp::TelemetrySink { public:
   void record_phase(const mtp::PhaseMetric& m) noexcept override { phases.push_back(m); }
   void record_expert_usage(const mtp::ExpertUsageMetric& m) noexcept override { experts.push_back(m); }
   void add_counter(const rocket::qwen38::moe::RouteCompactionOtelPoint& point)
       noexcept override { routes.push_back(point); }
+  void add_routed_expert_counter(
+      const rocket::qwen38::moe::RoutedExpertOtelPoint& point)
+      noexcept override { routed_experts.push_back(point); }
   std::vector<mtp::PhaseMetric> phases; std::vector<mtp::ExpertUsageMetric> experts;
   std::vector<rocket::qwen38::moe::RouteCompactionOtelPoint> routes;
+  std::vector<rocket::qwen38::moe::RoutedExpertOtelPoint> routed_experts;
 };
 }
 
@@ -198,6 +224,47 @@ int main() {
     stale.commit(1);
     assert(stale.phase()==mtp::ExecutorPhase::kFaulted);
   }
+  {
+    mtp::StateArena missing_state(sequences,depth,false);
+    Middle missing_middle(sequences,depth);
+    missing_middle.omit_moe_publication_=true;
+    mtp::NativeExecutor missing({depth, sequences, 300}, runtime, missing_middle,
+                                exchange, missing_state, sink, stream);
+    static_cast<void>(missing.draft(1));
+    assert(cudaStreamSynchronize(stream)==cudaSuccess);
+    bool rejected=false;
+    try { missing.validate_after_fence(1); }
+    catch (const mtp::NativeExecutorError&) { rejected=true; }
+    assert(rejected);
+    missing.commit(1);
+    assert(missing.phase()==mtp::ExecutorPhase::kFaulted);
+  }
+  {
+    mtp::StateArena failed_state(sequences,depth,false);
+    Middle failed_middle(sequences,depth); failed_middle.fault_moe_=true;
+    mtp::NativeExecutor failed({depth, sequences, 300}, runtime, failed_middle,
+                               exchange, failed_state, sink, stream);
+    bool rejected=false;
+    try { static_cast<void>(failed.draft(1)); }
+    catch (const mtp::NativeExecutorError&) { rejected=true; }
+    assert(rejected && failed.phase()==mtp::ExecutorPhase::kFaulted);
+    failed.commit(1);
+    assert(failed.phase()==mtp::ExecutorPhase::kFaulted);
+  }
+  {
+    mtp::StateArena stale_state(sequences,depth,false);
+    Middle stale_middle(sequences,depth); stale_middle.stale_moe_=true;
+    mtp::NativeExecutor stale({depth, sequences, 300}, runtime, stale_middle,
+                              exchange, stale_state, sink, stream);
+    static_cast<void>(stale.draft(1));
+    assert(cudaStreamSynchronize(stream)==cudaSuccess);
+    bool rejected=false;
+    try { stale.validate_after_fence(1); }
+    catch (const mtp::NativeExecutorError&) { rejected=true; }
+    assert(rejected);
+    stale.commit(1);
+    assert(stale.phase()==mtp::ExecutorPhase::kFaulted);
+  }
   mtp::NativeExecutor executor(
       {depth, sequences, 300}, runtime, middle, exchange, state, sink, stream);
   bool stale_rejected = false;
@@ -213,6 +280,7 @@ int main() {
   executor.validate_after_fence(1); executor.commit(1);
   executor.export_telemetry_after_fence(1); assert(sink.experts.size()==depth);
   assert(sink.routes.size() >= static_cast<std::size_t>(depth * 3));
+  assert(sink.routed_experts.size() == static_cast<std::size_t>(depth * 5));
   assert(middle.moe_calls_ == depth);
   assert(executor.phase()==mtp::ExecutorPhase::kReady);
   cudaFree(dwidths); cudaFree(inactive); cudaStreamDestroy(stream); cudaFree(slab); cudaFree(target);
