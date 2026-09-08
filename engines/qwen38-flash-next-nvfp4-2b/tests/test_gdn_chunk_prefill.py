@@ -14,9 +14,11 @@ from unittest.mock import patch
 from qwen38_slab.gdn_chunk_prefill import (
     ATTENTION_SCALE,
     GDN_PREFILL_LAYERS,
+    QSA_PREFILL_LAYERS,
     FLASHINFER_GDN_CHUNK_IDENTITY,
     GDN_PREFILL_ACCURACY_IDENTITY,
     AuthenticatedGdnPrefillSchedule,
+    AuthenticatedTargetPrefillOwner,
     AuthenticatedGdnChunkPrefillAdapter,
     FlashInferSm121GdnChunkBackend,
     GdnChunkPrefillError,
@@ -178,6 +180,94 @@ class GdnChunkPrefillTests(unittest.TestCase):
                 "outcome": "error",
             },
         )
+
+    def test_outer_owner_routes_all48_and_preserves_state_handoff(self):
+        for rows in (35, 87):
+            tracer = Tracer()
+            backends = {layer: Backend() for layer in GDN_PREFILL_LAYERS}
+            schedule = AuthenticatedGdnPrefillSchedule(
+                rank=0, rows=rows, backends=backends, tracer=tracer
+            )
+            owner = AuthenticatedTargetPrefillOwner(
+                rank=0, rows=rows, gdn_schedule=schedule, tracer=tracer
+            )
+            self.assertEqual(len(owner.routes), 48)
+            self.assertEqual(owner.routes.count("gdn"), 36)
+            self.assertEqual(owner.routes.count("qsa_unresolved"), 12)
+            self.assertEqual(
+                tuple(i for i, route in enumerate(owner.routes) if route == "gdn"),
+                GDN_PREFILL_LAYERS,
+            )
+            self.assertEqual(
+                tuple(
+                    i
+                    for i, route in enumerate(owner.routes)
+                    if route == "qsa_unresolved"
+                ),
+                QSA_PREFILL_LAYERS,
+            )
+            for layer in range(48):
+                value = tensors(rows)
+                if layer in QSA_PREFILL_LAYERS:
+                    with self.assertRaisesRegex(GdnChunkPrefillError, "QSA"):
+                        owner.execute_layer(layer, value)
+                    continue
+                output, final_state = owner.execute_layer(layer, value)
+                self.assertIs(output, value.output)
+                self.assertIs(final_state, value.final_state)
+                self.assertIs(
+                    backends[layer].calls[0].initial_state,
+                    value.initial_state,
+                )
+                self.assertIs(
+                    backends[layer].calls[0].final_state,
+                    value.final_state,
+                )
+
+    def test_outer_owner_qsa_and_wrong_domain_fail_closed_with_telemetry(self):
+        tracer = Tracer()
+        schedule = AuthenticatedGdnPrefillSchedule(
+            rank=1,
+            rows=35,
+            backends={layer: Backend() for layer in GDN_PREFILL_LAYERS},
+            tracer=tracer,
+        )
+        owner = AuthenticatedTargetPrefillOwner(
+            rank=1, rows=35, gdn_schedule=schedule, tracer=tracer
+        )
+        with self.assertRaisesRegex(GdnChunkPrefillError, "QSA"):
+            owner.execute_layer(3, tensors())
+        self.assertEqual(
+            tracer.spans[-1].attributes,
+            {
+                "execution.domain": "chunk_prefill",
+                "outer.phase": "dispatch",
+                "rank": 1,
+                "layer": 3,
+                "rows": 35,
+                "route": "qsa_unresolved",
+                "outcome": "error",
+            },
+        )
+        with self.assertRaises(GdnChunkPrefillError):
+            owner.execute_layer(0, tensors(87))
+        self.assertEqual(tracer.spans[-1].attributes["outcome"], "error")
+        self.assertEqual(tracer.spans[-1].attributes["rows"], 87)
+
+    def test_outer_owner_rejects_schedule_identity_and_publishes_failure(self):
+        tracer = Tracer()
+        schedule = AuthenticatedGdnPrefillSchedule(
+            rank=0,
+            rows=35,
+            backends={layer: Backend() for layer in GDN_PREFILL_LAYERS},
+            tracer=tracer,
+        )
+        with self.assertRaises(GdnChunkPrefillError):
+            AuthenticatedTargetPrefillOwner(
+                rank=1, rows=35, gdn_schedule=schedule, tracer=tracer
+            )
+        self.assertEqual(tracer.spans[-1].attributes["outcome"], "error")
+        self.assertEqual(tracer.spans[-1].attributes["outer.phase"], "construction")
 
     def test_real_tensor_bundle_owns_tensors_and_runs_supported_backend(self):
         allocations = []

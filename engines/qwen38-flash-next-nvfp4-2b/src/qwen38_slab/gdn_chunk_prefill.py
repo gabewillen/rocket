@@ -35,6 +35,7 @@ HEAD_DIM = 128
 ATTENTION_SCALE = HEAD_DIM**-0.5
 REAL_TENSOR_BUNDLE_SCHEMA = "rocket.qwen38.gdn-prefill-tensors.v1"
 GDN_PREFILL_LAYERS = tuple(layer for layer in range(48) if layer % 4 != 3)
+QSA_PREFILL_LAYERS = tuple(layer for layer in range(48) if layer % 4 == 3)
 
 
 class GdnChunkPrefillError(RuntimeError):
@@ -437,6 +438,14 @@ class AuthenticatedGdnPrefillSchedule:
     def layers(self) -> tuple[int, ...]:
         return tuple(self._owners)
 
+    @property
+    def rank(self) -> int:
+        return self._rank
+
+    @property
+    def rows(self) -> int:
+        return self._rows
+
     def execute_layer(
         self, layer: int, tensors: GdnChunkPrefillTensors
     ) -> tuple[object, object]:
@@ -448,6 +457,94 @@ class AuthenticatedGdnPrefillSchedule:
         return owner.execute(tensors)
 
 
+class AuthenticatedTargetPrefillOwner:
+    """Outer all-48 dispatch owner with an explicit unresolved QSA route.
+
+    This owner borrows one authenticated GDN schedule and forwards the same
+    caller-owned tensors without copies or relabeling. QSA positions remain a
+    closed failure until a stateful KV prefill owner is supplied.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        rows: int,
+        gdn_schedule: AuthenticatedGdnPrefillSchedule,
+        tracer: OtelTracer,
+    ) -> None:
+        with tracer.start_as_current_span(
+            "rocket.qwen38.target.prefill_owner"
+        ) as span:
+            span.set_attribute("execution.domain", "chunk_prefill")
+            span.set_attribute("outer.phase", "construction")
+            span.set_attribute("rank", rank if rank in (0, 1) else -1)
+            span.set_attribute("rows", rows if rows in ORACLE_PREFILL_ROWS else -1)
+            try:
+                if (
+                    rank not in (0, 1)
+                    or rows not in ORACLE_PREFILL_ROWS
+                    or gdn_schedule.rank != rank
+                    or gdn_schedule.rows != rows
+                    or gdn_schedule.layers != GDN_PREFILL_LAYERS
+                ):
+                    raise GdnChunkPrefillError(
+                        "target prefill owner identity changed"
+                    )
+                self._rank = rank
+                self._rows = rows
+                self._gdn_schedule = gdn_schedule
+                self._tracer = tracer
+            except BaseException:
+                span.set_attribute("outcome", "error")
+                raise
+            span.set_attribute("outcome", "success")
+
+    @property
+    def routes(self) -> tuple[str, ...]:
+        return tuple(
+            "qsa_unresolved" if layer in QSA_PREFILL_LAYERS else "gdn"
+            for layer in range(48)
+        )
+
+    def execute_layer(
+        self, layer: int, tensors: GdnChunkPrefillTensors
+    ) -> tuple[object, object]:
+        valid_layer = 0 <= layer < 48
+        route = (
+            "qsa_unresolved"
+            if valid_layer and layer in QSA_PREFILL_LAYERS
+            else "gdn"
+            if valid_layer
+            else "invalid"
+        )
+        rows = int(getattr(tensors.q, "shape", (0,))[0])
+        with self._tracer.start_as_current_span(
+            "rocket.qwen38.target.prefill_owner"
+        ) as span:
+            span.set_attribute("execution.domain", "chunk_prefill")
+            span.set_attribute("outer.phase", "dispatch")
+            span.set_attribute("rank", self._rank)
+            span.set_attribute("layer", layer if valid_layer else -1)
+            span.set_attribute("rows", rows if rows in ORACLE_PREFILL_ROWS else -1)
+            span.set_attribute("route", route)
+            try:
+                if not valid_layer or rows != self._rows:
+                    raise GdnChunkPrefillError(
+                        "target prefill dispatch contract changed"
+                    )
+                if route == "qsa_unresolved":
+                    raise GdnChunkPrefillError(
+                        "QSA prefill owner is unresolved"
+                    )
+                result = self._gdn_schedule.execute_layer(layer, tensors)
+            except BaseException:
+                span.set_attribute("outcome", "error")
+                raise
+            span.set_attribute("outcome", "success")
+            return result
+
+
 def make_flashinfer_gdn_prefill_schedule(
     *, rank: int, rows: int, tracer: OtelTracer
 ) -> AuthenticatedGdnPrefillSchedule:
@@ -455,6 +552,19 @@ def make_flashinfer_gdn_prefill_schedule(
         rank=rank,
         rows=rows,
         backends={layer: FlashInferSm121GdnChunkBackend() for layer in GDN_PREFILL_LAYERS},
+        tracer=tracer,
+    )
+
+
+def make_flashinfer_target_prefill_owner(
+    *, rank: int, rows: int, tracer: OtelTracer
+) -> AuthenticatedTargetPrefillOwner:
+    return AuthenticatedTargetPrefillOwner(
+        rank=rank,
+        rows=rows,
+        gdn_schedule=make_flashinfer_gdn_prefill_schedule(
+            rank=rank, rows=rows, tracer=tracer
+        ),
         tracer=tracer,
     )
 
@@ -663,6 +773,32 @@ def execute_authenticated_scheduled_bundle(bundle: Path) -> dict[str, object]:
     }
 
 
+def execute_authenticated_outer_prefill_bundle(bundle: Path) -> dict[str, object]:
+    """Authenticate one bundle, then route it through the all-48 outer owner."""
+    import torch
+
+    rank, layer, tensors = load_authenticated_real_tensor_bundle(bundle, torch)
+    tracer = _ProofTracer()
+    owner = make_flashinfer_target_prefill_owner(
+        rank=rank, rows=int(tensors.q.shape[0]), tracer=tracer
+    )
+    output, final_state = owner.execute_layer(layer, tensors)
+    torch.cuda.synchronize(0)
+    return {
+        "status": "success",
+        "implementation": GDN_PREFILL_ACCURACY_IDENTITY,
+        "owner_layers": len(owner.routes),
+        "gdn_layers": owner.routes.count("gdn"),
+        "qsa_layers": owner.routes.count("qsa_unresolved"),
+        "rank": rank,
+        "layer": layer,
+        "rows": int(tensors.q.shape[0]),
+        "output_sha256": _tensor_sha256(output, torch),
+        "final_state_sha256": _tensor_sha256(final_state, torch),
+        "telemetry": tracer.attributes,
+    }
+
+
 def compare_native_real_tensor_bundle(
     bundle: Path, native_library: Path
 ) -> dict[str, object]:
@@ -735,9 +871,20 @@ def executable_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--native-library", type=Path)
     parser.add_argument("--compare-flashinfer", action="store_true")
     parser.add_argument("--scheduled-flashinfer", action="store_true")
+    parser.add_argument("--outer-prefill", action="store_true")
     args = parser.parse_args(argv)
     try:
-        if args.scheduled_flashinfer:
+        if args.outer_prefill:
+            if (
+                args.native_library is not None
+                or args.compare_flashinfer
+                or args.scheduled_flashinfer
+            ):
+                raise GdnChunkPrefillError("GDN outer mode changed")
+            result = execute_authenticated_outer_prefill_bundle(
+                args.tensor_bundle
+            )
+        elif args.scheduled_flashinfer:
             if args.native_library is not None or args.compare_flashinfer:
                 raise GdnChunkPrefillError("GDN scheduled mode changed")
             result = execute_authenticated_scheduled_bundle(args.tensor_bundle)
@@ -782,12 +929,16 @@ __all__ = [
     "NATIVE_GDN_M35_IDENTITY",
     "GDN_PREFILL_ACCURACY_IDENTITY",
     "GDN_PREFILL_LAYERS",
+    "QSA_PREFILL_LAYERS",
+    "AuthenticatedTargetPrefillOwner",
     "AuthenticatedGdnPrefillSchedule",
     "NativeGdnM35PrefillBackend",
     "VALUE_HEADS",
     "execute_authenticated_real_tensor_bundle",
+    "execute_authenticated_outer_prefill_bundle",
     "execute_authenticated_scheduled_bundle",
     "make_flashinfer_gdn_prefill_schedule",
+    "make_flashinfer_target_prefill_owner",
     "compare_native_real_tensor_bundle",
     "executable_main",
     "load_authenticated_real_tensor_bundle",
