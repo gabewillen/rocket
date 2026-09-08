@@ -122,6 +122,43 @@ set_target_properties(qwen38_gdn_prefill_fused PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+set(ROCKET_QWEN38_GDN_B12X_AOT_DIR "" CACHE PATH
+  "Directory containing the four generated GDN B12X headers and objects")
+set(ROCKET_QWEN38_CUTE_DSL_RUNTIME "" CACHE FILEPATH
+  "Native libcute_dsl_runtime used by generated GDN B12X objects")
+add_library(qwen38_gdn_b12x_aot STATIC
+  src/linear_attention/gdn_b12x_aot.cc)
+target_include_directories(qwen38_gdn_b12x_aot PUBLIC src)
+target_link_libraries(qwen38_gdn_b12x_aot PUBLIC CUDA::cudart)
+target_compile_options(qwen38_gdn_b12x_aot PRIVATE -Wall -Wextra -Werror)
+set_target_properties(qwen38_gdn_b12x_aot PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(ROCKET_QWEN38_GDN_B12X_AOT_DIR)
+  set(_gdn_b12x_objects)
+  foreach(_shape t300_qkvz t300_ba t8192_qkvz t8192_ba)
+    if(NOT EXISTS "${ROCKET_QWEN38_GDN_B12X_AOT_DIR}/${_shape}.h" OR
+       NOT EXISTS "${ROCKET_QWEN38_GDN_B12X_AOT_DIR}/${_shape}.o")
+      message(FATAL_ERROR "Incomplete GDN B12X AOT shape ${_shape}")
+    endif()
+    list(APPEND _gdn_b12x_objects
+      "${ROCKET_QWEN38_GDN_B12X_AOT_DIR}/${_shape}.o")
+  endforeach()
+  if(NOT EXISTS "${ROCKET_QWEN38_CUTE_DSL_RUNTIME}")
+    message(FATAL_ERROR "ROCKET_QWEN38_CUTE_DSL_RUNTIME is required for B12X AOT")
+  endif()
+  set_source_files_properties(${_gdn_b12x_objects} PROPERTIES
+    EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  target_sources(qwen38_gdn_b12x_aot PRIVATE ${_gdn_b12x_objects})
+  target_include_directories(qwen38_gdn_b12x_aot SYSTEM PRIVATE
+    "${ROCKET_QWEN38_GDN_B12X_AOT_DIR}")
+  target_compile_definitions(qwen38_gdn_b12x_aot PRIVATE
+    ROCKET_QWEN38_GDN_B12X_AOT=1)
+  target_link_libraries(qwen38_gdn_b12x_aot PRIVATE
+    "${ROCKET_QWEN38_CUTE_DSL_RUNTIME}")
+else()
+  target_compile_definitions(qwen38_gdn_b12x_aot PRIVATE
+    ROCKET_QWEN38_GDN_B12X_AOT=0)
+endif()
+
 add_library(qwen38_gdn_graph SHARED
   src/linear_attention/gdn_cutlass.cu
   src/linear_attention/gdn_verifier.cu
@@ -132,7 +169,7 @@ target_include_directories(qwen38_gdn_graph PUBLIC
   "${ROCKET_QWEN38_CUTLASS_DIR}/tools/util/include"
 )
 target_link_libraries(qwen38_gdn_graph PUBLIC
-  qwen38_gdn_core qwen38_decode_execution CUDA::cudart
+  qwen38_gdn_core qwen38_gdn_b12x_aot qwen38_decode_execution CUDA::cudart
 )
 target_compile_options(qwen38_gdn_graph PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>
@@ -375,3 +412,12 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME qwen38-gdn-b12x-aot-cpu-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gdn_b12x_aot_contract.py)
+
+add_executable(qwen38-test-gdn-b12x-aot-contract
+  tests/test_gdn_b12x_aot_contract.cc)
+target_link_libraries(qwen38-test-gdn-b12x-aot-contract PRIVATE
+  qwen38_gdn_b12x_aot CUDA::cudart)
+target_compile_options(qwen38-test-gdn-b12x-aot-contract PRIVATE
+  -Wall -Wextra -Werror)
+add_test(NAME qwen38-gdn-b12x-aot-native-contract
+  COMMAND qwen38-test-gdn-b12x-aot-contract)
