@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Focused contract tests for the two-node expanded-calibration launcher."""
 
+import contextlib
+import hashlib
 import json
+import math
 import pathlib
 import socket
 import subprocess
@@ -31,7 +34,10 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             "CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n"
             "MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n"
             "GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\n"
-            "MASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\n"
+            "MASTER_PORT=61234\n"
+            "MASTER_PORT_DERIVATION=sha256-v1:61000-65023:32:exclude-api\n"
+            "MASTER_PORT_IDENTITY_SHA256=" + "0" * 64 + "\n"
+            "MASTER_PORT_CANDIDATE_INDEX=0\nGPU_MEMORY_UTILIZATION=0.835\n"
             f"MTP_DEPTH={depth}\nOUTPUT_DIR={root}\nPRODUCTION={production}\n"
             f"ORACLE_K0={oracle}\nNVFP4_HAS_BASE_ROUTERS=true\n"
             "ORACLE_EXPECTED_IDS='[1,2]'\n"
@@ -119,6 +125,11 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             self.source.index("\nwhile (($#))")
         ]
         with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+            pathlib.Path(directory, "run.json").write_text(json.dumps({
+                "master_port_candidate_count": 32,
+                "master_port_derivation": "sha256-v1:61000-65023:32:exclude-api",
+                "master_port_identity_sha256": "1" * 64,
+            }))
             harness = pathlib.Path(directory) / "masked-status-regression.sh"
             harness.write_text(
                 "set -euo pipefail\n"
@@ -135,6 +146,11 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             self.assertFalse(failure["valid"])
             self.assertFalse(failure["complete"])
             self.assertEqual(failure["phase"], "worker_output_prepare")
+            self.assertEqual(failure["rendezvous"], {
+                "master_port_candidate_count": 32,
+                "master_port_derivation": "sha256-v1:61000-65023:32:exclude-api",
+                "master_port_identity_sha256": "1" * 64,
+            })
 
     def test_signal_handlers_preserve_status_and_first_failure_telemetry(self):
         self.assertIn("trap 'on_shell_signal INT' INT", self.source)
@@ -281,14 +297,98 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertNotEqual(occupied.returncode, 0)
         self.assertEqual(available.returncode, 0, available.stderr)
 
-    def test_launch_checks_both_head_ports_before_remote_transfer(self):
-        master = 'check_port_available "$HEAD_IP" "$MASTER_PORT"'
+    def test_held_static_port_reproduces_red_then_bounded_selector_falls_back(self):
+        function = self.source[
+            self.source.index("check_port_available() {"):
+            self.source.index("\nactual_image_id=")
+        ]
+        low, span = 61000, 4024
+        identity = hashlib.sha256(b"held-static-port-regression").hexdigest()
+        digest = hashlib.sha256(identity.encode()).digest()
+        first_candidate = low + int.from_bytes(digest[:8], "big") % span
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as legacy_listener, \
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM) as candidate_listener:
+            legacy_listener.bind(("127.0.0.1", 50000))
+            candidate_listener.bind(("127.0.0.1", first_candidate))
+            legacy = subprocess.run(
+                ["bash", "-c", function + "\ncheck_port_available 127.0.0.1 50000"],
+                capture_output=True, text=True, check=False,
+            )
+            selected = subprocess.run(
+                [
+                    "bash", "-c",
+                    "set -euo pipefail\n"
+                    "fail() { printf '%s\\n' \"$*\" >&2; return 1; }\n"
+                    "HEAD_IP=127.0.0.1\nAPI_PORT=8888\n"
+                    + function
+                    + f"\nselect_master_port {identity}\n"
+                    + "printf '%s %s %s\\n' \"$MASTER_PORT\" "
+                    "\"$MASTER_PORT_CANDIDATE_INDEX\" \"$MASTER_PORT_IDENTITY_SHA256\"",
+                ],
+                capture_output=True, text=True, check=False,
+            )
+        self.assertNotEqual(legacy.returncode, 0)
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        port, index, selected_identity = selected.stdout.strip().split()
+        self.assertNotEqual(port, "50000")
+        self.assertNotEqual(port, str(first_candidate))
+        self.assertGreaterEqual(int(port), low)
+        self.assertLess(int(port), low + span)
+        self.assertGreater(int(index), 0)
+        self.assertLess(int(index), 32)
+        self.assertEqual(selected_identity, identity)
+
+    def test_master_port_is_selected_immediately_before_argv_freeze(self):
+        select = 'select_master_port "$MASTER_PORT_SOURCE_IDENTITY"'
         api = 'check_port_available "0.0.0.0" "$API_PORT"'
         transfer = 'scp -q "$ARTIFACT_DIR"/*'
-        self.assertIn(master, self.source)
+        freeze = 'write_launch_script_array "$OUTPUT_DIR/launch-worker.sh"'
+        self.assertIn(select, self.source)
         self.assertIn(api, self.source)
-        self.assertLess(self.source.index(master), self.source.index(transfer))
         self.assertLess(self.source.index(api), self.source.index(transfer))
+        self.assertGreater(self.source.index(select), self.source.index(transfer))
+        self.assertLess(self.source.index(select), self.source.index(freeze))
+        self.assertNotIn('check_port_available "$HEAD_IP" "$MASTER_PORT"', self.source)
+
+    def test_master_port_candidate_exhaustion_fails_closed_before_launch(self):
+        function = self.source[
+            self.source.index("check_port_available() {"):
+            self.source.index("\nactual_image_id=")
+        ]
+        identity = hashlib.sha256(b"exhaust-candidate-set").hexdigest()
+        digest = hashlib.sha256(identity.encode()).digest()
+        low, span = 61000, 4024
+        start = int.from_bytes(digest[:8], "big") % span
+        step = int.from_bytes(digest[8:16], "big") % span | 1
+        while math.gcd(step, span) != 1:
+            step = (step + 2) % span or 1
+        candidates = [low + (start + index * step) % span for index in range(32)]
+        with contextlib.ExitStack() as stack:
+            for port in candidates:
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    listener.bind(("127.0.0.1", port))
+                except OSError:
+                    listener.close()
+                else:
+                    stack.callback(listener.close)
+            exhausted = subprocess.run(
+                [
+                    "bash", "-c",
+                    "set -euo pipefail\n"
+                    "fail() { printf '%s\\n' \"$*\" >&2; return 1; }\n"
+                    "HEAD_IP=127.0.0.1\nAPI_PORT=8888\n"
+                    + function
+                    + f"\nselect_master_port {identity} || "
+                    + "fail 'all deterministic head master port candidates are unavailable'",
+                ],
+                capture_output=True, text=True, check=False,
+            )
+        self.assertNotEqual(exhausted.returncode, 0)
+        self.assertIn(
+            "all deterministic head master port candidates are unavailable",
+            exhausted.stderr,
+        )
 
     def test_remote_immutable_view_parent_exists_before_device_check(self):
         mkdir = '"mkdir -p \'$REMOTE_OUTPUT/artifacts\' \'$REMOTE_OUTPUT/logs\' \'$REMOTE_OUTPUT/work\'"'
@@ -472,7 +572,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
                     "--node-rank": "0" if name == "head" else "1",
                     "--nnodes": "2",
                     "--master-addr": "10.0.0.1",
-                    "--master-port": "50000",
+                    "--master-port": "61234",
                     "--all2all-backend": "allgather_reducescatter",
                 }
                 for option, value in required.items():
@@ -480,6 +580,13 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
                     self.assertEqual(actual[index + 1], value)
                 self.assertIn("--enforce-eager", actual)
                 self.assertIn("--enable-expert-parallel", actual)
+                self.assertIn("ROCKET_MASTER_PORT=61234", actual)
+                self.assertIn(
+                    "ROCKET_MASTER_PORT_DERIVATION=sha256-v1:61000-65023:32:exclude-api",
+                    actual,
+                )
+                self.assertIn("ROCKET_MASTER_PORT_IDENTITY_SHA256=" + "0" * 64, actual)
+                self.assertIn("ROCKET_MASTER_PORT_CANDIDATE_INDEX=0", actual)
                 if name == "head":
                     self.assertEqual(actual[-6:], ["--node-rank", "0", "--host", "0.0.0.0", "--port", "8888"])
                     self.assertIn("ROCKET_QWEN38_K0_ORACLE=1", actual)

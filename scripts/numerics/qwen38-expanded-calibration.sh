@@ -27,7 +27,8 @@ WORKER_IFACE="enp1s0f1np1"
 HEAD_HCA="rocep1s0f1"
 WORKER_HCA="rocep1s0f1"
 GID_INDEX="3"
-MASTER_PORT="50000"
+MASTER_PORT=""
+MASTER_PORT_DERIVATION="sha256-v1:61000-65023:32:exclude-api"
 API_PORT="8888"
 HEAD_CONTAINER="rocket-qwen38-calibration-head"
 WORKER_CONTAINER="rocket-qwen38-calibration-worker"
@@ -122,6 +123,8 @@ if path.exists():
     raise SystemExit(0)
 identity_path = path.with_name("oracle-identity.json")
 identity = json.loads(identity_path.read_text()) if identity_path.is_file() else {}
+run_path = path.with_name("run.json")
+run = json.loads(run_path.read_text()) if run_path.is_file() else {}
 capture = path.with_name("capture")
 record = {
     "schema": "rocket.qwen38.k0-target-oracle-failure.v1",
@@ -130,6 +133,15 @@ record = {
     "phase": sys.argv[2][:128],
     "reason": sys.argv[3][:1024],
     "identity": identity,
+    "rendezvous": {
+        key: run[key]
+        for key in (
+            "master_port", "master_port_candidate_count",
+            "master_port_candidate_index", "master_port_derivation",
+            "master_port_identity_sha256",
+        )
+        if key in run
+    },
     "completed": sorted(item.name for item in capture.glob("*.bin"))[:408] if capture.is_dir() else [],
 }
 path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
@@ -405,6 +417,42 @@ host, raw_port = sys.argv[1:]
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
     listener.bind((host, int(raw_port)))
 PY
+}
+
+select_master_port() {
+    local identity=$1 index candidate
+    [[ "$identity" =~ ^[0-9a-f]{64}$ ]] || \
+        fail "master port source identity must be a lowercase SHA-256"
+    mapfile -t master_port_candidates < <(python3 - "$identity" <<'PY'
+import hashlib
+import math
+import sys
+
+# Both authenticated nodes use Linux's 32768-60999 ephemeral range. Keep the
+# rendezvous candidates above it; the loop also excludes the API service port.
+low, span, count = 61000, 4024, 32
+digest = hashlib.sha256(sys.argv[1].encode()).digest()
+start = int.from_bytes(digest[:8], "big") % span
+step = int.from_bytes(digest[8:16], "big") % span | 1
+while math.gcd(step, span) != 1:
+    step = (step + 2) % span or 1
+for index in range(count):
+    print(low + (start + index * step) % span)
+PY
+    )
+    [[ "${#master_port_candidates[@]}" == 32 ]] || \
+        fail "master port candidate derivation changed"
+    for index in "${!master_port_candidates[@]}"; do
+        candidate=${master_port_candidates[$index]}
+        [[ "$candidate" != "$API_PORT" ]] || continue
+        if check_port_available "$HEAD_IP" "$candidate"; then
+            MASTER_PORT=$candidate
+            MASTER_PORT_CANDIDATE_INDEX=$index
+            MASTER_PORT_IDENTITY_SHA256=$identity
+            return 0
+        fi
+    done
+    return 1
 }
 
 actual_image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG" 2>/dev/null || true)
@@ -687,8 +735,6 @@ docker container inspect "$HEAD_CONTAINER" >/dev/null 2>&1 && fail "head contain
 ssh -o BatchMode=yes "$SSH_TARGET" \
     "docker container inspect '$WORKER_CONTAINER' >/dev/null 2>&1" && \
     fail "worker container already exists: $WORKER_CONTAINER"
-check_port_available "$HEAD_IP" "$MASTER_PORT" || \
-    fail "head master port is unavailable: $HEAD_IP:$MASTER_PORT"
 check_port_available "0.0.0.0" "$API_PORT" || \
     fail "head API port is unavailable: 0.0.0.0:$API_PORT"
 
@@ -741,7 +787,11 @@ write_launch_script_array() {
         -e "GLOO_SOCKET_IFNAME=$iface" -e "NCCL_SOCKET_IFNAME=$iface" -e "TP_SOCKET_IFNAME=$iface"
         -e NCCL_IB_DISABLE=0 -e "NCCL_IB_HCA=$hca" -e "NCCL_IB_GID_INDEX=$GID_INDEX"
         -e NCCL_IB_AUTO_DETECT=0 -e NCCL_DEBUG=WARN -e HF_HUB_OFFLINE=1
-        -e TRANSFORMERS_OFFLINE=1 -e "VLLM_HOST_IP=$node_ip" -e HF_HOME=/root/.cache/huggingface)
+        -e TRANSFORMERS_OFFLINE=1 -e "VLLM_HOST_IP=$node_ip" -e HF_HOME=/root/.cache/huggingface
+        -e "ROCKET_MASTER_PORT=$MASTER_PORT"
+        -e "ROCKET_MASTER_PORT_DERIVATION=$MASTER_PORT_DERIVATION"
+        -e "ROCKET_MASTER_PORT_IDENTITY_SHA256=$MASTER_PORT_IDENTITY_SHA256"
+        -e "ROCKET_MASTER_PORT_CANDIDATE_INDEX=$MASTER_PORT_CANDIDATE_INDEX")
     if [[ "$PRODUCTION" != true && "$ORACLE_K0" != true ]]; then
         args+=(-e ROCKET_NVFP4_CALIBRATE=1 -e ROCKET_NVFP4_SAMPLE_ELEMENTS=2048
             -e ROCKET_QWEN38_LOAD_TRACE=1 -e ROCKET_NVFP4_MAX_EMISSIONS=12)
@@ -888,6 +938,42 @@ if [[ "$WORKER_CACHE_KIND" == host_ext4 ]]; then
     [[ "$resolved_worker_shards" == 11 ]] || \
         fail "worker immutable cache view has unresolved checkpoint shards"
 fi
+MASTER_PORT_SOURCE_IDENTITY=$(sha256sum "$OUTPUT_DIR/run.json" | cut -d' ' -f1)
+if [[ "$ORACLE_K0" == true ]]; then
+    MASTER_PORT_SOURCE_IDENTITY=$(sha256sum "$OUTPUT_DIR/oracle-request.json" | cut -d' ' -f1)
+fi
+python3 - "$OUTPUT_DIR/run.json" "$MASTER_PORT_DERIVATION" \
+    "$MASTER_PORT_SOURCE_IDENTITY" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+record = json.loads(path.read_text())
+record.update({
+    "master_port_candidate_count": 32,
+    "master_port_derivation": sys.argv[2],
+    "master_port_identity_sha256": sys.argv[3],
+})
+path.write_text(json.dumps(record, sort_keys=True) + "\n")
+PY
+select_master_port "$MASTER_PORT_SOURCE_IDENTITY" || \
+    fail "all deterministic head master port candidates are unavailable"
+check_port_available "0.0.0.0" "$API_PORT" || \
+    fail "head API port became unavailable before argv freeze: 0.0.0.0:$API_PORT"
+python3 - "$OUTPUT_DIR/run.json" "$MASTER_PORT" "$MASTER_PORT_CANDIDATE_INDEX" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+record = json.loads(path.read_text())
+record.update({
+    "master_port": int(sys.argv[2]),
+    "master_port_candidate_index": int(sys.argv[3]),
+})
+path.write_text(json.dumps(record, sort_keys=True) + "\n")
+PY
 write_launch_script_array "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE" \
     "$WORKER_HCA" "$WORKER_RUNTIME_CACHE_MOUNT" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT" "$REMOTE_NVFP4_ARTIFACT" "$USE_IMMUTABLE_CACHE_VIEW"
 write_launch_script_array "$OUTPUT_DIR/launch-head.sh" 0 "$HEAD_IP" "$HEAD_IFACE" \
