@@ -60,6 +60,29 @@ struct TargetMoeB12xLaunch {
   cudaStream_t stream;
 };
 
+// Bounded create diagnostics. Values are stable telemetry attributes; pointer
+// values, hashes, and other unbounded caller data are never exported.
+enum class TargetMoeCreateFailure : std::uint8_t {
+  kNone,
+  kDevice,
+  kArtifactSha256,
+  kLayoutSha256,
+  kRank,
+  kLayer,
+  kW13Packed,
+  kW13Scale,
+  kDownPacked,
+  kDownScale,
+  kInputGlobalScale,
+  kW1Alpha,
+  kW2Alpha,
+  kDownInputScale,
+};
+
+[[nodiscard]] TargetMoeCreateFailure diagnose_target_moe_b12x_create(
+    int device, const TargetMoeB12xIdentity& identity,
+    const TargetMoeB12xWeights& weights) noexcept;
+
 // Owns the pinned fixed-c1 CuTe module only. All activations, dense routes,
 // weights, output, workspace, and stream remain caller-owned. Construction is
 // outside graph capture; launch performs no allocation, D2H, synchronization,
@@ -94,6 +117,9 @@ int rocket_qwen38_target_moe_b12x_create(
     int device, const rocket::qwen38::moe::TargetMoeB12xIdentity* identity,
     const rocket::qwen38::moe::TargetMoeB12xWeights* weights,
     void** handle) noexcept;
+int rocket_qwen38_target_moe_b12x_diagnose_create(
+    int device, const rocket::qwen38::moe::TargetMoeB12xIdentity* identity,
+    const rocket::qwen38::moe::TargetMoeB12xWeights* weights) noexcept;
 int rocket_qwen38_target_moe_b12x_enqueue(
     void* handle,
     const rocket::qwen38::moe::TargetMoeB12xLaunch* launch) noexcept;

@@ -15,23 +15,10 @@ namespace {
 #if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
 constexpr std::array<std::uint8_t, 32> kArtifactSha256{
     0xa9, 0xfc, 0xca, 0x02, 0x6a, 0x87, 0xad, 0x12,
-    0x85, 0xb9, 0x4f, 0xef, 0x19, 0x44, 0x8c, 0x51,
-    0xb4, 0x2d, 0x97, 0x51, 0x6f, 0x16, 0x21, 0x1c,
-    0x61, 0xae, 0x4c, 0x77, 0x0c, 0x6f, 0x0f, 0x4f};
+    0x85, 0xb9, 0x4f, 0xef, 0x19, 0x44, 0x48, 0xc5,
+    0x1b, 0x42, 0xd9, 0x75, 0x16, 0xf1, 0x62, 0x11,
+    0xc6, 0x1a, 0xe4, 0xc7, 0x70, 0xc6, 0xf0, 0xf4};
 
-bool valid_identity(const TargetMoeB12xIdentity& identity) noexcept {
-  return identity.artifact_sha256 == kArtifactSha256 &&
-         std::any_of(identity.layout_sha256.begin(), identity.layout_sha256.end(),
-                     [](std::uint8_t byte) { return byte != 0; }) &&
-         (identity.rank == 0 || identity.rank == 1) && identity.layer >= 0 &&
-         identity.layer < 48;
-}
-
-bool valid_weights(const TargetMoeB12xWeights& weights) noexcept {
-  return weights.w13_packed && weights.w13_scale && weights.down_packed &&
-         weights.down_scale && weights.input_global_scale && weights.w1_alpha &&
-         weights.w2_alpha && weights.down_input_scale;
-}
 #endif
 
 bool valid_launch(const TargetMoeB12xLaunch& launch) noexcept {
@@ -69,6 +56,34 @@ bool load_module(Module* module, int device, auto init, auto load) noexcept {
 
 }  // namespace
 
+TargetMoeCreateFailure diagnose_target_moe_b12x_create(
+    int device, const TargetMoeB12xIdentity& identity,
+    const TargetMoeB12xWeights& weights) noexcept {
+  if (device < 0) return TargetMoeCreateFailure::kDevice;
+#if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
+  if (identity.artifact_sha256 != kArtifactSha256)
+    return TargetMoeCreateFailure::kArtifactSha256;
+#endif
+  if (!std::any_of(identity.layout_sha256.begin(), identity.layout_sha256.end(),
+                   [](std::uint8_t byte) { return byte != 0; }))
+    return TargetMoeCreateFailure::kLayoutSha256;
+  if (identity.rank != 0 && identity.rank != 1)
+    return TargetMoeCreateFailure::kRank;
+  if (identity.layer < 0 || identity.layer >= 48)
+    return TargetMoeCreateFailure::kLayer;
+  if (!weights.w13_packed) return TargetMoeCreateFailure::kW13Packed;
+  if (!weights.w13_scale) return TargetMoeCreateFailure::kW13Scale;
+  if (!weights.down_packed) return TargetMoeCreateFailure::kDownPacked;
+  if (!weights.down_scale) return TargetMoeCreateFailure::kDownScale;
+  if (!weights.input_global_scale)
+    return TargetMoeCreateFailure::kInputGlobalScale;
+  if (!weights.w1_alpha) return TargetMoeCreateFailure::kW1Alpha;
+  if (!weights.w2_alpha) return TargetMoeCreateFailure::kW2Alpha;
+  if (!weights.down_input_scale)
+    return TargetMoeCreateFailure::kDownInputScale;
+  return TargetMoeCreateFailure::kNone;
+}
+
 #if ROCKET_QWEN38_TARGET_MOE_B12X_AOT
 struct TargetMoeB12xAot::Impl {
   int device;
@@ -80,7 +95,8 @@ struct TargetMoeB12xAot::Impl {
 TargetMoeB12xAot::TargetMoeB12xAot(
     int device, TargetMoeB12xIdentity identity, TargetMoeB12xWeights weights)
     : impl_(nullptr) {
-  if (device < 0 || !valid_identity(identity) || !valid_weights(weights))
+  if (diagnose_target_moe_b12x_create(device, identity, weights) !=
+      TargetMoeCreateFailure::kNone)
     throw std::invalid_argument("target MoE B12X identity or weights changed");
   impl_ = new Impl{device, identity, weights};
   if (!load_module(&impl_->module, device,
@@ -214,6 +230,17 @@ extern "C" int rocket_qwen38_target_moe_b12x_create(
     *handle = nullptr;
     return static_cast<int>(rocket::qwen38::moe::TargetMoeOutcome::kCudaError);
   }
+}
+
+extern "C" int rocket_qwen38_target_moe_b12x_diagnose_create(
+    int device,
+    const rocket::qwen38::moe::TargetMoeB12xIdentity* identity,
+    const rocket::qwen38::moe::TargetMoeB12xWeights* weights) noexcept {
+  using Failure = rocket::qwen38::moe::TargetMoeCreateFailure;
+  if (!identity) return static_cast<int>(Failure::kArtifactSha256);
+  if (!weights) return static_cast<int>(Failure::kW13Packed);
+  return static_cast<int>(rocket::qwen38::moe::diagnose_target_moe_b12x_create(
+      device, *identity, *weights));
 }
 
 extern "C" int rocket_qwen38_target_moe_b12x_enqueue(

@@ -6,10 +6,16 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 from pathlib import Path
 
 ARTIFACT_SHA256 = "a9fcca026a87ad1285b94feef19448c51b42d97516f16211c61ae4c770c6f0f4"
+CREATE_FAILURE_FIELDS = (
+    "none", "device", "artifact_sha256", "layout_sha256", "rank", "layer",
+    "w13_packed", "w13_scale", "down_packed", "down_scale",
+    "input_global_scale", "w1_alpha", "w2_alpha", "down_input_scale",
+)
 
 
 class Identity(ctypes.Structure):
@@ -61,6 +67,10 @@ def bind_library(path: Path):
         ctypes.POINTER(ctypes.c_void_p),
     ]
     library.rocket_qwen38_target_moe_b12x_create.restype = ctypes.c_int
+    library.rocket_qwen38_target_moe_b12x_diagnose_create.argtypes = [
+        ctypes.c_int, ctypes.POINTER(Identity), ctypes.POINTER(Weights),
+    ]
+    library.rocket_qwen38_target_moe_b12x_diagnose_create.restype = ctypes.c_int
     library.rocket_qwen38_target_moe_b12x_enqueue.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(Launch),
     ]
@@ -68,6 +78,50 @@ def bind_library(path: Path):
     library.rocket_qwen38_target_moe_b12x_destroy.argtypes = [ctypes.c_void_p]
     return library
 
+
+def create_failure_record(*, status: int, diagnostic: int, rank: int, layer: int):
+    """Return a fixed-cardinality diagnostic without pointer or hash values."""
+
+    field = (
+        CREATE_FAILURE_FIELDS[diagnostic]
+        if 0 <= diagnostic < len(CREATE_FAILURE_FIELDS)
+        else "unknown"
+    )
+    return {
+        "abi": "rocket.qwen38.target-moe.native-failure.v1",
+        "accepted": False,
+        "failure_class": "contract" if status == 1 else "cuda",
+        "first_invalid_field": field,
+        "layer": layer,
+        "phase": "create",
+        "rank": rank,
+        "status": status if status in (1, 3) else -1,
+    }
+
+
+def validate_artifact_mount_identity(
+    artifact: Path, expected_artifact_key: str = ARTIFACT_SHA256,
+) -> str:
+    """Fail before CUDA when a bind mount erases the content-addressed name."""
+
+    try:
+        manifest = json.loads((artifact / "manifest.json").read_bytes())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("target slab manifest is unavailable") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("target slab manifest root changed")
+    canonical = dict(manifest)
+    claimed = canonical.pop("artifact_key", None)
+    observed = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if claimed != expected_artifact_key or observed != claimed:
+        raise RuntimeError("target slab manifest artifact identity changed")
+    if artifact.name != claimed:
+        raise RuntimeError(
+            "target slab mount basename must equal manifest artifact_key"
+        )
+    return claimed
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -169,11 +223,19 @@ def main() -> None:
     if not library.rocket_qwen38_target_moe_b12x_available():
         raise RuntimeError("native target MoE AOT backend is unavailable")
     handle = ctypes.c_void_p()
+    device = torch.cuda.current_device()
+    diagnostic = library.rocket_qwen38_target_moe_b12x_diagnose_create(
+        device, ctypes.byref(identity), ctypes.byref(native_weights)
+    )
     status = library.rocket_qwen38_target_moe_b12x_create(
-        torch.cuda.current_device(), ctypes.byref(identity),
+        device, ctypes.byref(identity),
         ctypes.byref(native_weights), ctypes.byref(handle),
     )
     if status != 0 or not handle.value:
+        print(json.dumps(create_failure_record(
+            status=status, diagnostic=diagnostic, rank=args.rank,
+            layer=args.layer,
+        ), sort_keys=True))
         raise RuntimeError(f"native target MoE create failed: outcome={status}")
     try:
         oracle_backend = FlashInferRoutedMoeBackend(source_weights)
