@@ -37,11 +37,25 @@ endif()
 set(ROCKET_QWEN38_FLASHINFER_91BDA04_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/vendor/flashinfer-91bda04"
   CACHE PATH "Pinned FlashInfer 91bda04 CUTLASS runner slice")
+set(ROCKET_QWEN38_FLASHINFER_CUTLASS_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/vendor/cutlass-b46b16d"
+  CACHE PATH "Pinned CUTLASS 4.5 b46b16d dependency closure for FlashInfer")
 set(_gdn_flashinfer_template
   "${ROCKET_QWEN38_FLASHINFER_91BDA04_DIR}/include/flashinfer/gemm/fp4_gemm_template_sm120.h")
 if(NOT EXISTS "${_gdn_flashinfer_template}")
   message(FATAL_ERROR
     "Pinned FlashInfer 91bda04 GDN CUTLASS runner is required at ${_gdn_flashinfer_template}")
+endif()
+set(_gdn_flashinfer_cutlass_version
+  "${ROCKET_QWEN38_FLASHINFER_CUTLASS_DIR}/include/cutlass/version.h")
+if(NOT EXISTS "${_gdn_flashinfer_cutlass_version}")
+  message(FATAL_ERROR
+    "Pinned CUTLASS 4.5 b46b16d closure is required at ${_gdn_flashinfer_cutlass_version}")
+endif()
+file(READ "${_gdn_flashinfer_cutlass_version}" _gdn_flashinfer_cutlass_version_text)
+if(NOT _gdn_flashinfer_cutlass_version_text MATCHES "#define CUTLASS_MAJOR 4" OR
+   NOT _gdn_flashinfer_cutlass_version_text MATCHES "#define CUTLASS_MINOR 5")
+  message(FATAL_ERROR "FlashInfer GDN runner requires pinned CUTLASS 4.5 b46b16d")
 endif()
 
 add_library(qwen38_cutlass_qkv SHARED src/projection/cutlass_qkv.cu)
@@ -89,6 +103,9 @@ add_library(qwen38_decode_execution STATIC
 target_include_directories(qwen38_decode_execution PUBLIC src)
 target_link_libraries(qwen38_decode_execution PUBLIC qwen38_pair_reduce CUDA::cudart)
 target_compile_options(qwen38_decode_execution PRIVATE -Wall -Wextra -Werror)
+# Only this static archive needs host PIC because qwen38_gdn_graph links it into
+# a shared library. Keep the relocation fix local to its owner.
+set_target_properties(qwen38_decode_execution PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(qwen38_layer_pair_reduce SHARED src/decode/pair_reduce_c_api.cc)
 target_include_directories(qwen38_layer_pair_reduce PUBLIC src)
@@ -172,17 +189,27 @@ endif()
 add_library(qwen38_gdn_flashinfer_cutlass STATIC
   src/linear_attention/gdn_flashinfer_cutlass.cu)
 target_include_directories(qwen38_gdn_flashinfer_cutlass PUBLIC src PRIVATE
-  "${ROCKET_QWEN38_CUTLASS_DIR}/include"
-  "${ROCKET_QWEN38_CUTLASS_DIR}/tools/util/include"
+  "${ROCKET_QWEN38_FLASHINFER_CUTLASS_DIR}/include"
+  "${ROCKET_QWEN38_FLASHINFER_CUTLASS_DIR}/tools/util/include"
   "${ROCKET_QWEN38_FLASHINFER_91BDA04_DIR}/include")
 target_link_libraries(qwen38_gdn_flashinfer_cutlass PUBLIC CUDA::cudart)
 target_compile_options(qwen38_gdn_flashinfer_cutlass PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>)
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-use_fast_math;-Xfatbin=-compress-all;--compress-mode=size;-static-global-template-stub=false;-lineinfo>)
 target_compile_definitions(qwen38_gdn_flashinfer_cutlass PRIVATE
   ENABLE_BF16=1
+  ENABLE_FP4=1
+  FLASHINFER_ENABLE_BF16=1
+  FLASHINFER_ENABLE_F16=1
+  FLASHINFER_ENABLE_FP4_E2M1=1
+  FLASHINFER_ENABLE_FP8_E8M0=1
   CUTLASS_ENABLE_GDC_FOR_SM100=1)
 set_target_properties(qwen38_gdn_flashinfer_cutlass PROPERTIES
-  CUDA_ARCHITECTURES "121a"
+  # Match the prebuilt FlashInfer 0.6.17 wheel artifact loaded by the
+  # standalone vLLM comparator. Its SM12x CUTLASS module contains sm_120f
+  # family code even on GB10 (SM121).
+  CUDA_ARCHITECTURES "120f"
+  CUDA_STANDARD 17
+  CUDA_STANDARD_REQUIRED ON
   CUDA_SEPARABLE_COMPILATION OFF
   POSITION_INDEPENDENT_CODE ON)
 
