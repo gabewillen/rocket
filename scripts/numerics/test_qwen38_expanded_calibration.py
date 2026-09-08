@@ -17,6 +17,28 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
     def setUpClass(cls):
         cls.source = SCRIPT.read_text()
 
+    def launch_function(self):
+        return self.source[
+            self.source.index("write_launch_script_array() {"):
+            self.source.index('\nREMOTE_FP8_ARTIFACT=""')
+        ]
+
+    @staticmethod
+    def launch_environment(root, *, production="false", oracle="false", depth=3):
+        return (
+            "set -euo pipefail\n"
+            "HEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n"
+            "CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n"
+            "MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n"
+            "GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\n"
+            "MASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\n"
+            f"MTP_DEPTH={depth}\nOUTPUT_DIR={root}\nPRODUCTION={production}\n"
+            f"ORACLE_K0={oracle}\nNVFP4_HAS_BASE_ROUTERS=true\n"
+            "ORACLE_EXPECTED_IDS='[1,2]'\n"
+            "ORACLE_IDENTITY='{\"model_revision\":\"fc694\"}'\n"
+            "WORKER_HF_CACHE=/worker-cache\n"
+        )
+
     def test_shell_parses_and_help_does_not_prepare_or_launch(self):
         syntax = subprocess.run(
             ["bash", "-n", str(SCRIPT)], capture_output=True, text=True, check=False
@@ -42,7 +64,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
     def test_k0_oracle_omits_speculation_and_is_fail_closed(self):
         self.assertIn('ORACLE_K0=true; MTP_DEPTH=0', self.source)
         self.assertIn('--oracle-k0 requires the accepted --nvfp4-artifact-dir', self.source)
-        self.assertIn('speculative_options=""', self.source)
+        self.assertIn('[[ "$ORACLE_K0" == true ]] || args+=(--speculative-config', self.source)
         self.assertIn("patch-qwen38-k0-oracle.py", self.source)
         self.assertIn("qwen38-k0-oracle.py\" validate", self.source)
         self.assertIn('model_oracle.py:', self.source)
@@ -106,12 +128,44 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             self.assertFalse(failure["complete"])
             self.assertEqual(failure["phase"], "worker_output_prepare")
 
+    def test_signal_handlers_preserve_status_and_first_failure_telemetry(self):
+        self.assertIn("trap 'on_shell_signal INT' INT", self.source)
+        self.assertIn("trap 'on_shell_signal TERM' TERM", self.source)
+        lifecycle = self.source[
+            self.source.index('head_log_pid=""'):
+            self.source.index("\ncommand -v docker")
+        ]
+        writer = self.source[
+            self.source.index("write_oracle_failure() {"):
+            self.source.index("\nwhile (($#))")
+        ]
+        for signal, status in (("INT", 130), ("TERM", 143)):
+            with self.subTest(signal=signal), tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+                harness = pathlib.Path(directory) / "signal-regression.sh"
+                harness.write_text(
+                    "set -euo pipefail\n"
+                    f"OUTPUT_DIR={directory}\n"
+                    "ORACLE_K0=true\nKEEP_RUNNING=false\n"
+                    "SSH_TARGET=unused\nHEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n"
+                    + writer + lifecycle
+                    + f'\nCURRENT_PHASE=model_load\non_shell_signal {signal}\n'
+                )
+                result = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, status, result.stderr)
+                failure_path = pathlib.Path(directory) / "oracle-failure.json"
+                first = failure_path.read_bytes()
+                failure = json.loads(first)
+                self.assertEqual(failure["phase"], "model_load")
+                self.assertEqual(failure["reason"], f"received SIG{signal}")
+                subprocess.run(["bash", str(harness)], capture_output=True, text=True)
+                self.assertEqual(failure_path.read_bytes(), first)
+
     def test_oracle_worker_uses_bounded_tmpfs_and_rank0_owns_capture(self):
         self.assertIn('REMOTE_OUTPUT="/dev/shm/rocket-qwen38-k0-', self.source)
         self.assertIn('WORKER_SCRATCH_MIN_BYTES=', self.source)
         self.assertIn('worker tmpfs capacity', self.source)
         self.assertIn('ROCKET_QWEN38_K0_ORACLE=1', self.source)
-        self.assertIn('if [[ "$node_rank" == 0 ]]', self.source)
+        self.assertIn('if [[ "$ORACLE_K0" == true && "$node_rank" == 0 ]]', self.source)
         self.assertIn("find '$REMOTE_OUTPUT' -depth -delete", self.source)
 
     def test_worker_host_cache_is_ext4_and_manifest_matched_fail_closed(self):
@@ -142,15 +196,15 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn('"$worker_cache_device" == "$worker_output_device"', self.source)
         self.assertIn('find -L "$head_view_snapshot"', self.source)
         self.assertIn('find -L $remote_view_snapshot_q', self.source)
-        self.assertIn('HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1', self.source)
+        self.assertIn('-e TRANSFORMERS_OFFLINE=1 -e "VLLM_HOST_IP=$node_ip"', self.source)
         self.assertIn('"head_runtime_cache_path":"$HEAD_RUNTIME_CACHE_MOUNT"', self.source)
         self.assertIn('"worker_runtime_cache_path":"$WORKER_RUNTIME_CACHE_MOUNT"', self.source)
 
     def test_production_mode_cuts_instrumentation_and_runs_ladder(self):
         self.assertIn('if [[ "$PRODUCTION" == true ]]', self.source)
-        self.assertIn("/ROCKET_NVFP4_CALIBRATE=/d", self.source)
-        self.assertIn("/model_telemetry.py:.*\\/model.py:ro/d", self.source)
-        self.assertIn("s/--enforce-eager //", self.source)
+        self.assertIn('if [[ "$PRODUCTION" != true && "$ORACLE_K0" != true ]]', self.source)
+        self.assertIn('elif [[ "$PRODUCTION" == true && "$NVFP4_HAS_BASE_ROUTERS" == true ]]', self.source)
+        self.assertIn('[[ "$PRODUCTION" == true ]] || args+=(--enforce-eager)', self.source)
         self.assertIn("openai-forked-prefix.py", self.source)
         self.assertIn("--concurrency 1,2,4,8,16", self.source)
         self.assertIn('$OUTPUT_DIR/throughput.json', self.source)
@@ -288,8 +342,8 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertIn("/rocket/qwen38-linear-fp8:ro", self.source)
         self.assertIn("ROCKET_QWEN38_FP8_OVERLAY_MANIFEST", self.source)
         self.assertIn("ROCKET_QWEN38_FP8_QUANT_CONFIG", self.source)
-        self.assertIn('quant_config_source="$artifact_dir/hf_quant_config_patched.json"', self.source)
-        self.assertIn('quant_config_source="$fp8_host_dir/hf_quant_config.json"', self.source)
+        self.assertIn('quant_source="$artifact_dir/hf_quant_config_patched.json"', self.source)
+        self.assertIn('quant_source="$fp8_host_dir/hf_quant_config.json"', self.source)
         self.assertIn("assert len(result['selected']) == $NVFP4_EXPECTED_COUNT", self.source)
         self.assertIn('if [[ -z "$FP8_ARTIFACT_DIR" && -z "$NVFP4_ARTIFACT_DIR" ]]', self.source)
         self.assertEqual(self.source.count("linear-attention-fp8.safetensors"), 2)
@@ -354,140 +408,102 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
         self.assertLess(self.source.index(condition), self.source.index(patcher))
 
     def test_production_with_routers_mounts_router_only_model(self):
-        function = self.source[
-            self.source.index("write_launch_script() {"):
-            self.source.index('\nREMOTE_FP8_ARTIFACT=""')
-        ]
-        production = self.source[
-            self.source.index('if [[ "$PRODUCTION" == true ]]; then', self.source.index("write_launch_script() {")):
-            self.source.index('\nrun_checked "worker_launcher_transfer" scp')
-        ]
+        function = self.launch_function()
         with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
             root = pathlib.Path(directory)
             harness = root / "production.sh"
             harness.write_text(
-                "set -euo pipefail\n"
-                'HEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n'
-                'CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n'
-                'MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n'
-                'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\nMTP_DEPTH=3\n'
-                f'OUTPUT_DIR={root}\nPRODUCTION=true\nNVFP4_HAS_BASE_ROUTERS=true\n'
+                self.launch_environment(root, production="true")
                 + function
-                + f'\nwrite_launch_script {root / "launch-worker.sh"} 1 10.0.0.2 eth1 hca /cache /generated --headless ro "" /durable/nvfp4\n'
-                + f'write_launch_script {root / "launch-head.sh"} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" /durable/nvfp4\n'
-                + production
+                + f'\nwrite_launch_script_array {root / "launch-worker.sh"} 1 10.0.0.2 eth1 hca /cache /generated --headless ro "" /durable/nvfp4\n'
+                + f'write_launch_script_array {root / "launch-head.sh"} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0 --port 8888" ro "" /durable/nvfp4\n'
             )
             result = subprocess.run(
                 ["bash", str(harness)], capture_output=True, text=True, check=False
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             for name in ("launch-head.sh", "launch-worker.sh"):
-                generated = (root / name).read_text()
+                generated = subprocess.run(
+                    ["bash", str(root / name), "--print-argv"], check=True,
+                    capture_output=True, text=True,
+                ).stdout
                 self.assertIn(
                     "/generated/model_router.py:/vllm/model/model.py:ro", generated
                 )
                 self.assertNotIn("model_telemetry.py", generated)
                 self.assertNotIn("ROCKET_NVFP4_CALIBRATE", generated)
 
-    def test_generated_launch_scripts_are_single_commands(self):
-        function = self.source[
-            self.source.index("write_launch_script() {"):
-            self.source.index('\nREMOTE_FP8_ARTIFACT=""')
-        ]
+    def test_empty_speculation_generates_exact_distinct_k0_argv(self):
+        function = self.launch_function()
         with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
             root = pathlib.Path(directory)
-            default_script = root / "default.sh"
-            fp8_script = root / "fp8.sh"
-            nvfp4_script = root / "nvfp4.sh"
-            low_memory_script = root / "low-memory.sh"
+            head = root / "oracle-head.sh"
+            worker = root / "oracle-worker.sh"
             harness = root / "generate.sh"
             harness.write_text(
-                "set -euo pipefail\n"
-                'HEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n'
-                'CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n'
-                'MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n'
-                'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\nMTP_DEPTH=3\n'
+                self.launch_environment(root, oracle="true", depth=0)
                 + function
-                + f'\nwrite_launch_script {default_script} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" ""\n'
-                + f'write_launch_script {fp8_script} 1 10.0.0.2 eth1 hca /cache /generated --headless ro /durable/fp8 ""\n'
-                + f'write_launch_script {nvfp4_script} 1 10.0.0.2 eth1 hca /cache /generated --headless ro "" /durable/nvfp4\n'
-                + 'GPU_MEMORY_UTILIZATION=0.60\n'
-                + f'write_launch_script {low_memory_script} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" /durable/nvfp4\n'
+                + f'\nwrite_launch_script_array {head} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0 --port 8888" ro "" /durable/nvfp4\n'
+                + f'write_launch_script_array {worker} 1 10.0.0.2 eth1 hca /cache /generated --headless ro "" /durable/nvfp4\n'
             )
             subprocess.run(["bash", str(harness)], check=True)
-            for generated in (default_script, fp8_script, nvfp4_script, low_memory_script):
-                parsed = subprocess.run(
-                    ["bash", "-n", str(generated)], capture_output=True, text=True
-                )
-                self.assertEqual(parsed.returncode, 0, parsed.stderr)
-                source = generated.read_text()
-                self.assertNotIn("$fp8_options", source)
-                command = source[source.index("exec docker run"):].splitlines()
-                self.assertTrue(all(line.rstrip().endswith("\\") for line in command[:-1]))
-                self.assertFalse(command[-1].rstrip().endswith("\\"))
-            default = default_script.read_text()
-            self.assertNotIn("/rocket/qwen38-linear-fp8", default)
-            self.assertIn("/generated/hf_quant_config_patched.json", default)
-            self.assertIn("--gpu-memory-utilization 0.835", default)
-            fp8 = fp8_script.read_text()
-            self.assertIn("-v /durable/fp8:/rocket/qwen38-linear-fp8:ro", fp8)
-            self.assertIn(
-                "-e ROCKET_QWEN38_FP8_OVERLAY_MANIFEST=/rocket/qwen38-linear-fp8/manifest.json",
-                fp8,
-            )
-            self.assertIn(
-                "-e ROCKET_QWEN38_FP8_QUANT_CONFIG=/rocket/qwen38-linear-fp8/hf_quant_config.json",
-                fp8,
-            )
-            self.assertIn(
-                "/durable/fp8/hf_quant_config.json:/root/.cache/huggingface/hub/model-cache/snapshots/revision/hf_quant_config.json:ro",
-                fp8,
-            )
-            nvfp4 = nvfp4_script.read_text()
-            self.assertIn(
-                "-v /durable/nvfp4:/rocket/qwen38-linear-nvfp4:ro", nvfp4
-            )
-            self.assertIn(
-                "-e ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=/rocket/qwen38-linear-nvfp4/manifest.json",
-                nvfp4,
-            )
-            self.assertIn(
-                "/generated/config_nvfp4_patched.json:/root/.cache/huggingface/hub/model-cache/snapshots/revision/config.json:ro",
-                nvfp4,
-            )
-            self.assertIn(
-                "--gpu-memory-utilization 0.60", low_memory_script.read_text()
-            )
+            vectors = {}
+            for name, generated in (("head", head), ("worker", worker)):
+                syntax = subprocess.run(["bash", "-n", str(generated)], capture_output=True, text=True)
+                self.assertEqual(syntax.returncode, 0, syntax.stderr)
+                actual = json.loads(subprocess.run(
+                    ["bash", str(generated), "--print-argv"], check=True,
+                    capture_output=True, text=True,
+                ).stdout)
+                expected = json.loads(pathlib.Path(f"{generated}.expected-argv.json").read_text())
+                self.assertEqual(actual, expected)
+                self.assertNotIn("--speculative-config", actual)
+                required = {
+                    "--compilation-config": '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}',
+                    "--hf-overrides": '{"text_config":{"ple_embedding_dtype":"float8_e4m3fn"}}',
+                    "--node-rank": "0" if name == "head" else "1",
+                    "--nnodes": "2",
+                    "--master-addr": "10.0.0.1",
+                    "--master-port": "50000",
+                    "--all2all-backend": "allgather_reducescatter",
+                }
+                for option, value in required.items():
+                    index = actual.index(option)
+                    self.assertEqual(actual[index + 1], value)
+                self.assertIn("--enforce-eager", actual)
+                self.assertIn("--enable-expert-parallel", actual)
+                if name == "head":
+                    self.assertEqual(actual[-6:], ["--node-rank", "0", "--host", "0.0.0.0", "--port", "8888"])
+                    self.assertIn("ROCKET_QWEN38_K0_ORACLE=1", actual)
+                else:
+                    self.assertEqual(actual[-3:], ["--node-rank", "1", "--headless"])
+                    self.assertNotIn("ROCKET_QWEN38_K0_ORACLE=1", actual)
+                vectors[name] = actual
+            self.assertNotEqual(vectors["head"], vectors["worker"])
+
 
     def test_generated_k0_head_is_syntax_valid_and_has_no_speculative_config(self):
-        function = self.source[
-            self.source.index("write_launch_script() {"):
-            self.source.index('\nREMOTE_FP8_ARTIFACT=""')
-        ]
+        function = self.launch_function()
         with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
             root = pathlib.Path(directory)
             destination = root / "oracle-head.sh"
             harness = root / "generate-oracle.sh"
             harness.write_text(
-                "set -euo pipefail\n"
-                'HEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n'
-                'CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n'
-                'MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n'
-                'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.60\nMTP_DEPTH=0\n'
-                f'ORACLE_K0=true\nOUTPUT_DIR={root}\n'
-                "ORACLE_EXPECTED_IDS='[1,2]'\n"
-                "ORACLE_IDENTITY='{\"model_revision\":\"fc694\"}'\n"
+                self.launch_environment(root, oracle="true", depth=0)
                 + function
-                + f'\nwrite_launch_script {destination} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" /durable/nvfp4\n'
+                + f'\nwrite_launch_script_array {destination} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0 --port 8888" ro "" /durable/nvfp4\n'
             )
             result = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             syntax = subprocess.run(["bash", "-n", str(destination)], capture_output=True, text=True)
             self.assertEqual(syntax.returncode, 0, syntax.stderr)
-            generated = destination.read_text()
+            generated = json.loads(subprocess.run(
+                ["bash", str(destination), "--print-argv"], check=True,
+                capture_output=True, text=True,
+            ).stdout)
             self.assertNotIn("--speculative-config", generated)
             self.assertIn("ROCKET_QWEN38_K0_ORACLE=1", generated)
-            self.assertIn("/rocket/oracle-root/capture", generated)
+            self.assertIn("ROCKET_QWEN38_K0_ORACLE_DIR=/rocket/oracle-root/capture", generated)
             self.assertNotIn("--disable-log-requests", generated)
             self.assertNotIn("--disable-prefix-caching", generated)
 
@@ -516,10 +532,7 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
             self.assertIn("finite number in (0,1]", result.stderr)
 
     def test_fixed_mtp_depths_generate_exact_configs_and_k0_fails_closed(self):
-        function = self.source[
-            self.source.index("write_launch_script() {"):
-            self.source.index('\nREMOTE_FP8_ARTIFACT=""')
-        ]
+        function = self.launch_function()
         with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
             root = pathlib.Path(directory)
             generated = []
@@ -527,26 +540,21 @@ class ExpandedCalibrationLauncherTest(unittest.TestCase):
                 destination = root / f"k{depth}.sh"
                 harness = root / f"generate-k{depth}.sh"
                 harness.write_text(
-                    "set -euo pipefail\n"
-                    'HEAD_CONTAINER=head\nWORKER_CONTAINER=worker\n'
-                    'CONTAINER_MODEL_DIR=/vllm/model\nCONTAINER_VLLM_DIR=/vllm\n'
-                    'MODEL_CACHE_NAME=model-cache\nMODEL_REVISION=revision\n'
-                    f'GID_INDEX=3\nIMAGE_TAG=image\nMODEL_ID=model\nHEAD_IP=10.0.0.1\nMASTER_PORT=50000\nGPU_MEMORY_UTILIZATION=0.835\nMTP_DEPTH={depth}\n'
+                    self.launch_environment(root, depth=depth)
                     + function
-                    + f'\nwrite_launch_script {destination} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0" ro "" ""\n'
+                    + f'\nwrite_launch_script_array {destination} 0 10.0.0.1 eth0 hca /cache /generated "--host 0.0.0.0 --port 8888" ro "" ""\n'
                 )
                 subprocess.run(["bash", str(harness)], check=True)
-                self.assertIn(
-                    f"--speculative-config '{{\"method\":\"mtp\",\"num_speculative_tokens\":{depth}}}'",
-                    destination.read_text(),
-                )
-                generated.append(destination.read_text())
+                argv = json.loads(subprocess.run(
+                    ["bash", str(destination), "--print-argv"], check=True,
+                    capture_output=True, text=True,
+                ).stdout)
+                index = argv.index("--speculative-config")
+                self.assertEqual(json.loads(argv[index + 1])["num_speculative_tokens"], depth)
+                argv[index + 1] = "K"
+                generated.append(argv)
             normalized = [
-                value.replace(
-                    f'"num_speculative_tokens\":{depth}',
-                    '"num_speculative_tokens\":K',
-                )
-                for depth, value in enumerate(generated, 1)
+                json.dumps(value, sort_keys=True) for value in generated
             ]
             self.assertEqual(len(set(normalized)), 1)
         for depth in ("0", "8", "-1", "x", "01"):

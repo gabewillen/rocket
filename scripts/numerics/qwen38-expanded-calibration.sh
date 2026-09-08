@@ -116,6 +116,8 @@ import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
+if path.exists():
+    raise SystemExit(0)
 identity_path = path.with_name("oracle-identity.json")
 identity = json.loads(identity_path.read_text()) if identity_path.is_file() else {}
 capture = path.with_name("capture")
@@ -352,6 +354,22 @@ on_shell_error() {
 on_shell_exit() {
     local status=$?
     trap - ERR EXIT INT TERM
+    if ((status != 0)); then
+        write_oracle_failure "$CURRENT_PHASE" "shell exited with status $status"
+    fi
+    cleanup "$status"
+    exit "$status"
+}
+
+on_shell_signal() {
+    local signal=$1 status
+    case "$signal" in
+        INT) status=130 ;;
+        TERM) status=143 ;;
+        *) status=1 ;;
+    esac
+    trap - ERR EXIT INT TERM
+    write_oracle_failure "$CURRENT_PHASE" "received SIG$signal"
     cleanup "$status"
     exit "$status"
 }
@@ -365,7 +383,8 @@ run_checked() {
 set -E
 trap on_shell_error ERR
 trap on_shell_exit EXIT
-trap 'exit 130' INT TERM
+trap 'on_shell_signal INT' INT
+trap 'on_shell_signal TERM' TERM
 
 command -v docker >/dev/null || fail "docker is required"
 command -v python3 >/dev/null || fail "python3 is required"
@@ -701,88 +720,77 @@ run_checked "worker_artifact_transfer" scp -q "$ARTIFACT_DIR"/* "$SSH_TARGET:$RE
 run_checked "worker_artifact_verify" ssh -o BatchMode=yes "$SSH_TARGET" \
     "cd '$REMOTE_OUTPUT/artifacts' && sha256sum --check SHA256SUMS"
 
-write_launch_script() {
+write_launch_script_array() {
     local destination=$1 node_rank=$2 node_ip=$3 iface=$4 hca=$5 cache_mount=$6 artifact_dir=$7 mode=$8 cache_access=$9 fp8_host_dir=${10} nvfp4_host_dir=${11}
-    local use_immutable_cache_view=${12:-false}
-    local fp8_options="" nvfp4_options="" oracle_options="" speculative_options="--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":$MTP_DEPTH}' \\" quant_config_source="$artifact_dir/hf_quant_config_patched.json" config_source="$artifact_dir/config_patched.json"
-    if [[ -n "$fp8_host_dir" ]]; then
-        quant_config_source="$fp8_host_dir/hf_quant_config.json"
-        config_source="$artifact_dir/config_fp8_patched.json"
-        fp8_options="
-  -v $(printf '%q' "$fp8_host_dir"):/rocket/qwen38-linear-fp8:ro \\
-  -e ROCKET_QWEN38_FP8_OVERLAY_MANIFEST=/rocket/qwen38-linear-fp8/manifest.json \\
-  -e ROCKET_QWEN38_FP8_QUANT_CONFIG=/rocket/qwen38-linear-fp8/hf_quant_config.json \\"
+    local use_immutable_cache_view=${12:-false} container_name="$WORKER_CONTAINER"
+    local config_source="$artifact_dir/config_patched.json" quant_source="$artifact_dir/hf_quant_config_patched.json"
+    local -a args mode_args
+    [[ "$node_rank" == 0 ]] && container_name="$HEAD_CONTAINER"
+    read -r -a mode_args <<< "$mode"
+    [[ -n "$fp8_host_dir" ]] && config_source="$artifact_dir/config_fp8_patched.json" && quant_source="$fp8_host_dir/hf_quant_config.json"
+    [[ -n "$nvfp4_host_dir" ]] && config_source="$artifact_dir/config_nvfp4_patched.json" && quant_source="$nvfp4_host_dir/hf_quant_config.json"
+    args=(run -d --name "$container_name" --gpus all --network host --ipc host
+        --cap-add SYS_NICE --ulimit memlock=-1 --ulimit stack=67108864
+        --device /dev/infiniband:/dev/infiniband
+        -e "GLOO_SOCKET_IFNAME=$iface" -e "NCCL_SOCKET_IFNAME=$iface" -e "TP_SOCKET_IFNAME=$iface"
+        -e NCCL_IB_DISABLE=0 -e "NCCL_IB_HCA=$hca" -e "NCCL_IB_GID_INDEX=$GID_INDEX"
+        -e NCCL_IB_AUTO_DETECT=0 -e NCCL_DEBUG=WARN -e HF_HUB_OFFLINE=1
+        -e TRANSFORMERS_OFFLINE=1 -e "VLLM_HOST_IP=$node_ip" -e HF_HOME=/root/.cache/huggingface)
+    if [[ "$PRODUCTION" != true && "$ORACLE_K0" != true ]]; then
+        args+=(-e ROCKET_NVFP4_CALIBRATE=1 -e ROCKET_NVFP4_SAMPLE_ELEMENTS=2048
+            -e ROCKET_QWEN38_LOAD_TRACE=1 -e ROCKET_NVFP4_MAX_EMISSIONS=12)
     fi
-    if [[ -n "$nvfp4_host_dir" ]]; then
-        quant_config_source="$nvfp4_host_dir/hf_quant_config.json"
-        config_source="$artifact_dir/config_nvfp4_patched.json"
-        nvfp4_options="
-  -v $(printf '%q' "$nvfp4_host_dir"):/rocket/qwen38-linear-nvfp4:ro \\
-  -e ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=/rocket/qwen38-linear-nvfp4/manifest.json \\
-  -e ROCKET_QWEN38_NVFP4_QUANT_CONFIG=/rocket/qwen38-linear-nvfp4/hf_quant_config.json \\"
+    [[ -n "$fp8_host_dir" ]] && args+=(-v "$fp8_host_dir:/rocket/qwen38-linear-fp8:ro" -e ROCKET_QWEN38_FP8_OVERLAY_MANIFEST=/rocket/qwen38-linear-fp8/manifest.json -e ROCKET_QWEN38_FP8_QUANT_CONFIG=/rocket/qwen38-linear-fp8/hf_quant_config.json)
+    [[ -n "$nvfp4_host_dir" ]] && args+=(-v "$nvfp4_host_dir:/rocket/qwen38-linear-nvfp4:ro" -e ROCKET_QWEN38_NVFP4_OVERLAY_MANIFEST=/rocket/qwen38-linear-nvfp4/manifest.json -e ROCKET_QWEN38_NVFP4_QUANT_CONFIG=/rocket/qwen38-linear-nvfp4/hf_quant_config.json)
+    if [[ "$ORACLE_K0" == true && "$node_rank" == 0 ]]; then
+        args+=(-e ROCKET_QWEN38_K0_ORACLE=1 -e "ROCKET_QWEN38_K0_EXPECTED_IDS=$ORACLE_EXPECTED_IDS"
+            -e "ROCKET_QWEN38_K0_IDENTITY=$ORACLE_IDENTITY" -e ROCKET_QWEN38_K0_ORACLE_DIR=/rocket/oracle-root/capture
+            -v "$OUTPUT_DIR:/rocket/oracle-root")
+    elif [[ "$ORACLE_K0" == true ]]; then
+        args+=(-v "$WORKER_HF_CACHE:/rocket/source-hf:ro")
     fi
-    if [[ "${ORACLE_K0:-false}" == true ]]; then
-        speculative_options=""
-        if [[ "$node_rank" == 0 ]]; then
-            oracle_options="
-  -e ROCKET_QWEN38_K0_ORACLE=1 \\
-  -e ROCKET_QWEN38_K0_EXPECTED_IDS=$(printf '%q' "$ORACLE_EXPECTED_IDS") \\
-  -e ROCKET_QWEN38_K0_IDENTITY=$(printf '%q' "$ORACLE_IDENTITY") \\
-  -e ROCKET_QWEN38_K0_ORACLE_DIR=/rocket/oracle-root/capture \\
-  -v $(printf '%q' "$OUTPUT_DIR"):/rocket/oracle-root \\"
-        else
-            oracle_options="
-  -v $(printf '%q' "$WORKER_HF_CACHE"):/rocket/source-hf:ro \\"
-        fi
+    args+=(-v "$artifact_dir/ple_layer_patched.py:$CONTAINER_MODEL_DIR/ple_layer.py:ro"
+        -v "$artifact_dir/modelopt_patched.py:$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro"
+        -v "$artifact_dir/weight_utils_64k.py:$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py:ro"
+        -v "$artifact_dir/platform_qsa_patched.py:$CONTAINER_VLLM_DIR/platforms/interface.py:ro")
+    if [[ "$ORACLE_K0" == true ]]; then
+        args+=(-v "$artifact_dir/model_oracle.py:$CONTAINER_MODEL_DIR/model.py:ro")
+    elif [[ "$PRODUCTION" == true && "$NVFP4_HAS_BASE_ROUTERS" == true ]]; then
+        args+=(-v "$artifact_dir/model_router.py:$CONTAINER_MODEL_DIR/model.py:ro")
+    elif [[ "$PRODUCTION" != true ]]; then
+        args+=(-v "$artifact_dir/model_telemetry.py:$CONTAINER_MODEL_DIR/model.py:ro")
     fi
-    cat > "$destination" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-exec docker run -d --name $(if [[ "$node_rank" == 0 ]]; then printf '%q' "$HEAD_CONTAINER"; else printf '%q' "$WORKER_CONTAINER"; fi) \\
-  --gpus all --network host --ipc host \\
-  --cap-add SYS_NICE --ulimit memlock=-1 --ulimit stack=67108864 \\
-  --device /dev/infiniband:/dev/infiniband \\
-  -e GLOO_SOCKET_IFNAME=$(printf '%q' "$iface") \\
-  -e NCCL_SOCKET_IFNAME=$(printf '%q' "$iface") \\
-  -e TP_SOCKET_IFNAME=$(printf '%q' "$iface") \\
-  -e NCCL_IB_DISABLE=0 -e NCCL_IB_HCA=$(printf '%q' "$hca") \\
-  -e NCCL_IB_GID_INDEX=$GID_INDEX -e NCCL_IB_AUTO_DETECT=0 -e NCCL_DEBUG=WARN \\
-  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \\
-  -e VLLM_HOST_IP=$(printf '%q' "$node_ip") -e HF_HOME=/root/.cache/huggingface \\
-  -e ROCKET_NVFP4_CALIBRATE=1 -e ROCKET_NVFP4_SAMPLE_ELEMENTS=2048 \\
-  -e ROCKET_QWEN38_LOAD_TRACE=1 \\
-  -e ROCKET_NVFP4_MAX_EMISSIONS=12 \\$fp8_options$nvfp4_options$oracle_options
-  -v $(printf '%q' "$artifact_dir/ple_layer_patched.py"):$CONTAINER_MODEL_DIR/ple_layer.py:ro \\
-  -v $(printf '%q' "$artifact_dir/modelopt_patched.py"):$CONTAINER_VLLM_DIR/model_executor/layers/quantization/modelopt.py:ro \\
-  -v $(printf '%q' "$artifact_dir/weight_utils_64k.py"):$CONTAINER_VLLM_DIR/model_executor/model_loader/weight_utils.py:ro \\
-  -v $(printf '%q' "$artifact_dir/platform_qsa_patched.py"):$CONTAINER_VLLM_DIR/platforms/interface.py:ro \\
-  -v $(printf '%q' "$artifact_dir/model_telemetry.py"):$CONTAINER_MODEL_DIR/model.py:ro \\
-  -v $(printf '%q' "$artifact_dir/qsa_ops_patched.py"):$CONTAINER_MODEL_DIR/ops/qsa.py:ro \\
-  -v $(printf '%q' "$artifact_dir/qsa_nvidia_patched.py"):$CONTAINER_MODEL_DIR/qsa.py:ro \\
-  -v $(printf '%q' "$config_source"):/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/config.json:ro \\
-  -v $(printf '%q' "$quant_config_source"):/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/hf_quant_config.json:ro \\
-  -v $(printf '%q' "$cache_mount"):/root/.cache/huggingface:$cache_access \\
-  -v \$HOME/.cache/vllm:/root/.cache/vllm \\
-  $IMAGE_TAG $MODEL_ID \\
-  --revision $MODEL_REVISION --served-model-name qwen3.8-flash-next \\
-  --tensor-parallel-size 2 --gpu-memory-utilization $(printf '%q' "$GPU_MEMORY_UTILIZATION") \\
-  --max-num-seqs 16 --max-num-batched-tokens 8192 --max-model-len 262144 \\
-  --kv-cache-dtype fp8 --load-format safetensors --safetensors-load-strategy lazy \\
-  --enable-chunked-prefill --reasoning-parser qwen3 --enable-auto-tool-choice \\
-  --tool-call-parser qwen3_coder --distributed-executor-backend mp \\
-  --mm-encoder-tp-mode data --nnodes 2 --master-addr $HEAD_IP --master-port $MASTER_PORT \\
-  --enable-expert-parallel --all2all-backend allgather_reducescatter \\
-$(if [[ -n "$speculative_options" ]]; then printf '  %s\n' "$speculative_options"; fi)
-  --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' \\
-  --hf-overrides '{"text_config":{"ple_embedding_dtype":"float8_e4m3fn"}}' \\
-  --enforce-eager --node-rank $node_rank $mode
-EOF
-    if [[ "$use_immutable_cache_view" == true ]]; then
-        sed -i \
-            -e '\|/snapshots/.*/config.json:ro|d' \
-            -e '\|/snapshots/.*/hf_quant_config.json:ro|d' \
-            "$destination"
+    args+=(-v "$artifact_dir/qsa_ops_patched.py:$CONTAINER_MODEL_DIR/ops/qsa.py:ro" -v "$artifact_dir/qsa_nvidia_patched.py:$CONTAINER_MODEL_DIR/qsa.py:ro")
+    if [[ "$use_immutable_cache_view" != true ]]; then
+        args+=(-v "$config_source:/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/config.json:ro"
+            -v "$quant_source:/root/.cache/huggingface/hub/$MODEL_CACHE_NAME/snapshots/$MODEL_REVISION/hf_quant_config.json:ro")
     fi
+    args+=(-v "$cache_mount:/root/.cache/huggingface:$cache_access" -v "$HOME/.cache/vllm:/root/.cache/vllm"
+        "$IMAGE_TAG" "$MODEL_ID" --revision "$MODEL_REVISION" --served-model-name qwen3.8-flash-next
+        --tensor-parallel-size 2 --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --max-num-seqs 16
+        --max-num-batched-tokens 8192 --max-model-len 262144 --kv-cache-dtype fp8 --load-format safetensors
+        --safetensors-load-strategy lazy --enable-chunked-prefill --reasoning-parser qwen3 --enable-auto-tool-choice
+        --tool-call-parser qwen3_coder --distributed-executor-backend mp --mm-encoder-tp-mode data
+        --nnodes 2 --master-addr "$HEAD_IP" --master-port "$MASTER_PORT" --enable-expert-parallel
+        --all2all-backend allgather_reducescatter)
+    [[ "$ORACLE_K0" == true ]] || args+=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$MTP_DEPTH}")
+    args+=(--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'
+        --hf-overrides '{"text_config":{"ple_embedding_dtype":"float8_e4m3fn"}}')
+    [[ "$PRODUCTION" == true ]] || args+=(--enforce-eager)
+    args+=(--node-rank "$node_rank" "${mode_args[@]}")
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'docker_args=('
+        printf '  %q\n' "${args[@]}"
+        printf '%s\n' ')' 'if [[ "${1:-}" == "--print-argv" ]]; then' \
+            '  exec python3 -c '\''import json,sys; print(json.dumps(sys.argv[1:],separators=(",",":")))'\'' "${docker_args[@]}"' \
+            'fi' 'exec docker "${docker_args[@]}"'
+    } > "$destination"
+    python3 - "$destination.expected-argv.json" "${args[@]}" <<'PY'
+import json
+import pathlib
+import sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:], separators=(",", ":")) + "\n")
+PY
     chmod +x "$destination"
 }
 
@@ -874,38 +882,23 @@ if [[ "$WORKER_CACHE_KIND" == host_ext4 ]]; then
     [[ "$resolved_worker_shards" == 11 ]] || \
         fail "worker immutable cache view has unresolved checkpoint shards"
 fi
-write_launch_script "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE" \
+write_launch_script_array "$OUTPUT_DIR/launch-worker.sh" 1 "$WORKER_IP" "$WORKER_IFACE" \
     "$WORKER_HCA" "$WORKER_RUNTIME_CACHE_MOUNT" "$REMOTE_OUTPUT/artifacts" "--headless" "ro" "$REMOTE_FP8_ARTIFACT" "$REMOTE_NVFP4_ARTIFACT" "$USE_IMMUTABLE_CACHE_VIEW"
-write_launch_script "$OUTPUT_DIR/launch-head.sh" 0 "$HEAD_IP" "$HEAD_IFACE" \
+write_launch_script_array "$OUTPUT_DIR/launch-head.sh" 0 "$HEAD_IP" "$HEAD_IFACE" \
     "$HEAD_HCA" "$HEAD_RUNTIME_CACHE_MOUNT" "$ARTIFACT_DIR" "--host 0.0.0.0 --port $API_PORT" "ro" "$FP8_ARTIFACT_DIR" "$NVFP4_ARTIFACT_DIR" "$USE_IMMUTABLE_CACHE_VIEW"
-if [[ "$PRODUCTION" == true ]]; then
-    for launch_script in "$OUTPUT_DIR/launch-head.sh" "$OUTPUT_DIR/launch-worker.sh"; do
-        sed -i \
-            -e '/ROCKET_NVFP4_CALIBRATE=/d' \
-            -e '/ROCKET_NVFP4_SAMPLE_ELEMENTS=/d' \
-            -e '/ROCKET_NVFP4_MAX_EMISSIONS=/d' \
-            -e '/ROCKET_QWEN38_LOAD_TRACE=/d' \
-            -e 's/--enforce-eager //' \
-            "$launch_script"
-        if [[ "$NVFP4_HAS_BASE_ROUTERS" == true ]]; then
-            sed -i 's/model_telemetry.py:/model_router.py:/' "$launch_script"
-        else
-            sed -i '/model_telemetry.py:.*\/model.py:ro/d' "$launch_script"
-        fi
-    done
-fi
-if [[ "${ORACLE_K0:-false}" == true ]]; then
-    for launch_script in "$OUTPUT_DIR/launch-head.sh" "$OUTPUT_DIR/launch-worker.sh"; do
-        sed -i \
-            -e '/ROCKET_NVFP4_CALIBRATE=/d' \
-            -e '/ROCKET_NVFP4_SAMPLE_ELEMENTS=/d' \
-            -e '/ROCKET_NVFP4_MAX_EMISSIONS=/d' \
-            -e '/ROCKET_QWEN38_LOAD_TRACE=/d' \
-            -e 's/model_telemetry.py:/model_oracle.py:/' \
-            "$launch_script"
-    done
-fi
-run_checked "worker_launcher_transfer" scp -q "$OUTPUT_DIR/launch-worker.sh" "$SSH_TARGET:$REMOTE_OUTPUT/launch-worker.sh"
+for launch_script in "$OUTPUT_DIR/launch-head.sh" "$OUTPUT_DIR/launch-worker.sh"; do
+    run_checked "launch_argv_identity" bash "$launch_script" --print-argv > "$launch_script.actual-argv.json"
+    cmp "$launch_script.expected-argv.json" "$launch_script.actual-argv.json" || \
+        fail "generated launch argv differs from expected vector: $launch_script"
+done
+run_checked "worker_launcher_transfer" scp -q "$OUTPUT_DIR/launch-worker.sh" \
+    "$SSH_TARGET:$REMOTE_OUTPUT/launch-worker.sh"
+run_checked "worker_launch_argv_identity" ssh -o BatchMode=yes "$SSH_TARGET" \
+    "bash '$REMOTE_OUTPUT/launch-worker.sh' --print-argv" \
+    > "$OUTPUT_DIR/launch-worker.sh.remote-actual-argv.json"
+cmp "$OUTPUT_DIR/launch-worker.sh.expected-argv.json" \
+    "$OUTPUT_DIR/launch-worker.sh.remote-actual-argv.json" || \
+    fail "remote launch argv differs from expected worker vector"
 
 if [[ "$LAUNCH" != true ]]; then
     printf 'Two-node preflight complete. Re-run with a new empty --output-dir and --launch to execute.\n'
