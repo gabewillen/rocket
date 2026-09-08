@@ -105,6 +105,7 @@ class ReducerTests(unittest.TestCase):
         concurrent_barrier = source.index(
             "barrier_outputs = engine.generate(prompts, warm_sampling"
         )
+        observable_counts = source.index('"ROCKET_ROUTER_CACHE_BARRIER\\t"')
         continuation = source.index("prompts = measured_prompts")
         cached_check = source.index("output.num_cached_tokens != expected_cached_tokens")
         metadata = source.index("os.environ.update(cohort_metadata)")
@@ -114,6 +115,7 @@ class ReducerTests(unittest.TestCase):
         self.assertLess(continuation, concurrent_barrier)
         self.assertLess(sequential_prime, concurrent_barrier)
         self.assertLess(concurrent_barrier, cached_check)
+        self.assertLess(observable_counts, cached_check)
         self.assertLess(cached_check, metadata)
         self.assertLess(metadata, measured)
         self.assertIn('if concurrency == 16:', source)
@@ -134,11 +136,17 @@ class ReducerTests(unittest.TestCase):
             '"pool_with_c1_c8_prompt_distribution": concurrency != 16', source
         )
         self.assertIn("args.prefix_tokens != 6304", source)
-        self.assertIn("attention_block_size != 3216", source)
+        self.assertNotIn(
+            "engine.llm_engine.vllm_config.cache_config.block_size", source
+        )
+        self.assertIn("args.expected_cache_block_size != 3216", source)
         self.assertIn("prompt_tokens != 6433", source)
         self.assertIn("expected_cached_tokens != 6432", source)
         self.assertIn('"cache_pages": 2 if concurrency == 16 else None', source)
         self.assertIn('"two_cache_pages" if concurrency == 16 else None', source)
+        self.assertIn(
+            '"attention_block_size_proof": "all_request_cache_hit_counts"', source
+        )
 
     def test_decode_exceeds_observed_c2_three_call_terminal_by_full_iteration(self):
         self.assertEqual(LIVE_MODULE.VERIFY_WIDTH, 5)

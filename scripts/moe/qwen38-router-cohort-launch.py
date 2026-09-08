@@ -115,6 +115,20 @@ def validate_node_plan(node: str, plan: dict, manifest: dict) -> None:
 
 
 def build_plan(manifest: dict, home: Path, calibration: Path, port: int, suffix: str) -> dict:
+    workload = manifest["workload"]
+    expected_workload = {
+        "concurrency": 16,
+        "decode": 24,
+        "prefix_tokens": 6304,
+        "divergence_tokens": 128,
+        "expected_cache_block_size": 3216,
+        "expected_prompt_tokens": 6433,
+        "expected_cached_tokens": 6432,
+        "cache_geometry": "two_cache_pages",
+        "pool_with_c1_c8_prompt_distribution": False,
+    }
+    if workload != expected_workload:
+        raise ValueError("manifest workload differs from the c16 geometry contract")
     common_env = {
         "HF_HUB_OFFLINE": "1",
         "HF_HOME": "/root/.cache/huggingface",
@@ -157,9 +171,13 @@ def build_plan(manifest: dict, home: Path, calibration: Path, port: int, suffix:
                 manifest["image"], "-m", "torch.distributed.run", "--nnodes=2",
                 "--nproc-per-node=1", f"--node-rank={rank}",
                 "--master-addr=192.168.100.10", f"--master-port={port}",
-                "/work/qwen38-router-cohort-live.py", "--concurrency", "16",
-                "--decode", "24", "--prefix-tokens", "6304",
-                "--divergence-tokens", "128",
+                "/work/qwen38-router-cohort-live.py", "--concurrency",
+                str(workload["concurrency"]),
+                "--decode", str(workload["decode"]),
+                "--prefix-tokens", str(workload["prefix_tokens"]),
+                "--divergence-tokens", str(workload["divergence_tokens"]),
+                "--expected-cache-block-size",
+                str(workload["expected_cache_block_size"]),
             )
         )
         nodes[node] = {"name": name, "rank": rank, "env": env, "binds": binds, "docker_argv": argv}
@@ -167,6 +185,7 @@ def build_plan(manifest: dict, home: Path, calibration: Path, port: int, suffix:
         "schema": "rocket.qwen38.router-cohort-launch-dry-run.v1",
         "port": port,
         "suffix": suffix,
+        "workload": workload,
         "image": manifest["image"],
         "driver_sha256": manifest["driver"]["sha256"],
         "model_telemetry_sha256": manifest["model_telemetry"]["sha256"],
@@ -245,8 +264,8 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--calibration-root", type=Path, default=Path.home() / "calibration")
     parser.add_argument("--remote", default="192.168.100.11")
-    parser.add_argument("--port", type=int, default=50183)
-    parser.add_argument("--suffix", default="geometry-r5")
+    parser.add_argument("--port", type=int, default=50185)
+    parser.add_argument("--suffix", default="geometry-r6")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))

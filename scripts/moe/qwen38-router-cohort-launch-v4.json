@@ -3,9 +3,20 @@
   "image": "sha256:d464f3b466fa9c45ddbff8a812e80564503b6879a9fd95c1a47514f3f0df5a4a",
   "entrypoint": "python3",
   "run_label": "geometry-v1",
+  "workload": {
+    "concurrency": 16,
+    "decode": 24,
+    "prefix_tokens": 6304,
+    "divergence_tokens": 128,
+    "expected_cache_block_size": 3216,
+    "expected_prompt_tokens": 6433,
+    "expected_cached_tokens": 6432,
+    "cache_geometry": "two_cache_pages",
+    "pool_with_c1_c8_prompt_distribution": false
+  },
   "driver": {
     "path": "qwen38-router-cohort-v4-c16-20260908-01/qwen38-router-cohort-live-geometry-v1.py",
-    "sha256": "66299a1a3d0c6bbce31a75acd1efc538ba7996d36318f77a7dd7df22058ee497"
+    "sha256": "2b9dea304a3977692b2ac0d9174002f00fe9844df4bb475a3998d7d9d82f9e1c"
   },
   "model_telemetry": {
     "path": "qwen38-router-cohort-v4-c16-20260908-01/artifacts/model_telemetry-geometry-v1.py",

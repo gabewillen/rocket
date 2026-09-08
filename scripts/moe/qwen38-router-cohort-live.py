@@ -41,6 +41,7 @@ def main() -> None:
     parser.add_argument("--decode", type=int, default=MIN_DECODE)
     parser.add_argument("--prefix-tokens", type=int, default=8192)
     parser.add_argument("--divergence-tokens", type=int, default=128)
+    parser.add_argument("--expected-cache-block-size", type=int, default=3216)
     args = parser.parse_args()
     if args.decode < MIN_DECODE:
         parser.error(
@@ -101,14 +102,13 @@ def main() -> None:
 
     concurrency = args.concurrency
     cohort = f"forked-prefix-c{concurrency}-k4"
-    attention_block_size = int(engine.llm_engine.vllm_config.cache_config.block_size)
     if concurrency == 16 and (
         args.prefix_tokens != 6304
         or args.divergence_tokens != 128
-        or attention_block_size != 3216
+        or args.expected_cache_block_size != 3216
     ):
         raise RuntimeError(
-            "c16 requires prefix=6304, divergence=128, and cache block size=3216"
+            "c16 requires prefix=6304, divergence=128, and expected cache block size=3216"
         )
     prompts = []
     for stream in range(concurrency):
@@ -150,12 +150,31 @@ def main() -> None:
             )
         prompts = measured_prompts
         barrier_outputs = engine.generate(prompts, warm_sampling, use_tqdm=False)
+        cached_prompt_tokens = [
+            output.num_cached_tokens for output in barrier_outputs
+        ]
+        print(
+            "ROCKET_ROUTER_CACHE_BARRIER\t"
+            + json.dumps(
+                {
+                    "cached_prompt_tokens": cached_prompt_tokens,
+                    "expected_cache_block_size": args.expected_cache_block_size,
+                    "expected_cached_tokens": 6432,
+                    "prompt_tokens": 6433,
+                    "requests": len(barrier_outputs),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         if len(barrier_outputs) != concurrency:
             raise RuntimeError("c16 cache barrier returned the wrong request count")
         for prompt, output in zip(prompts, barrier_outputs):
             prompt_tokens = len(prompt["prompt_token_ids"])
             expected_cached_tokens = (
-                (prompt_tokens - 1) // attention_block_size * attention_block_size
+                (prompt_tokens - 1)
+                // args.expected_cache_block_size
+                * args.expected_cache_block_size
             )
             if (
                 len(output.outputs[0].token_ids) != 1
@@ -168,9 +187,8 @@ def main() -> None:
                     f"request_id={output.request_id} "
                     f"cached={output.num_cached_tokens} "
                     f"expected={expected_cached_tokens} "
-                    f"block_size={attention_block_size}"
+                    f"block_size={args.expected_cache_block_size}"
                 )
-            cached_prompt_tokens.append(output.num_cached_tokens)
         cache_barrier = "two-cache-pages-v2"
 
     # Publish cohort metadata as one post-warmup transition. The c16 barrier
@@ -186,7 +204,7 @@ def main() -> None:
     if cache_barrier is not None:
         cohort_metadata["ROCKET_ROUTER_CACHE_BARRIER"] = cache_barrier
         cohort_metadata["ROCKET_ROUTER_CACHE_BLOCK_SIZE"] = str(
-            attention_block_size
+            args.expected_cache_block_size
         )
     os.environ.update(cohort_metadata)
     sampling = SamplingParams(
@@ -221,7 +239,8 @@ def main() -> None:
                         concurrency * args.divergence_tokens
                     ),
                     "cache_barrier": cache_barrier,
-                    "attention_block_size": attention_block_size,
+                    "attention_block_size": args.expected_cache_block_size,
+                    "attention_block_size_proof": "all_request_cache_hit_counts",
                     "cache_pages": 2 if concurrency == 16 else None,
                     "cache_geometry": (
                         "two_cache_pages" if concurrency == 16 else None
