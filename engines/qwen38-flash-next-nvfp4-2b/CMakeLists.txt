@@ -165,6 +165,23 @@ target_compile_options(qwen38_target_layer3_generation PRIVATE
 set_target_properties(qwen38_target_layer3_generation PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
 
+add_library(qwen38_target_layer3_oracle_comparator STATIC
+  src/decode/target_layer3_oracle_comparator.cc)
+target_include_directories(qwen38_target_layer3_oracle_comparator PUBLIC src)
+target_link_libraries(qwen38_target_layer3_oracle_comparator PUBLIC
+  qwen38_decode_execution CUDA::cudart rocket_qwen38_openssl3_crypto)
+target_compile_options(qwen38_target_layer3_oracle_comparator PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_target_layer3_oracle_comparator PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+
+add_executable(qwen38-target-layer3-oracle-auth
+  tests/target_layer3_oracle_auth.cc)
+target_link_libraries(qwen38-target-layer3-oracle-auth PRIVATE
+  qwen38_target_layer3_oracle_comparator)
+target_compile_options(qwen38-target-layer3-oracle-auth PRIVATE
+  -Wall -Wextra -Werror)
+
 add_library(qwen38_target_moe_n640_materializer SHARED
   src/moe/target_moe_n640_materializer.cu)
 target_include_directories(qwen38_target_moe_n640_materializer PUBLIC src)
@@ -630,6 +647,16 @@ add_executable(qwen38-token-output-bench bench/token_output_bench.cu)
 target_link_libraries(qwen38-token-output-bench PRIVATE qwen38_token_output)
 
 enable_testing()
+add_test(NAME qwen38-target-layer3-oracle-cpu-contract
+  COMMAND qwen38-target-layer3-oracle-auth)
+set(ROCKET_QWEN38_LAYER3_ORACLE_CAPTURE
+  "/home/glwillen/calibration/qwen38-k0-oracle-a1794d5-01/capture"
+  CACHE PATH "Authenticated layer-3 K0 oracle capture")
+if(EXISTS "${ROCKET_QWEN38_LAYER3_ORACLE_CAPTURE}/manifest.json")
+  add_test(NAME qwen38-target-layer3-oracle-authenticated-contract
+    COMMAND qwen38-target-layer3-oracle-auth
+      "${ROCKET_QWEN38_LAYER3_ORACLE_CAPTURE}")
+endif()
 add_test(NAME qwen38-qsa-expand-smoke COMMAND qwen38-qsa-expand-smoke)
 add_test(NAME qwen38-layer3-rope-owner-cpu-contract
   COMMAND qwen38-test-layer3-rope-owner)
