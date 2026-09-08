@@ -907,11 +907,11 @@ void CutlassGdnPrefillProjection::launch_input_quantize(
   cuda_check(cudaPeekAtLastError(), "launch prefill input quantization");
 }
 
-void CutlassGdnPrefillProjection::launch_qkvz(int tokens,
-                                              cudaStream_t stream) {
+void CutlassGdnPrefillProjection::launch_qkvz_raw(int tokens,
+                                                  cudaStream_t stream) {
   auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
   if (!bucket || !stream)
-    throw std::invalid_argument("prefill QKVZ projection contract changed");
+    throw std::invalid_argument("prefill raw QKVZ projection contract changed");
   if (impl_->input_backend == GdnPrefillInputBackend::kB12x) {
     impl_->b12x->launch({bucket->input_packed, bucket->input_sfa,
                          impl_->qkvz_weight, impl_->qkvz_scale, bucket->qkvz,
@@ -922,17 +922,31 @@ void CutlassGdnPrefillProjection::launch_qkvz(int tokens,
   } else {
     bucket->qkvz_gemm.run(stream);
   }
+  cuda_check(cudaPeekAtLastError(), "launch raw prefill QKVZ projection");
+}
+
+void CutlassGdnPrefillProjection::launch_qkvz_scale(int tokens,
+                                                    cudaStream_t stream) {
+  auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  if (!bucket || !stream)
+    throw std::invalid_argument("prefill QKVZ scale contract changed");
   scale_projection<<<dim3((kQkvzN + 255) / 256, tokens), 256, 0, stream>>>(
       bucket->qkvz, kQkvzN, kQkvN, impl_->globals.qkv.global_scale,
       impl_->globals.z.global_scale);
-  cuda_check(cudaPeekAtLastError(), "launch prefill QKVZ projection");
+  cuda_check(cudaPeekAtLastError(), "launch prefill QKVZ scale");
 }
 
-void CutlassGdnPrefillProjection::launch_ba(int tokens,
-                                            cudaStream_t stream) {
+void CutlassGdnPrefillProjection::launch_qkvz(int tokens,
+                                              cudaStream_t stream) {
+  launch_qkvz_raw(tokens, stream);
+  launch_qkvz_scale(tokens, stream);
+}
+
+void CutlassGdnPrefillProjection::launch_ba_raw(int tokens,
+                                                cudaStream_t stream) {
   auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
   if (!bucket || !stream)
-    throw std::invalid_argument("prefill BA projection contract changed");
+    throw std::invalid_argument("prefill raw BA projection contract changed");
   if (impl_->input_backend == GdnPrefillInputBackend::kB12x) {
     impl_->b12x->launch({bucket->input_packed, bucket->input_sfa,
                          impl_->ba_weight, impl_->ba_scale, bucket->ba,
@@ -943,10 +957,24 @@ void CutlassGdnPrefillProjection::launch_ba(int tokens,
   } else {
     bucket->ba_gemm.run(stream);
   }
+  cuda_check(cudaPeekAtLastError(), "launch raw prefill BA projection");
+}
+
+void CutlassGdnPrefillProjection::launch_ba_scale(int tokens,
+                                                  cudaStream_t stream) {
+  auto* bucket = impl_ ? impl_->bucket(tokens) : nullptr;
+  if (!bucket || !stream)
+    throw std::invalid_argument("prefill BA scale contract changed");
   scale_projection<<<dim3((kBaN + 255) / 256, tokens), 256, 0, stream>>>(
       bucket->ba, kBaN, kBN, impl_->globals.b.global_scale,
       impl_->globals.a.global_scale);
-  cuda_check(cudaPeekAtLastError(), "launch prefill BA projection");
+  cuda_check(cudaPeekAtLastError(), "launch prefill BA scale");
+}
+
+void CutlassGdnPrefillProjection::launch_ba(int tokens,
+                                            cudaStream_t stream) {
+  launch_ba_raw(tokens, stream);
+  launch_ba_scale(tokens, stream);
 }
 
 void CutlassGdnPrefillProjection::launch_reference_input(

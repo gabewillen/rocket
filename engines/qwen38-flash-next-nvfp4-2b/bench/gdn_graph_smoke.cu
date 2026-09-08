@@ -756,7 +756,7 @@ void run_wheel_qkvz_cross(std::string_view wheel_shared_object,
 }
 
 template <typename Launch>
-std::pair<float, float> capture_measure(cudaStream_t stream, Launch launch) {
+RawMeasurement capture_measure(cudaStream_t stream, Launch launch) {
   cudaGraph_t graph = nullptr;
   cudaGraphExec_t executable = nullptr;
   check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
@@ -771,7 +771,7 @@ std::pair<float, float> capture_measure(cudaStream_t stream, Launch launch) {
   cudaEvent_t begin = nullptr, end = nullptr;
   check(cudaEventCreate(&begin), "create prefill begin event");
   check(cudaEventCreate(&end), "create prefill end event");
-  std::vector<float> samples;
+  RawMeasurement result;
   for (int iteration = 0; iteration < 50; ++iteration) {
     check(cudaEventRecord(begin, stream), "record prefill begin");
     check(cudaGraphLaunch(executable, stream), "replay prefill projection");
@@ -780,14 +780,52 @@ std::pair<float, float> capture_measure(cudaStream_t stream, Launch launch) {
     float milliseconds = 0.0F;
     check(cudaEventElapsedTime(&milliseconds, begin, end),
           "time prefill projection");
-    samples.push_back(milliseconds * 1000.0F);
+    result.samples.push_back(milliseconds * 1000.0F);
   }
-  std::sort(samples.begin(), samples.end());
+  auto ordered = result.samples;
+  std::sort(ordered.begin(), ordered.end());
+  result.p50 = ordered[24];
+  result.p95 = ordered[47];
   cudaEventDestroy(end);
   cudaEventDestroy(begin);
   cudaGraphExecDestroy(executable);
   cudaGraphDestroy(graph);
-  return {samples[24], samples[47]};
+  return result;
+}
+
+// A scale-only replay would repeatedly rescale the same output. Prepare an
+// unscaled GEMM result outside each event interval so the measured kernel sees
+// the production input bytes on every sample.
+template <typename Prepare, typename Launch>
+RawMeasurement capture_measure_prepared(cudaStream_t stream, Prepare prepare,
+                                        Launch launch) {
+  for (int iteration = 0; iteration < 10; ++iteration) {
+    prepare();
+    launch();
+  }
+  check(cudaStreamSynchronize(stream), "synchronize prepared phase warmup");
+  cudaEvent_t begin = nullptr, end = nullptr;
+  check(cudaEventCreate(&begin), "create prepared phase begin event");
+  check(cudaEventCreate(&end), "create prepared phase end event");
+  RawMeasurement result;
+  for (int iteration = 0; iteration < 50; ++iteration) {
+    prepare();
+    check(cudaEventRecord(begin, stream), "record prepared phase begin");
+    launch();
+    check(cudaEventRecord(end, stream), "record prepared phase end");
+    check(cudaEventSynchronize(end), "synchronize prepared phase end");
+    float milliseconds = 0.0F;
+    check(cudaEventElapsedTime(&milliseconds, begin, end),
+          "time prepared phase");
+    result.samples.push_back(milliseconds * 1000.0F);
+  }
+  auto ordered = result.samples;
+  std::sort(ordered.begin(), ordered.end());
+  result.p50 = ordered[24];
+  result.p95 = ordered[47];
+  cudaEventDestroy(end);
+  cudaEventDestroy(begin);
+  return result;
 }
 
 void run_prefill_projection(int device,
@@ -832,9 +870,21 @@ void run_prefill_projection(int device,
       projection.launch_input_quantize(
           static_cast<__nv_bfloat16*>(hidden.pointer), tokens, stream);
     });
+    const auto qkvz_raw = capture_measure(stream, [&] {
+      projection.launch_qkvz_raw(tokens, stream);
+    });
+    const auto qkvz_scale = capture_measure_prepared(
+        stream, [&] { projection.launch_qkvz_raw(tokens, stream); },
+        [&] { projection.launch_qkvz_scale(tokens, stream); });
     const auto qkvz = capture_measure(stream, [&] {
       projection.launch_qkvz(tokens, stream);
     });
+    const auto ba_raw = capture_measure(stream, [&] {
+      projection.launch_ba_raw(tokens, stream);
+    });
+    const auto ba_scale = capture_measure_prepared(
+        stream, [&] { projection.launch_ba_raw(tokens, stream); },
+        [&] { projection.launch_ba_scale(tokens, stream); });
     const auto ba = capture_measure(stream, [&] {
       projection.launch_ba(tokens, stream);
     });
@@ -889,24 +939,68 @@ void run_prefill_projection(int device,
                             ? "flashinfer_wheel_0.6.17_sm120f_fallback"
                             : "flashinfer_cutlass_91bda04")
               << " prefill_tokens=" << tokens
-              << " shared_input_quantizations=1 input_p50_us=" << input.first
-              << " input_p95_us=" << input.second
-              << " quantize_once_p50_us=" << quantize.first
-              << " quantize_once_p95_us=" << quantize.second
-              << " qkvz_p50_us=" << qkvz.first
-              << " qkvz_p95_us=" << qkvz.second
-              << " ba_p50_us=" << ba.first
-              << " ba_p95_us=" << ba.second
-              << " two_quant_reference_p50_us=" << reference.first
-              << " two_quant_reference_p95_us=" << reference.second
-              << " output_p50_us=" << output.first
-              << " output_p95_us=" << output.second
+              << " shared_input_quantizations=1 input_p50_us=" << input.p50
+              << " input_p95_us=" << input.p95
+              << " quantize_once_p50_us=" << quantize.p50
+              << " quantize_once_p95_us=" << quantize.p95
+              << " qkvz_raw_p50_us=" << qkvz_raw.p50
+              << " qkvz_raw_p95_us=" << qkvz_raw.p95
+              << " qkvz_scale_p50_us=" << qkvz_scale.p50
+              << " qkvz_scale_p95_us=" << qkvz_scale.p95
+              << " qkvz_p50_us=" << qkvz.p50
+              << " qkvz_p95_us=" << qkvz.p95
+              << " ba_raw_p50_us=" << ba_raw.p50
+              << " ba_raw_p95_us=" << ba_raw.p95
+              << " ba_scale_p50_us=" << ba_scale.p50
+              << " ba_scale_p95_us=" << ba_scale.p95
+              << " ba_p50_us=" << ba.p50
+              << " ba_p95_us=" << ba.p95
+              << " two_quant_reference_p50_us=" << reference.p50
+              << " two_quant_reference_p95_us=" << reference.p95
+              << " output_p50_us=" << output.p50
+              << " output_p95_us=" << output.p95
               << " qkvz_hash=" << input_hash << " output_hash=" << output_hash
               << " packed_parity=" << (packed_parity ? "pass" : "fail")
               << " sfa_parity=" << (sfa_parity ? "pass" : "fail")
               << " qkvz_parity=" << (qkvz_parity ? "pass" : "fail")
               << " ba_parity=" << (ba_parity ? "pass" : "fail")
               << " graph_capture=pass\n";
+    std::cout << "{\"prefill_component_trace\":1,\"tokens\":" << tokens
+              << ",\"physical_mnk\":{\"qkvz\":[" << tokens
+              << ",8192,2560],\"ba\":[" << tokens
+              << ",48,2560]},\"ba_logical_n\":48,\"ba_physical_n\":48,"
+              << "\"ba_slice\":false,\"alpha_semantics\":"
+              << "\"single_scalar_pointer_cannot_represent_split_scales\","
+              << "\"scales\":{\"qkv\":" << weights.qkv.global_scale
+              << ",\"z\":" << weights.z.global_scale << ",\"b\":"
+              << weights.b.global_scale << ",\"a\":"
+              << weights.a.global_scale
+              << "},\"runner_alpha\":1.0,\"runner\":{\"wheel_sha256\":\""
+              << rocket::qwen38::linear_attention::kGdnFlashInferWheelSha256
+              << "\",\"tactic\":-1,\"scheduler\":\"dp\","
+              << "\"swap_ab\":false,\"cta\":[128,128,256],"
+              << "\"cluster\":[1,1,1]},\"event_scope\":"
+              << "\"cuda_events_on_projection_stream\",\"graph_scope\":"
+              << "\"raw_and_composed_capture_replay_scale_only_prepared_eager\","
+              << "\"host_wrapper_parameter_overhead\":\"excluded\","
+              << "\"runner_parameter_binding\":\"construction_once_outside_events\","
+              << "\"quantize\":{";
+    print_raw_samples(quantize);
+    std::cout << "},\"qkvz_raw\":{";
+    print_raw_samples(qkvz_raw);
+    std::cout << "},\"qkvz_scale\":{";
+    print_raw_samples(qkvz_scale);
+    std::cout << "},\"qkvz_composed\":{";
+    print_raw_samples(qkvz);
+    std::cout << "},\"ba_raw\":{";
+    print_raw_samples(ba_raw);
+    std::cout << "},\"ba_scale\":{";
+    print_raw_samples(ba_scale);
+    std::cout << "},\"ba_composed\":{";
+    print_raw_samples(ba);
+    std::cout << "},\"full_input\":{";
+    print_raw_samples(input);
+    std::cout << "},\"graph_capture\":\"pass\"}\n";
   }
   cudaStreamDestroy(stream);
 }

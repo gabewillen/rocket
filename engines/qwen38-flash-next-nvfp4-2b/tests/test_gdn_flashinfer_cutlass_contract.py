@@ -193,6 +193,38 @@ class GdnFlashInferCutlassContract(unittest.TestCase):
         self.assertNotIn("const std::string qkvz_geometry", smoke)
         self.assertNotIn("const std::string sfa_geometry", smoke)
 
+    def test_projection_component_trace_separates_raw_gemm_and_family_scale(self) -> None:
+        smoke = (ENGINE / "bench/gdn_graph_smoke.cu").read_text()
+        header = (ENGINE / "src/linear_attention/gdn_cutlass.h").read_text()
+        source = (ENGINE / "src/linear_attention/gdn_cutlass.cu").read_text()
+        flashinfer = (
+            ENGINE
+            / "vendor/flashinfer-91bda04/include/flashinfer/gemm/fp4_gemm_template_sm120.h"
+        ).read_text()
+        for method in (
+            "launch_qkvz_raw", "launch_qkvz_scale",
+            "launch_ba_raw", "launch_ba_scale",
+        ):
+            self.assertIn(method, header)
+            self.assertIn(f"CutlassGdnPrefillProjection::{method}", source)
+        self.assertIn("capture_measure_prepared", smoke)
+        self.assertIn(r'\"prefill_component_trace\":1', smoke)
+        self.assertIn(r'\"ba_logical_n\":48,\"ba_physical_n\":48', smoke)
+        self.assertIn(r'\"ba_slice\":false', smoke)
+        self.assertIn(r'\"host_wrapper_parameter_overhead\":\"excluded\"', smoke)
+        self.assertIn(
+            r'\"runner_parameter_binding\":\"construction_once_outside_events\"',
+            smoke,
+        )
+        self.assertIn(r'\"runner_alpha\":1.0', smoke)
+        self.assertIn(r'\"qkvz_raw\"', smoke)
+        self.assertIn(r'\"qkvz_scale\"', smoke)
+        self.assertIn(r'\"ba_raw\"', smoke)
+        self.assertIn(r'\"ba_scale\"', smoke)
+        self.assertIn("operator_args.epilogue.thread.alpha_ptr", flashinfer)
+        self.assertIn("float const* global_sf", flashinfer)
+        self.assertIn("column < split ? first : second", source)
+
 
 if __name__ == "__main__":
     unittest.main()

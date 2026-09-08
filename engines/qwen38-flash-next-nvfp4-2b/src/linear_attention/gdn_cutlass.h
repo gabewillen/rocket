@@ -132,7 +132,14 @@ class CutlassGdnPrefillProjection final {
                     cudaStream_t stream);
   void launch_input_quantize(const __nv_bfloat16* hidden, int tokens,
                              cudaStream_t stream);
+  // Diagnostic phase boundaries. The raw launch writes unscaled GEMM output;
+  // the scale launch applies the two family-specific weight_scale_2 values.
+  // Production callers use launch_qkvz()/launch_ba(), which compose both.
+  void launch_qkvz_raw(int tokens, cudaStream_t stream);
+  void launch_qkvz_scale(int tokens, cudaStream_t stream);
   void launch_qkvz(int tokens, cudaStream_t stream);
+  void launch_ba_raw(int tokens, cudaStream_t stream);
+  void launch_ba_scale(int tokens, cudaStream_t stream);
   void launch_ba(int tokens, cudaStream_t stream);
   // Matched two-quant control over the same authenticated immutable weights.
   // It exists for parity and phase attribution, not production dispatch.
