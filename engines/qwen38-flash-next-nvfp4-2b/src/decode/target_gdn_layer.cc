@@ -52,7 +52,8 @@ TargetGdnLayer::TargetGdnLayer(
 TargetFullLayerResult TargetGdnLayer::execute(
     std::uint64_t generation, const __nv_bfloat16* replicated_pre_layer,
     __nv_bfloat16* replicated_post_layer, std::string_view trace_id,
-    std::string_view request_id, cudaStream_t stream) {
+    std::string_view request_id, cudaStream_t stream,
+    TargetK0ExecutionProgress* progress) {
   bool moe_needs_failure_fence = false;
   const auto fail = [&](pair_reduce::Outcome outcome) noexcept {
     if (moe_needs_failure_fence) {
@@ -77,8 +78,9 @@ TargetFullLayerResult TargetGdnLayer::execute(
         buffers_.attention_injection, state_.convolution, state_.recurrent,
         state_.state_index, buffers_.reduced_attention,
         buffers_.post_attention_hidden, buffers_.moe_input,
-        buffers_.moe_injection, trace_id, request_id, stream);
+        buffers_.moe_injection, trace_id, request_id, stream, progress);
 
+    target_k0_enter_layer(progress, TargetK0LayerExecutionStage::kMoe);
     moe_generation_.enqueue(generation, stream);
     moe_needs_failure_fence = true;
     moe_.launch(buffers_.moe_input, generation, 1, stream);
@@ -88,8 +90,11 @@ TargetFullLayerResult TargetGdnLayer::execute(
     moe_.publish_after_fence(generation);
     require(moe_.projected_output(), rank_, layer_,
             "target MoE published no rank-local partial");
+    target_k0_enter_layer(progress, TargetK0LayerExecutionStage::kMoeReduction);
     moe_reducer_.reduce(moe_.projected_output(), buffers_.reduced_moe, 1,
                         trace_id, request_id, stream);
+    target_k0_enter_layer(progress,
+                          TargetK0LayerExecutionStage::kFinalHyperconnection);
     hyperconnection_.combine(
         buffers_.post_attention_hidden, buffers_.reduced_moe,
         buffers_.moe_injection, replicated_post_layer, 1, stream);

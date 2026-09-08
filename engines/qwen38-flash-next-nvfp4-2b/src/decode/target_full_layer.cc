@@ -62,7 +62,7 @@ TargetFullLayerResult TargetFullLayer::execute(
     __nv_bfloat16* moe_input, __nv_bfloat16* moe_injection,
     float* reduced_moe, __nv_bfloat16* post_layer,
     std::string_view trace_id, std::string_view request_id,
-    cudaStream_t stream) {
+    cudaStream_t stream, TargetK0ExecutionProgress* progress) {
   const auto lifecycle = Clock::now();
   bool moe_needs_failure_fence = false;
   const auto fail = [&](pair_reduce::Outcome outcome) noexcept {
@@ -90,6 +90,8 @@ TargetFullLayerResult TargetFullLayer::execute(
             rank_, layer_, "all caller-owned c1 buffers and stream are required");
 
     auto start = Clock::now();
+    target_k0_enter_layer(progress,
+                          TargetK0LayerExecutionStage::kAttentionHyperconnection);
     hyperconnection_.mix(materialized_pre_layer, attention_input,
                          attention_injection, 1, stream);
     hyperconnection_.synchronize(stream);
@@ -97,6 +99,7 @@ TargetFullLayerResult TargetFullLayer::execute(
          elapsed_ns(start), kHyperBytes);
 
     start = Clock::now();
+    target_k0_enter_layer(progress, TargetK0LayerExecutionStage::kAttention);
     attention_.launch(attention_input, qsa_state, generation, 1, stream);
     hyperconnection_.synchronize(stream);
     require(attention_.projected_output(), rank_, layer_,
@@ -105,12 +108,16 @@ TargetFullLayerResult TargetFullLayer::execute(
          elapsed_ns(start), kHiddenBytes);
 
     start = Clock::now();
+    target_k0_enter_layer(progress,
+                          TargetK0LayerExecutionStage::kAttentionReduction);
     attention_reducer_.reduce(attention_.projected_output(), reduced_attention,
                               1, trace_id, request_id, stream);
     emit("attention_pair_reduce", pair_reduce::Outcome::kOk, trace_id,
          request_id, elapsed_ns(start), kHiddenBytes);
 
     start = Clock::now();
+    target_k0_enter_layer(progress,
+                          TargetK0LayerExecutionStage::kMlpHyperconnection);
     hyperconnection_.combine_and_mix(
         materialized_pre_layer, reduced_attention, attention_injection,
         post_attention_hidden, moe_input, moe_injection, 1, stream);
@@ -119,6 +126,7 @@ TargetFullLayerResult TargetFullLayer::execute(
          elapsed_ns(start), kHyperBytes);
 
     start = Clock::now();
+    target_k0_enter_layer(progress, TargetK0LayerExecutionStage::kMoe);
     moe_needs_failure_fence = true;
     moe_.launch(moe_input, generation, 1, stream);
     hyperconnection_.synchronize(stream);
@@ -131,12 +139,16 @@ TargetFullLayerResult TargetFullLayer::execute(
          elapsed_ns(start), kHiddenBytes);
 
     start = Clock::now();
+    target_k0_enter_layer(progress,
+                          TargetK0LayerExecutionStage::kMoeReduction);
     moe_reducer_.reduce(moe_.projected_output(), reduced_moe, 1, trace_id,
                         request_id, stream);
     emit("moe_pair_reduce", pair_reduce::Outcome::kOk, trace_id, request_id,
          elapsed_ns(start), kHiddenBytes);
 
     start = Clock::now();
+    target_k0_enter_layer(progress,
+                          TargetK0LayerExecutionStage::kFinalHyperconnection);
     hyperconnection_.combine(post_attention_hidden, reduced_moe,
                              moe_injection, post_layer, 1, stream);
     hyperconnection_.synchronize(stream);

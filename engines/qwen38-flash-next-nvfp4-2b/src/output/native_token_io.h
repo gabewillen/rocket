@@ -82,7 +82,8 @@ class NativeTokenIoOwner final : public decode::TargetK0TokenIoPort {
   // Returned device views remain valid until the next call or destruction.
   decode::TargetK0TokenOutput finish_prefill(
       const __nv_bfloat16* replicated_post_layer,
-      std::uint64_t generation, cudaStream_t stream) override;
+      std::uint64_t generation, cudaStream_t stream,
+      decode::TargetK0ExecutionProgress* progress = nullptr) override;
 
  private:
   struct Impl;

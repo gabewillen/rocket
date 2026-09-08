@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "decode/execution.h"
+#include "decode/target_k0_execution_progress.h"
 
 namespace rocket::qwen38::decode {
 
@@ -94,7 +95,8 @@ class LinearAttentionLayer final {
       const std::int32_t* state_indices, float* reduced_attention,
       __nv_bfloat16* updated_hidden, __nv_bfloat16* next_block_input,
       __nv_bfloat16* next_injection, std::string_view trace_id,
-      std::string_view request_id, cudaStream_t stream);
+      std::string_view request_id, cudaStream_t stream,
+      TargetK0ExecutionProgress* progress = nullptr);
 
  private:
   void emit(std::string_view stage, pair_reduce::Outcome outcome, int m,

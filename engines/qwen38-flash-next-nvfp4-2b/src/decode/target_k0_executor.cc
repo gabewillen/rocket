@@ -45,7 +45,9 @@ TargetK0Executor::TargetK0Executor(
 TargetK0ExecutionResult TargetK0Executor::execute_prefill(
     std::uint64_t first_generation,
     std::span<const std::int32_t> prompt_tokens,
-    std::string_view trace_id, std::string_view request_id) {
+    std::string_view trace_id, std::string_view request_id,
+    TargetK0ExecutionProgress* progress) {
+  target_k0_enter(progress, TargetK0ExecutionStage::kValidation);
   if (phase_ != TargetK0ExecutorPhase::kReady || first_generation == 0 ||
       prompt_tokens.size() != static_cast<std::size_t>(comparator_.rows()) ||
       trace_id.size() > 128 || request_id.size() > 128)
@@ -61,16 +63,28 @@ TargetK0ExecutionResult TargetK0Executor::execute_prefill(
   phase_ = TargetK0ExecutorPhase::kActive;
   std::uint64_t bytes = 0;
   try {
+    target_k0_enter(progress, TargetK0ExecutionStage::kTokenSourceWait);
     token_io_.wait_source(stream_);
-    for (auto* layer : layers_) layer->wait_source(stream_);
+    for (int layer = 0; layer < kDecoderLayers; ++layer) {
+      target_k0_enter(progress, TargetK0ExecutionStage::kLayerSourceWait, -1,
+                      layer);
+      layers_[layer]->wait_source(stream_);
+    }
+    target_k0_enter(progress, TargetK0ExecutionStage::kBeginSequence);
     reductions_.begin_sequence(first_generation,
                                static_cast<int>(prompt_tokens.size()));
     for (std::size_t row = 0; row < prompt_tokens.size(); ++row) {
       const auto generation =
           first_generation + static_cast<std::uint64_t>(row);
+      target_k0_enter(progress, TargetK0ExecutionStage::kBeginRow,
+                      static_cast<int>(row));
       reductions_.begin_row(static_cast<int>(row), generation);
+      target_k0_enter(progress, TargetK0ExecutionStage::kEmbeddingReduction,
+                      static_cast<int>(row));
       token_io_.embed_row(prompt_tokens[row], generation, arena_.hidden_a,
                           stream_);
+      target_k0_enter(progress, TargetK0ExecutionStage::kEmbeddingComparison,
+                      static_cast<int>(row));
       comparator_.compare(TargetK0Boundary::kEmbedding,
                           static_cast<int>(row), -1, arena_.hidden_a,
                           kTargetK0Hidden, stream_);
@@ -79,7 +93,12 @@ TargetK0ExecutionResult TargetK0Executor::execute_prefill(
       const __nv_bfloat16* input = arena_.hidden_a;
       __nv_bfloat16* output = arena_.hidden_b;
       for (int layer = 0; layer < kDecoderLayers; ++layer) {
-        layers_[layer]->execute_row(generation, input, output, stream_);
+        target_k0_enter(progress, TargetK0ExecutionStage::kLayerExecution,
+                        static_cast<int>(row), layer);
+        layers_[layer]->execute_row(generation, input, output, stream_,
+                                    progress);
+        target_k0_enter(progress, TargetK0ExecutionStage::kLayerComparison,
+                        static_cast<int>(row), layer);
         comparator_.compare(TargetK0Boundary::kLayer,
                             static_cast<int>(row), layer, output,
                             kTargetK0HyperHidden, stream_);
@@ -96,22 +115,33 @@ TargetK0ExecutionResult TargetK0Executor::execute_prefill(
 
     const auto final_generation =
         first_generation + prompt_tokens.size() - 1;
+    target_k0_enter(progress, TargetK0ExecutionStage::kFinalNorm,
+                    static_cast<int>(prompt_tokens.size() - 1));
     const auto output =
-        token_io_.finish_prefill(arena_.hidden_a, final_generation, stream_);
+        token_io_.finish_prefill(arena_.hidden_a, final_generation, stream_,
+                                 progress);
     if (!output.final_hidden_bf16 || !output.local_logits ||
         output.global_token < 0 ||
         output.global_token >= 248'320)
       throw std::logic_error("K0 token output changed");
+    target_k0_enter(progress, TargetK0ExecutionStage::kFinalNormComparison,
+                    static_cast<int>(prompt_tokens.size() - 1));
     comparator_.compare(TargetK0Boundary::kFinalNorm,
                         static_cast<int>(prompt_tokens.size() - 1), -1,
                         output.final_hidden_bf16, kTargetK0Hidden, stream_);
+    target_k0_enter(progress, TargetK0ExecutionStage::kLogitsComparison,
+                    static_cast<int>(prompt_tokens.size() - 1));
     comparator_.compare(TargetK0Boundary::kLocalLogits,
                         static_cast<int>(prompt_tokens.size() - 1), -1,
                         output.local_logits, kTargetK0LocalVocab, stream_);
+    target_k0_enter(progress, TargetK0ExecutionStage::kTokenComparison,
+                    static_cast<int>(prompt_tokens.size() - 1));
     comparator_.compare_token(output.global_token);
     bytes += kTargetK0Hidden * sizeof(__nv_bfloat16) +
              kTargetK0LocalVocab * sizeof(float);
     phase_ = TargetK0ExecutorPhase::kCompleted;
+    target_k0_enter(progress, TargetK0ExecutionStage::kComplete,
+                    static_cast<int>(prompt_tokens.size() - 1));
     emit(pair_reduce::Outcome::kOk, trace_id, request_id, bytes);
     return {output.global_token, static_cast<int>(prompt_tokens.size()),
             final_generation};

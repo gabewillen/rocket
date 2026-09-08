@@ -21,6 +21,10 @@ struct Qwen38TargetK0Oracle35Result {
   std::int32_t physical_layer_index;
   std::int32_t gdn_owner_substage;
   std::int32_t moe_aot_cuda_failure;
+  std::int32_t execution_stage;
+  std::int32_t execution_row;
+  std::int32_t execution_layer;
+  std::int32_t execution_layer_stage;
 };
 
 enum Qwen38TargetK0Oracle35Status : int {

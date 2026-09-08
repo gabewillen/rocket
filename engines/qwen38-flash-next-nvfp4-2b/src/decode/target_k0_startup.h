@@ -36,7 +36,8 @@ class TargetK0StartupOwner final {
   TargetK0GeneratedToken execute_prefill(
       std::uint64_t first_generation,
       std::span<const std::int32_t> prompt_tokens,
-      std::string_view trace_id, std::string_view request_id);
+      std::string_view trace_id, std::string_view request_id,
+      TargetK0ExecutionProgress* progress = nullptr);
 
  private:
   TargetK0StartupOwner() = default;

@@ -60,12 +60,29 @@ MOE_AOT_CUDA_FAILURES = {
     4: "no_binary_for_gpu", 5: "out_of_memory", 6: "not_supported",
     7: "other",
 }
+EXECUTION_STAGES = {
+    0: "validation", 1: "token_source_wait", 2: "layer_source_wait",
+    3: "begin_sequence", 4: "begin_row", 5: "embedding_reduction",
+    6: "embedding_comparison", 7: "layer_execution",
+    8: "layer_comparison", 9: "final_norm", 10: "lm_head",
+    11: "winner_exchange", 12: "terminal_fence",
+    13: "final_norm_comparison", 14: "logits_comparison",
+    15: "token_comparison", 16: "complete",
+}
+LAYER_EXECUTION_STAGES = {
+    0: "none", 1: "state_preparation", 2: "attention_hyperconnection",
+    3: "attention", 4: "attention_reduction",
+    5: "mlp_hyperconnection", 6: "moe", 7: "moe_reduction",
+    8: "final_hyperconnection",
+}
 
 
 class NativeRunStatusError(RuntimeError):
     def __init__(self, status: int, physical_substage: int = 0,
                  physical_layer: int = -1, gdn_owner_substage: int = 0,
-                 moe_aot_cuda_failure: int = 0):
+                 moe_aot_cuda_failure: int = 0, execution_stage: int = 0,
+                 execution_row: int = -1, execution_layer: int = -1,
+                 execution_layer_stage: int = 0):
         self.stage = NATIVE_STATUS_STAGES.get(status, "unknown")
         self.physical_substage = PHYSICAL_LAYER_SUBSTAGES.get(
             physical_substage, "unknown")
@@ -77,6 +94,12 @@ class NativeRunStatusError(RuntimeError):
                 "gdn_owner") else "unknown"
         self.moe_aot_cuda_failure = MOE_AOT_CUDA_FAILURES.get(
             moe_aot_cuda_failure, "other")
+        self.execution_stage = EXECUTION_STAGES.get(execution_stage, "unknown")
+        self.execution_row = execution_row if 0 <= execution_row < 35 else -1
+        self.execution_layer = (execution_layer if 0 <= execution_layer < 48
+                                else -1)
+        self.execution_layer_stage = LAYER_EXECUTION_STAGES.get(
+            execution_layer_stage, "unknown")
         super().__init__("native K0 run rejected")
 
 
@@ -106,6 +129,10 @@ class _NativeResult(ctypes.Structure):
         ("physical_layer_index", ctypes.c_int32),
         ("gdn_owner_substage", ctypes.c_int32),
         ("moe_aot_cuda_failure", ctypes.c_int32),
+        ("execution_stage", ctypes.c_int32),
+        ("execution_row", ctypes.c_int32),
+        ("execution_layer", ctypes.c_int32),
+        ("execution_layer_stage", ctypes.c_int32),
     )
 
 
@@ -163,6 +190,13 @@ def _emit_failure(counter: object, rank: int, phase: str,
                 attributes["failure.layer"] = error.physical_layer
             attributes["failure.gdn_owner_substage"] = error.gdn_owner_substage
             attributes["failure.moe_aot_cuda"] = error.moe_aot_cuda_failure
+            attributes["failure.execution_stage"] = error.execution_stage
+            if error.execution_row >= 0:
+                attributes["failure.execution_row"] = error.execution_row
+            if error.execution_layer >= 0:
+                attributes["failure.execution_layer"] = error.execution_layer
+            attributes["failure.execution_layer_stage"] = (
+                error.execution_layer_stage)
         counter.add(1, attributes)
     except BaseException:
         pass
@@ -239,7 +273,9 @@ def _native_run(args: argparse.Namespace, lease: object,
         raise NativeRunStatusError(
             status, result.physical_layer_substage,
             result.physical_layer_index, result.gdn_owner_substage,
-            result.moe_aot_cuda_failure,
+            result.moe_aot_cuda_failure, result.execution_stage,
+            result.execution_row, result.execution_layer,
+            result.execution_layer_stage,
         )
     return result
 
@@ -262,6 +298,14 @@ def _snapshot(result: _NativeResult) -> dict[str, object]:
             result.gdn_owner_substage, "unknown"),
         "moe_aot_cuda_failure": MOE_AOT_CUDA_FAILURES.get(
             result.moe_aot_cuda_failure, "other"),
+        "execution_stage": EXECUTION_STAGES.get(result.execution_stage,
+                                                 "unknown"),
+        "execution_row": (result.execution_row
+                          if 0 <= result.execution_row < 35 else -1),
+        "execution_layer": (result.execution_layer
+                            if 0 <= result.execution_layer < 48 else -1),
+        "execution_layer_stage": LAYER_EXECUTION_STAGES.get(
+            result.execution_layer_stage, "unknown"),
     }
 
 
@@ -318,6 +362,12 @@ def worker(args: argparse.Namespace) -> int:
                 physical["physical_layer_index"] = error.physical_layer
             physical["gdn_owner_substage"] = error.gdn_owner_substage
             physical["moe_aot_cuda_failure"] = error.moe_aot_cuda_failure
+            physical["execution_stage"] = error.execution_stage
+            if error.execution_row >= 0:
+                physical["execution_row"] = error.execution_row
+            if error.execution_layer >= 0:
+                physical["execution_layer"] = error.execution_layer
+            physical["execution_layer_stage"] = error.execution_layer_stage
         print(json.dumps({"schema": SCHEMA, "valid": False, "complete": False,
                           "rank": args.rank, "phase": phase,
                           "failure_class": failure["class"],

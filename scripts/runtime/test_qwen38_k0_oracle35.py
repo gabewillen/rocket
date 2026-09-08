@@ -142,6 +142,24 @@ class Oracle35LauncherTests(unittest.TestCase):
             path.write_bytes(b"x" * 32)
             self.assertEqual(module._secret(path), b"x" * 32)
 
+    def test_execution_progress_mapping_is_closed_and_bounded(self):
+        self.assertEqual(set(module.EXECUTION_STAGES), set(range(17)))
+        self.assertEqual(set(module.LAYER_EXECUTION_STAGES), set(range(9)))
+        error = module.NativeRunStatusError(
+            41, execution_stage=7, execution_row=34, execution_layer=47,
+            execution_layer_stage=7)
+        self.assertEqual(error.execution_stage, "layer_execution")
+        self.assertEqual(error.execution_row, 34)
+        self.assertEqual(error.execution_layer, 47)
+        self.assertEqual(error.execution_layer_stage, "moe_reduction")
+        unknown = module.NativeRunStatusError(
+            41, execution_stage=17, execution_row=35, execution_layer=48,
+            execution_layer_stage=9)
+        self.assertEqual((unknown.execution_stage, unknown.execution_row,
+                          unknown.execution_layer,
+                          unknown.execution_layer_stage),
+                         ("unknown", -1, -1, "unknown"))
+
     def test_nested_slab_cause_is_bounded_and_published(self):
         inner = module.SlabError("private artifact path")
         outer = module.CudaSlabLoadError("outer loader wrapper")
@@ -196,6 +214,8 @@ class Oracle35LauncherTests(unittest.TestCase):
             "physical_layer_substage",
             "gdn_owner_substage",
             "moe_aot_cuda_failure",
+            "execution_stage", "execution_row", "execution_layer",
+            "execution_layer_stage",
         })
 
 

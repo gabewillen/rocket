@@ -41,8 +41,8 @@ struct PhysicalReducer final : decode::HiddenPartialReducer {
 
 struct Layer final : decode::TargetK0LayerPort {
   Layer(int layer, decode::HiddenPartialReducer& attention,
-        decode::HiddenPartialReducer& moe)
-      : layer_(layer), attention_(attention), moe_(moe) {}
+        decode::HiddenPartialReducer& moe, bool fail = false)
+      : layer_(layer), attention_(attention), moe_(moe), fail_(fail) {}
   int rank() const noexcept override { return 0; }
   int layer() const noexcept override { return layer_; }
   decode::TargetK0AttentionKind attention_kind() const noexcept override {
@@ -57,7 +57,11 @@ struct Layer final : decode::TargetK0LayerPort {
       const noexcept override { return &moe_; }
   void wait_source(cudaStream_t) override { ++waits; }
   void execute_row(std::uint64_t, const __nv_bfloat16*, __nv_bfloat16*,
-                   cudaStream_t stream) override {
+                   cudaStream_t stream,
+                   decode::TargetK0ExecutionProgress* progress) override {
+    decode::target_k0_enter_layer(
+        progress, decode::TargetK0LayerExecutionStage::kAttentionReduction);
+    if (fail_) throw std::runtime_error("injected layer failure");
     __nv_bfloat16 partial{};
     float reduced{};
     attention_.reduce(&partial, &reduced, 1, "trace", "request", stream);
@@ -69,6 +73,7 @@ struct Layer final : decode::TargetK0LayerPort {
   decode::HiddenPartialReducer& moe_;
   int waits = 0;
   int rows = 0;
+  bool fail_ = false;
 };
 
 struct TokenIo final : decode::TargetK0TokenIoPort {
@@ -78,7 +83,10 @@ struct TokenIo final : decode::TargetK0TokenIoPort {
   void embed_row(std::int32_t, std::uint64_t, __nv_bfloat16*,
                  cudaStream_t) override { ++embeds; }
   decode::TargetK0TokenOutput finish_prefill(
-      const __nv_bfloat16*, std::uint64_t, cudaStream_t) override {
+      const __nv_bfloat16*, std::uint64_t, cudaStream_t,
+      decode::TargetK0ExecutionProgress* progress) override {
+    decode::target_k0_enter_stage(
+        progress, decode::TargetK0ExecutionStage::kTerminalFence);
     ++finishes;
     return {&final_hidden, logits.data(), 248'046};
   }
@@ -138,8 +146,9 @@ int main() {
         {hidden_a.data(), hidden_b.data()}, stream);
     std::array<std::int32_t, 35> prompt{};
     prompt.fill(13);
-    const auto result =
-        executor.execute_prefill(1, prompt, "trace", "request");
+    decode::TargetK0ExecutionProgress progress;
+    const auto result = executor.execute_prefill(1, prompt, "trace", "request",
+                                                 &progress);
     check(result.token == 248'046 && result.rows == 35 &&
           result.final_generation == 35 &&
           executor.phase() == decode::TargetK0ExecutorPhase::kCompleted &&
@@ -147,8 +156,48 @@ int main() {
           token_io.embeds == 35 && token_io.finishes == 1 &&
           comparator.boundaries == 35 * 49 + 2 && comparator.tokens == 1 &&
           sink.last == pr::Outcome::kOk);
+    check(progress.stage == decode::TargetK0ExecutionStage::kComplete &&
+          progress.row == 34 && progress.layer == -1 &&
+          progress.layer_stage ==
+              decode::TargetK0LayerExecutionStage::kNone);
     for (const auto& layer : owners)
       check(layer->waits == 1 && layer->rows == 35);
+
+    PhysicalReducer failed_reducer;
+    Sink failed_sink;
+    decode::TargetK0PairReduceSchedule failed_schedule(failed_reducer,
+                                                       failed_sink);
+    std::array<std::unique_ptr<Layer>, decode::kDecoderLayers> failed_owners;
+    std::array<decode::TargetK0LayerPort*, decode::kDecoderLayers>
+        failed_layers{};
+    for (int layer = 0; layer < decode::kDecoderLayers; ++layer) {
+      failed_owners[layer] = std::make_unique<Layer>(
+          layer, failed_schedule.attention_port(layer),
+          failed_schedule.moe_port(layer), layer == 7);
+      failed_layers[layer] = failed_owners[layer].get();
+    }
+    TokenIo failed_token_io;
+    Comparator failed_comparator;
+    decode::TargetK0Executor failed_executor(
+        0, failed_layers, failed_token_io, failed_schedule, failed_comparator,
+        failed_sink, {hidden_a.data(), hidden_b.data()}, stream);
+    decode::TargetK0ExecutionProgress failed_progress;
+    bool execution_failed = false;
+    try {
+      (void)failed_executor.execute_prefill(1, prompt, "trace", "request",
+                                            &failed_progress);
+    } catch (const std::runtime_error&) {
+      execution_failed = true;
+    }
+    check(execution_failed &&
+          failed_executor.phase() == decode::TargetK0ExecutorPhase::kFaulted &&
+          failed_progress.stage ==
+              decode::TargetK0ExecutionStage::kLayerExecution &&
+          failed_progress.row == 0 && failed_progress.layer == 7 &&
+          failed_progress.layer_stage ==
+              decode::TargetK0LayerExecutionStage::kAttentionReduction &&
+          failed_sink.spans == 1 &&
+          failed_sink.last == pr::Outcome::kCudaError);
 
     PhysicalReducer rejected_reducer;
     Sink rejected_sink;

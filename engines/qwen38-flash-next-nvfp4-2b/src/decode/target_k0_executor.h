@@ -10,6 +10,7 @@
 #include <string_view>
 
 #include "decode/decoder_verifier.h"
+#include "decode/target_k0_execution_progress.h"
 #include "decode/target_k0_pair_reduce.h"
 
 namespace rocket::qwen38::decode {
@@ -72,7 +73,8 @@ class TargetK0LayerPort {
   virtual void execute_row(std::uint64_t generation,
                            const __nv_bfloat16* replicated_pre_layer,
                            __nv_bfloat16* replicated_post_layer,
-                           cudaStream_t stream) = 0;
+                           cudaStream_t stream,
+                           TargetK0ExecutionProgress* progress = nullptr) = 0;
 };
 
 class TargetK0TokenIoPort {
@@ -91,7 +93,8 @@ class TargetK0TokenIoPort {
   // until the next call or owner destruction.
   virtual TargetK0TokenOutput finish_prefill(
       const __nv_bfloat16* replicated_post_layer,
-      std::uint64_t generation, cudaStream_t stream) = 0;
+      std::uint64_t generation, cudaStream_t stream,
+      TargetK0ExecutionProgress* progress = nullptr) = 0;
 };
 
 class TargetK0OracleComparator {
@@ -134,7 +137,8 @@ class TargetK0Executor final {
   TargetK0ExecutionResult execute_prefill(
       std::uint64_t first_generation,
       std::span<const std::int32_t> prompt_tokens,
-      std::string_view trace_id, std::string_view request_id);
+      std::string_view trace_id, std::string_view request_id,
+      TargetK0ExecutionProgress* progress = nullptr);
 
   [[nodiscard]] TargetK0ExecutorPhase phase() const noexcept { return phase_; }
 

@@ -50,7 +50,8 @@ class TargetQsaK0LayerOwner final : public TargetK0LayerPort {
   void execute_row(std::uint64_t generation,
                    const __nv_bfloat16* replicated_pre_layer,
                    __nv_bfloat16* replicated_post_layer,
-                   cudaStream_t stream) override;
+                   cudaStream_t stream,
+                   TargetK0ExecutionProgress* progress = nullptr) override;
 
  private:
   struct Bundle;

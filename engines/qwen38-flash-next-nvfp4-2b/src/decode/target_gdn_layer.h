@@ -99,7 +99,8 @@ class TargetGdnLayer final {
       std::uint64_t generation,
       const __nv_bfloat16* replicated_pre_layer,
       __nv_bfloat16* replicated_post_layer, std::string_view trace_id,
-      std::string_view request_id, cudaStream_t stream);
+      std::string_view request_id, cudaStream_t stream,
+      TargetK0ExecutionProgress* progress = nullptr);
 
  private:
   void emit(pair_reduce::Outcome outcome, std::string_view trace_id,

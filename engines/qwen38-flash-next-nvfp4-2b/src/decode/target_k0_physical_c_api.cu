@@ -108,11 +108,14 @@ extern "C" int qwen38_target_k0_oracle35_run(
   std::memset(result, 0, sizeof(*result));
   result->token = -1;
   result->physical_layer_index = -1;
+  result->execution_row = -1;
+  result->execution_layer = -1;
   std::shared_ptr<decode::TargetK0BoundedTelemetry> telemetry;
   int failure_status = QWEN38_TARGET_K0_VALIDATION;
   decode::TargetK0PhysicalStartupStage startup_stage =
       decode::TargetK0PhysicalStartupStage::kValidation;
   decode::TargetK0PhysicalLayerConstructionProgress layer_progress;
+  decode::TargetK0ExecutionProgress execution_progress;
   const auto resolved_status = [&]() noexcept {
     return failure_status < 0 ? status_for(startup_stage) : failure_status;
   };
@@ -124,6 +127,12 @@ extern "C" int qwen38_target_k0_oracle35_run(
         static_cast<std::int32_t>(layer_progress.gdn_stage);
     result->moe_aot_cuda_failure =
         static_cast<std::int32_t>(layer_progress.moe_aot_cuda_failure);
+    result->execution_stage =
+        static_cast<std::int32_t>(execution_progress.stage);
+    result->execution_row = execution_progress.row;
+    result->execution_layer = execution_progress.layer;
+    result->execution_layer_stage =
+        static_cast<std::int32_t>(execution_progress.layer_stage);
     if (telemetry) publish(telemetry->snapshot(), *result);
   };
   try {
@@ -179,7 +188,7 @@ extern "C" int qwen38_target_k0_oracle35_run(
         telemetry, &startup_stage, &layer_progress);
     failure_status = QWEN38_TARGET_K0_PROMPT_EXECUTION;
     const auto generated = owner->execute_oracle35(
-        1, "k0-oracle35", "oracle-05ea3af");
+        1, "k0-oracle35", "oracle-05ea3af", &execution_progress);
     result->token = generated.execution.token;
     result->rows = generated.execution.rows;
     result->final_generation = generated.execution.final_generation;

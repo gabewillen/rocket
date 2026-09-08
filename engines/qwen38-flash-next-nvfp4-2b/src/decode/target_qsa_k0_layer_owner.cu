@@ -199,7 +199,10 @@ void TargetQsaK0LayerOwner::wait_source(cudaStream_t stream) {
 
 void TargetQsaK0LayerOwner::execute_row(
     std::uint64_t generation, const __nv_bfloat16* replicated_pre_layer,
-    __nv_bfloat16* replicated_post_layer, cudaStream_t stream) {
+    __nv_bfloat16* replicated_post_layer, cudaStream_t stream,
+    TargetK0ExecutionProgress* progress) {
+  target_k0_enter_layer(progress,
+                        TargetK0LayerExecutionStage::kStatePreparation);
   const auto& state = bundle_->generation->view(row_, generation);
   bundle_->generation->enqueue_prepare(row_, generation, stream);
   bundle_->layer->execute(
@@ -207,7 +210,7 @@ void TargetQsaK0LayerOwner::execute_row(
       bundle_->rows.attention_injection, bundle_->rows.reduced_attention,
       bundle_->rows.post_attention_hidden, bundle_->rows.moe_input,
       bundle_->rows.moe_injection, bundle_->rows.reduced_moe,
-      replicated_post_layer, "k0-target", "prefill", stream);
+      replicated_post_layer, "k0-target", "prefill", stream, progress);
   ++row_;
 }
 

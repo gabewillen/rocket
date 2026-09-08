@@ -112,11 +112,11 @@ TargetK0PhysicalStartupOwner::~TargetK0PhysicalStartupOwner() {
 
 TargetK0GeneratedToken TargetK0PhysicalStartupOwner::execute_oracle35(
     std::uint64_t first_generation, std::string_view trace_id,
-    std::string_view request_id) {
+    std::string_view request_id, TargetK0ExecutionProgress* progress) {
   if (!authenticated_ || !startup_ || prompt_tokens_.size() != 35)
     throw std::logic_error("K0 physical startup was not published");
   return startup_->execute_prefill(first_generation, prompt_tokens_, trace_id,
-                                   request_id);
+                                   request_id, progress);
 }
 
 }  // namespace rocket::qwen38::decode

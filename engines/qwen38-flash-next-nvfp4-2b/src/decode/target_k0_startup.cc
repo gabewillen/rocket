@@ -51,11 +51,12 @@ std::unique_ptr<TargetK0StartupOwner> TargetK0StartupOwner::create(
 TargetK0GeneratedToken TargetK0StartupOwner::execute_prefill(
     std::uint64_t first_generation,
     std::span<const std::int32_t> prompt_tokens,
-    std::string_view trace_id, std::string_view request_id) {
+    std::string_view trace_id, std::string_view request_id,
+    TargetK0ExecutionProgress* progress) {
   if (!executor_)
     throw std::logic_error("K0 startup executor was not published");
   const auto execution = executor_->execute_prefill(
-      first_generation, prompt_tokens, trace_id, request_id);
+      first_generation, prompt_tokens, trace_id, request_id, progress);
   return {execution,
           detokenize_target_k0_token(tokenizer_, execution.token)};
 }

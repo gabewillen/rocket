@@ -301,17 +301,21 @@ void NativeTokenIoOwner::embed_row(std::int32_t token,
 
 decode::TargetK0TokenOutput NativeTokenIoOwner::finish_prefill(
     const __nv_bfloat16* replicated_post_layer, std::uint64_t generation,
-    cudaStream_t stream) {
+    cudaStream_t stream, decode::TargetK0ExecutionProgress* progress) {
   const auto started = Clock::now();
   try {
     if (!replicated_post_layer || !stream || generation == 0 ||
         generation != impl_->last_embedding_generation ||
         generation <= impl_->last_finish_generation)
       throw std::invalid_argument("K0 final token row contract changed");
+    decode::target_k0_enter_stage(
+        progress, decode::TargetK0ExecutionStage::kFinalNorm);
     impl_->final->combine_and_collapse(
         replicated_post_layer, impl_->zero_block_output,
         impl_->zero_injection, impl_->updated_hidden, impl_->final_hidden, 1,
         stream);
+    decode::target_k0_enter_stage(progress,
+                                  decode::TargetK0ExecutionStage::kLmHead);
     check(lm_head(impl_->head, impl_->final_hidden,
                   slab_at<__nv_bfloat16>(impl_->slab->publication(), kLmHead),
                   impl_->local_logits, 1, impl_->rank, stream),
@@ -319,6 +323,8 @@ decode::TargetK0TokenOutput NativeTokenIoOwner::finish_prefill(
     check(local_argmax(impl_->local_logits, impl_->local_winner, 1,
                        impl_->rank, stream),
           "enqueue local argmax");
+    decode::target_k0_enter_stage(
+        progress, decode::TargetK0ExecutionStage::kWinnerExchange);
     impl_->winner_exchange->enqueue(impl_->local_winner, impl_->rank_winners,
                                     1, impl_->rank, stream);
     check(global_greedy(impl_->rank_winners, impl_->global_token, 1, 0.0F,
@@ -327,6 +333,8 @@ decode::TargetK0TokenOutput NativeTokenIoOwner::finish_prefill(
     check(cudaMemcpyAsync(impl_->terminal_token_host, impl_->global_token,
                           sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream),
           "stage terminal token");
+    decode::target_k0_enter_stage(
+        progress, decode::TargetK0ExecutionStage::kTerminalFence);
     check(cudaStreamSynchronize(stream), "terminal token fence");
     impl_->winner_exchange->validate_after_fence();
     const std::int32_t token = *impl_->terminal_token_host;

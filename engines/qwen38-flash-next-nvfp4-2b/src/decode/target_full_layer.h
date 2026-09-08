@@ -2,6 +2,7 @@
 #pragma once
 
 #include "decode/full_attention_layer.h"
+#include "decode/target_k0_execution_progress.h"
 
 namespace rocket::qwen38::decode {
 
@@ -57,7 +58,7 @@ class TargetFullLayer final {
       __nv_bfloat16* moe_input, __nv_bfloat16* moe_injection,
       float* reduced_moe, __nv_bfloat16* post_layer,
       std::string_view trace_id, std::string_view request_id,
-      cudaStream_t stream);
+      cudaStream_t stream, TargetK0ExecutionProgress* progress = nullptr);
 
  private:
   void emit(std::string_view stage, pair_reduce::Outcome outcome,

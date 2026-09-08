@@ -67,7 +67,9 @@ class TargetK0PhysicalStartupOwner final {
   [[nodiscard]] bool authenticated() const noexcept { return authenticated_; }
   TargetK0GeneratedToken execute_oracle35(std::uint64_t first_generation,
                                            std::string_view trace_id,
-                                           std::string_view request_id);
+                                           std::string_view request_id,
+                                           TargetK0ExecutionProgress* progress =
+                                               nullptr);
 
  private:
   TargetK0PhysicalStartupOwner() = default;

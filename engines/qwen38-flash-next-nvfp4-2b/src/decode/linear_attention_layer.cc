@@ -68,7 +68,8 @@ LinearAttentionResult LinearAttentionLayer::execute(
     const std::int32_t* state_indices, float* reduced_attention,
     __nv_bfloat16* updated_hidden, __nv_bfloat16* next_block_input,
     __nv_bfloat16* next_injection, std::string_view trace_id,
-    std::string_view request_id, cudaStream_t stream) {
+    std::string_view request_id, cudaStream_t stream,
+    TargetK0ExecutionProgress* progress) {
   const auto lifecycle_start = Clock::now();
   try {
     require(!faulted_, rank_, layer_, "faulted transition cannot be retried");
@@ -82,6 +83,8 @@ LinearAttentionResult LinearAttentionLayer::execute(
             rank_, layer_, "all borrowed buffers and stream are required");
 
     auto start = Clock::now();
+    target_k0_enter_layer(progress,
+                          TargetK0LayerExecutionStage::kAttentionHyperconnection);
     hyperconnection_.mix(hidden, block_input, injection, m, stream);
     hyperconnection_.synchronize(stream);
     emit(stage_name(layer_, "attn_hc_mix"),
@@ -89,6 +92,7 @@ LinearAttentionResult LinearAttentionLayer::execute(
          elapsed_ns(start), kHyperBytesPerRow * m);
 
     start = Clock::now();
+    target_k0_enter_layer(progress, TargetK0LayerExecutionStage::kAttention);
     graph_.launch(block_input, conv_state, recurrent_state, state_indices, m,
                   stream);
     hyperconnection_.synchronize(stream);
@@ -100,6 +104,8 @@ LinearAttentionResult LinearAttentionLayer::execute(
          elapsed_ns(start), graph_.logical_bytes_per_row(m) * m);
 
     start = Clock::now();
+    target_k0_enter_layer(progress,
+                          TargetK0LayerExecutionStage::kAttentionReduction);
     reducer_.reduce(partial, reduced_attention, m, trace_id, request_id,
                     stream);
     emit(stage_name(layer_, "pair_reduce"),
@@ -107,6 +113,8 @@ LinearAttentionResult LinearAttentionLayer::execute(
          elapsed_ns(start), kHiddenBytesPerRow * m);
 
     start = Clock::now();
+    target_k0_enter_layer(progress,
+                          TargetK0LayerExecutionStage::kMlpHyperconnection);
     hyperconnection_.combine_and_mix(
         hidden, reduced_attention, injection, updated_hidden,
         next_block_input, next_injection, m, stream);

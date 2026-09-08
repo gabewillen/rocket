@@ -459,12 +459,13 @@ void TargetGdnLayerDeviceOwner::wait_source(cudaStream_t stream) {
 
 void TargetGdnLayerDeviceOwner::execute_row(
     std::uint64_t generation, const __nv_bfloat16* replicated_pre_layer,
-    __nv_bfloat16* replicated_post_layer, cudaStream_t stream) {
+    __nv_bfloat16* replicated_post_layer, cudaStream_t stream,
+    TargetK0ExecutionProgress* progress) {
   if (!authenticated_ || !bundle_ || !bundle_->layer)
     fail("execution ownership changed");
   const auto result = bundle_->layer->execute(
       generation, replicated_pre_layer, replicated_post_layer,
-      "k0-gdn-layer", "oracle-05ea3af", stream);
+      "k0-gdn-layer", "oracle-05ea3af", stream, progress);
   if (result.generation != generation || result.rank != rank_ ||
       result.layer != layer_ || result.post_layer != replicated_post_layer)
     throw std::logic_error("target GDN row publication changed");
