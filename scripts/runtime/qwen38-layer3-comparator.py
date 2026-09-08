@@ -14,8 +14,12 @@ ORACLE_SCHEMA = "rocket.qwen38.k0-target-oracle.v1"
 SLICE_SCHEMA = "rocket.qwen38.k0-layer3-slice.v1"
 RESULT_SCHEMA = "rocket.qwen38.k0-layer3-comparison.v1"
 REVISION = "fc694b54fb0174e0913e6adf86691ef85a4ead47"
+ORACLE_MANIFEST_SHA256 = "05ea3af1c4694a9c035ce2fe9ce006acc58881df0fe86771b1846f4bd8e5f48b"
+GREEDY_TOKEN_ID = 248046
+MODEL = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 HIDDEN = 2560
 HC_STREAMS = 4
+VOCAB = 248320
 
 
 def sha256(path: Path) -> str:
@@ -49,11 +53,15 @@ def artifact(manifest: dict, name: str) -> dict:
     return matches[0]
 
 
-def prepare(capture_dir: Path, output: Path) -> None:
+def prepare(
+    capture_dir: Path, output: Path, expected_manifest_sha256: str,
+    expected_greedy_token: int, expected_tokens: int,
+) -> None:
     manifest_path = capture_dir / "manifest.json"
     if not manifest_path.is_file():
         fail("oracle", "51-artifact oracle manifest is absent")
     manifest = json.loads(manifest_path.read_text())
+    manifest_sha256 = sha256(manifest_path)
     names = [
         "embedding",
         *[f"layer.{i:02d}" for i in range(48)],
@@ -67,9 +75,25 @@ def prepare(capture_dir: Path, output: Path) -> None:
         or manifest.get("complete") is not True
         or [item.get("name") for item in manifest.get("artifacts", [])] != names
         or identity.get("model_revision") != REVISION
+        or identity.get("model") != MODEL
+        or identity.get("tensor_parallel_size") != 2
+        or identity.get("node_count") != 2
+        or identity.get("speculation") != "disabled"
+        or manifest_sha256 != expected_manifest_sha256
+        or manifest.get("greedy_token_id") != expected_greedy_token
     ):
         fail("oracle", "51-artifact oracle identity or sequence changed")
     token_ids = manifest.get("input_token_ids")
+    if (
+        not isinstance(token_ids, list)
+        or len(token_ids) != expected_tokens
+        or any(
+            isinstance(token, bool) or not isinstance(token, int)
+            or not 0 <= token < VOCAB
+            for token in token_ids
+        )
+    ):
+        fail("oracle", "oracle input token extent or vocabulary changed")
     expected_files = {"manifest.json"}
     for item in manifest["artifacts"]:
         path = capture_dir / item.get("file", "")
@@ -84,8 +108,24 @@ def prepare(capture_dir: Path, output: Path) -> None:
     actual_files = {path.name for path in capture_dir.iterdir() if path.is_file()}
     if actual_files != expected_files:
         fail("oracle", "51-artifact oracle has missing or extra files")
+    layer_shape = [expected_tokens, HC_STREAMS * HIDDEN]
+    expected_extents = {
+        "embedding": [expected_tokens, HIDDEN],
+        **{f"layer.{layer:02d}": layer_shape for layer in range(48)},
+        "final_norm": [expected_tokens, HIDDEN],
+        "logits": [1, VOCAB],
+    }
+    for item in manifest["artifacts"]:
+        if (
+            item.get("dtype") != "bfloat16"
+            or item.get("shape") != expected_extents[item["name"]]
+            or item.get("strides") != [item["shape"][1], 1]
+            or item.get("numel") != item["shape"][0] * item["shape"][1]
+            or item.get("bytes") != item["numel"] * 2
+        ):
+            fail("oracle", f"oracle artifact extent changed: {item['name']}")
     before, expected = artifact(manifest, "layer.02"), artifact(manifest, "layer.03")
-    shape = [len(token_ids), HC_STREAMS * HIDDEN] if isinstance(token_ids, list) else None
+    shape = layer_shape
     if (
         not token_ids
         or before.get("dtype") != "bfloat16"
@@ -110,7 +150,15 @@ def prepare(capture_dir: Path, output: Path) -> None:
         }
     record = {
         "schema": SLICE_SCHEMA,
-        "oracle_manifest_sha256": sha256(manifest_path),
+        "oracle_manifest_sha256": manifest_sha256,
+        "oracle_artifact_count": 51,
+        "oracle_extents": {
+            "embedding": expected_extents["embedding"],
+            "layers": {"count": 48, "shape": layer_shape},
+            "final_norm": expected_extents["final_norm"],
+            "logits": expected_extents["logits"],
+        },
+        "greedy_token_id": expected_greedy_token,
         "model_revision": REVISION,
         "layer": 3,
         "token_count": len(token_ids),
@@ -192,6 +240,11 @@ def main() -> None:
     p = commands.add_parser("prepare")
     p.add_argument("--capture-dir", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument(
+        "--expected-manifest-sha256", default=ORACLE_MANIFEST_SHA256
+    )
+    p.add_argument("--expected-greedy-token", type=int, default=GREEDY_TOKEN_ID)
+    p.add_argument("--expected-tokens", type=int, default=35)
     c = commands.add_parser("compare")
     c.add_argument("--contract", type=Path, required=True)
     c.add_argument("--observed", type=Path, required=True)
@@ -199,7 +252,10 @@ def main() -> None:
     c.add_argument("--rtol", type=float, default=0.08)
     args = parser.parse_args()
     if args.command == "prepare":
-        prepare(args.capture_dir, args.output)
+        prepare(
+            args.capture_dir, args.output, args.expected_manifest_sha256,
+            args.expected_greedy_token, args.expected_tokens,
+        )
     else:
         compare(args.contract, args.observed, args.atol, args.rtol)
 
