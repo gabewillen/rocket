@@ -27,11 +27,23 @@ class TargetQsaPreprocessSourceTests(unittest.TestCase):
     def test_target_selection_uses_external_block64_c1_buffers(self):
         source = (ENGINE / "src/projection/cutlass_qkv.cu").read_text()
         launch = source.split('extern "C" int qwen38_target_qsa_select_c1', 1)[1]
+        launch = launch.split('extern "C" int qwen38_target_qsa_projection_create_c1', 1)[0]
         self.assertIn("score_target_qsa_c1_block64", launch)
         self.assertIn("select_qsa_topk_radix512<<<1, 512", launch)
         self.assertIn("selected_tokens", launch)
         self.assertNotIn("cudaMalloc", launch)
         self.assertNotIn("cudaDeviceSynchronize", launch)
+
+    def test_c1_projection_replay_borrows_graph_arena(self):
+        source = (ENGINE / "src/projection/cutlass_qkv.cu").read_text()
+        replay = source.split('extern "C" int qwen38_target_qsa_project_qkv_c1', 1)[1]
+        replay = replay.split('extern "C" int qwen38_target_qsa_projection_destroy_c1', 1)[0]
+        self.assertIn("<<<1, 256", replay)
+        self.assertIn("apply_attention_gate_c1", replay)
+        self.assertNotIn("cudaMalloc", replay)
+        self.assertNotIn("cudaMemcpy", replay)
+        self.assertNotIn("cudaDeviceSynchronize", replay)
+        self.assertNotIn("cudaStreamSynchronize", replay)
 
 
 if __name__ == "__main__":

@@ -834,18 +834,19 @@ __global__ void qsa_merge_splitk(const float* partial_output,
 }
 
 __global__ void scale_qkv_families(__nv_bfloat16* output, float q_scale,
-                                   float k_scale, float v_scale) {
+                                   float k_scale, float v_scale, int rows) {
   const int column = blockIdx.x * blockDim.x + threadIdx.x;
   const int row = blockIdx.y;
-  if (column >= kN) return;
+  if (column >= kN || row >= rows) return;
   const float scale = column < kNq ? q_scale : (column < kNq + kNk ? k_scale : v_scale);
   const int index = row * kN + column;
   output[index] = __float2bfloat16(__bfloat162float(output[index]) * scale);
 }
 
-__global__ void scale_output_projection(__nv_bfloat16* output, float scale) {
+__global__ void scale_output_projection(__nv_bfloat16* output, float scale,
+                                        int rows) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index < kM * kOutputN)
+  if (index < rows * kOutputN)
     output[index] = __float2bfloat16(__bfloat162float(output[index]) * scale);
 }
 
@@ -853,14 +854,14 @@ struct FixedPlan {
   cutlass::DeviceAllocation<std::uint8_t> workspace;
   Gemm gemm;
 
-  bool init(int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
+  bool init(int m, int n, int k, const std::uint8_t* a, const std::uint8_t* sfa,
             const std::uint8_t* b, const std::uint8_t* sfb, float global,
             __nv_bfloat16* d, int device) {
-    StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {kM, k, 1});
+    StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
     StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
-    StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {kM, n, 1});
-    LayoutSFA la = ScaleConfig::tile_atom_to_shape_SFA(make_shape(kM, n, k, 1));
-    LayoutSFB lb = ScaleConfig::tile_atom_to_shape_SFB(make_shape(kM, n, k, 1));
+    StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
+    LayoutSFA la = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+    LayoutSFB lb = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
     auto pa = reinterpret_cast<const ElementInput*>(a);
     auto pb = reinterpret_cast<const ElementInput*>(b);
     auto psa = reinterpret_cast<const ElementSF*>(sfa);
@@ -868,7 +869,7 @@ struct FixedPlan {
     auto pd = reinterpret_cast<ElementD*>(d);
     typename Gemm::Arguments args;
     args = typename Gemm::Arguments{
-        cutlass::gemm::GemmUniversalMode::kGemm, {kM, n, k, 1},
+        cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k, 1},
         {pa, sa, pb, sb, psa, la, psb, lb},
         {{global, 0.0f}, nullptr, sd, pd, sd}};
     if (gemm.can_implement(args) != cutlass::Status::kSuccess) return false;
@@ -893,6 +894,37 @@ struct QkvPlan {
     cudaFree(packed);
   }
 };
+
+struct TargetQsaProjectionPlan {
+  std::uint8_t* fused_weight = nullptr;
+  std::uint8_t* fused_scale = nullptr;
+  std::uint8_t* qkv_packed = nullptr;
+  std::uint8_t* qkv_sfa = nullptr;
+  __nv_bfloat16* raw_qkv = nullptr;
+  __nv_bfloat16* gated_attention = nullptr;
+  std::uint8_t* output_packed = nullptr;
+  std::uint8_t* output_sfa = nullptr;
+  __nv_bfloat16* projected_output = nullptr;
+  float q_global = 1.0f, k_global = 1.0f, v_global = 1.0f;
+  float output_global = 1.0f;
+  FixedPlan qkv_projection;
+  FixedPlan output_projection;
+  ~TargetQsaProjectionPlan() {
+    cudaFree(fused_scale);
+    cudaFree(fused_weight);
+  }
+};
+
+__global__ void apply_attention_gate_c1(
+    const __nv_bfloat16* attention, const __nv_bfloat16* gate,
+    __nv_bfloat16* output) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < kOutputK) {
+    const float g = __bfloat162float(gate[index]);
+    output[index] = __float2bfloat16(
+        __bfloat162float(attention[index]) / (1.0f + expf(-g)));
+  }
+}
 
 struct QsaPlan {
   __nv_bfloat16* query = nullptr;
@@ -978,7 +1010,7 @@ extern "C" int qwen38_cutlass_qkv_create(
     plan->q_global = q_global;
     plan->k_global = k_global;
     plan->v_global = v_global;
-    if (!plan->fused.init(kN, kK, plan->packed, plan->sfa, plan->fused_weight,
+    if (!plan->fused.init(kM, kN, kK, plan->packed, plan->sfa, plan->fused_weight,
                           plan->fused_scale, 1.0f, plan->output, device)) {
       last_error = "CUTLASS cannot initialize the fixed QKV shape";
       return 1;
@@ -1017,7 +1049,7 @@ extern "C" int qwen38_cutlass_qkv_project(void* opaque, cudaStream_t stream) {
     return 1;
   }
   scale_qkv_families<<<dim3((kN + 255) / 256, kM), 256, 0, stream>>>(
-      plan->output, plan->q_global, plan->k_global, plan->v_global);
+      plan->output, plan->q_global, plan->k_global, plan->v_global, kM);
   if (!cuda_ok(cudaGetLastError(), "scale_qkv_families")) return 1;
   return 0;
 }
@@ -1104,7 +1136,7 @@ extern "C" int qwen38_qsa_indexer_create(const std::uint8_t* output_weight,
                           cudaMemcpyDeviceToDevice), "copy output scale"))
     return 1;
   plan->output_global = output_global;
-  if (!plan->output_projection.init(kOutputN, kOutputK, plan->output_packed,
+  if (!plan->output_projection.init(kM, kOutputN, kOutputK, plan->output_packed,
                                     plan->output_sfa, plan->output_weight,
                                     plan->output_scale, 1.0f,
                                     plan->projected_output, device)) {
@@ -1292,7 +1324,8 @@ extern "C" int qwen38_qsa_output_project(void* opaque, cudaStream_t stream) {
     last_error = "CUTLASS attention output projection failed"; return 1;
   }
   scale_output_projection<<<(kM * kOutputN + 255) / 256, 256, 0, stream>>>(
-      plan->projected_output, plan->output_global * kOutputActivationGlobal);
+      plan->projected_output, plan->output_global * kOutputActivationGlobal,
+      kM);
   return cuda_ok(cudaGetLastError(), "scale attention output projection") ? 0 : 1;
 }
 
@@ -1344,4 +1377,138 @@ extern "C" int qwen38_target_qsa_select_c1(
   return cuda_ok(cudaGetLastError(), "target QSA selected-token expansion")
              ? 0
              : 1;
+}
+
+extern "C" int qwen38_target_qsa_projection_create_c1(
+    const std::uint8_t* q_weight, const std::uint8_t* q_scale, float q_global,
+    const std::uint8_t* k_weight, const std::uint8_t* k_scale, float k_global,
+    const std::uint8_t* v_weight, const std::uint8_t* v_scale, float v_global,
+    const std::uint8_t* o_weight, const std::uint8_t* o_scale, float o_global,
+    std::uint8_t* qkv_packed, std::uint8_t* qkv_sfa, void* raw_qkv,
+    void* gated_attention, std::uint8_t* output_packed,
+    std::uint8_t* output_sfa, void* projected_output, int device,
+    void** result) {
+  last_error.clear();
+  if (!q_weight || !q_scale || !k_weight || !k_scale || !v_weight ||
+      !v_scale || !o_weight || !o_scale || !qkv_packed || !qkv_sfa ||
+      !raw_qkv || !gated_attention || !output_packed || !output_sfa ||
+      !projected_output || !result || device < 0 || !isfinite(q_global) ||
+      !isfinite(k_global) || !isfinite(v_global) || !isfinite(o_global) ||
+      q_global <= 0.0f || k_global <= 0.0f || v_global <= 0.0f ||
+      o_global <= 0.0f) {
+    last_error = "invalid caller-owned c1 QSA projection bindings";
+    return 1;
+  }
+  *result = nullptr;
+  auto plan = std::make_unique<TargetQsaProjectionPlan>();
+  plan->qkv_packed = qkv_packed;
+  plan->qkv_sfa = qkv_sfa;
+  plan->raw_qkv = static_cast<__nv_bfloat16*>(raw_qkv);
+  plan->gated_attention = static_cast<__nv_bfloat16*>(gated_attention);
+  plan->output_packed = output_packed;
+  plan->output_sfa = output_sfa;
+  plan->projected_output = static_cast<__nv_bfloat16*>(projected_output);
+  plan->q_global = q_global;
+  plan->k_global = k_global;
+  plan->v_global = v_global;
+  plan->output_global = o_global;
+  const std::size_t q_weight_bytes = static_cast<std::size_t>(kNq) * kK / 2;
+  const std::size_t k_weight_bytes = static_cast<std::size_t>(kNk) * kK / 2;
+  const std::size_t q_scale_bytes = static_cast<std::size_t>(kNq) * kK / 16;
+  const std::size_t k_scale_bytes = static_cast<std::size_t>(kNk) * kK / 16;
+  if (!cuda_ok(cudaSetDevice(device), "cudaSetDevice") ||
+      !cuda_ok(cudaMalloc(&plan->fused_weight,
+                          static_cast<std::size_t>(kN) * kK / 2),
+               "cudaMalloc c1 fused QKV weight") ||
+      !cuda_ok(cudaMalloc(&plan->fused_scale,
+                          static_cast<std::size_t>(kN) * kK / 16),
+               "cudaMalloc c1 fused QKV scale") ||
+      !cuda_ok(cudaMemcpy(plan->fused_weight, q_weight, q_weight_bytes,
+                          cudaMemcpyDeviceToDevice), "copy c1 Q weight") ||
+      !cuda_ok(cudaMemcpy(plan->fused_weight + q_weight_bytes, k_weight,
+                          k_weight_bytes, cudaMemcpyDeviceToDevice),
+               "copy c1 K weight") ||
+      !cuda_ok(cudaMemcpy(plan->fused_weight + q_weight_bytes + k_weight_bytes,
+                          v_weight, static_cast<std::size_t>(kNv) * kK / 2,
+                          cudaMemcpyDeviceToDevice), "copy c1 V weight") ||
+      !cuda_ok(cudaMemcpy(plan->fused_scale, q_scale, q_scale_bytes,
+                          cudaMemcpyDeviceToDevice), "copy c1 Q scale") ||
+      !cuda_ok(cudaMemcpy(plan->fused_scale + q_scale_bytes, k_scale,
+                          k_scale_bytes, cudaMemcpyDeviceToDevice),
+               "copy c1 K scale") ||
+      !cuda_ok(cudaMemcpy(plan->fused_scale + q_scale_bytes + k_scale_bytes,
+                          v_scale, static_cast<std::size_t>(kNv) * kK / 16,
+                          cudaMemcpyDeviceToDevice), "copy c1 V scale"))
+    return 1;
+  if (!plan->qkv_projection.init(
+          1, kN, kK, plan->qkv_packed, plan->qkv_sfa,
+          plan->fused_weight, plan->fused_scale, 1.0f, plan->raw_qkv, device) ||
+      !plan->output_projection.init(
+          1, kOutputN, kOutputK, plan->output_packed, plan->output_sfa,
+          o_weight, o_scale, 1.0f, plan->projected_output, device)) {
+    last_error = "CUTLASS cannot initialize caller-owned c1 QSA projections";
+    return 1;
+  }
+  *result = plan.release();
+  return 0;
+}
+
+extern "C" int qwen38_target_qsa_project_qkv_c1(
+    void* opaque, const void* hidden, cudaStream_t stream) {
+  last_error.clear();
+  if (!opaque || !hidden || !stream) {
+    last_error = "invalid c1 QKV launch bindings";
+    return 1;
+  }
+  auto* plan = static_cast<TargetQsaProjectionPlan*>(opaque);
+  quantize_c16_fixed<kK><<<1, 256, 0, stream>>>(
+      plan->qkv_packed, plan->qkv_sfa,
+      static_cast<const __nv_bfloat16*>(hidden), 1.0f);
+  if (!cuda_ok(cudaGetLastError(), "quantize c1 QKV input") ||
+      plan->qkv_projection.gemm.run(stream) != cutlass::Status::kSuccess) {
+    if (last_error.empty()) last_error = "CUTLASS c1 QKV projection failed";
+    return 1;
+  }
+  scale_qkv_families<<<dim3((kN + 255) / 256, 1), 256, 0, stream>>>(
+      plan->raw_qkv, plan->q_global, plan->k_global, plan->v_global, 1);
+  return cuda_ok(cudaGetLastError(), "scale c1 QKV families") ? 0 : 1;
+}
+
+extern "C" int qwen38_target_qsa_project_output_c1(
+    void* opaque, const void* attention, const void* gate,
+    cudaStream_t stream) {
+  last_error.clear();
+  if (!opaque || !attention || !gate || !stream) {
+    last_error = "invalid c1 QSA output launch bindings";
+    return 1;
+  }
+  auto* plan = static_cast<TargetQsaProjectionPlan*>(opaque);
+  apply_attention_gate_c1<<<(kOutputK + 255) / 256, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(attention),
+      static_cast<const __nv_bfloat16*>(gate), plan->gated_attention);
+  quantize_c16_fixed<kOutputK><<<1, 256, 0, stream>>>(
+      plan->output_packed, plan->output_sfa, plan->gated_attention,
+      kOutputActivationGlobal);
+  if (!cuda_ok(cudaGetLastError(), "gate and quantize c1 QSA output") ||
+      plan->output_projection.gemm.run(stream) != cutlass::Status::kSuccess) {
+    if (last_error.empty()) last_error = "CUTLASS c1 QSA output projection failed";
+    return 1;
+  }
+  scale_output_projection<<<(kOutputN + 255) / 256, 256, 0, stream>>>(
+      plan->projected_output, plan->output_global * kOutputActivationGlobal,
+      1);
+  return cuda_ok(cudaGetLastError(), "scale c1 QSA output projection") ? 0 : 1;
+}
+
+extern "C" int qwen38_target_qsa_projection_output_c1(
+    void* opaque, void** output, std::size_t* elements) {
+  if (!opaque || !output || !elements) return 1;
+  *output = static_cast<TargetQsaProjectionPlan*>(opaque)->projected_output;
+  *elements = kOutputN;
+  return 0;
+}
+
+extern "C" int qwen38_target_qsa_projection_destroy_c1(void* opaque) {
+  delete static_cast<TargetQsaProjectionPlan*>(opaque);
+  return 0;
 }

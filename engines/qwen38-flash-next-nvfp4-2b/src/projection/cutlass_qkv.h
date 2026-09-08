@@ -103,4 +103,25 @@ int qwen38_target_qsa_select_c1(
     std::int32_t* selected_tokens, int compressed_blocks,
     cudaStream_t stream);
 
+// Fixed c1 main Q/K/V and gated output projections. All activation, scale,
+// intermediate, and output buffers are caller-owned and graph-stable.
+int qwen38_target_qsa_projection_create_c1(
+    const std::uint8_t* q_weight, const std::uint8_t* q_scale, float q_global,
+    const std::uint8_t* k_weight, const std::uint8_t* k_scale, float k_global,
+    const std::uint8_t* v_weight, const std::uint8_t* v_scale, float v_global,
+    const std::uint8_t* o_weight, const std::uint8_t* o_scale, float o_global,
+    std::uint8_t* qkv_packed, std::uint8_t* qkv_sfa, void* raw_qkv_bf16,
+    void* gated_attention_bf16, std::uint8_t* output_packed,
+    std::uint8_t* output_sfa, void* projected_output_bf16, int device,
+    void** plan);
+int qwen38_target_qsa_project_qkv_c1(void* plan, const void* hidden_bf16,
+                                    cudaStream_t stream);
+int qwen38_target_qsa_project_output_c1(void* plan,
+                                       const void* attention_bf16,
+                                       const void* gate_bf16,
+                                       cudaStream_t stream);
+int qwen38_target_qsa_projection_output_c1(void* plan, void** output_bf16,
+                                          std::size_t* elements);
+int qwen38_target_qsa_projection_destroy_c1(void* plan);
+
 }
