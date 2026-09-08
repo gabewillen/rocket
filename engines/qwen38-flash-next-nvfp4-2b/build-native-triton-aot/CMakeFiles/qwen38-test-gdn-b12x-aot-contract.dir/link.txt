@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG "CMakeFiles/qwen38-test-gdn-b12x-aot-contract.dir/tests/test_gdn_b12x_aot_contract.cc.o" -o qwen38-test-gdn-b12x-aot-contract  -Wl,-rpath,/usr/local/cuda-13.0/targets/sbsa-linux/lib libqwen38_gdn_b12x_aot.a /usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so 

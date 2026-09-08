@@ -1,0 +1,2 @@
+/usr/bin/ar qc libqwen38_target_moe_b12x_aot.a CMakeFiles/qwen38_target_moe_b12x_aot.dir/src/moe/target_moe_b12x_aot.cc.o "/home/glwillen/Development/rocket-k0-e2e-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-target-moe-aot/target_moe_b12x_c1.o"
+/usr/bin/ranlib libqwen38_target_moe_b12x_aot.a

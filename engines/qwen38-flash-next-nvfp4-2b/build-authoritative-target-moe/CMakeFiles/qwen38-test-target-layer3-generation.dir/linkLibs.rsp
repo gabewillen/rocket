@@ -1,0 +1,1 @@
+ libqwen38_target_layer3_generation.a libqwen38_decode_execution.a libqwen38_pair_reduce.a "/usr/lib/aarch64-linux-gnu/libibverbs.so" "/usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so" -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 extern "C" {
 struct evp_md_ctx_st;
@@ -80,6 +81,20 @@ bool nonzero(const std::array<std::uint8_t, 32>& value) {
   });
 }
 
+std::array<std::uint8_t, 32> parse_digest(std::string_view text) {
+  if (text.size() != 64) throw std::logic_error("target MoE digest constant changed");
+  std::array<std::uint8_t, 32> result{};
+  const auto nibble = [](char value) -> std::uint8_t {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    throw std::logic_error("target MoE digest constant is invalid");
+  };
+  for (std::size_t index = 0; index < result.size(); ++index)
+    result[index] = static_cast<std::uint8_t>(
+        nibble(text[2 * index]) * 16 + nibble(text[2 * index + 1]));
+  return result;
+}
+
 template <typename... Spans>
 std::array<std::uint8_t, 32> digest(Spans... spans) {
   auto* context = EVP_MD_CTX_new();
@@ -97,6 +112,23 @@ std::array<std::uint8_t, 32> digest(Spans... spans) {
 }
 
 }  // namespace
+
+TargetMoeTransformedIdentity target_moe_layer3_transformed_identity(int rank) {
+  if (rank != 0 && rank != 1)
+    throw std::invalid_argument("target MoE transformed rank identity changed");
+  static constexpr std::string_view layouts[] = {
+      "ebf6db24c257c3516f7ff8c94bb2ba70d692c62c4cbf1b2577ebe99a3f56875b",
+      "6e20c303b336f980e94e7aa3d897009ac527e1810279c09c8cbab1bd7867f841"};
+  static constexpr std::string_view source[] = {
+      "5e62ca24366069fbbfb05b234730a72046976d87269f0739da6a29e7ed50e93d",
+      "fd4c46b152a4a8199b3370e27c4e825f79f54ebdcd8f5e808074d18fac5101e9"};
+  static constexpr std::string_view physical[] = {
+      "e0d9089c5976a77d3a6d460713b5be5dae962c02fc64b6a84c5db7c8cf3558fc",
+      "54fc2b8b2df62686e0a40a46ae6b9e3568de866dbeea2794a669c0849c83dc25"};
+  return {parse_digest(layouts[rank]), parse_digest(source[rank]),
+          parse_digest(physical[rank]), kTargetMoeLogicalIntermediate,
+          kTargetMoePhysicalIntermediate, 256, kTargetMoeHidden, rank, 3};
+}
 
 TargetMoePhysicalN768Host materialize_target_moe_n640_host(
     const TargetMoeLogicalN640& source) {
@@ -189,6 +221,18 @@ std::array<std::uint8_t, 32> target_moe_n768_sha256(
                 std::span<const float>(physical.down_input_scale));
 }
 
+std::array<std::array<std::uint8_t, 32>, 8> target_moe_n768_plane_sha256(
+    const TargetMoePhysicalN768Host& p) {
+  return {digest(std::span<const std::uint8_t>(p.w13_packed)),
+          digest(std::span<const std::uint8_t>(p.w13_scale)),
+          digest(std::span<const std::uint8_t>(p.down_packed)),
+          digest(std::span<const std::uint8_t>(p.down_scale)),
+          digest(std::span<const float>(p.input_global_scale)),
+          digest(std::span<const float>(p.folded_w1_alpha)),
+          digest(std::span<const float>(p.w2_alpha)),
+          digest(std::span<const float>(p.down_input_scale))};
+}
+
 TargetMoeN768DeviceOwner::TargetMoeN768DeviceOwner(
     int device, const TargetMoeLogicalN640& source,
     TargetMoeTransformedIdentity identity)
@@ -199,8 +243,14 @@ TargetMoeN768DeviceOwner::TargetMoeN768DeviceOwner(
       identity.logical_intermediate != static_cast<int>(kN) ||
       identity.physical_intermediate != static_cast<int>(kNp) ||
       identity.experts != static_cast<int>(kExperts) ||
-      identity.hidden != static_cast<int>(kH))
+      identity.hidden != static_cast<int>(kH) ||
+      (identity.rank != 0 && identity.rank != 1) || identity.layer != 3)
     throw std::invalid_argument("target MoE transformed identity changed");
+  const auto expected = target_moe_layer3_transformed_identity(identity.rank);
+  if (identity.source_layout_sha256 != expected.source_layout_sha256 ||
+      identity.source_planes_sha256 != expected.source_planes_sha256 ||
+      identity.physical_planes_sha256 != expected.physical_planes_sha256)
+    throw std::invalid_argument("target MoE transformed digest identity changed");
   if ((OpenSSL_version_num() >> 28) != 3)
     throw std::runtime_error("target MoE SHA256 requires OpenSSL 3 ABI");
   if (cudaSetDevice(device) != cudaSuccess)
@@ -253,3 +303,75 @@ TargetMoeN768DeviceOwner::~TargetMoeN768DeviceOwner() {
 }
 
 }  // namespace rocket::qwen38::moe
+
+namespace {
+thread_local std::string materializer_last_error;
+}
+
+extern "C" int rocket_qwen38_target_moe_n640_hash(
+    const RocketQwen38TargetMoeLogicalN640* source,
+    std::uint8_t source_sha256[32],
+    std::uint8_t physical_sha256[32]) noexcept {
+  materializer_last_error.clear();
+  if (!source || !source_sha256 || !physical_sha256) return 1;
+  try {
+    namespace moe = rocket::qwen38::moe;
+    constexpr std::size_t e = 256, h = 2560, n = 640;
+    if (!source->w13_packed || !source->w13_scale || !source->down_packed ||
+        !source->down_scale || !source->input_global_scale ||
+        !source->w1_alpha || !source->w2_alpha || !source->down_input_scale)
+      throw std::invalid_argument("target MoE logical C ABI pointer changed");
+    const moe::TargetMoeLogicalN640 view{
+        {source->w13_packed, e * 2 * n * h / 2},
+        {source->w13_scale, e * 2 * n * (h / 16)},
+        {source->down_packed, e * h * n / 2},
+        {source->down_scale, e * h * (n / 16)},
+        {source->input_global_scale, e}, {source->w1_alpha, e},
+        {source->w2_alpha, e}, {source->down_input_scale, e}};
+    const auto source_digest = moe::target_moe_n640_sha256(view);
+    const auto physical = moe::materialize_target_moe_n640_host(view);
+    const auto physical_digest = moe::target_moe_n768_sha256(physical);
+    std::copy(source_digest.begin(), source_digest.end(), source_sha256);
+    std::copy(physical_digest.begin(), physical_digest.end(), physical_sha256);
+    return 0;
+  } catch (const std::exception& error) {
+    materializer_last_error = error.what();
+  } catch (...) {
+    materializer_last_error = "unknown target MoE N640 materializer failure";
+  }
+  return 1;
+}
+
+extern "C" const char* rocket_qwen38_target_moe_n640_last_error() noexcept {
+  return materializer_last_error.c_str();
+}
+
+extern "C" int rocket_qwen38_target_moe_n640_plane_hashes(
+    const RocketQwen38TargetMoeLogicalN640* source,
+    std::uint8_t output[8][32]) noexcept {
+  materializer_last_error.clear();
+  if (!source || !output || !source->w13_packed || !source->w13_scale ||
+      !source->down_packed || !source->down_scale ||
+      !source->input_global_scale || !source->w1_alpha || !source->w2_alpha ||
+      !source->down_input_scale)
+    return 1;
+  try {
+    namespace moe = rocket::qwen38::moe;
+    constexpr std::size_t e = 256, h = 2560, n = 640;
+    const moe::TargetMoeLogicalN640 view{
+        {source->w13_packed, e * 2 * n * h / 2},
+        {source->w13_scale, e * 2 * n * (h / 16)},
+        {source->down_packed, e * h * n / 2},
+        {source->down_scale, e * h * (n / 16)},
+        {source->input_global_scale, e}, {source->w1_alpha, e},
+        {source->w2_alpha, e}, {source->down_input_scale, e}};
+    const auto p = moe::materialize_target_moe_n640_host(view);
+    const auto digests = moe::target_moe_n768_plane_sha256(p);
+    for (std::size_t plane = 0; plane < digests.size(); ++plane)
+      std::copy(digests[plane].begin(), digests[plane].end(), output[plane]);
+    return 0;
+  } catch (const std::exception& error) {
+    materializer_last_error = error.what();
+  }
+  return 1;
+}

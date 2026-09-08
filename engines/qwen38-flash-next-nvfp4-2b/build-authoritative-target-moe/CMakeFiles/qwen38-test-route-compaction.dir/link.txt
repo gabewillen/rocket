@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG "CMakeFiles/qwen38-test-route-compaction.dir/tests/test_route_compaction.cc.o" -o qwen38-test-route-compaction  -Wl,-rpath,/usr/local/cuda-13.0/targets/sbsa-linux/lib libqwen38_route_compaction_contract.a /usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so 

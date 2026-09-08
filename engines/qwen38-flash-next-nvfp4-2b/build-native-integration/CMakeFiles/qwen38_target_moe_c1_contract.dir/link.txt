@@ -1,0 +1,2 @@
+/usr/bin/ar qc libqwen38_target_moe_c1_contract.a CMakeFiles/qwen38_target_moe_c1_contract.dir/src/moe/target_moe_c1.cc.o
+/usr/bin/ranlib libqwen38_target_moe_c1_contract.a

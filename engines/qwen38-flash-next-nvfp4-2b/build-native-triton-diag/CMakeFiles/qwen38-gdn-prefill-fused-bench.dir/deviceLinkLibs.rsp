@@ -1,0 +1,1 @@
+ libqwen38_gdn_prefill_fused.a  -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

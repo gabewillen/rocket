@@ -1,0 +1,2 @@
+/usr/bin/ar qc libqwen38_native_hyperconnection_adapter.a CMakeFiles/qwen38_native_hyperconnection_adapter.dir/src/hyperconnection/native_adapter.cc.o
+/usr/bin/ranlib libqwen38_native_hyperconnection_adapter.a

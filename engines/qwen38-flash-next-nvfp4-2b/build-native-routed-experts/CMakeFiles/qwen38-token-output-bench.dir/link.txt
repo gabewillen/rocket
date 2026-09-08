@@ -1,0 +1,1 @@
+/usr/bin/g++ @CMakeFiles/qwen38-token-output-bench.dir/objects1.rsp CMakeFiles/qwen38-token-output-bench.dir/cmake_device_link.o -o qwen38-token-output-bench @CMakeFiles/qwen38-token-output-bench.dir/linkLibs.rsp -L"/usr/local/cuda/targets/sbsa-linux/lib/stubs" -L"/usr/local/cuda/targets/sbsa-linux/lib"

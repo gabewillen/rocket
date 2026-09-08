@@ -1,0 +1,1 @@
+ libqwen38_decode_execution.a  -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

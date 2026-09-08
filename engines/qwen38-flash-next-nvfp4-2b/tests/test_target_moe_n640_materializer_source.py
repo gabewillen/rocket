@@ -29,6 +29,22 @@ class TargetMoeN640MaterializerSource(unittest.TestCase):
         self.assertIn("OpenSSL_version_num() >> 28", (
             ROOT / "src/moe/target_moe_n640_materializer.cu").read_text())
 
+    def test_physical_comparator_invokes_pinned_flashinfer(self):
+        script = (ROOT.parents[1] / "scripts/moe/compare-qwen38-target-moe-n768.py").read_text()
+        self.assertIn("moe_dispatch._pad_intermediate_to_tile", script)
+        self.assertIn("moe_dispatch._get_weight_views", script)
+        self.assertNotIn("def _python_physical", script)
+        self.assertIn('FLASHINFER_COMMIT = "91bda04c66f7cb851e1ab3b78b9fecea644b9844"', script)
+        self.assertIn("pinned FlashInfer source identity changed", script)
+        self.assertIn("FLASHINFER_FP4_HELPERS_SHA256", script)
+        self.assertIn("FLASHINFER_W4A16_HOST_SHA256", script)
+
+    def test_rank_layout_digests_are_fixed(self):
+        source = (ROOT / "src/moe/target_moe_n640_materializer.cu").read_text()
+        self.assertIn("ebf6db24c257c3516f7ff8c94bb2ba70d692c62c4cbf1b2577ebe99a3f56875b", source)
+        self.assertIn("6e20c303b336f980e94e7aa3d897009ac527e1810279c09c8cbab1bd7867f841", source)
+        self.assertIn("identity.source_layout_sha256 != expected.source_layout_sha256", source)
+
 
 if __name__ == "__main__":
     unittest.main()

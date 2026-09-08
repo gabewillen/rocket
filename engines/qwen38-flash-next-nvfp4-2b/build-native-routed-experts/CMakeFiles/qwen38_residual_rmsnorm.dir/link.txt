@@ -1,0 +1,2 @@
+/usr/bin/ar qc libqwen38_residual_rmsnorm.a CMakeFiles/qwen38_residual_rmsnorm.dir/src/norm/residual_rmsnorm.cu.o
+/usr/bin/ranlib libqwen38_residual_rmsnorm.a

@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG "CMakeFiles/qwen38-test-target-moe-c1.dir/tests/test_target_moe_c1.cc.o" -o qwen38-test-target-moe-c1  -Wl,-rpath,/usr/local/cuda-13.0/targets/sbsa-linux/lib libqwen38_target_moe_c1_contract.a /usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so 

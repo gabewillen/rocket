@@ -1,0 +1,1 @@
+ libqwen38_residual_rmsnorm.a  -lcudadevrt -lcudart_static -lrt -lpthread -ldl 

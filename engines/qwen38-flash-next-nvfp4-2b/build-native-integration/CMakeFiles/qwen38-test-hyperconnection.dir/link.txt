@@ -1,0 +1,1 @@
+/usr/bin/g++ @CMakeFiles/qwen38-test-hyperconnection.dir/objects1.rsp -o qwen38-test-hyperconnection @CMakeFiles/qwen38-test-hyperconnection.dir/linkLibs.rsp -L"/usr/local/cuda/targets/sbsa-linux/lib/stubs" -L"/usr/local/cuda/targets/sbsa-linux/lib"

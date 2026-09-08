@@ -1,0 +1,2 @@
+/usr/bin/ar qc libqwen38_gdn_flashinfer_cutlass.a CMakeFiles/qwen38_gdn_flashinfer_cutlass.dir/src/linear_attention/gdn_flashinfer_cutlass.cu.o
+/usr/bin/ranlib libqwen38_gdn_flashinfer_cutlass.a

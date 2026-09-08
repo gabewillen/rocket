@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG "CMakeFiles/qwen38-qsa-sidecar-auth.dir/tests/qsa_sidecar_auth.cc.o" -o qwen38-qsa-sidecar-auth  -Wl,-rpath,/usr/local/cuda-13.0/targets/sbsa-linux/lib libqwen38_qsa_sidecar_owner.a /usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so /usr/lib/aarch64-linux-gnu/libcrypto.so.3 

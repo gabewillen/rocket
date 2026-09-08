@@ -1,0 +1,2 @@
+/usr/bin/ar qc libqwen38_qsa_sidecar_owner.a CMakeFiles/qwen38_qsa_sidecar_owner.dir/src/attention/qsa_sidecar_owner.cc.o
+/usr/bin/ranlib libqwen38_qsa_sidecar_owner.a

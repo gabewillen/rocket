@@ -1,0 +1,1 @@
+/usr/bin/g++ -fPIC -shared -Wl,-soname,libqwen38_native_qsa_c_api.so -o libqwen38_native_qsa_c_api.so @CMakeFiles/qwen38_native_qsa_c_api.dir/objects1.rsp CMakeFiles/qwen38_native_qsa_c_api.dir/cmake_device_link.o @CMakeFiles/qwen38_native_qsa_c_api.dir/linkLibs.rsp -L"/usr/local/cuda/targets/sbsa-linux/lib/stubs" -L"/usr/local/cuda/targets/sbsa-linux/lib"

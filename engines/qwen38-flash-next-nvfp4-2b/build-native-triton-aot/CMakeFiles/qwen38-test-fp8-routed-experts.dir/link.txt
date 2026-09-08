@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG "CMakeFiles/qwen38-test-fp8-routed-experts.dir/tests/test_fp8_routed_experts.cc.o" -o qwen38-test-fp8-routed-experts  -Wl,-rpath,/usr/local/cuda-13.0/targets/sbsa-linux/lib libqwen38_route_compaction_contract.a /usr/local/cuda-13.0/targets/sbsa-linux/lib/libcudart.so 

@@ -1,0 +1,13 @@
+qwen38-qsa-mtp-state-view-contract 1 0.00240523
+qwen38-route-compaction-cpu-contract 3 0.000354769
+qwen38-fp8-routed-experts-cpu-contract 2 0.000479842
+qwen38-route-compaction-source-contract 2 0.010567
+qwen38-fp8-routed-experts-source-contract 1 0.0209485
+qwen38-full-attention-layer-contract 5 0.000369954
+qwen38-native-mtp-executor-contract 2 0.400687
+qwen38-target-full-layer-contract 6 0.000230613
+qwen38-target-moe-c1-cpu-contract 1 0.00107015
+qwen38-target-moe-b12x-aot-cpu-contract 1 0.000911756
+qwen38-native-qsa-c-api-contract 4 0.000309188
+qwen38-native-hyperconnection-adapter-contract 1 0.00163563
+---

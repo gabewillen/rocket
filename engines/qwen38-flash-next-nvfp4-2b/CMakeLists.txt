@@ -26,6 +26,11 @@ find_library(ROCKET_QWEN38_CRYPTO NAMES crypto libcrypto.so.3 REQUIRED)
 if(NOT ROCKET_QWEN38_CRYPTO MATCHES "libcrypto\\.so\\.3$")
   message(FATAL_ERROR "Qwen target MoE materializer requires OpenSSL 3 libcrypto ABI")
 endif()
+file(SHA256 "${ROCKET_QWEN38_CRYPTO}" _rocket_qwen38_crypto_sha256)
+if(NOT _rocket_qwen38_crypto_sha256 STREQUAL
+   "60076983c2ea0d6b73cc64fb39cafa0a0f90f220ef000f6effb4aaac47500949")
+  message(FATAL_ERROR "Qwen OpenSSL 3 runtime identity changed")
+endif()
 add_library(rocket_qwen38_openssl3_crypto SHARED IMPORTED GLOBAL)
 set_target_properties(rocket_qwen38_openssl3_crypto PROPERTIES
   IMPORTED_LOCATION "${ROCKET_QWEN38_CRYPTO}")
@@ -137,7 +142,7 @@ target_compile_options(qwen38_target_layer3_generation PRIVATE
 set_target_properties(qwen38_target_layer3_generation PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
 
-add_library(qwen38_target_moe_n640_materializer STATIC
+add_library(qwen38_target_moe_n640_materializer SHARED
   src/moe/target_moe_n640_materializer.cu)
 target_include_directories(qwen38_target_moe_n640_materializer PUBLIC src)
 target_link_libraries(qwen38_target_moe_n640_materializer PUBLIC
@@ -146,6 +151,22 @@ target_compile_options(qwen38_target_moe_n640_materializer PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
 set_target_properties(qwen38_target_moe_n640_materializer PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+
+add_library(qwen38_qsa_sidecar_owner STATIC
+  src/attention/qsa_sidecar_owner.cc)
+target_include_directories(qwen38_qsa_sidecar_owner PUBLIC src)
+target_link_libraries(qwen38_qsa_sidecar_owner PUBLIC
+  CUDA::cudart rocket_qwen38_openssl3_crypto)
+target_compile_options(qwen38_qsa_sidecar_owner PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38_qsa_sidecar_owner PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+
+add_executable(qwen38-qsa-sidecar-auth tests/qsa_sidecar_auth.cc)
+target_link_libraries(qwen38-qsa-sidecar-auth PRIVATE
+  qwen38_qsa_sidecar_owner)
+target_compile_options(qwen38-qsa-sidecar-auth PRIVATE
+  -Wall -Wextra -Werror)
 
 add_library(qwen38_native_hyperconnection_adapter STATIC
   src/hyperconnection/native_adapter.cc)
@@ -818,6 +839,9 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME qwen38-target-moe-n640-materializer-source-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_target_moe_n640_materializer_source.py)
+add_test(NAME qwen38-qsa-sidecar-owner-source-contract
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_qsa_sidecar_owner_source.py)
 add_test(NAME qwen38-route-compaction-source-contract
   COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_route_compaction_source.py)

@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <stdexcept>
 #include <vector>
 
 namespace moe = rocket::qwen38::moe;
@@ -39,5 +40,17 @@ int main() {
   if (source_digest == physical_digest || source_digest[0] == 0 ||
       physical_digest[0] == 0)
     return 4;
+  const auto rank0 = moe::target_moe_layer3_transformed_identity(0);
+  const auto rank1 = moe::target_moe_layer3_transformed_identity(1);
+  if (rank0.rank != 0 || rank1.rank != 1 ||
+      rank0.source_planes_sha256 == rank1.source_planes_sha256 ||
+      rank0.physical_planes_sha256 == rank1.physical_planes_sha256 ||
+      rank0.source_layout_sha256 == rank1.source_layout_sha256)
+    return 5;
+  try {
+    (void)moe::target_moe_layer3_transformed_identity(2);
+    return 6;
+  } catch (const std::invalid_argument&) {
+  }
   return 0;
 }

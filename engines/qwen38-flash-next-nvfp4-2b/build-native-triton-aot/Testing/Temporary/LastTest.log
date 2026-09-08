@@ -1,0 +1,33 @@
+Start testing: Sep 08 04:08 UTC
+----------------------------------------------------------
+15/28 Testing: qwen38-route-compaction-cpu-contract
+15/28 Test: qwen38-route-compaction-cpu-contract
+Command: "/home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-triton-aot/qwen38-test-route-compaction"
+Directory: /home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-triton-aot
+"qwen38-route-compaction-cpu-contract" start time: Sep 08 04:08 UTC
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"qwen38-route-compaction-cpu-contract" end time: Sep 08 04:08 UTC
+"qwen38-route-compaction-cpu-contract" time elapsed: 00:00:00
+----------------------------------------------------------
+
+16/28 Testing: qwen38-fp8-routed-experts-cpu-contract
+16/28 Test: qwen38-fp8-routed-experts-cpu-contract
+Command: "/home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-triton-aot/qwen38-test-fp8-routed-experts"
+Directory: /home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-triton-aot
+"qwen38-fp8-routed-experts-cpu-contract" start time: Sep 08 04:08 UTC
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"qwen38-fp8-routed-experts-cpu-contract" end time: Sep 08 04:08 UTC
+"qwen38-fp8-routed-experts-cpu-contract" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Sep 08 04:08 UTC

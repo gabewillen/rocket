@@ -34,7 +34,11 @@ struct TargetMoeTransformedIdentity {
   int physical_intermediate = kTargetMoePhysicalIntermediate;
   int experts = 256;
   int hidden = kTargetMoeHidden;
+  int rank = -1;
+  int layer = 3;
 };
+
+TargetMoeTransformedIdentity target_moe_layer3_transformed_identity(int rank);
 
 struct TargetMoePhysicalN768Host {
   std::vector<std::uint8_t> w13_packed;
@@ -59,6 +63,8 @@ TargetMoePhysicalN768Host materialize_target_moe_n640_host(
 std::array<std::uint8_t, 32> target_moe_n640_sha256(
     const TargetMoeLogicalN640& source);
 std::array<std::uint8_t, 32> target_moe_n768_sha256(
+    const TargetMoePhysicalN768Host& physical);
+std::array<std::array<std::uint8_t, 32>, 8> target_moe_n768_plane_sha256(
     const TargetMoePhysicalN768Host& physical);
 
 // One-time device owner. Construction transforms and copies on its private
@@ -85,3 +91,25 @@ class TargetMoeN768DeviceOwner final {
 };
 
 }  // namespace rocket::qwen38::moe
+
+extern "C" {
+struct RocketQwen38TargetMoeLogicalN640 {
+  const std::uint8_t* w13_packed;
+  const std::uint8_t* w13_scale;
+  const std::uint8_t* down_packed;
+  const std::uint8_t* down_scale;
+  const float* input_global_scale;
+  const float* w1_alpha;
+  const float* w2_alpha;
+  const float* down_input_scale;
+};
+
+int rocket_qwen38_target_moe_n640_hash(
+    const RocketQwen38TargetMoeLogicalN640* source,
+    std::uint8_t source_sha256[32],
+    std::uint8_t physical_sha256[32]) noexcept;
+int rocket_qwen38_target_moe_n640_plane_hashes(
+    const RocketQwen38TargetMoeLogicalN640* source,
+    std::uint8_t physical_plane_sha256[8][32]) noexcept;
+const char* rocket_qwen38_target_moe_n640_last_error() noexcept;
+}

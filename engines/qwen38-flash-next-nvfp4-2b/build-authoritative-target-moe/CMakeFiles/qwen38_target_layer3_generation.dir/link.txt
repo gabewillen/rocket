@@ -1,0 +1,2 @@
+/usr/bin/ar qc libqwen38_target_layer3_generation.a CMakeFiles/qwen38_target_layer3_generation.dir/src/decode/target_layer3_generation.cu.o
+/usr/bin/ranlib libqwen38_target_layer3_generation.a

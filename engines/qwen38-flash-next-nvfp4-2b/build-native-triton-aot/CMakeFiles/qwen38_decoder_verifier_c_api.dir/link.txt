@@ -1,0 +1,1 @@
+/usr/bin/g++ -fPIC -shared -Wl,-soname,libqwen38_decoder_verifier_c_api.so -o libqwen38_decoder_verifier_c_api.so @CMakeFiles/qwen38_decoder_verifier_c_api.dir/objects1.rsp @CMakeFiles/qwen38_decoder_verifier_c_api.dir/linkLibs.rsp -L"/usr/local/cuda/targets/sbsa-linux/lib/stubs" -L"/usr/local/cuda/targets/sbsa-linux/lib"

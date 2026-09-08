@@ -1,0 +1,2 @@
+/usr/bin/ar qc libqwen38_target_moe_c1.a CMakeFiles/qwen38_target_moe_c1.dir/src/moe/target_moe_c1.cu.o
+/usr/bin/ranlib libqwen38_target_moe_c1.a

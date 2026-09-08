@@ -1,0 +1,73 @@
+Start testing: Sep 08 03:13 UTC
+----------------------------------------------------------
+15/28 Testing: qwen38-route-compaction-cpu-contract
+15/28 Test: qwen38-route-compaction-cpu-contract
+Command: "/home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-routed-experts/qwen38-test-route-compaction"
+Directory: /home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-routed-experts
+"qwen38-route-compaction-cpu-contract" start time: Sep 08 03:13 UTC
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"qwen38-route-compaction-cpu-contract" end time: Sep 08 03:13 UTC
+"qwen38-route-compaction-cpu-contract" time elapsed: 00:00:00
+----------------------------------------------------------
+
+16/28 Testing: qwen38-fp8-routed-experts-cpu-contract
+16/28 Test: qwen38-fp8-routed-experts-cpu-contract
+Command: "/home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-routed-experts/qwen38-test-fp8-routed-experts"
+Directory: /home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-routed-experts
+"qwen38-fp8-routed-experts-cpu-contract" start time: Sep 08 03:13 UTC
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"qwen38-fp8-routed-experts-cpu-contract" end time: Sep 08 03:13 UTC
+"qwen38-fp8-routed-experts-cpu-contract" time elapsed: 00:00:00
+----------------------------------------------------------
+
+24/28 Testing: qwen38-route-compaction-source-contract
+24/28 Test: qwen38-route-compaction-source-contract
+Command: "/usr/bin/python3" "/home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/tests/test_route_compaction_source.py"
+Directory: /home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-routed-experts
+"qwen38-route-compaction-source-contract" start time: Sep 08 03:13 UTC
+Output:
+----------------------------------------------------------
+....
+----------------------------------------------------------------------
+Ran 4 tests in 0.000s
+
+OK
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"qwen38-route-compaction-source-contract" end time: Sep 08 03:13 UTC
+"qwen38-route-compaction-source-contract" time elapsed: 00:00:00
+----------------------------------------------------------
+
+25/28 Testing: qwen38-fp8-routed-experts-source-contract
+25/28 Test: qwen38-fp8-routed-experts-source-contract
+Command: "/usr/bin/python3" "/home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/tests/test_fp8_routed_experts_source.py"
+Directory: /home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-routed-experts
+"qwen38-fp8-routed-experts-source-contract" start time: Sep 08 03:13 UTC
+Output:
+----------------------------------------------------------
+....
+----------------------------------------------------------------------
+Ran 4 tests in 0.000s
+
+OK
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"qwen38-fp8-routed-experts-source-contract" end time: Sep 08 03:13 UTC
+"qwen38-fp8-routed-experts-source-contract" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Sep 08 03:13 UTC

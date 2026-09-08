@@ -1,0 +1,14 @@
+==WARNING== Note: Running with unmodified GPU clocks. If not controlled otherwise, profiling results may be inconsistent.
+==PROF== Connected to process 1282221 (/home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-triton-aot/qwen38-mtp-routed-expert-profile)
+==PROF== Profiling "gate_up_silu": 0%....50%....100% - 19 passes
+META	device=0	name=NVIDIA GB10	cc=12.1	warmup=1	samples=2	case=c8-k7-r1	plain_kernel_launches=6	cubin_launches=4
+FIELDS	rank	concurrency	draft_depth	rows	owner_routes	active_experts	stage	p50_ms	p95_ms	mean_ms	stddev_ms	cv	min_ms	warmup	samples	graph_nodes	active_weight_bytes	route_expanded_weight_bytes	capacity_control
+RESULT	1	8	7	64	292	51	whole	2.576448	2.601952	2.589200	0.012752	0.004925	2.576448	1	2	6	250705800	1435413600	0
+RESULT	1	8	7	64	292	51	route_compact	0.235712	0.236128	0.235920	0.000208	0.000882	0.235712	1	2	6	250705800	1435413600	0
+RESULT	1	8	7	64	292	51	prepare	0.106336	0.106336	0.106336	0.000000	0.000000	0.106336	1	2	6	250705800	1435413600	0
+RESULT	1	8	7	64	292	51	quantize_hidden	0.008192	0.008192	0.008192	0.000000	0.000000	0.008192	1	2	6	250705800	1435413600	0
+RESULT	1	8	7	64	292	51	gate_up	1.490944	1.495040	1.492992	0.002048	0.001372	1.490944	1	2	6	250705800	1435413600	0
+RESULT	1	8	7	64	292	51	silu_quantize	0.008192	0.008192	0.008192	0.000000	0.000000	0.008192	1	2	6	250705800	1435413600	0
+RESULT	1	8	7	64	292	51	down_reduce	0.733184	0.735232	0.734208	0.001024	0.001395	0.733184	1	2	6	250705800	1435413600	0
+==PROF== Disconnected from process 1282221
+==PROF== Report: /home/glwillen/Development/rocket-native-integration-worktree/engines/qwen38-flash-next-nvfp4-2b/build-native-triton-aot/ncu-af4c2fe/c8-k7-r1.ncu-rep

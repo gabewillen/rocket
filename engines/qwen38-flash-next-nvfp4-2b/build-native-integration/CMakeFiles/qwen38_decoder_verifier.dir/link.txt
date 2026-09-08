@@ -1,0 +1,2 @@
+/usr/bin/ar qc libqwen38_decoder_verifier.a CMakeFiles/qwen38_decoder_verifier.dir/src/decode/decoder_verifier.cc.o
+/usr/bin/ranlib libqwen38_decoder_verifier.a
