@@ -118,6 +118,15 @@ class PreflightTests(unittest.TestCase):
              "cuda_ready_event", "publication_receipt"),
         )
         self.assertEqual(_native_finalize_stage(999), "native_status")
+        self.assertEqual(
+            tuple(_native_finalize_stage(value) for value in range(351, 367)),
+            ("receipt_header", "publication_pointer_event", "publication_bytes",
+             "publication_rank_device", "slab_key", "artifact_manifest",
+             "layout_identity", "chunks_authenticated", "peak_pinned_bytes",
+             "open_duration", "probe_memory_type", "probe_device",
+             "allocation_base", "allocation_extent", "receipt_chunk",
+             "receipt_bytes"),
+        )
 
 
 if __name__ == "__main__":

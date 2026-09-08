@@ -65,6 +65,14 @@ def _native_finalize_stage(result: int) -> str:
         31: "cuda_device", 32: "cuda_pointer",
         33: "cuda_allocation_range", 34: "cuda_ready_event",
         35: "publication_receipt",
+        351: "receipt_header", 352: "publication_pointer_event",
+        353: "publication_bytes", 354: "publication_rank_device",
+        355: "slab_key", 356: "artifact_manifest",
+        357: "layout_identity", 358: "chunks_authenticated",
+        359: "peak_pinned_bytes", 360: "open_duration",
+        361: "probe_memory_type", 362: "probe_device",
+        363: "allocation_base", 364: "allocation_extent",
+        365: "receipt_chunk", 366: "receipt_bytes",
     }.get(result, "native_status")
 
 

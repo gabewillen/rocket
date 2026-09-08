@@ -116,10 +116,11 @@ extern "C" int qwen38_target_slab_retain_accepted_loader(
     const TargetSlabCudaProbeResult probe{
         static_cast<std::uintptr_t>(allocation_base), allocation_bytes,
         attributes.device, attributes.type == cudaMemoryTypeDevice, true};
-    if (!validate_accepted_loader_publication(
-            publication, probe, receipt_started_ns, receipt_completed_ns,
-            chunk_receipts, chunk_receipt_count))
-      return 35;
+    const auto validation = diagnose_accepted_loader_publication(
+        publication, probe, receipt_started_ns, receipt_completed_ns,
+        chunk_receipts, chunk_receipt_count);
+    if (validation != TargetSlabPublicationValidation::kAccepted)
+      return 350 + static_cast<int>(validation);
     const std::string receipt(receipt_sha256);
     std::lock_guard guard(g_retained_target_slab_lock);
     if (auto* prior = g_retained_target_slabs[rank]) {
@@ -155,23 +156,51 @@ bool validate_accepted_loader_publication(
     const TargetSlabCudaProbeResult& probe, std::uint64_t started_ns,
     std::uint64_t completed_ns,
     const TargetSlabChunkReceipt* receipts, std::size_t count) noexcept {
+  return diagnose_accepted_loader_publication(
+             publication, probe, started_ns, completed_ns, receipts, count) ==
+         TargetSlabPublicationValidation::kAccepted;
+}
+
+TargetSlabPublicationValidation diagnose_accepted_loader_publication(
+    const TargetSlabPublication& publication,
+    const TargetSlabCudaProbeResult& probe, std::uint64_t started_ns,
+    std::uint64_t completed_ns, const TargetSlabChunkReceipt* receipts,
+    std::size_t count) noexcept {
   if (!receipts || count != kTargetSlabChunks || started_ns == 0 ||
-      completed_ns <= started_ns || !publication.device_base ||
-      !publication.ready_event || publication.bytes != kTargetSlabBytes ||
-      publication.device < 0 || (publication.rank != 0 && publication.rank != 1) ||
-      publication.slab_key !=
-          (publication.rank == 0 ? "rank0-target" : "rank1-target") ||
-      publication.artifact_key != kTargetSlabArtifactKey ||
-      publication.manifest_sha256 != kTargetSlabManifestSha256 ||
-      publication.chunks_authenticated != kTargetSlabChunks ||
-      publication.peak_host_pinned_bytes != kTargetSlabPeakPinnedBytes ||
-      publication.open_to_publish_ns != completed_ns - started_ns ||
-      !probe.device_memory || !probe.ready_event_complete ||
-      probe.device != publication.device ||
-      probe.allocation_base !=
-          reinterpret_cast<std::uintptr_t>(publication.device_base) ||
-      probe.allocation_bytes != publication.bytes)
-    return false;
+      completed_ns <= started_ns)
+    return TargetSlabPublicationValidation::kReceiptHeader;
+  if (!publication.device_base || !publication.ready_event ||
+      !probe.ready_event_complete)
+    return TargetSlabPublicationValidation::kPublicationPointerEvent;
+  if (publication.bytes != kTargetSlabBytes)
+    return TargetSlabPublicationValidation::kPublicationBytes;
+  if (publication.device < 0 ||
+      (publication.rank != 0 && publication.rank != 1))
+    return TargetSlabPublicationValidation::kPublicationRankDevice;
+  if (publication.slab_key !=
+      (publication.rank == 0 ? "rank0-target" : "rank1-target"))
+    return TargetSlabPublicationValidation::kSlabKey;
+  if (publication.artifact_key != kTargetSlabArtifactKey ||
+      publication.manifest_sha256 != kTargetSlabManifestSha256)
+    return TargetSlabPublicationValidation::kArtifactManifest;
+  if (publication.layout_sha256 !=
+      (publication.rank == 0 ? kRank0LayoutSha256 : kRank1LayoutSha256))
+    return TargetSlabPublicationValidation::kLayoutIdentity;
+  if (publication.chunks_authenticated != kTargetSlabChunks)
+    return TargetSlabPublicationValidation::kChunksAuthenticated;
+  if (publication.peak_host_pinned_bytes != kTargetSlabPeakPinnedBytes)
+    return TargetSlabPublicationValidation::kPeakPinnedBytes;
+  if (publication.open_to_publish_ns != completed_ns - started_ns)
+    return TargetSlabPublicationValidation::kOpenDuration;
+  if (!probe.device_memory)
+    return TargetSlabPublicationValidation::kProbeMemoryType;
+  if (probe.device != publication.device)
+    return TargetSlabPublicationValidation::kProbeDevice;
+  if (probe.allocation_base !=
+      reinterpret_cast<std::uintptr_t>(publication.device_base))
+    return TargetSlabPublicationValidation::kAllocationBase;
+  if (probe.allocation_bytes != publication.bytes)
+    return TargetSlabPublicationValidation::kAllocationExtent;
   const auto& expected =
       publication.rank == 0 ? kRank0Chunks : kRank1Chunks;
   std::uint64_t observed_bytes = 0;
@@ -180,10 +209,12 @@ bool validate_accepted_loader_publication(
     if (observed.index != index || observed.bytes != expected[index].bytes ||
         observed.direct_read_ns == 0 || observed.sha256_ns == 0 ||
         observed.h2d_fence_ns == 0)
-      return false;
+      return TargetSlabPublicationValidation::kReceiptChunk;
     observed_bytes += observed.bytes;
   }
-  return observed_bytes == kTargetSlabBytes;
+  return observed_bytes == kTargetSlabBytes
+             ? TargetSlabPublicationValidation::kAccepted
+             : TargetSlabPublicationValidation::kReceiptBytes;
 }
 
 namespace {

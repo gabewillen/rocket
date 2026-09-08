@@ -111,6 +111,33 @@ struct TargetSlabCudaProbeResult {
   bool ready_event_complete;
 };
 
+enum class TargetSlabPublicationValidation : std::uint8_t {
+  kAccepted,
+  kReceiptHeader,
+  kPublicationPointerEvent,
+  kPublicationBytes,
+  kPublicationRankDevice,
+  kSlabKey,
+  kArtifactManifest,
+  kLayoutIdentity,
+  kChunksAuthenticated,
+  kPeakPinnedBytes,
+  kOpenDuration,
+  kProbeMemoryType,
+  kProbeDevice,
+  kAllocationBase,
+  kAllocationExtent,
+  kReceiptChunk,
+  kReceiptBytes,
+};
+
+TargetSlabPublicationValidation diagnose_accepted_loader_publication(
+    const TargetSlabPublication& publication,
+    const TargetSlabCudaProbeResult& probe, std::uint64_t receipt_started_ns,
+    std::uint64_t receipt_completed_ns,
+    const TargetSlabChunkReceipt* chunk_receipts,
+    std::size_t chunk_receipt_count) noexcept;
+
 // Allocation-free validation seam. Production supplies values obtained from
 // CUDA pointer/address-range/event probes. CPU tests inject the same typed
 // result without gaining a capability-minting API.
