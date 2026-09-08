@@ -32,6 +32,12 @@ inline constexpr SlabDescriptor kEmbedding{
 inline constexpr SlabDescriptor kFinalNorm{
     "model.language_model.hyper_connection_mixer.hc_norm.weight",
     1'271'398'400, 20'480};
+inline constexpr SlabDescriptor kFinalDown{
+    "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
+    1'271'418'880, 6'553'600};
+inline constexpr SlabDescriptor kFinalUp{
+    "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight",
+    1'277'972'480, 6'553'600};
 
 struct Winner {
   float value;

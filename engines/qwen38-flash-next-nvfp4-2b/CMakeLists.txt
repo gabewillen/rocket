@@ -489,6 +489,34 @@ set_target_properties(qwen38_token_output PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+add_library(qwen38_native_token_io STATIC
+  src/output/native_token_io.cu
+  src/output/token_io_roots.cc)
+target_include_directories(qwen38_native_token_io PUBLIC src)
+target_link_libraries(qwen38_native_token_io PUBLIC
+  qwen38_token_output qwen38_hyperconnection qwen38_target_slab_owner
+  qwen38_pair_reduce rocket_qwen38_openssl3_crypto CUDA::cudart
+  CUDA::cuda_driver CUDA::cublas)
+target_compile_options(qwen38_native_token_io PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror>
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xcompiler=-Wall,-Wextra,-Werror>)
+set_target_properties(qwen38_native_token_io PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
+
+add_library(qwen38_native_token_io_preflight SHARED
+  src/output/native_token_io_preflight.cc)
+target_include_directories(qwen38_native_token_io_preflight PUBLIC src)
+target_link_libraries(qwen38_native_token_io_preflight PRIVATE
+  qwen38_native_token_io CUDA::cudart)
+target_compile_options(qwen38_native_token_io_preflight PRIVATE
+  -Wall -Wextra -Werror)
+target_link_options(qwen38_native_token_io_preflight PRIVATE
+  -Wl,--exclude-libs,ALL)
+set_target_properties(qwen38_native_token_io_preflight PROPERTIES
+  POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE CUDA
+  CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON)
+
 add_library(qwen38_route_compaction_contract STATIC
   src/moe/route_compaction.cc
   src/moe/fp8_routed_experts.cc)
@@ -890,6 +918,25 @@ add_test(NAME qwen38-residual-rmsnorm-contract COMMAND qwen38-test-residual-rmsn
 
 add_executable(qwen38-test-token-output tests/test_token_output.cu)
 target_link_libraries(qwen38-test-token-output PRIVATE qwen38_token_output)
+add_executable(qwen38-test-token-io-roots tests/test_token_io_roots.cc)
+target_link_libraries(qwen38-test-token-io-roots PRIVATE qwen38_native_token_io)
+target_compile_options(qwen38-test-token-io-roots PRIVATE
+  -Wall -Wextra -Werror)
+set_target_properties(qwen38-test-token-io-roots PROPERTIES LINKER_LANGUAGE CUDA)
+add_test(NAME qwen38-token-io-roots-rejection-contract
+  COMMAND qwen38-test-token-io-roots)
+set(ROCKET_QWEN38_TOKENIZER_ROOT
+  "/home/glwillen/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fc694b54fb0174e0913e6adf86691ef85a4ead47"
+  CACHE PATH "Pinned Qwen3.8 tokenizer root")
+set(ROCKET_QWEN38_K0_ORACLE_ROOT
+  "/home/glwillen/calibration/qwen38-k0-oracle-a1794d5-01/capture"
+  CACHE PATH "Pinned 35-row K0 oracle capture")
+if(EXISTS "${ROCKET_QWEN38_TOKENIZER_ROOT}/tokenizer.json" AND
+   EXISTS "${ROCKET_QWEN38_K0_ORACLE_ROOT}/manifest.json")
+  add_test(NAME qwen38-token-io-roots-authenticated-contract
+    COMMAND qwen38-test-token-io-roots
+      "${ROCKET_QWEN38_TOKENIZER_ROOT}" "${ROCKET_QWEN38_K0_ORACLE_ROOT}")
+endif()
 target_compile_options(qwen38-test-token-output PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
 )
