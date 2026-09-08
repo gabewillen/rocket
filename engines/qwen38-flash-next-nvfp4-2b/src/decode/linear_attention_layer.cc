@@ -103,6 +103,9 @@ LinearAttentionResult LinearAttentionLayer::execute(
     const __nv_bfloat16* partial = graph_.projected_output();
     require(partial != nullptr, rank_, layer_,
             "GDN graph returned no projected output");
+    target_k0_observe_layer0(
+        progress, TargetK0LayerBoundary::kAttentionOutput, partial,
+        kLinearHidden, TargetK0DiagnosticDtype::kBfloat16, stream);
     emit(stage_name(layer_, "gdn_graph"),
          pair_reduce::Outcome::kOk, m, trace_id, request_id,
          elapsed_ns(start), graph_.logical_bytes_per_row(m) * m);
@@ -112,6 +115,10 @@ LinearAttentionResult LinearAttentionLayer::execute(
                           TargetK0LayerExecutionStage::kAttentionReduction);
     reducer_.reduce(partial, reduced_attention, m, trace_id, request_id,
                     stream);
+    target_k0_observe_layer0(
+        progress, TargetK0LayerBoundary::kAttentionReduction,
+        reduced_attention, kLinearHidden, TargetK0DiagnosticDtype::kFloat32,
+        stream);
     emit(stage_name(layer_, "pair_reduce"),
          pair_reduce::Outcome::kOk, m, trace_id, request_id,
          elapsed_ns(start), kHiddenBytesPerRow * m);
@@ -123,6 +130,10 @@ LinearAttentionResult LinearAttentionLayer::execute(
         hidden, reduced_attention, injection, updated_hidden,
         next_block_input, next_injection, m, stream);
     hyperconnection_.synchronize(stream);
+    target_k0_observe_layer0(
+        progress, TargetK0LayerBoundary::kHyperconnectionCombineMix,
+        updated_hidden, 4 * kLinearHidden,
+        TargetK0DiagnosticDtype::kBfloat16, stream);
     emit(stage_name(layer_, "mlp_hc_combine_mix"),
          pair_reduce::Outcome::kOk, m, trace_id, request_id,
          elapsed_ns(start), kHyperBytesPerRow * m);

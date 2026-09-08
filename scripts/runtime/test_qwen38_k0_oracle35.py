@@ -230,7 +230,22 @@ class Oracle35LauncherTests(unittest.TestCase):
             "execution_layer_stage",
             "gdn_graph_stage",
             "startup_construction_stage",
+            "layer_boundary_diagnostics",
         })
+        self.assertEqual(module._snapshot(result)[
+            "layer_boundary_diagnostics"], ())
+
+    def test_layer_boundary_diagnostics_are_fixed_and_numeric(self):
+        result = module._NativeResult()
+        result.layer_boundary_hashes[1] = 7
+        result.layer_boundary_elements[1] = 2560
+        result.layer_boundary_zero_counts[1] = 3
+        result.layer_boundary_nonfinite_counts[1] = 0
+        self.assertEqual(module._layer_boundary_diagnostics(result), ({
+            "boundary": "attention_reduction", "hash": 7,
+            "elements": 2560, "zero_count": 3, "nonfinite_count": 0,
+        },))
+        self.assertEqual(len(module.LAYER_BOUNDARY_NAMES), 6)
 
 
 if __name__ == "__main__":

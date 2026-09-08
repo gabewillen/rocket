@@ -139,6 +139,18 @@ extern "C" int qwen38_target_k0_oracle35_run(
         static_cast<std::int32_t>(execution_progress.gdn_graph_stage);
     result->startup_construction_stage =
         static_cast<std::int32_t>(construction_progress);
+    std::copy(execution_progress.boundary_evidence.hashes.begin(),
+              execution_progress.boundary_evidence.hashes.end(),
+              result->layer_boundary_hashes);
+    std::copy(execution_progress.boundary_evidence.elements.begin(),
+              execution_progress.boundary_evidence.elements.end(),
+              result->layer_boundary_elements);
+    std::copy(execution_progress.boundary_evidence.zero_counts.begin(),
+              execution_progress.boundary_evidence.zero_counts.end(),
+              result->layer_boundary_zero_counts);
+    std::copy(execution_progress.boundary_evidence.nonfinite_counts.begin(),
+              execution_progress.boundary_evidence.nonfinite_counts.end(),
+              result->layer_boundary_nonfinite_counts);
     if (telemetry) publish(telemetry->snapshot(), *result);
   };
   try {

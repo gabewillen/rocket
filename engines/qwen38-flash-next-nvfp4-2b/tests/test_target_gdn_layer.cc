@@ -182,6 +182,27 @@ struct Storage {
             &post_attention, &moe_input, &moe_injection, &reduced_moe};
   }
 };
+
+struct BoundaryObserver final : decode::TargetK0LayerBoundaryObserver {
+  void observe(decode::TargetK0LayerBoundary boundary, const void*,
+               std::size_t elements, decode::TargetK0DiagnosticDtype dtype,
+               cudaStream_t stream,
+               decode::TargetK0LayerBoundaryEvidence& evidence) override {
+    check(stream && elements > 0, "boundary diagnostic extent changed");
+    const auto index = static_cast<std::size_t>(boundary);
+    order.push_back(boundary);
+    evidence.elements[index] = static_cast<std::uint32_t>(elements);
+    evidence.hashes[index] = 1 + index;
+    if (boundary == decode::TargetK0LayerBoundary::kAttentionReduction ||
+        boundary == decode::TargetK0LayerBoundary::kMoeReduction)
+      check(dtype == decode::TargetK0DiagnosticDtype::kFloat32,
+            "reduction diagnostic dtype changed");
+    else
+      check(dtype == decode::TargetK0DiagnosticDtype::kBfloat16,
+            "BF16 diagnostic dtype changed");
+  }
+  std::vector<decode::TargetK0LayerBoundary> order;
+};
 }  // namespace
 
 int main() {
@@ -236,6 +257,37 @@ int main() {
     check(trace.stages.back() == "rocket.qwen38.k0.gdn_layer.lifecycle" &&
               trace.outcomes.back() == pr::Outcome::kOk,
           "GDN lifecycle telemetry changed");
+
+    std::vector<std::string> diagnostic_order;
+    Graph diagnostic_graph(0, 0, diagnostic_order);
+    Moe diagnostic_moe(0, 0, diagnostic_order);
+    Reducer diagnostic_attention(0, "attention_reduce", diagnostic_order);
+    Reducer diagnostic_moe_reduce(0, "moe_reduce", diagnostic_order);
+    Hyper diagnostic_hyper(diagnostic_order);
+    Generation diagnostic_generation(0, 0, diagnostic_order);
+    Trace diagnostic_trace;
+    Storage diagnostic_storage;
+    decode::TargetGdnLayer diagnostic_owner(
+        diagnostic_graph, diagnostic_moe, diagnostic_attention,
+        diagnostic_moe_reduce, diagnostic_hyper, diagnostic_generation,
+        diagnostic_trace, diagnostic_storage.state(),
+        diagnostic_storage.buffers());
+    BoundaryObserver observer;
+    decode::TargetK0ExecutionProgress progress;
+    progress.row = 0;
+    progress.layer = 0;
+    progress.boundary_observer = &observer;
+    diagnostic_owner.execute(
+        1, &input, &output, "gdn-diagnostic", "row-0",
+        reinterpret_cast<cudaStream_t>(&diagnostic_storage), &progress);
+    check(observer.order == std::vector<decode::TargetK0LayerBoundary>{
+                                decode::TargetK0LayerBoundary::kAttentionOutput,
+                                decode::TargetK0LayerBoundary::kAttentionReduction,
+                                decode::TargetK0LayerBoundary::kHyperconnectionCombineMix,
+                                decode::TargetK0LayerBoundary::kMoeOutput,
+                                decode::TargetK0LayerBoundary::kMoeReduction,
+                                decode::TargetK0LayerBoundary::kFinalHyperconnection},
+          "layer0 boundary diagnostic order changed");
 
     auto short_state = storage.state();
     --short_state.recurrent_elements;

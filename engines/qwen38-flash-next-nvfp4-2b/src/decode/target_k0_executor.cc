@@ -61,6 +61,8 @@ TargetK0ExecutionResult TargetK0Executor::execute_prefill(
       throw std::invalid_argument("K0 prompt/oracle identity changed");
 
   phase_ = TargetK0ExecutorPhase::kActive;
+  if (progress) progress->boundary_observer =
+                    dynamic_cast<TargetK0LayerBoundaryObserver*>(&comparator_);
   std::uint64_t bytes = 0;
   try {
     target_k0_enter(progress, TargetK0ExecutionStage::kTokenSourceWait);

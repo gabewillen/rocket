@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <cuda_runtime_api.h>
+
+#include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace rocket::qwen38::decode {
@@ -55,6 +59,40 @@ enum class TargetK0GdnGraphStage : std::uint8_t {
   kOutputPublication,
 };
 
+// Diagnostic-only row0/layer0 boundaries. These values never select forward
+// behavior or acceptance. The fixed arrays are safe to publish as bounded
+// numeric OTEL measurements; the hash is never used as a metric dimension.
+enum class TargetK0LayerBoundary : std::uint8_t {
+  kAttentionOutput,
+  kAttentionReduction,
+  kHyperconnectionCombineMix,
+  kMoeOutput,
+  kMoeReduction,
+  kFinalHyperconnection,
+  kCount,
+};
+
+enum class TargetK0DiagnosticDtype : std::uint8_t { kBfloat16, kFloat32 };
+
+inline constexpr std::size_t kTargetK0LayerBoundaryCount =
+    static_cast<std::size_t>(TargetK0LayerBoundary::kCount);
+
+struct TargetK0LayerBoundaryEvidence {
+  std::array<std::uint64_t, kTargetK0LayerBoundaryCount> hashes{};
+  std::array<std::uint32_t, kTargetK0LayerBoundaryCount> elements{};
+  std::array<std::uint32_t, kTargetK0LayerBoundaryCount> zero_counts{};
+  std::array<std::uint32_t, kTargetK0LayerBoundaryCount> nonfinite_counts{};
+};
+
+class TargetK0LayerBoundaryObserver {
+ public:
+  virtual ~TargetK0LayerBoundaryObserver() = default;
+  virtual void observe(TargetK0LayerBoundary boundary, const void* device_values,
+                       std::size_t elements, TargetK0DiagnosticDtype dtype,
+                       cudaStream_t stream,
+                       TargetK0LayerBoundaryEvidence& evidence) = 0;
+};
+
 struct TargetK0ExecutionProgress {
   TargetK0ExecutionStage stage = TargetK0ExecutionStage::kValidation;
   std::int32_t row = -1;
@@ -62,6 +100,8 @@ struct TargetK0ExecutionProgress {
   TargetK0LayerExecutionStage layer_stage =
       TargetK0LayerExecutionStage::kNone;
   TargetK0GdnGraphStage gdn_graph_stage = TargetK0GdnGraphStage::kNone;
+  TargetK0LayerBoundaryObserver* boundary_observer = nullptr;
+  TargetK0LayerBoundaryEvidence boundary_evidence{};
 };
 
 inline void target_k0_enter(
@@ -96,6 +136,17 @@ inline void target_k0_enter_stage(TargetK0ExecutionProgress* progress,
 inline void target_k0_enter_gdn_graph(TargetK0ExecutionProgress* progress,
                                       TargetK0GdnGraphStage stage) noexcept {
   if (progress) progress->gdn_graph_stage = stage;
+}
+
+inline void target_k0_observe_layer0(
+    TargetK0ExecutionProgress* progress, TargetK0LayerBoundary boundary,
+    const void* device_values, std::size_t elements,
+    TargetK0DiagnosticDtype dtype, cudaStream_t stream) {
+  if (progress && progress->row == 0 && progress->layer == 0 &&
+      progress->boundary_observer)
+    progress->boundary_observer->observe(
+        boundary, device_values, elements, dtype, stream,
+        progress->boundary_evidence);
 }
 
 }  // namespace rocket::qwen38::decode

@@ -22,7 +22,8 @@ struct TargetK0OracleEvidence {
 // expected files are authenticated and retained in ordinary host memory at
 // construction. compare() owns one bounded pinned D2H buffer and fences each
 // named boundary. It is not part of the serving graph or production registry.
-class NativeTargetK0OracleComparator final : public TargetK0OracleComparator {
+class NativeTargetK0OracleComparator final : public TargetK0OracleComparator,
+                                             public TargetK0LayerBoundaryObserver {
  public:
   NativeTargetK0OracleComparator(
       int rank, const std::filesystem::path& capture,
@@ -40,6 +41,10 @@ class NativeTargetK0OracleComparator final : public TargetK0OracleComparator {
                const void* device_values, std::size_t elements,
                cudaStream_t stream) override;
   void compare_token(std::int32_t token) override;
+  void observe(TargetK0LayerBoundary boundary, const void* device_values,
+               std::size_t elements, TargetK0DiagnosticDtype dtype,
+               cudaStream_t stream,
+               TargetK0LayerBoundaryEvidence& evidence) override;
   const TargetK0OracleEvidence& evidence() const noexcept;
 
  private:

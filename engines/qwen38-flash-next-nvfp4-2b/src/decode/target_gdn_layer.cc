@@ -90,15 +90,25 @@ TargetFullLayerResult TargetGdnLayer::execute(
     moe_.publish_after_fence(generation);
     require(moe_.projected_output(), rank_, layer_,
             "target MoE published no rank-local partial");
+    target_k0_observe_layer0(
+        progress, TargetK0LayerBoundary::kMoeOutput, moe_.projected_output(),
+        kLinearHidden, TargetK0DiagnosticDtype::kBfloat16, stream);
     target_k0_enter_layer(progress, TargetK0LayerExecutionStage::kMoeReduction);
     moe_reducer_.reduce(moe_.projected_output(), buffers_.reduced_moe, 1,
                         trace_id, request_id, stream);
+    target_k0_observe_layer0(
+        progress, TargetK0LayerBoundary::kMoeReduction, buffers_.reduced_moe,
+        kLinearHidden, TargetK0DiagnosticDtype::kFloat32, stream);
     target_k0_enter_layer(progress,
                           TargetK0LayerExecutionStage::kFinalHyperconnection);
     hyperconnection_.combine(
         buffers_.post_attention_hidden, buffers_.reduced_moe,
         buffers_.moe_injection, replicated_post_layer, 1, stream);
     hyperconnection_.synchronize(stream);
+    target_k0_observe_layer0(
+        progress, TargetK0LayerBoundary::kFinalHyperconnection,
+        replicated_post_layer, 4 * kLinearHidden,
+        TargetK0DiagnosticDtype::kBfloat16, stream);
   } catch (const pair_reduce::PairReduceContractError&) {
     fail(pair_reduce::Outcome::kContractError);
     throw;

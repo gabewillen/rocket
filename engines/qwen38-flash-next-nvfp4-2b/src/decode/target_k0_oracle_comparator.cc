@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -180,6 +181,25 @@ struct NativeTargetK0OracleComparator::Impl {
     if (rank == 0 || rank == 1)
       telemetry->record_duration({rank, 1, pair_reduce::kDtype, outcome, 0});
   }
+
+  void emit_boundary(TargetK0LayerBoundary boundary,
+                     pair_reduce::Outcome outcome,
+                     std::uint64_t bytes) noexcept {
+    if (!telemetry) return;
+    static constexpr std::array<std::string_view,
+                                kTargetK0LayerBoundaryCount>
+        stages = {"rocket.qwen38.k0_boundary.attention_output",
+                  "rocket.qwen38.k0_boundary.attention_reduction",
+                  "rocket.qwen38.k0_boundary.hc_combine_mix",
+                  "rocket.qwen38.k0_boundary.moe_output",
+                  "rocket.qwen38.k0_boundary.moe_reduction",
+                  "rocket.qwen38.k0_boundary.final_hc"};
+    const auto index = static_cast<std::size_t>(boundary);
+    if (index >= stages.size()) return;
+    telemetry->emit_span_and_log({stages[index], "k0-boundary", "row0-layer0",
+                                  rank == 0 || rank == 1 ? rank : -1, 1,
+                                  pair_reduce::kDtype, outcome, 0, bytes});
+  }
 };
 
 NativeTargetK0OracleComparator::NativeTargetK0OracleComparator(
@@ -301,6 +321,66 @@ std::string_view NativeTargetK0OracleComparator::manifest_sha256() const
     noexcept { return impl_->manifest; }
 bool NativeTargetK0OracleComparator::authenticated() const noexcept {
   return impl_->valid;
+}
+
+void NativeTargetK0OracleComparator::observe(
+    TargetK0LayerBoundary boundary, const void* device_values,
+    std::size_t elements, TargetK0DiagnosticDtype dtype, cudaStream_t stream,
+    TargetK0LayerBoundaryEvidence& evidence) {
+  const auto index = static_cast<std::size_t>(boundary);
+  const bool wide = boundary == TargetK0LayerBoundary::kHyperconnectionCombineMix ||
+                    boundary == TargetK0LayerBoundary::kFinalHyperconnection;
+  const bool fp32 = boundary == TargetK0LayerBoundary::kAttentionReduction ||
+                    boundary == TargetK0LayerBoundary::kMoeReduction;
+  const std::size_t expected_elements =
+      wide ? static_cast<std::size_t>(kTargetK0HyperHidden)
+           : static_cast<std::size_t>(kTargetK0Hidden);
+  if (!impl_->valid || index >= kTargetK0LayerBoundaryCount ||
+      !device_values || !stream || elements != expected_elements ||
+      (fp32 ? dtype != TargetK0DiagnosticDtype::kFloat32
+            : dtype != TargetK0DiagnosticDtype::kBfloat16) ||
+      evidence.elements[index] != 0)
+    throw std::invalid_argument("K0 boundary diagnostic contract changed");
+  const std::size_t element_bytes =
+      dtype == TargetK0DiagnosticDtype::kFloat32 ? sizeof(float)
+                                                 : sizeof(std::uint16_t);
+  const std::size_t observed_bytes = elements * element_bytes;
+  if (observed_bytes > kMaxObservedBytes ||
+      impl_->cuda->copy_d2h(impl_->observed, device_values, observed_bytes,
+                            stream) != cudaSuccess ||
+      impl_->cuda->event_record(impl_->ready, stream) != cudaSuccess ||
+      impl_->cuda->event_sync(impl_->ready) != cudaSuccess) {
+    impl_->emit_boundary(boundary, pair_reduce::Outcome::kCudaError,
+                         observed_bytes);
+    throw std::runtime_error("K0 boundary diagnostic D2H fence failed");
+  }
+
+  constexpr std::uint64_t kFnvOffset = 14695981039346656037ULL;
+  constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
+  std::uint64_t hash = kFnvOffset;
+  const auto* bytes = static_cast<const std::uint8_t*>(impl_->observed);
+  for (std::size_t byte = 0; byte < observed_bytes; ++byte)
+    hash = (hash ^ bytes[byte]) * kFnvPrime;
+  std::uint32_t zero_count = 0;
+  std::uint32_t nonfinite_count = 0;
+  if (dtype == TargetK0DiagnosticDtype::kFloat32) {
+    const auto* values = static_cast<const float*>(impl_->observed);
+    for (std::size_t element = 0; element < elements; ++element) {
+      zero_count += values[element] == 0.0F;
+      nonfinite_count += !std::isfinite(values[element]);
+    }
+  } else {
+    const auto* values = static_cast<const std::uint16_t*>(impl_->observed);
+    for (std::size_t element = 0; element < elements; ++element) {
+      zero_count += (values[element] & 0x7fffU) == 0;
+      nonfinite_count += (values[element] & 0x7f80U) == 0x7f80U;
+    }
+  }
+  evidence.hashes[index] = hash;
+  evidence.elements[index] = static_cast<std::uint32_t>(elements);
+  evidence.zero_counts[index] = zero_count;
+  evidence.nonfinite_counts[index] = nonfinite_count;
+  impl_->emit_boundary(boundary, pair_reduce::Outcome::kOk, observed_bytes);
 }
 std::int32_t NativeTargetK0OracleComparator::expected_input_token(int row) const {
   if (!impl_->valid || row < 0 || row >= rows())

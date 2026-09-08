@@ -116,6 +116,7 @@ class NativeRunStatusError(RuntimeError):
         self.gdn_graph_stage = GDN_GRAPH_STAGES.get(gdn_graph_stage, "unknown")
         self.startup_construction_stage = STARTUP_CONSTRUCTION_STAGES.get(
             startup_construction_stage, "unknown")
+        self.layer_boundary_diagnostics = ()
         super().__init__("native K0 run rejected")
 
 
@@ -151,6 +152,10 @@ class _NativeResult(ctypes.Structure):
         ("execution_layer_stage", ctypes.c_int32),
         ("gdn_graph_stage", ctypes.c_int32),
         ("startup_construction_stage", ctypes.c_int32),
+        ("layer_boundary_hashes", ctypes.c_uint64 * 6),
+        ("layer_boundary_elements", ctypes.c_uint32 * 6),
+        ("layer_boundary_zero_counts", ctypes.c_uint32 * 6),
+        ("layer_boundary_nonfinite_counts", ctypes.c_uint32 * 6),
     )
 
 
@@ -291,7 +296,7 @@ def _native_run(args: argparse.Namespace, lease: object,
         *arrays, ctypes.byref(result),
     )
     if status:
-        raise NativeRunStatusError(
+        error = NativeRunStatusError(
             status, result.physical_layer_substage,
             result.physical_layer_index, result.gdn_owner_substage,
             result.moe_aot_cuda_failure, result.execution_stage,
@@ -299,7 +304,26 @@ def _native_run(args: argparse.Namespace, lease: object,
             result.execution_layer_stage, result.gdn_graph_stage,
             result.startup_construction_stage,
         )
+        error.layer_boundary_diagnostics = _layer_boundary_diagnostics(result)
+        raise error
     return result
+
+
+LAYER_BOUNDARY_NAMES = (
+    "attention_output", "attention_reduction", "hc_combine_mix",
+    "moe_output", "moe_reduction", "final_hc",
+)
+
+
+def _layer_boundary_diagnostics(result: _NativeResult) -> tuple[dict[str, int | str], ...]:
+    return tuple({"boundary": name,
+                  "hash": int(result.layer_boundary_hashes[index]),
+                  "elements": int(result.layer_boundary_elements[index]),
+                  "zero_count": int(result.layer_boundary_zero_counts[index]),
+                  "nonfinite_count": int(
+                      result.layer_boundary_nonfinite_counts[index])}
+                 for index, name in enumerate(LAYER_BOUNDARY_NAMES)
+                 if result.layer_boundary_elements[index])
 
 
 def _snapshot(result: _NativeResult) -> dict[str, object]:
@@ -332,6 +356,7 @@ def _snapshot(result: _NativeResult) -> dict[str, object]:
                                                  "unknown"),
         "startup_construction_stage": STARTUP_CONSTRUCTION_STAGES.get(
             result.startup_construction_stage, "unknown"),
+        "layer_boundary_diagnostics": _layer_boundary_diagnostics(result),
     }
 
 
@@ -397,6 +422,8 @@ def worker(args: argparse.Namespace) -> int:
             physical["gdn_graph_stage"] = error.gdn_graph_stage
             physical["startup_construction_stage"] = (
                 error.startup_construction_stage)
+            physical["layer_boundary_diagnostics"] = (
+                error.layer_boundary_diagnostics)
         print(json.dumps({"schema": SCHEMA, "valid": False, "complete": False,
                           "rank": args.rank, "phase": phase,
                           "failure_class": failure["class"],

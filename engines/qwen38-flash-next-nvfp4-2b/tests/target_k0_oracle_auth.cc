@@ -90,6 +90,29 @@ int main(int argc, char** argv) {
           comparator.expected_input_token(0) == 7734 &&
           comparator.expected_input_token(34) == 13);
     auto stream = reinterpret_cast<cudaStream_t>(0x1);
+    decode::TargetK0LayerBoundaryEvidence boundary_evidence;
+    std::vector<float> reduced(decode::kTargetK0Hidden, 0.0F);
+    reduced[17] = 1.0F;
+    comparator.observe(decode::TargetK0LayerBoundary::kAttentionReduction,
+                       reduced.data(), reduced.size(),
+                       decode::TargetK0DiagnosticDtype::kFloat32, stream,
+                       boundary_evidence);
+    const auto reduction_index = static_cast<std::size_t>(
+        decode::TargetK0LayerBoundary::kAttentionReduction);
+    check(boundary_evidence.hashes[reduction_index] != 0 &&
+          boundary_evidence.elements[reduction_index] == reduced.size() &&
+          boundary_evidence.zero_counts[reduction_index] == reduced.size() - 1 &&
+          boundary_evidence.nonfinite_counts[reduction_index] == 0);
+    bool duplicate_rejected = false;
+    try {
+      comparator.observe(decode::TargetK0LayerBoundary::kAttentionReduction,
+                         reduced.data(), reduced.size(),
+                         decode::TargetK0DiagnosticDtype::kFloat32, stream,
+                         boundary_evidence);
+    } catch (const std::invalid_argument&) {
+      duplicate_rejected = true;
+    }
+    check(duplicate_rejected);
     auto embedding = read_bf16(capture / "embedding.bin");
     comparator.compare(decode::TargetK0Boundary::kEmbedding, 0, -1,
                        embedding.data(), decode::kTargetK0Hidden, stream);

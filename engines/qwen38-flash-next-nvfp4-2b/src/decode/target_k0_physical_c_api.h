@@ -27,6 +27,10 @@ struct Qwen38TargetK0Oracle35Result {
   std::int32_t execution_layer_stage;
   std::int32_t gdn_graph_stage;
   std::int32_t startup_construction_stage;
+  std::uint64_t layer_boundary_hashes[6];
+  std::uint32_t layer_boundary_elements[6];
+  std::uint32_t layer_boundary_zero_counts[6];
+  std::uint32_t layer_boundary_nonfinite_counts[6];
 };
 
 enum Qwen38TargetK0Oracle35Status : int {
