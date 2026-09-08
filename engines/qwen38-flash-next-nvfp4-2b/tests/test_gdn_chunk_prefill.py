@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+import inspect
 from unittest.mock import patch
 
 from qwen38_slab.gdn_chunk_prefill import (
@@ -13,6 +14,8 @@ from qwen38_slab.gdn_chunk_prefill import (
     FlashInferSm121GdnChunkBackend,
     GdnChunkPrefillError,
     GdnChunkPrefillTensors,
+    ORACLE_MANIFEST_SHA256,
+    execute_authenticated_sm121a_chunk_prefill,
 )
 
 
@@ -24,6 +27,21 @@ class Tensor:
 
     def is_contiguous(self):
         return True
+
+    def detach(self):
+        return self
+
+    def contiguous(self):
+        return self
+
+    def view(self, _dtype):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return types.SimpleNamespace(tobytes=lambda: repr(self.shape).encode())
 
 
 def tensors(rows=35):
@@ -76,6 +94,60 @@ class Backend:
 
 
 class GdnChunkPrefillTests(unittest.TestCase):
+    def test_executable_boundary_owns_tensors_and_runs_supported_backend(self):
+        allocations = []
+        torch = types.SimpleNamespace(
+            bfloat16="bfloat16",
+            float32="float32",
+            int64="int64",
+            uint8="uint8",
+            cuda=types.SimpleNamespace(
+                synchronize=lambda device: allocations.append(("sync", device))
+            ),
+        )
+
+        def allocate(shape, *_args, dtype, device, **_kwargs):
+            self.assertEqual(device, "cuda:0")
+            value = Tensor(tuple(shape), dtype)
+            allocations.append(value)
+            return value
+
+        torch.full = allocate
+        torch.zeros = allocate
+        torch.empty = allocate
+        torch.tensor = lambda values, *, dtype, device: allocate(
+            (len(values),), dtype=dtype, device=device
+        )
+        backend = Backend()
+        result = execute_authenticated_sm121a_chunk_prefill(
+            rank=0,
+            layer=0,
+            rows=35,
+            oracle_manifest_sha256=ORACLE_MANIFEST_SHA256,
+            torch_module=torch,
+            backend=backend,
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["implementation"], FLASHINFER_GDN_CHUNK_IDENTITY)
+        self.assertEqual(result["telemetry"]["execution.domain"], "chunk_prefill")
+        self.assertEqual(allocations[-1], ("sync", 0))
+        self.assertEqual(len(backend.calls), 1)
+        source = inspect.getsource(execute_authenticated_sm121a_chunk_prefill)
+        self.assertNotIn("data_ptr", source)
+        self.assertNotIn("ctypes", source)
+
+    def test_executable_boundary_rejects_identity_before_allocation(self):
+        torch = types.SimpleNamespace()
+        with self.assertRaises(GdnChunkPrefillError):
+            execute_authenticated_sm121a_chunk_prefill(
+                rank=0,
+                layer=0,
+                rows=35,
+                oracle_manifest_sha256="0" * 64,
+                torch_module=torch,
+                backend=Backend(),
+            )
+
     def test_authenticated_oracle35_call_publishes_exact_owned_outputs(self):
         backend, tracer = Backend(), Tracer()
         adapter = AuthenticatedGdnChunkPrefillAdapter(0, 0, backend, tracer)

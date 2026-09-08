@@ -9,6 +9,9 @@ keeps that boundary explicit and separate from Rocket's packed-decode port.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -16,6 +19,9 @@ PINNED_VLLM_COMMIT = "8e685d198"
 PINNED_FLASHINFER_VERSION = "0.6.17"
 FLASHINFER_GDN_CHUNK_IDENTITY = (
     "vllm:8e685d198:flashinfer:0.6.17:gdn-prefill-sm121a"
+)
+ORACLE_MANIFEST_SHA256 = (
+    "05ea3af1c4694a9c035ce2fe9ce006acc58881df0fe86771b1846f4bd8e5f48b"
 )
 
 ORACLE_PREFILL_ROWS = frozenset((35, 87))
@@ -216,6 +222,125 @@ class AuthenticatedGdnChunkPrefillAdapter:
             raise GdnChunkPrefillError("GDN chunk-prefill output alias changed")
 
 
+class _ProofSpan:
+    def __init__(self, attributes: dict[str, object]) -> None:
+        self._attributes = attributes
+
+    def __enter__(self) -> "_ProofSpan":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def set_attribute(self, key: str, value: object) -> None:
+        self._attributes[key] = value
+
+
+class _ProofTracer:
+    def __init__(self) -> None:
+        self.attributes: dict[str, object] = {}
+
+    def start_as_current_span(self, _name: str) -> _ProofSpan:
+        return _ProofSpan(self.attributes)
+
+
+def _tensor_sha256(tensor: object, torch_module: object) -> str:
+    detached = tensor.detach().contiguous().view(torch_module.uint8)
+    return hashlib.sha256(detached.cpu().numpy().tobytes()).hexdigest()
+
+
+def execute_authenticated_sm121a_chunk_prefill(
+    *,
+    rank: int,
+    layer: int,
+    rows: int,
+    oracle_manifest_sha256: str,
+    torch_module: object | None = None,
+    backend: GdnChunkPrefillBackend | None = None,
+) -> dict[str, object]:
+    """Execute one bounded real chunk-prefill call from Torch-owned tensors.
+
+    This is the process-local executable boundary. It never accepts addresses:
+    every device allocation is a Torch tensor whose ownership remains in this
+    frame through synchronization and digest publication.
+    """
+    if oracle_manifest_sha256 != ORACLE_MANIFEST_SHA256:
+        raise GdnChunkPrefillError("GDN chunk-prefill oracle identity changed")
+    if rows not in ORACLE_PREFILL_ROWS:
+        raise GdnChunkPrefillError("GDN chunk-prefill row count changed")
+
+    if torch_module is None:
+        import torch as torch_module
+    tracer = _ProofTracer()
+    implementation = backend or FlashInferSm121GdnChunkBackend()
+    device = "cuda:0"
+    bf16 = torch_module.bfloat16
+    fp32 = torch_module.float32
+    tensors = GdnChunkPrefillTensors(
+        q=torch_module.full(
+            (rows, KEY_HEADS, HEAD_DIM), 0.125, dtype=bf16, device=device
+        ),
+        k=torch_module.full(
+            (rows, KEY_HEADS, HEAD_DIM), -0.25, dtype=bf16, device=device
+        ),
+        v=torch_module.full(
+            (rows, VALUE_HEADS, HEAD_DIM), 0.5, dtype=bf16, device=device
+        ),
+        log_decay=torch_module.full(
+            (rows, VALUE_HEADS), math.log(0.99), dtype=fp32, device=device
+        ),
+        beta=torch_module.full((rows, VALUE_HEADS), 0.5, dtype=fp32, device=device),
+        initial_state=torch_module.zeros(
+            (1, VALUE_HEADS, HEAD_DIM, HEAD_DIM), dtype=fp32, device=device
+        ),
+        output=torch_module.empty(
+            (rows, VALUE_HEADS, HEAD_DIM), dtype=bf16, device=device
+        ),
+        final_state=torch_module.empty(
+            (1, VALUE_HEADS, HEAD_DIM, HEAD_DIM), dtype=fp32, device=device
+        ),
+        cu_seqlens=torch_module.tensor(
+            [0, rows], dtype=torch_module.int64, device=device
+        ),
+    )
+    adapter = AuthenticatedGdnChunkPrefillAdapter(rank, layer, implementation, tracer)
+    output, final_state = adapter.execute(tensors)
+    torch_module.cuda.synchronize(0)
+    return {
+        "status": "success",
+        "implementation": implementation.implementation_identity,
+        "rank": rank,
+        "layer": layer,
+        "rows": rows,
+        "output_sha256": _tensor_sha256(output, torch_module),
+        "final_state_sha256": _tensor_sha256(final_state, torch_module),
+        "telemetry": tracer.attributes,
+    }
+
+
+def executable_main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rank", required=True, type=int)
+    parser.add_argument("--layer", required=True, type=int)
+    parser.add_argument("--rows", required=True, type=int)
+    parser.add_argument("--oracle-manifest-sha256", required=True)
+    args = parser.parse_args(argv)
+    try:
+        result = execute_authenticated_sm121a_chunk_prefill(
+            rank=args.rank,
+            layer=args.layer,
+            rows=args.rows,
+            oracle_manifest_sha256=args.oracle_manifest_sha256,
+        )
+    except BaseException:
+        print(json.dumps({"status": "error", "stage": "chunk_prefill"}, sort_keys=True))
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 __all__ = [
     "ATTENTION_SCALE",
     "AuthenticatedGdnChunkPrefillAdapter",
@@ -226,7 +351,10 @@ __all__ = [
     "HEAD_DIM",
     "KEY_HEADS",
     "ORACLE_PREFILL_ROWS",
+    "ORACLE_MANIFEST_SHA256",
     "PINNED_FLASHINFER_VERSION",
     "PINNED_VLLM_COMMIT",
     "VALUE_HEADS",
+    "execute_authenticated_sm121a_chunk_prefill",
+    "executable_main",
 ]
