@@ -706,7 +706,7 @@ add_library(qwen38_target_moe_b12x_aot STATIC
   src/moe/target_moe_b12x_aot.cc)
 target_include_directories(qwen38_target_moe_b12x_aot PUBLIC src)
 target_link_libraries(qwen38_target_moe_b12x_aot PUBLIC
-  qwen38_target_moe_c1_contract CUDA::cudart)
+  qwen38_target_moe_c1_contract qwen38_target_layer_native_plan CUDA::cudart)
 target_compile_options(qwen38_target_moe_b12x_aot PRIVATE
   -Wall -Wextra -Werror)
 set_target_properties(qwen38_target_moe_b12x_aot PROPERTIES
@@ -1130,7 +1130,7 @@ target_compile_options(qwen38-test-target-layer3-native-plan PRIVATE
 add_executable(qwen38-test-target-layer-native-plan
   tests/test_target_layer_native_plan.cc)
 target_link_libraries(qwen38-test-target-layer-native-plan PRIVATE
-  qwen38_target_layer_native_plan)
+  qwen38_target_layer_native_plan qwen38_target_moe_b12x_aot)
 target_compile_options(qwen38-test-target-layer-native-plan PRIVATE
   -Wall -Wextra -Werror)
 set_target_properties(qwen38-test-target-layer-native-plan PROPERTIES

@@ -46,6 +46,11 @@ struct TargetLayerNativePlan {
 void validate_target_layer_native_plan_binding(
     const TargetLayerNativePlan& plan);
 
+bool authenticate_target_layer_native_plan_identity(
+    int rank, int layer, std::string_view descriptor_sha256,
+    std::string_view binding_inventory_sha256,
+    std::string_view publication_layout_sha256) noexcept;
+
 TargetLayerNativePlan load_target_layer_native_plan(
     const std::filesystem::path& path);
 

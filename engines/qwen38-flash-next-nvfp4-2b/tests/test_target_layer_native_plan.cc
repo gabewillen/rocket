@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "decode/target_layer_native_plan.h"
+#include "moe/target_moe_b12x_aot.h"
 
 #include <array>
 #include <filesystem>
@@ -19,6 +20,20 @@ int main(int argc, char** argv) {
         plan.attention_kind != (qsa ? TargetK0AttentionKind::kQsa
                                     : TargetK0AttentionKind::kGdn) ||
         plan.extents.size() != (qsa ? 3'108U : 3'111U)) return 3;
+    const rocket::qwen38::moe::TargetMoeCompactRuntimeIdentity moe_identity{
+        plan.rank, plan.layer, plan.descriptor_sha256,
+        plan.native_binding_inventory_sha256,
+        plan.slab_publication_layout_sha256,
+        "modelopt_nvfp4_group16_cutlass_sm121_sfb",
+        "rocket.qwen38.target-moe.device-stage.v1",
+        "route_position_iota10_unique_positive_remote_zero_v1"};
+    if (!rocket::qwen38::moe::authenticate_target_moe_compact_runtime_identity(
+            moe_identity)) return 5;
+    auto changed_identity = moe_identity;
+    changed_identity.descriptor_sha256[0] =
+        changed_identity.descriptor_sha256[0] == '0' ? '1' : '0';
+    if (rocket::qwen38::moe::authenticate_target_moe_compact_runtime_identity(
+            changed_identity)) return 6;
     auto mutated = plan;
     ++mutated.extents.back().offset_bytes;
     try {

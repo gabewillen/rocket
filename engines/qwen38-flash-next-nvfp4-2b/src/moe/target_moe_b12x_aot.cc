@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "moe/target_moe_b12x_aot.h"
 
+#include "decode/target_layer_native_plan.h"
+
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -67,19 +69,10 @@ bool authenticate_target_moe_compact_runtime_identity(
                 "3eba3e23ff7f67feb496fde266674516d9d864bb6e92b7f50874992abdfe5d27");
   static_assert(std::string_view(kRocketQwen38TargetMoeCompactRouteRemapAbiSha256) ==
                 "5c603e36be3f2a271c4702edfb361608e268100a44dcd3123673fee152d83ea8");
-  const std::string_view descriptor = identity.rank == 0
-      ? kRocketQwen38TargetMoeCompactRank0DescriptorSha256
-      : kRocketQwen38TargetMoeCompactRank1DescriptorSha256;
-  const std::string_view inventory = identity.rank == 0
-      ? kRocketQwen38TargetMoeCompactRank0BindingInventorySha256
-      : kRocketQwen38TargetMoeCompactRank1BindingInventorySha256;
-  const std::string_view publication = identity.rank == 0
-      ? kRocketQwen38TargetMoeCompactRank0PublicationLayoutSha256
-      : kRocketQwen38TargetMoeCompactRank1PublicationLayoutSha256;
-  return (identity.rank == 0 || identity.rank == 1) &&
-         identity.descriptor_sha256 == descriptor &&
-         identity.binding_inventory_sha256 == inventory &&
-         identity.publication_layout_sha256 == publication &&
+  return decode::authenticate_target_layer_native_plan_identity(
+             identity.rank, identity.layer, identity.descriptor_sha256,
+             identity.binding_inventory_sha256,
+             identity.publication_layout_sha256) &&
          identity.source_abi == kSourceAbi &&
          identity.transform_abi == kTransformAbi &&
          identity.route_remap_abi == kRouteRemapAbi;

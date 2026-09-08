@@ -28,6 +28,7 @@ struct TargetMoeB12xIdentity {
 
 struct TargetMoeCompactRuntimeIdentity {
   int rank;
+  int layer;
   std::string descriptor_sha256;
   std::string binding_inventory_sha256;
   std::string publication_layout_sha256;

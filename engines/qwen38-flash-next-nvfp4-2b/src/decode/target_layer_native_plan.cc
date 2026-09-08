@@ -242,6 +242,19 @@ std::string descriptor_payload(const TargetLayerNativePlan& plan) {
 
 }  // namespace
 
+bool authenticate_target_layer_native_plan_identity(
+    int rank, int layer, std::string_view descriptor_sha256,
+    std::string_view binding_inventory_sha256,
+    std::string_view publication_layout_sha256) noexcept {
+  return std::any_of(kIdentities.begin(), kIdentities.end(),
+                     [&](const Identity& item) {
+    return item.rank == rank && item.layer == layer &&
+           item.descriptor == descriptor_sha256 &&
+           item.inventory == binding_inventory_sha256 &&
+           item.publication == publication_layout_sha256;
+  });
+}
+
 void validate_target_layer_native_plan_binding(
     const TargetLayerNativePlan& plan) {
   const bool qsa = plan.layer >= 0 && plan.layer < 48 && plan.layer % 4 == 3;

@@ -144,7 +144,7 @@ TargetLayerNativeMoeWeights bind_target_layer_native_moe_weights(
         scalar("down_proj", "weight_scale_2")};
   }
   result.routed_identity = moe::TargetMoeCompactRuntimeIdentity{
-      plan.rank, plan.descriptor_sha256,
+      plan.rank, plan.layer, plan.descriptor_sha256,
       plan.native_binding_inventory_sha256,
       plan.slab_publication_layout_sha256,
       "modelopt_nvfp4_group16_cutlass_sm121_sfb",
