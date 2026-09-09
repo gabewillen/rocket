@@ -23,7 +23,10 @@ DEFAULT_EXPECTED_GPUS = 1
 COMMAND_TIMEOUT_SECONDS = 10
 _INTEGER = re.compile(r"[0-9]+")
 _CONTAINER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
-_CONTAINER_MISSING = re.compile(r"(?:Error:\s*)?No such object:\s*([^\n]+)\Z")
+_CONTAINER_MISSING = re.compile(
+    r"(?:Error:\s*No such object:|Error(?: response from daemon)?:\s*"
+    r"No such container:)\s*([^\n]+)\Z"
+)
 _CONTAINER_STATES = frozenset(
     {"created", "running", "paused", "restarting", "removing", "exited", "dead"}
 )

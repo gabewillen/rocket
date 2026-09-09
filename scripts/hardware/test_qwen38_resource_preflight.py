@@ -143,6 +143,14 @@ class ResourcePreflightTest(unittest.TestCase):
         self.assertIsNone(
             MODULE.read_container_state("rocket-capture", fake_runner([missing]))
         )
+        daemon_missing = completed(
+            "", 1, "Error response from daemon: No such container: rocket-capture"
+        )
+        self.assertIsNone(
+            MODULE.read_container_state(
+                "rocket-capture", fake_runner([daemon_missing])
+            )
+        )
         with self.assertRaisesRegex(MODULE.ResourcePreflightError, "command_failed"):
             MODULE.read_container_state(
                 "rocket-capture",
