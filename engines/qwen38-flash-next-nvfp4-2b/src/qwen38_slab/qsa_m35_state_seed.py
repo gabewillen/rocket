@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 SCHEMA = "rocket.qwen38.qsa-prefill-boundary.v2"
+C1_SCHEMA = "rocket.qwen38.qsa-c1-input.v3"
 ORACLE_MANIFEST_SHA256 = (
     "05ea3af1c4694a9c035ce2fe9ce006acc58881df0fe86771b1846f4bd8e5f48b"
 )
@@ -41,6 +42,12 @@ _LAYOUTS = {
     "compressed_state_slots": ("int64", (8,), 8),
     "compressed_state": ("bfloat16", (8, 1, 128), 2),
 }
+_C1_LAYOUTS = {
+    **_LAYOUTS,
+    "row35_hidden": ("bfloat16", (1, 2560), 2),
+    "row35_index_query": ("bfloat16", (1, 4, 128), 2),
+    "row35_positions": ("int64", (3, 1), 8),
+}
 
 
 class QsaM35StateSeedError(RuntimeError):
@@ -51,7 +58,8 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
-def authenticate_qsa_m35_state_bundle(bundle: Path) -> dict[str, bytes]:
+def _authenticate_bundle(bundle: Path, schema: str,
+                         layouts: dict[str, tuple[str, tuple[int, ...], int]]) -> tuple[dict, dict[str, bytes]]:
     try:
         manifest = json.loads((bundle / "manifest.json").read_bytes())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -64,7 +72,7 @@ def authenticate_qsa_m35_state_bundle(bundle: Path) -> dict[str, bytes]:
     if (
         claimed != observed
         or bundle.name != observed
-        or manifest.get("schema") != SCHEMA
+        or manifest.get("schema") != schema
         or manifest.get("oracle_manifest_sha256") != ORACLE_MANIFEST_SHA256
         or manifest.get("implementation") != IMPLEMENTATION
         or manifest.get("rank") != 0
@@ -79,10 +87,10 @@ def authenticate_qsa_m35_state_bundle(bundle: Path) -> dict[str, bytes]:
         for entry in manifest["tensors"]
         if isinstance(entry, dict)
     }
-    if set(entries) != set(_LAYOUTS) or len(entries) != len(manifest["tensors"]):
+    if set(entries) != set(layouts) or len(entries) != len(manifest["tensors"]):
         raise QsaM35StateSeedError("QSA M35 state inventory changed")
     result: dict[str, bytes] = {}
-    for name, (dtype, shape, element_bytes) in _LAYOUTS.items():
+    for name, (dtype, shape, element_bytes) in layouts.items():
         entry = entries[name]
         filename = entry.get("file")
         expected_bytes = math.prod(shape) * element_bytes
@@ -107,7 +115,36 @@ def authenticate_qsa_m35_state_bundle(bundle: Path) -> dict[str, bytes]:
         ):
             raise QsaM35StateSeedError("QSA M35 state payload changed")
         result[name] = payload
-    return result
+    return manifest, result
+
+
+def authenticate_qsa_m35_state_bundle(bundle: Path) -> dict[str, bytes]:
+    _, payloads = _authenticate_bundle(bundle, SCHEMA, _LAYOUTS)
+    return payloads
+
+
+def authenticate_qsa_c1_input_bundle(bundle: Path) -> dict[str, bytes]:
+    manifest, payloads = _authenticate_bundle(bundle, C1_SCHEMA, _C1_LAYOUTS)
+    parent_manifest = {
+        "schema": SCHEMA,
+        "oracle_manifest_sha256": manifest.get("oracle_manifest_sha256"),
+        "implementation": manifest.get("implementation"),
+        "source_sha256": manifest.get("source_sha256"),
+        "rank": manifest.get("rank"), "layer": manifest.get("layer"),
+        "rows": manifest.get("rows"),
+        "generation_index": manifest.get("generation_index"),
+        "tensors": manifest["tensors"][:len(_LAYOUTS)],
+    }
+    if (
+        manifest.get("parent_artifact_key")
+        != hashlib.sha256(_canonical(parent_manifest)).hexdigest()
+        or manifest.get("c1_position") != 35
+        or manifest.get("indexer_source_sha256")
+        != "e2f398a2fe29466c9681627651ccb5b8eb2b5980445c9e44b270ff45bcb61066"
+        or struct.unpack("<qqq", payloads["row35_positions"]) != (35, 35, 35)
+    ):
+        raise QsaM35StateSeedError("QSA c1 input identity changed")
+    return payloads
 
 
 class _StateView(ctypes.Structure):
@@ -184,9 +221,8 @@ def _fp8_codes_to_bf16(payload: bytes, scale: float) -> bytes:
     return bytes(result)
 
 
-def execute_qsa_m35_state_seed(bundle: Path, library: Path) -> dict[str, object]:
-    """Run one authenticated, caller-owned host-native state publication."""
-    payloads = authenticate_qsa_m35_state_bundle(bundle)
+def _execute_qsa_state_payloads(artifact_key: str, payloads: dict[str, bytes],
+                                library: Path) -> dict[str, object]:
     cudart_name = ctypes.util.find_library("cudart") or "libcudart.so.13"
     cudart = ctypes.CDLL(cudart_name)
     cudart.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
@@ -312,7 +348,7 @@ def execute_qsa_m35_state_seed(bundle: Path, library: Path) -> dict[str, object]
     ):
         raise QsaM35StateSeedError("native QSA state publication changed")
     return {
-        "status": "success", "artifact_key": bundle.name,
+        "status": "success", "artifact_key": artifact_key,
         "rank": 0, "layer": 3, "rows_seeded": 35,
         "main_key_bf16_sha256": hashlib.sha256(key_bytes).hexdigest(),
         "main_value_bf16_sha256": hashlib.sha256(value_bytes).hexdigest(),
@@ -321,3 +357,26 @@ def execute_qsa_m35_state_seed(bundle: Path, library: Path) -> dict[str, object]
         "next_row": 35, "telemetry": records,
         "c1_execution": "blocked_missing_authenticated_row35_hidden_and_index_query",
     }
+
+
+def execute_qsa_m35_state_seed(bundle: Path, library: Path) -> dict[str, object]:
+    """Run one authenticated, caller-owned host-native state publication."""
+    return _execute_qsa_state_payloads(
+        bundle.name, authenticate_qsa_m35_state_bundle(bundle), library
+    )
+
+
+def execute_qsa_c1_seeded_boundary(bundle: Path, library: Path) -> dict[str, object]:
+    """Seed captured M35 state and expose the exact remaining c1 ABI gate."""
+    payloads = authenticate_qsa_c1_input_bundle(bundle)
+    result = _execute_qsa_state_payloads(bundle.name, payloads, library)
+    result.update({
+        "row35_hidden_bf16_sha256": hashlib.sha256(
+            payloads["row35_hidden"]
+        ).hexdigest(),
+        "row35_index_query_bf16_sha256": hashlib.sha256(
+            payloads["row35_index_query"]
+        ).hexdigest(),
+        "c1_execution": "blocked_rope_rows_35_exclude_position_35",
+    })
+    return result
