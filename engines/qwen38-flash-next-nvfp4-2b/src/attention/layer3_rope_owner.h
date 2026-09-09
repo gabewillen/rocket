@@ -13,6 +13,7 @@ namespace rocket::qwen38::attention {
 
 inline constexpr int kLayer3RopeLayer = 3;
 inline constexpr int kLayer3RopeRows = 35;
+inline constexpr int kLayer3RopeC1Rows = 36;
 inline constexpr int kLayer3RopePairs = 32;
 inline constexpr int kLayer3RopeColumns = 64;
 inline constexpr float kLayer3RopeTheta = 10'000'000.0f;
@@ -30,6 +31,8 @@ inline constexpr std::string_view kLayer3RopeVllmImageDigest =
     "sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8";
 inline constexpr std::string_view kLayer3RopePayloadSha256 =
     "f22ad8a42a36ec8078d7f43a89bdb98cbb05ef7139c34b09a7cd5af62b98a516";
+inline constexpr std::string_view kLayer3RopeC1PayloadSha256 =
+    "6d1b5342ffb5f792f51c4599a8c3ac511b4a795877c2e21a113ac488195fda77";
 
 struct Layer3RopeIdentity {
   std::string_view checkpoint_revision;
@@ -58,12 +61,16 @@ Layer3RopeIdentity layer3_rope_identity(int rank);
 // The returned identity remains layer-bound so a layer owner cannot accept a
 // descriptor for another attention position in the schedule.
 Layer3RopeIdentity target_qsa_rope_identity(int rank, int layer);
+Layer3RopeIdentity target_qsa_c1_rope_identity(int rank, int layer);
 
 // Exact pinned-vLLM BF16 payload consumed by NativeQsaFullAttentionGraph,
 // row-major [35,64] with stride [64,1]. Columns [0,32) are cosine and
 // [32,64) are sine. This host view exists for independent CPU contract tests;
 // the operational path publishes only device storage.
 std::span<const std::uint16_t> layer3_rope_host_bits() noexcept;
+// Versioned extension of layer3_rope_host_bits through position 35. Its first
+// 35 rows are byte-identical to the legacy payload.
+std::span<const std::uint16_t> layer3_rope_c1_host_bits() noexcept;
 
 class Layer3RopeDeviceOwner final {
  public:
@@ -75,6 +82,25 @@ class Layer3RopeDeviceOwner final {
   const Layer3RopeIdentity& identity() const noexcept { return identity_; }
   // Consumers must enqueue wait() before reading view().cos_sin. The event is
   // the publication boundary; construction does not synchronize the device.
+  Layer3RopeView view() const noexcept;
+  void wait(cudaStream_t consumer_stream) const;
+
+ private:
+  int device_ = -1;
+  Layer3RopeIdentity identity_{};
+  __nv_bfloat16* cos_sin_ = nullptr;
+  cudaStream_t initialization_stream_ = nullptr;
+  cudaEvent_t ready_ = nullptr;
+};
+
+class Layer3RopeC1DeviceOwner final {
+ public:
+  Layer3RopeC1DeviceOwner(int device, Layer3RopeIdentity identity);
+  ~Layer3RopeC1DeviceOwner();
+  Layer3RopeC1DeviceOwner(const Layer3RopeC1DeviceOwner&) = delete;
+  Layer3RopeC1DeviceOwner& operator=(const Layer3RopeC1DeviceOwner&) = delete;
+
+  const Layer3RopeIdentity& identity() const noexcept { return identity_; }
   Layer3RopeView view() const noexcept;
   void wait(cudaStream_t consumer_stream) const;
 

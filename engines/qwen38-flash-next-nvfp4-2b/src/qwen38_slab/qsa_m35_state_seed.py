@@ -377,6 +377,9 @@ def execute_qsa_c1_seeded_boundary(bundle: Path, library: Path) -> dict[str, obj
         "row35_index_query_bf16_sha256": hashlib.sha256(
             payloads["row35_index_query"]
         ).hexdigest(),
-        "c1_execution": "blocked_rope_rows_35_exclude_position_35",
+        "c1_rope_rows": 36,
+        "c1_rope_payload_sha256":
+            "6d1b5342ffb5f792f51c4599a8c3ac511b4a795877c2e21a113ac488195fda77",
+        "c1_execution": "blocked_missing_composite_state_weight_arena_owner",
     })
     return result

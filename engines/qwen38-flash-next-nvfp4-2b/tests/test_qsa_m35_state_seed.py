@@ -21,6 +21,7 @@ from qwen38_slab.qsa_m35_state_seed import (
     _StateView,
     authenticate_qsa_c1_input_bundle,
     authenticate_qsa_m35_state_bundle,
+    execute_qsa_c1_seeded_boundary,
 )
 
 
@@ -143,6 +144,25 @@ class QsaM35StateSeedTests(unittest.TestCase):
             (bundle / "manifest.json").write_text(json.dumps(manifest))
             with self.assertRaises(QsaM35StateSeedError):
                 authenticate_qsa_m35_state_bundle(bundle)
+
+    def test_c1_boundary_reports_closed_post_rope_owner_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = self.c1_bundle(Path(directory))
+            import unittest.mock
+            with unittest.mock.patch(
+                "qwen38_slab.qsa_m35_state_seed._execute_qsa_state_payloads",
+                return_value={"status": "success"},
+            ):
+                result = execute_qsa_c1_seeded_boundary(bundle, Path("unused"))
+            self.assertEqual(result["c1_rope_rows"], 36)
+            self.assertEqual(
+                result["c1_rope_payload_sha256"],
+                "6d1b5342ffb5f792f51c4599a8c3ac511b4a795877c2e21a113ac488195fda77",
+            )
+            self.assertEqual(
+                result["c1_execution"],
+                "blocked_missing_composite_state_weight_arena_owner",
+            )
 
 
 if __name__ == "__main__":

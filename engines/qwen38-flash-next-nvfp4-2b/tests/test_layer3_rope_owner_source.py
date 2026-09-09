@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "src/attention/layer3_rope_owner.h"
 SOURCE = ROOT / "src/attention/layer3_rope_owner.cc"
 BITS = ROOT / "src/attention/layer3_rope_bits.inc"
+POSITION35_BITS = ROOT / "src/attention/layer3_rope_position35_bits.inc"
 CONFIG = Path(
     "/home/glwillen/.cache/huggingface/hub/"
     "models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/"
@@ -22,6 +23,7 @@ CONFIG = Path(
 )
 CONFIG_SHA256 = "deef67a61f3311faf051b23dc4192f442c7fee4f9cd2f38cbcbe4da55c763a80"
 PAYLOAD_SHA256 = "f22ad8a42a36ec8078d7f43a89bdb98cbb05ef7139c34b09a7cd5af62b98a516"
+C1_PAYLOAD_SHA256 = "6d1b5342ffb5f792f51c4599a8c3ac511b4a795877c2e21a113ac488195fda77"
 
 
 def main() -> None:
@@ -32,6 +34,14 @@ def main() -> None:
     payload = struct.pack(f"<{len(words)}H", *words)
     assert hashlib.sha256(payload).hexdigest() == PAYLOAD_SHA256
     assert PAYLOAD_SHA256 in header
+    position35 = [
+        int(item, 16)
+        for item in re.findall(r"0x[0-9a-f]{4}", POSITION35_BITS.read_text())
+    ]
+    assert len(position35) == 64
+    c1_payload = struct.pack(f"<{len(words) + len(position35)}H", *(words + position35))
+    assert hashlib.sha256(c1_payload).hexdigest() == C1_PAYLOAD_SHA256
+    assert C1_PAYLOAD_SHA256 in header
     assert "58f4d1ed59074a181c9db6e4c5a950db14e7ad0b" in header
     assert "fc694b54fb0174e0913e6adf86691ef85a4ead47" in header
     assert "8e685d198" in header
