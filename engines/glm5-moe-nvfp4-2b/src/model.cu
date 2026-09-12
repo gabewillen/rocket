@@ -291,6 +291,25 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
     cuda_check(cudaHostAlloc(&exl3_tok_stage_,
                              static_cast<std::size_t>(MR) * 10,
                              cudaHostAllocDefault), "exl3 tok stage");
+    int num_sms = 0;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+    exl3_conc_ = num_sms / 12;
+    if (exl3_conc_ < 1) exl3_conc_ = 1;
+    exl3_max_tpe_ = MR;  // worst case: all slots on one expert
+    cuda_check(cudaMalloc(&exl3_temp_g_,
+                          static_cast<std::size_t>(exl3_conc_) * exl3_max_tpe_ * H * 2),
+               "exl3 temp g");
+    cuda_check(cudaMalloc(&exl3_temp_u_,
+                          static_cast<std::size_t>(exl3_conc_) * exl3_max_tpe_ * H * 2),
+               "exl3 temp u");
+    cuda_check(cudaMalloc(&exl3_temp_ig_,
+                          static_cast<std::size_t>(exl3_conc_) * exl3_max_tpe_ * MI * 2),
+               "exl3 temp ig");
+    cuda_check(cudaMalloc(&exl3_temp_iu_,
+                          static_cast<std::size_t>(exl3_conc_) * exl3_max_tpe_ * MI * 2),
+               "exl3 temp iu");
+    cuda_check(cudaMalloc(&exl3_a_had_,
+                          static_cast<std::size_t>(MB) * H * 2), "exl3 a_had");
   }
   dense_row_in_group_ = I(MB);
   dense_group_of_row_ = I(MB);
@@ -1193,6 +1212,10 @@ void DecodeEngine::run_moe_exl3(int layer, int batch, const std::vector<int>& id
                              stream_), "exl3 w H2D");
   cuda_check(cudaMemcpyAsync(exl3_ptrs_dev_, stage_ptrs, sizeof(Exl3MoeLayerPtrs),
                              cudaMemcpyHostToDevice, stream_), "exl3 ptrs H2D");
+  // The host staging buffer is reused on the next run_moe_exl3 call; the
+  // H2D must complete before the host overwrites it. The sync cost is
+  // negligible next to the expert streaming that just finished.
+  cuda_check(cudaStreamSynchronize(stream_), "exl3 staging sync");
 
   bf16_to_fp16_rows(exl3_hidden_fp16_, normed_, static_cast<long long>(batch) * H, stream_);
   cuda_check(cudaMemsetAsync(exl3_out_fp32_, 0, static_cast<std::size_t>(batch) * H * 4,
@@ -1200,9 +1223,13 @@ void DecodeEngine::run_moe_exl3(int layer, int batch, const std::vector<int>& id
   int num_sms = 0;
   cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
   exl3_moe_raw(exl3_hidden_fp16_, exl3_out_fp32_, exl3_expert_count_, exl3_tok_sorted_,
-               exl3_w_sorted_, nullptr, nullptr, nullptr, nullptr,
+               exl3_w_sorted_, exl3_temp_g_, exl3_temp_u_, exl3_temp_ig_, exl3_temp_iu_,
                static_cast<const Exl3MoeLayerPtrs*>(exl3_ptrs_dev_), batch, H, MI, NE, K,
-               rows, num_sms, cfg_.swiglu_limit, 4, stream_);
+               exl3_max_tpe_, num_sms, cfg_.swiglu_limit, 4, stream_);
+  { const cudaError_t le = cudaGetLastError();
+    if (le != cudaSuccess)
+      std::fprintf(stderr, "[exl3-moe-kernel] layer %d: %s\n", layer, cudaGetErrorString(le));
+  }
   fp32_to_bf16_rows(acc_, exl3_out_fp32_, static_cast<long long>(batch) * H, stream_);
 }
 
@@ -1682,6 +1709,11 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
     {
       StageTimer t(stream_, &stages_.norms, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       rmsnorm(normed_, collapsed_, lw.input_norm, batch, H, cfg_.rms_norm_eps, stream_);
+    }
+    if (std::getenv("ROCKET_TRACE_COPY")) {
+      const cudaError_t le = cudaGetLastError();
+      if (le != cudaSuccess)
+        std::fprintf(stderr, "[sticky] layer %d entry: %s\n", l, cudaGetErrorString(le));
     }
     if (cfg_.layers[l].attn == fuel::AttnKind::kKda) {
       StageTimer t(stream_, &stages_.kda, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);

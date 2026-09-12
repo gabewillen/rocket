@@ -245,6 +245,7 @@ ModelConfig load_model_config(const std::filesystem::path& attention_yaml,
   const json::JsonValue root = parser.parse_document();
   const json::JsonValue& t = member(root, "text_config");
   const json::JsonValue* qc = root.member("quant_config");
+  if (qc == nullptr) qc = root.member("quantization_config");
   c.quant_method = "nvfp4";
   if (qc != nullptr && qc->kind == json::JsonValue::Kind::kObject) {
     const json::JsonValue* qm = qc->member("quant_method");

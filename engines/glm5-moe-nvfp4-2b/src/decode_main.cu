@@ -43,9 +43,10 @@ std::string printable(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::filesystem::path snapshot = rocket::fuel::default_nvfp4_snapshot_dir();
+  std::filesystem::path snapshot = rocket::fuel::default_nvfp4_snapshot_dir();
+  if (const char* exl3 = std::getenv("ROCKET_FUEL_EXL3_DIR")) snapshot = exl3;
   if (snapshot.empty() || !std::filesystem::exists(snapshot / "config.json")) {
-    std::fprintf(stderr, "no NVFP4 snapshot; set $ROCKET_FUEL_NVFP4_DIR\n");
+    std::fprintf(stderr, "no snapshot; set $ROCKET_FUEL_NVFP4_DIR or $ROCKET_FUEL_EXL3_DIR\n");
     return 77;
   }
   const std::filesystem::path attn = rocket::fuel::default_attention_yaml();

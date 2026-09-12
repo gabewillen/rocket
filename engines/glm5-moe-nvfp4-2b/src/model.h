@@ -358,6 +358,12 @@ class DecodeEngine {
   std::int64_t* exl3_expert_count_ = nullptr; // [n_routed_experts]
   void* exl3_ptrs_dev_ = nullptr;         // [n_routed_experts * 9] device ptrs
   void* exl3_ptrs_stage_ = nullptr;       // pinned staging for ptr arrays
+  void* exl3_temp_g_ = nullptr;           // [conc, max_tpe, H] fp16
+  void* exl3_temp_u_ = nullptr;
+  void* exl3_temp_ig_ = nullptr;          // [conc, max_tpe, MI] fp16
+  void* exl3_temp_iu_ = nullptr;
+  int exl3_conc_ = 0, exl3_max_tpe_ = 0;
+  void* exl3_a_had_ = nullptr;            // [MB, H] fp16 hadamard scratch
   std::int64_t* exl3_counts_stage_ = nullptr;  // pinned staging
   void* exl3_tok_stage_ = nullptr;        // pinned staging (tok + w)
   int *dense_row_in_group_ = nullptr, *dense_group_of_row_ = nullptr;

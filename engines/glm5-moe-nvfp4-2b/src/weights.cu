@@ -63,6 +63,10 @@ void* WeightStore::device_alloc(std::size_t bytes) {
 }
 
 void WeightStore::copy_in(void* dst, const void* src, std::size_t bytes) {
+  static const bool trace = std::getenv("ROCKET_TRACE_COPY") != nullptr;
+  static unsigned seq = 0;
+  if (trace)
+    std::fprintf(stderr, "[copy %u] dst=%p bytes=%zu\n", ++seq, dst, bytes);
   std::size_t done = 0;
   while (done < bytes) {
     const std::size_t chunk = std::min(pinned_bytes_, bytes - done);
@@ -85,6 +89,8 @@ fuel::DType WeightStore::dtype_of(std::string_view tensor_name) const {
 }
 
 const bf16* WeightStore::upload_bf16(std::string_view name, std::int64_t expect_numel) {
+  if (std::getenv("ROCKET_TRACE_COPY"))
+    std::fprintf(stderr, "[up-bf16] %.*s\n", (int)name.size(), name.data());
   const fuel::TensorView& t = ckpt_.tensor(name);
   if (t.dtype != fuel::DType::kBF16) fail(std::string(name) + " is not BF16");
   if (t.numel() != expect_numel)
@@ -97,6 +103,8 @@ const bf16* WeightStore::upload_bf16(std::string_view name, std::int64_t expect_
 }
 
 const float* WeightStore::upload_f32(std::string_view name, std::int64_t expect_numel) {
+  if (std::getenv("ROCKET_TRACE_COPY"))
+    std::fprintf(stderr, "[up-f32] %.*s\n", (int)name.size(), name.data());
   const fuel::TensorView& t = ckpt_.tensor(name);
   // Hub and NIM snapshots of this fuel disagree on the dtype of tiny scalar
   // tensors (hyper-connection bases/scales ship BF16 on the hub, F32 in the
@@ -142,15 +150,21 @@ const float* WeightStore::upload_f32(std::string_view name, std::int64_t expect_
 
 const bf16* WeightStore::upload_concat(const std::vector<std::string>& names,
                                        std::int64_t expect_numel) {
+  if (std::getenv("ROCKET_TRACE_COPY"))
+    std::fprintf(stderr, "[up-concat] %s\n", names.front().c_str());
   std::size_t total = 0;
   std::int64_t numel = 0;
   // Hub fuel ships KDA conv taps F32 where the NIM bundle had BF16. Round to
   // BF16 here (lossy); the family journal records it and the decode token-
   // divergence check is the gate.
+  // F32→BF16 conversion only when the source is actually F32; the EXL3 fuel
+  // ships conv taps as BF16 and must take the plain copy path (halving the
+  // slab for already-BF16 tensors overflows it on the third copy).
   const bool f32_from_conv =
       std::all_of(names.begin(), names.end(), [](const std::string& n) {
         return n.ends_with("conv1d.weight");
-      });
+      }) &&
+      ckpt_.tensor(names.front()).dtype == fuel::DType::kF32;
   for (const std::string& n : names) {
     const fuel::TensorView& t = ckpt_.tensor(n);
     if (!(t.dtype == fuel::DType::kBF16 || (f32_from_conv && t.dtype == fuel::DType::kF32)))
@@ -183,6 +197,9 @@ const bf16* WeightStore::upload_concat(const std::vector<std::string>& names,
         for (int i = 0; i < 8; ++i) std::printf(" %04x", host[i]);
         std::printf("\n");
       }
+      if (std::getenv("ROCKET_TRACE_COPY"))
+        std::fprintf(stderr, "[conv-copy] %s off=%zu bytes=%zu\n", n.c_str(), off,
+                     host.size() * 2);
       copy_in(d + off, host.data(), host.size() * 2);
       if (std::getenv("ROCKET_DEBUG_LAYER0") != nullptr && n.find("layers.0.") != std::string::npos) {
         std::vector<std::uint16_t> back(8);
@@ -319,6 +336,9 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
           std::memcpy(&w.kda.q_overlay.global, global.data(), sizeof(float));
         }
       }
+      { const cudaError_t pre = cudaGetLastError();
+        if (pre != cudaSuccess)
+          std::fprintf(stderr, "[pre-conv] sticky CUDA error: %s\n", cudaGetErrorString(pre)); }
       w.kda.conv = upload_concat({a + "q_conv1d.weight", a + "k_conv1d.weight", a + "v_conv1d.weight"},
                                  static_cast<std::int64_t>(3) * qkv * cfg_.kda_conv_kernel);
       w.kda.f_a = upload_bf16(a + "f_a_proj.weight", static_cast<std::int64_t>(hd) * H);
@@ -505,7 +525,17 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
   // trellis [k/16, n/16, bits*16] int16 + suh [k] f16 + svh [n] f16), 12.6
   // MiB per expert at K4; attention and dense stay BF16 in the checkpoint.
   // The slot holds the nine blobs back to back in gate, up, down order.
+  { // Probe: can we still cudaMalloc after mmapping 120 shards?
+    void* probe = nullptr;
+    cudaError_t prc = cudaMalloc(&probe, 12619776);
+    std::fprintf(stderr, "[probe] cudaMalloc(12MB) after mmap: %s (%p)\n",
+                 cudaGetErrorString(prc), probe);
+    if (prc == cudaSuccess) cudaFree(probe);
+  }
   exl3_fuel_ = cfg_.quant_method == "exl3";
+  if (std::getenv("ROCKET_TRACE_COPY"))
+    std::fprintf(stderr, "[fuel] quant_method=%s exl3_fuel=%d\n",
+                 cfg_.quant_method.c_str(), exl3_fuel_);
   if (exl3_fuel_) {
     const std::size_t gt = static_cast<std::size_t>(cfg_.moe_intermediate_size) * H / 2;
     const std::size_t dt = static_cast<std::size_t>(H) * cfg_.moe_intermediate_size / 2;
@@ -515,27 +545,10 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
     std::size_t n_slots = expert_cache_bytes / exl3_slot_bytes_;
     if (n_slots < static_cast<std::size_t>(cfg_.num_experts_per_tok))
       fail("expert cache is smaller than one token's top-k working set");
+    // Slots are allocated lazily in exl3_expert on first use; only the
+    // capacity is decided here.
     exl3_slots_.resize(n_slots);
     exl3_lru_pos_.resize(n_slots);
-    for (std::size_t i = 0; i < n_slots; ++i) {
-      auto* base = static_cast<std::uint8_t*>(device_alloc(exl3_slot_bytes_));
-      exl3_owned_.push_back(base);
-      std::size_t off = 0;
-      auto seg = [&](std::size_t bytes) {
-        void* p = base + off;
-        off += bytes;
-        return p;
-      };
-      auto& v = exl3_slots_[i];
-      v.gate_trellis = seg(gt);  v.gate_suh = seg(suh_g);  v.gate_svh = seg(svh_g);
-      v.up_trellis = seg(gt);    v.up_suh = seg(suh_g);    v.up_svh = seg(svh_g);
-      v.down_trellis = seg(dt);  v.down_suh = seg(suh_d);  v.down_svh = seg(svh_d);
-    }
-    for (std::size_t i = 0; i < n_slots; ++i) {
-      exl3_lru_.push_front(static_cast<int>(i));
-      exl3_lru_pos_[i] = exl3_lru_.begin();
-    }
-    resident_bytes_ += n_slots * exl3_slot_bytes_;
     // NVFP4 slot pool skipped entirely on this fuel.
     slot_bytes_ = 0;
     slots_.clear();
@@ -582,7 +595,16 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
     lru_pos_[i] = lru_.begin();
   }
   }
+  { const cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess)
+      std::fprintf(stderr, "[ctor-end] sticky CUDA error: %s\n", cudaGetErrorString(ce));
+    else
+      std::fprintf(stderr, "[ctor-end] clean\n"); }
   guard.armed = false;
+  { const cudaError_t ce = cudaGetLastError();
+    std::fprintf(stderr, "[ctor-end2] %s\n", cudaGetErrorString(ce)); }
+    if (ce != cudaSuccess)
+      std::fprintf(stderr, "[ctor-end] sticky CUDA error: %s\n", cudaGetErrorString(ce)); }
 }
 
 WeightStore::~WeightStore() {
@@ -621,6 +643,20 @@ const Exl3ExpertView& WeightStore::exl3_expert(int layer, int expert_id, cudaStr
   const std::size_t gt = SI * H / 2;
   const std::size_t dt = H * SI / 2;
   Exl3ExpertView& v = exl3_slots_[slot];
+  if (v.gate_trellis == nullptr) {
+    // Lazy slot allocation on first use
+    auto* base = static_cast<std::uint8_t*>(device_alloc(exl3_slot_bytes_));
+    exl3_owned_.push_back(base);
+    std::size_t off = 0;
+    auto seg = [&](std::size_t bytes) {
+      void* ptr = base + off;
+      off += bytes;
+      return ptr;
+    };
+    v.gate_trellis = seg(gt);  v.gate_suh = seg(H * 2);  v.gate_svh = seg(SI * 2);
+    v.up_trellis = seg(gt);    v.up_suh = seg(H * 2);    v.up_svh = seg(SI * 2);
+    v.down_trellis = seg(dt);  v.down_suh = seg(SI * 2);  v.down_svh = seg(H * 2);
+  }
   struct Blob { const char* suffix; std::size_t bytes; const void** dst; };
   const Blob blobs[9] = {
       {"gate_proj.trellis", gt, &v.gate_trellis},
@@ -635,12 +671,19 @@ const Exl3ExpertView& WeightStore::exl3_expert(int layer, int expert_id, cudaStr
   };
   for (const auto& b : blobs) {
     const fuel::TensorView& t = ckpt_.tensor(p + b.suffix);
+    if (std::getenv("ROCKET_TRACE_COPY"))
+      std::fprintf(stderr, "[exl3-blob] L%d.E%d %s dst=%p bytes=%zu\n",
+                   layer, expert_id, b.suffix, *b.dst, t.nbytes);
     std::memcpy(pinned_, t.data, t.nbytes);
     cuda_check(cudaMemcpyAsync(const_cast<void*>(*b.dst), pinned_, t.nbytes,
                                cudaMemcpyHostToDevice, s), "exl3 blob H2D");
     streamed_bytes_ += t.nbytes;
   }
   cuda_check(cudaStreamSynchronize(s), "exl3 stream sync");
+  if (std::getenv("ROCKET_TRACE_COPY"))
+    std::fprintf(stderr, "[exl3-expert] L%d.E%d slot=%d/%zu base=%p gt=%p up_t=%p dn_t=%p\n",
+                 layer, expert_id, slot, exl3_slots_.size(),
+                 exl3_owned_[slot], v.gate_trellis, v.up_trellis, v.down_trellis);
   exl3_resident_[key] = slot;
   exl3_lru_.push_front(slot);
   exl3_lru_pos_[slot] = exl3_lru_.begin();
