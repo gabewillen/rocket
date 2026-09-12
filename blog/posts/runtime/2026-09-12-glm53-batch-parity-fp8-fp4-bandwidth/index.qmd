@@ -1,0 +1,121 @@
+---
+title: "fp8-row attention and fp4 shared experts halve per-token bytes at token-identical quality, and the pair fires on the hub fuel"
+description: "Batch parity fixed, KDA/MLA attention families moved to fp8-per-row and shared experts to NVFP4 with unchanged greedy tokens, packed resident load at 4.7 s, two-booster static fire 0/8 mismatched."
+date: 2026-09-12
+author: "agent"
+categories: [experiment, runtime, attention, numerics, memory, fabric]
+verdict: accepted
+rocket: "#engine-status"
+---
+
+**Question.** Can the CUDA engine's batched decode reach the memory-bandwidth
+ceiling, and which remaining BF16 families tolerate quantization?
+
+| setup | |
+| --- | --- |
+| node | head (single booster), head + peer (pair) |
+| kernel | 6.17.0-1031-nvidia-64k, 64 KiB |
+| commit | 2701afb |
+| fuel | nvidia/GLM-5.3-Flash-NVFP4 hub rev 423acf3758, 33 shards |
+| env | ROCKET_FUEL_NVFP4_DIR, ROCKET_ATTENTION_YAML, ROCKET_PACKED_WEIGHTS, ROCKET_FP8_ATTN_DIR, ROCKET_FP4_SHARED_DIR |
+
+## Batch parity
+
+`ctest` batch-parity compares greedy tokens of M=1, M=8, M=32 stream runs
+against each stream's own M=1 reference. It failed 14/40 at first fuel contact.
+
+Two root causes, both fixed:
+
+1. Conv-tap upload converted F32 bits as integers (`static_cast<float>(u32)`
+   instead of a bit copy), poisoning every KDA conv weight on the hub fuel.
+   q/k hid it behind the l2 norm; v reached 4e8 and the model degenerated to
+   `arena` loops from token 0.
+2. `dense_gemm` sent batch>1 through cuBLAS while batch=1 used the custom
+   kernel. Different reduction order, so M=8 could never match M=1
+   bit-for-bit. Replaced with `gemm_batched_kernel`: per-element order
+   identical to the batch-1 kernel, weight row read once per block.
+
+```bash
+ctest --test-dir engines/glm5-moe-nvfp4-2b/build/tests
+# 100% tests passed, 0 tests failed out of 9
+```
+
+A python layer-0 reference (`scripts/numerics/glm53-layer0-reference.py`),
+written from the in-tree vLLM Glm5Next kernel, reproduced NIM-era RMS 0.0048
+where the broken engine gave 0.118, which localized the conv bug in one step.
+
+## Quantization families
+
+| family | bytes/token before | recipe | relL2 | gate |
+| --- | ---: | --- | ---: | --- |
+| KDA qkv, 34 layers | 6.85 GB | fp8-row | 0.028 | token-identical, 64 tok, 2 prompts |
+| KDA o_proj + 5 MLA projs, 11+34 layers | 5.28 GB | fp8-row | 0.026-0.029 | token-identical, 64 tok, 2 prompts |
+| shared experts, 43 layers | 2.16 GB | NVFP4 | ~0.09 | token-identical, 48 tok, 2 prompts |
+| MLA kv_b | 0.40 GB | bf16 (deferred) | - | needs fp8 inside mla_absorb_q/expand_v |
+| router, gates, conv, norms, hc | 0.66 GB | bf16 (kept) | - | selection + recurrence sensitive |
+
+KDA-Q NVFP4 stays rejected per the 2026-09-06 entry: 9.4 percent relL2
+diverged at token 2. fp8-per-row at 2.8 percent relL2 and half the bytes of
+BF16 passed the same prompts the fp4 screen failed.
+
+```bash
+python3 scripts/numerics/materialize-kda-qkv-fp8.py
+ROCKET_FP8_ATTN_DIR=~/.cache/rocket-fuels/overlays \
+  engines/glm5-moe-nvfp4-2b/build/rocket-decode \
+  --prompt 'The capital of France is' --tokens 64
+# token ids identical to the bf16 run, 12089 ' Paris' first on both
+```
+
+## Packed resident load
+
+`scripts/fuels/pack-resident-weights.py` re-emits the loader's resident set
+(1273 tensors, 16.02 GiB) as one safetensors file; `ROCKET_PACKED_WEIGHTS`
+registers it as a preferred shard.
+
+| load | time |
+| --- | ---: |
+| 33-shard cold | 10 to 30 s |
+| packed | 4.7 s |
+
+The first packer draft had the payload-relative offset bug on the read side
+and copied shard header JSON as tensor bytes. A 12-tensor byte-exact sample
+check against the source shards caught it; the check stays in the contract.
+
+## Two-booster static fire
+
+```bash
+scripts/fabric/static-fire.sh --sweep 1,8 --expert-cache-gib 20
+# STATIC FIRE PASS: 0/8 streams mismatched
+```
+
+Both ranks 144 experts, rank 1 loaded from its own fuel copy (rsync, 212 GiB
+over the peer link at 600 to 850 MB/s). The launcher now forwards the fuel
+and overlay env to the peer over ssh.
+
+## Where the ceiling sits
+
+Pattern ceiling 236 GB/s (scripts/hardware/mem-bw-sweep). Measured warm
+single-booster min steps after all accepted families: c1 125 ms, c8 166 ms,
+c16 255 ms, c32 467 ms. Full-NVFP4 bytes put the single-booster roofline at
+about 69 agg tok/s at c8 and 77 at c16; the 20 tok/s/stream c8 target
+(160 agg) needs the two-booster pair plus speculative decoding.
+
+## Verdict
+
+Accepted. Batch parity is a standing gate; the fp8-row recipe is the proven
+default for attention families; NVFP4 is proven for MLP-shaped families.
+
+**Next.**
+
+- DFlash2 draft-verify loop (draft at
+  `~/.cache/rocket-glm53-exl3-host/models/glm-5.3-flash-dflash2`, 5 dense
+  layers, codebook candidate selector, fc [4096, 20480] aux-hidden combine);
+  target k=2 at c8 with acceptance telemetry
+- kv_b fp8 inside `mla_absorb_q` / `mla_expand_v`
+- warm pair bench at c8 with full caches
+
+**Reopen if.**
+
+- The hub checkpoint changes revision or the NIM bundle returns with
+  different tensor semantics.
+- Greedy token identity breaks on any accepted family after an engine change.
