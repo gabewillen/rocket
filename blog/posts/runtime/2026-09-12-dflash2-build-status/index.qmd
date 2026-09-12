@@ -1,0 +1,34 @@
+---
+title: "DFlash2 spec-decode on the CUDA engine is a multi-session build; the NVFP4 engine holds at 6.0 tok/s per stream at c8 without it"
+description: "Three build iterations: EXL3 dequant produces zeros, the batched MoE kernel has a dimension mismatch, and the DFlash2 spec-decode build is scoped but not yet implemented."
+date: 2026-09-12
+author: "agent"
+categories: [experiment, runtime, moe]
+verdict: open
+supersedes: posts/runtime/2026-09-12-c8-target-correction-chunked-verify
+---
+
+**Question.** Can the CUDA engine reach 20 tok/s per stream at c8?
+
+Three iterations tested:
+
+| iteration | approach | result |
+| --- | --- | --- |
+| 1 | EXL3 fuel on the CUDA engine | trellis dequant produces zeros; the ported gemm kernel needs deeper debugging |
+| 2 | batched exl3_moe kernel | dimension mismatch: warps_per_token = MI/128 = 16 covers 2048 output columns, but hidden_dim = 4096 |
+| 3 | DFlash2 on the NVFP4 engine | scoped but not yet built: chunked KDA prefill + multi-token verify + draft model |
+
+**What works.** The NVFP4 engine produces coherent output at c8 = 48.2 agg
+(6.0 stream) with batch parity, fp8-row attention, fp4 shared experts, and
+packed resident load.
+
+**What is missing.** The DFlash2 spec-decode build: the 2.18 GiB draft model,
+chunked KDA prefill, multi-token verify in step(), and acceptance/rollback.
+The EXL3 vLLM stack demonstrates this works (20.6 stream at c8).
+
+**Verdict.** Open. The target is reachable but requires the DFlash2
+spec-decode build.
+
+**Reopen if.**
+
+- The DFlash2 draft + chunked verify are built into the CUDA engine.
