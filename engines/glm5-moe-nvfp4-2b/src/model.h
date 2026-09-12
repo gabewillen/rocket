@@ -251,6 +251,7 @@ class DecodeEngine {
   void run_moe_router_stage(int layer, int batch);
   void run_moe_dispatch_stage(int layer, int batch);
   void run_moe_post_stage(int layer, int batch);
+  void run_shared_mlp(int layer, int batch);
   void run_step_layers_graph(int batch);
   void ensure_graphs_built(int batch);
   void destroy_graphs();
@@ -346,7 +347,7 @@ class DecodeEngine {
   // Dense-MLP fp4 grouped-path scratch (one group per projection).
   std::uint8_t *dense_a1_packed_ = nullptr, *dense_a1_sf_ = nullptr;
   std::uint8_t *dense_a2_packed_ = nullptr, *dense_a2_sf_ = nullptr;
-  bf16 *dense_gu_ = nullptr, *dense_down_raw_ = nullptr;
+  bf16 *dense_gu_ = nullptr, *dense_down_raw_ = nullptr, *shared_gu_ = nullptr;
   int *dense_row_in_group_ = nullptr, *dense_group_of_row_ = nullptr;
   long long* dense_sf_base_ = nullptr;
   float *dense_gate_global_ = nullptr, *dense_up_global_ = nullptr, *dense_down_global_ = nullptr;

@@ -253,6 +253,7 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   dense_a2_packed_ = U8(static_cast<std::size_t>(MB) * DI / 2);
   dense_a2_sf_ = U8(192 * 512);  // k_tiles(I=12288)=192
   dense_down_raw_ = A(static_cast<std::size_t>(MB) * H);
+  shared_gu_ = A(static_cast<std::size_t>(MB) * 2 * MI * cfg_.n_shared_experts);
   dense_row_in_group_ = I(MB);
   dense_group_of_row_ = I(MB);
   dense_sf_base_ = I64(1);
@@ -1160,10 +1161,7 @@ void DecodeEngine::run_moe(int layer, int batch) {
   // accumulated in the same order and the merged result is unchanged.
   if (!ep_overlap_) finish_moe_exchange();
 
-  gemm_bf16(mlp_gate_, mo.shared.gate, normed_, batch, SI, H, stream_);
-  gemm_bf16(mlp_up_, mo.shared.up, normed_, batch, SI, H, stream_);
-  swiglu_clamped(mlp_h_, mlp_gate_, mlp_up_, batch * SI, cfg_.swiglu_limit, stream_);
-  gemm_bf16(mlp_out_, mo.shared.down, mlp_h_, batch, H, SI, stream_);
+  run_shared_mlp(layer, batch);
   if (ep_overlap_) finish_moe_exchange();
   add_bf16(acc_, mlp_out_, batch * H, stream_);
   cudaMemcpyAsync(sublayer_out_, acc_, static_cast<std::size_t>(batch) * H * sizeof(bf16),
@@ -1381,16 +1379,64 @@ void DecodeEngine::run_moe_dispatch_stage(int layer, int batch) {
 // hc-combine. Deferred to the *start* of the next graph segment
 // (ensure_graphs_built) because it must run after dispatch, which is never
 // itself inside a graph.
+
+// Shared-expert FFN into mlp_out_: bf16 GEMMs, or the NVFP4 grouped path
+// (one group per projection, fused gate|up slab) when the fp4 overlays are
+// loaded. The sticky variant keeps the graph-segment calls capture-safe and
+// the batch-invariant kernels keep M=1 and M=B bit-identical.
+void DecodeEngine::run_shared_mlp(int layer, int batch) {
+  const MoeW& mo = w_.layer(layer).moe;
+  const int H = cfg_.hidden_size;
+  const int MI = cfg_.moe_intermediate_size;
+  const int SI = MI * cfg_.n_shared_experts;
+  const DenseMlpW& sh = mo.shared;
+  if (sh.fp4_gate.packed != nullptr) {
+    cudaMemcpyAsync(dense_gate_global_, &sh.fp4_gate.global, sizeof(float),
+                    cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(dense_up_global_, &sh.fp4_up.global, sizeof(float), cudaMemcpyHostToDevice,
+                    stream_);
+    cudaMemcpyAsync(dense_down_global_, &sh.fp4_down.global, sizeof(float),
+                    cudaMemcpyHostToDevice, stream_);
+    nvfp4_quantize_rows(dense_a1_packed_, dense_a1_sf_, normed_, dense_row_in_group_,
+                        dense_group_of_row_, dense_sf_base_, batch, H, stream_);
+    GroupedGemmGroup g1;
+    g1.m = batch;
+    g1.a_packed = dense_a1_packed_;
+    g1.a_scale = dense_a1_sf_;
+    g1.b_packed = sh.fp4_gate.packed;  // fused gate|up, n = 2*SI
+    g1.b_scale = sh.fp4_gate_sw;
+    g1.d_out = shared_gu_;
+    if (!grouped_gemm_nvfp4_sticky({g1}, 2 * SI, H, stream_))
+      fail("shared fp4 grouped GEMM1 failed");
+    swiglu_grouped(mlp_h_, shared_gu_, dense_gate_global_, dense_up_global_, dense_group_of_row_,
+                   batch, SI, cfg_.swiglu_limit, stream_);
+    nvfp4_quantize_rows(dense_a2_packed_, dense_a2_sf_, mlp_h_, dense_row_in_group_,
+                        dense_group_of_row_, dense_sf_base_, batch, SI, stream_);
+    GroupedGemmGroup g2;
+    g2.m = batch;
+    g2.a_packed = dense_a2_packed_;
+    g2.a_scale = dense_a2_sf_;
+    g2.b_packed = sh.fp4_down.packed;
+    g2.b_scale = sh.fp4_down_sw;
+    g2.d_out = dense_down_raw_;
+    if (!grouped_gemm_nvfp4_sticky({g2}, H, SI, stream_)) fail("shared fp4 grouped GEMM2 failed");
+    mul_scalar_bf16(mlp_out_, dense_down_raw_, sh.fp4_down.global,
+                    static_cast<long long>(batch) * H, stream_);
+    return;
+  }
+  gemm_bf16(mlp_gate_, sh.gate, normed_, batch, SI, H, stream_);
+  gemm_bf16(mlp_up_, sh.up, normed_, batch, SI, H, stream_);
+  swiglu_clamped(mlp_h_, mlp_gate_, mlp_up_, batch * SI, cfg_.swiglu_limit, stream_);
+  gemm_bf16(mlp_out_, sh.down, mlp_h_, batch, H, SI, stream_);
+}
+
 void DecodeEngine::run_moe_post_stage(int layer, int batch) {
   const MoeW& mo = w_.layer(layer).moe;
   const int H = cfg_.hidden_size;
   const int MI = cfg_.moe_intermediate_size;
   const int SI = MI * cfg_.n_shared_experts;
   const int hc = cfg_.hc_mult;
-  gemm_bf16(mlp_gate_, mo.shared.gate, normed_, batch, SI, H, stream_);
-  gemm_bf16(mlp_up_, mo.shared.up, normed_, batch, SI, H, stream_);
-  swiglu_clamped(mlp_h_, mlp_gate_, mlp_up_, batch * SI, cfg_.swiglu_limit, stream_);
-  gemm_bf16(mlp_out_, mo.shared.down, mlp_h_, batch, H, SI, stream_);
+  run_shared_mlp(layer, batch);
   add_bf16(acc_, mlp_out_, batch * H, stream_);
   cudaMemcpyAsync(sublayer_out_, acc_, static_cast<std::size_t>(batch) * H * sizeof(bf16),
                   cudaMemcpyDeviceToDevice, stream_);

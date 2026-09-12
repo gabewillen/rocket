@@ -450,6 +450,53 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
           upload_bf16(p + "mlp.shared_experts.up_proj.weight", static_cast<std::int64_t>(SI) * H);
       w.moe.shared.down =
           upload_bf16(p + "mlp.shared_experts.down_proj.weight", static_cast<std::int64_t>(H) * SI);
+      // Shared experts to NVFP4 (same operand convention as the routed
+      // experts): a fused gate|up packed slab with pre-swizzled SFBs, down
+      // separate, all under ROCKET_FP4_SHARED_DIR/l-<layer>/<proj>/.
+      if (const char* fp4dir = std::getenv("ROCKET_FP4_SHARED_DIR")) {
+        const std::filesystem::path ld =
+            std::filesystem::path(fp4dir) / ("l-" + std::to_string(l));
+        if (std::filesystem::exists(ld / "gate_proj" / "weight.u8")) {
+          const fuel::SfLayout lay = fuel::sf_layout(SI, H, 16);
+          const auto gp = read_file(ld / "gate_proj" / "weight.u8",
+                                    static_cast<std::size_t>(SI) * H / 2);
+          const auto up = read_file(ld / "up_proj" / "weight.u8",
+                                    static_cast<std::size_t>(SI) * H / 2);
+          const auto dp = read_file(ld / "down_proj" / "weight.u8",
+                                    static_cast<std::size_t>(H) * SI / 2);
+          const auto gsc = read_file(ld / "gate_proj" / "weight_scale",
+                                     static_cast<std::size_t>(SI) * H / 16);
+          const auto usc = read_file(ld / "up_proj" / "weight_scale",
+                                     static_cast<std::size_t>(SI) * H / 16);
+          const auto dsc = read_file(ld / "down_proj" / "weight_scale",
+                                     static_cast<std::size_t>(H) * SI / 16);
+          const auto gg = read_file(ld / "gate_proj" / "weight_scale_2", sizeof(float));
+          const auto ug = read_file(ld / "up_proj" / "weight_scale_2", sizeof(float));
+          const auto dg = read_file(ld / "down_proj" / "weight_scale_2", sizeof(float));
+          auto* w13 = static_cast<std::uint8_t*>(device_alloc(gp.size() + up.size()));
+          copy_in(w13, gp.data(), gp.size());
+          copy_in(w13 + gp.size(), up.data(), up.size());
+          w.moe.shared.fp4_gate.packed = w13;
+          w.moe.shared.fp4_up.packed = w13 + gp.size();
+          auto* w13s = static_cast<std::uint8_t*>(device_alloc(2 * lay.bytes()));
+          std::vector<std::uint8_t> sw(lay.bytes());
+          fuel::swizzle_block_scales(gsc.data(), lay, sw.data());
+          copy_in(w13s, sw.data(), sw.size());
+          fuel::swizzle_block_scales(usc.data(), lay, sw.data());
+          copy_in(w13s + lay.bytes(), sw.data(), sw.size());
+          w.moe.shared.fp4_gate_sw = w13s;
+          w.moe.shared.fp4_up_sw = w13s + lay.bytes();
+          auto* dpd = static_cast<std::uint8_t*>(device_alloc(dp.size()));
+          copy_in(dpd, dp.data(), dp.size());
+          w.moe.shared.fp4_down.packed = dpd;
+          auto* dsd = static_cast<std::uint8_t*>(device_alloc(dsc.size()));
+          copy_in(dsd, dsc.data(), dsc.size());
+          w.moe.shared.fp4_down_sw = dsd;
+          std::memcpy(&w.moe.shared.fp4_gate.global, gg.data(), sizeof(float));
+          std::memcpy(&w.moe.shared.fp4_up.global, ug.data(), sizeof(float));
+          std::memcpy(&w.moe.shared.fp4_down.global, dg.data(), sizeof(float));
+        }
+      }
     }
   }
 
