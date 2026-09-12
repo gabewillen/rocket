@@ -517,7 +517,15 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
   const int heads = cfg_.kda_heads;
   const int MB = max_batch_;
 
-  if (k.q_overlay.packed) {
+  if (k.qkv_fp8.packed != nullptr) {
+    // FP8-per-row q/k/v (same row order as the bf16 concat): half the weight
+    // bytes of the largest per-token family. Batch-invariant kernel keeps
+    // M=1 and M=B bit-identical.
+    gemm_fp8_row(q_raw_, k.qkv_fp8.packed, k.qkv_fp8.scales, normed_, batch, qkv, H, 0, stream_);
+    gemm_fp8_row(k_raw_, k.qkv_fp8.packed, k.qkv_fp8.scales, normed_, batch, qkv, H, qkv, stream_);
+    gemm_fp8_row(v_raw_, k.qkv_fp8.packed, k.qkv_fp8.scales, normed_, batch, qkv, H,
+                 2 * qkv, stream_);
+  } else if (k.q_overlay.packed) {
     for (int m = 0; m < batch; ++m)
       gemv_nvfp4(q_raw_ + static_cast<std::size_t>(m) * qkv, k.q_overlay.packed,
                  k.q_overlay.scale, k.q_overlay.global,
@@ -635,7 +643,11 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
                   qkv);
   kda_gated_norm(kda_on_, kda_o_, lr_b_, k.o_norm, batch, heads, hd, cfg_.rms_norm_eps, stream_);
   k_mark("o_norm");
-  gemm_bf16(sublayer_out_, k.o_proj, kda_on_, batch, H, qkv, stream_);
+  if (k.o_proj_fp8.packed != nullptr)
+    gemm_fp8_row(sublayer_out_, k.o_proj_fp8.packed, k.o_proj_fp8.scales, kda_on_, batch, H, qkv,
+                 0, stream_);
+  else
+    gemm_bf16(sublayer_out_, k.o_proj, kda_on_, batch, H, qkv, stream_);
   k_mark("o_proj");
   if (telemetry_)
     record_absmax("layer" + std::to_string(layer) + ".kda_o.output", sublayer_out_, batch, H);
@@ -654,19 +666,34 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   const int ih = cfg_.index_n_heads;
   const int kpool = cfg_.index_kpool;
 
-  gemm_bf16(q_resid_raw_, m.q_a, normed_, batch, cfg_.q_lora_rank, H, stream_);
+  if (m.q_a_fp8.packed != nullptr)
+    gemm_fp8_row(q_resid_raw_, m.q_a_fp8.packed, m.q_a_fp8.scales, normed_, batch,
+                 cfg_.q_lora_rank, H, 0, stream_);
+  else
+    gemm_bf16(q_resid_raw_, m.q_a, normed_, batch, cfg_.q_lora_rank, H, stream_);
   rmsnorm(q_resid_, q_resid_raw_, m.q_a_norm, batch, cfg_.q_lora_rank, cfg_.rms_norm_eps, stream_);
-  gemm_bf16(q_, m.q_b, q_resid_, batch, heads * cfg_.qk_head_dim(), cfg_.q_lora_rank, stream_);
+  if (m.q_b_fp8.packed != nullptr)
+    gemm_fp8_row(q_, m.q_b_fp8.packed, m.q_b_fp8.scales, q_resid_, batch,
+                 heads * cfg_.qk_head_dim(), cfg_.q_lora_rank, 0, stream_);
+  else
+    gemm_bf16(q_, m.q_b, q_resid_, batch, heads * cfg_.qk_head_dim(), cfg_.q_lora_rank, stream_);
   if (telemetry_)
     record_absmax("layer" + std::to_string(layer) + ".mla_q.output", q_, batch,
                   heads * cfg_.qk_head_dim());
 
-  gemm_bf16(ckv_, m.kv_a, normed_, batch, kvl, H, stream_);
+  if (m.kv_a_fp8.packed != nullptr)
+    gemm_fp8_row(ckv_, m.kv_a_fp8.packed, m.kv_a_fp8.scales, normed_, batch, kvl, H, 0, stream_);
+  else
+    gemm_bf16(ckv_, m.kv_a, normed_, batch, kvl, H, stream_);
   if (telemetry_)
     record_absmax("layer" + std::to_string(layer) + ".mla_kv.output", ckv_, batch, kvl);
   rmsnorm(latent_stage_, ckv_, m.kv_a_norm, batch, kvl, cfg_.rms_norm_eps, stream_);
 
-  gemm_bf16(q_idx_, m.idx_wq_b, q_resid_, batch, ih * ihd, cfg_.q_lora_rank, stream_);
+  if (m.idx_wq_b_fp8.packed != nullptr)
+    gemm_fp8_row(q_idx_, m.idx_wq_b_fp8.packed, m.idx_wq_b_fp8.scales, q_resid_, batch, ih * ihd,
+                 cfg_.q_lora_rank, 0, stream_);
+  else
+    gemm_bf16(q_idx_, m.idx_wq_b, q_resid_, batch, ih * ihd, cfg_.q_lora_rank, stream_);
   gemm_bf16(idx_k_raw_, m.idx_wk, normed_, batch, ihd, H, stream_);
   layernorm(idx_k_stage_, idx_k_raw_, m.idx_k_norm_w, m.idx_k_norm_b, batch, ihd, 1e-6f, stream_);
   gemm_bf16(idx_g_stage_, m.idx_gate, normed_, batch, ihd, H, stream_);
@@ -706,7 +733,11 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
              heads, kvl, stream_);
   mla_expand_v(v_out_, m.kv_b, ctx_, batch, heads, cfg_.qk_nope_head_dim, cfg_.v_head_dim, kvl,
               stream_);
-  gemm_bf16(sublayer_out_, m.o_proj, v_out_, batch, H, heads * cfg_.v_head_dim, stream_);
+  if (m.o_proj_fp8.packed != nullptr)
+    gemm_fp8_row(sublayer_out_, m.o_proj_fp8.packed, m.o_proj_fp8.scales, v_out_, batch, H,
+                 heads * cfg_.v_head_dim, 0, stream_);
+  else
+    gemm_bf16(sublayer_out_, m.o_proj, v_out_, batch, H, heads * cfg_.v_head_dim, stream_);
   if (telemetry_)
     record_absmax("layer" + std::to_string(layer) + ".mla_o.output", sublayer_out_, batch, H);
 

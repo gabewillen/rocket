@@ -220,6 +220,38 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
     }
   } guard{owned_, pinned_};
 
+  // FP8-per-row overlay loader: reads {weight.u8, weight_scale.f32} produced
+  // by materialize-nvfp4-overlay --fp8-row. Rows must match the bf16 tensor's
+  // row count exactly; the bf16 upload still happens (provenance + fallback).
+  auto try_fp8_row = [&](const std::string& tensor_name, std::int64_t rows,
+                         std::int64_t k_true, Fp8RowW& out) {
+    const char* root = std::getenv("ROCKET_FP8_ATTN_DIR");
+    if (root == nullptr) return;
+    // tensor_name -> overlay subdir: layers.N.self_attn.o_proj.weight -> l-N/o_proj
+    const std::size_t layers = tensor_name.find("layers.");
+    if (layers == std::string::npos) return;
+    const std::string rest = tensor_name.substr(layers + 7);
+    const std::size_t dot = rest.find('.');
+    if (dot == std::string::npos) return;
+    const std::string layer_id = rest.substr(0, dot);
+    std::string leaf = rest.substr(dot + 1);
+    for (const std::string suffix : {".weight"}) {
+      const std::size_t at = leaf.rfind(suffix);
+      if (at != std::string::npos && at + suffix.size() == leaf.size()) leaf = leaf.substr(0, at);
+    }
+    const std::filesystem::path dir =
+        std::filesystem::path(root) / ("l-" + layer_id) / leaf;
+    if (!std::filesystem::exists(dir / "weight.u8")) return;
+    const auto packed = read_file(dir / "weight.u8", static_cast<std::size_t>(rows) * k_true);
+    const auto scales = read_file(dir / "weight_scale.f32", static_cast<std::size_t>(rows) * 4);
+    auto* pd = static_cast<std::uint8_t*>(device_alloc(packed.size()));
+    copy_in(pd, packed.data(), packed.size());
+    auto* sd = static_cast<float*>(device_alloc(scales.size()));
+    copy_in(sd, scales.data(), scales.size());
+    out.packed = pd;
+    out.scales = sd;
+  };
+
   pinned_bytes_ = 64u << 20;
   cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&pinned_), pinned_bytes_, cudaHostAllocDefault),
              "cudaHostAlloc staging");
@@ -253,6 +285,22 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
       const std::string a = p + "self_attn.";
       w.kda.qkv = upload_concat({a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"},
                                 static_cast<std::int64_t>(3) * qkv * H);
+      if (const char* fp8_dir = std::getenv("ROCKET_KDA_QKV_FP8_DIR")) {
+        const std::filesystem::path layer_dir =
+            std::filesystem::path(fp8_dir) / ("l-" + std::to_string(l));
+        if (std::filesystem::exists(layer_dir / "weight.u8")) {
+          const auto packed =
+              read_file(layer_dir / "weight.u8", static_cast<std::size_t>(3) * qkv * H);
+          const auto scales =
+              read_file(layer_dir / "weight_scale.f32", static_cast<std::size_t>(3) * qkv * 4);
+          auto* pd = static_cast<std::uint8_t*>(device_alloc(packed.size()));
+          copy_in(pd, packed.data(), packed.size());
+          auto* sd = static_cast<float*>(device_alloc(scales.size()));
+          copy_in(sd, scales.data(), scales.size());
+          w.kda.qkv_fp8.packed = pd;
+          w.kda.qkv_fp8.scales = sd;
+        }
+      }
       if (const char* overlay = std::getenv("ROCKET_KDA_Q_NVFP4_OBJECT")) {
         const int overlay_layer = std::atoi(std::getenv("ROCKET_KDA_Q_NVFP4_LAYER")
                                                 ? std::getenv("ROCKET_KDA_Q_NVFP4_LAYER") : "-1");
@@ -282,6 +330,7 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
       w.kda.dt_bias = upload_f32(a + "dt_bias", qkv);
       w.kda.o_norm = upload_bf16(a + "o_norm.weight", hd);
       w.kda.o_proj = upload_bf16(a + "o_proj.weight", static_cast<std::int64_t>(H) * qkv);
+      try_fp8_row(a + "o_proj.weight", H, qkv, w.kda.o_proj_fp8);
     } else {
       const std::string a = p + "self_attn.";
       w.mla.q_a = upload_bf16(a + "q_a_proj.weight", static_cast<std::int64_t>(cfg_.q_lora_rank) * H);
@@ -295,7 +344,15 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
                                static_cast<std::int64_t>(cfg_.mla_kv_b_out()) * cfg_.kv_lora_rank);
       w.mla.o_proj = upload_bf16(a + "o_proj.weight",
                                  static_cast<std::int64_t>(H) * cfg_.mla_heads * cfg_.v_head_dim);
+      try_fp8_row(a + "o_proj.weight", H, cfg_.mla_heads * cfg_.v_head_dim, w.mla.o_proj_fp8);
+      try_fp8_row(a + "q_b_proj.weight", cfg_.mla_heads * qk, cfg_.q_lora_rank, w.mla.q_b_fp8);
+      try_fp8_row(a + "kv_b_proj.weight", cfg_.mla_kv_b_out(), cfg_.kv_lora_rank, w.mla.kv_b_fp8);
+      try_fp8_row(a + "q_a_proj.weight", cfg_.q_lora_rank, H, w.mla.q_a_fp8);
+      try_fp8_row(a + "kv_a_proj_with_mqa.weight", cfg_.kv_lora_rank + cfg_.qk_rope_head_dim, H,
+                  w.mla.kv_a_fp8);
       const std::string ix = a + "indexer.";
+      try_fp8_row(ix + "wq_b.weight", cfg_.index_n_heads * cfg_.index_head_dim, cfg_.q_lora_rank,
+                  w.mla.idx_wq_b_fp8);
       w.mla.idx_wk = upload_bf16(ix + "wk.weight", static_cast<std::int64_t>(cfg_.index_head_dim) * H);
       w.mla.idx_wq_b = upload_bf16(
           ix + "wq_b.weight",

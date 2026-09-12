@@ -46,8 +46,15 @@ struct Nvfp4W {
   float global = 0.0f;
 };
 
+struct Fp8RowW {
+  const std::uint8_t* packed = nullptr;  // [rows, k] e4m3 payload
+  const float* scales = nullptr;         // [rows] f32 per-row scale
+};
+
 struct KdaW {
   const bf16* qkv = nullptr;      // [3*qkv_dim, hidden], q then k then v
+  Fp8RowW qkv_fp8;                // optional fp8-per-row replacement (same row order)
+  Fp8RowW o_proj_fp8;             // optional fp8-per-row o_proj [hidden, qkv_dim]
   Nvfp4W q_overlay;               // optional isolated W4A16 quality experiment
   const bf16* conv = nullptr;     // [3*qkv_dim, kernel]
   const bf16* f_a = nullptr;      // [head_dim, hidden]
@@ -76,6 +83,14 @@ struct MlaW {
   const bf16* idx_weights = nullptr;  // [index_heads, hidden]
   const bf16* idx_gate = nullptr;     // [index_head_dim, hidden]
   const bf16* idx_ape = nullptr;      // [kpool, index_head_dim]
+  // Optional fp8-per-row replacements (row order identical to the bf16
+  // tensors; norms and small gate tensors stay bf16).
+  Fp8RowW o_proj_fp8;    // [hidden, heads*v]
+  Fp8RowW q_b_fp8;       // [heads*qk, q_lora]
+  Fp8RowW kv_b_fp8;      // [heads*(nope+v), kv_lora]
+  Fp8RowW q_a_fp8;       // [q_lora, hidden]
+  Fp8RowW kv_a_fp8;      // [kv_lora(+mqa), hidden]
+  Fp8RowW idx_wq_b_fp8;  // [index_heads*index_head_dim, q_lora]
 };
 
 struct DenseMlpW {

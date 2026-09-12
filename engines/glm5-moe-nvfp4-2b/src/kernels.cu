@@ -101,6 +101,37 @@ __global__ void gemm_batched_kernel(Out* __restrict__ y, const bf16* __restrict_
   }
 }
 
+// FP8 e4m3 payload, one f32 scale per output row. Same batch-invariant
+// structure as gemm_batched_kernel: per-element accumulation order is
+// independent of batch composition, so M=1 and M=B are bit-identical.
+template <typename Out, int BATCH>
+__global__ void gemm_fp8_row_batched_kernel(Out* __restrict__ y, const std::uint8_t* __restrict__ w,
+                                            const float* __restrict__ scales,
+                                            const bf16* __restrict__ x, int n_rows, int k,
+                                            int batch, int row_off) {
+  __shared__ float red[32];
+  const long long wrow = static_cast<long long>(blockIdx.x) + row_off;
+  const std::uint8_t* wr = w + wrow * k;
+  const float rs = scales[wrow];
+  float acc[BATCH];
+  for (int m = 0; m < BATCH; ++m) acc[m] = 0.0f;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    const float wv = static_cast<float>(reinterpret_cast<const __nv_fp8_e4m3*>(wr)[i]);
+    for (int m = 0; m < BATCH; ++m) acc[m] += wv * f(x[static_cast<long long>(m) * k + i]);
+  }
+  for (int m = 0; m < batch; ++m) {
+    const float total = block_sum(acc[m], red) * rs;
+    if (threadIdx.x == 0) {
+      Out* yr = y + static_cast<long long>(m) * n_rows;
+      if constexpr (sizeof(Out) == 4) {
+        yr[blockIdx.x] = total;
+      } else {
+        yr[blockIdx.x] = b(total);
+      }
+    }
+  }
+}
+
 // ------------------------------------------------------------------- norms
 
 __global__ void rmsnorm_kernel(bf16* __restrict__ out, const bf16* __restrict__ x,
@@ -1046,6 +1077,36 @@ void mul_scalar_bf16(bf16* out, const bf16* in, float scalar, long long n, cudaS
   mul_scalar_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(out, in, scalar,
                                                                           static_cast<int>(n));
 }
+template <typename Out>
+void gemm_fp8_row_dispatch(Out* y, const std::uint8_t* w, const float* scales, const bf16* x,
+                           int batch, int n_rows, int k, int row_off, cudaStream_t s) {
+  int m0 = 0;
+  while (m0 < batch) {
+    const int rem = batch - m0;
+    const int b = rem < 16 ? rem : 16;
+    Out* y_part = y + static_cast<std::size_t>(m0) * n_rows;
+    const bf16* x_part = x + static_cast<std::size_t>(m0) * k;
+    if (b <= 2)
+      gemm_fp8_row_batched_kernel<Out, 2><<<n_rows, 256, 0, s>>>(y_part, w, scales, x_part, n_rows,
+                                                                 k, b, row_off);
+    else if (b <= 4)
+      gemm_fp8_row_batched_kernel<Out, 4><<<n_rows, 256, 0, s>>>(y_part, w, scales, x_part, n_rows,
+                                                                 k, b, row_off);
+    else if (b <= 8)
+      gemm_fp8_row_batched_kernel<Out, 8><<<n_rows, 256, 0, s>>>(y_part, w, scales, x_part, n_rows,
+                                                                 k, b, row_off);
+    else
+      gemm_fp8_row_batched_kernel<Out, 16><<<n_rows, 256, 0, s>>>(y_part, w, scales, x_part, n_rows,
+                                                                  k, b, row_off);
+    m0 += b;
+  }
+}
+
+void gemm_fp8_row(bf16* y, const std::uint8_t* w, const float* scales, const bf16* x, int batch,
+                  int n_rows, int k, int row_off, cudaStream_t s) {
+  gemm_fp8_row_dispatch<bf16>(y, w, scales, x, batch, n_rows, k, row_off, s);
+}
+
 void gemm_bf16(bf16* y, const bf16* w, const bf16* x, int batch, int n_rows, int k, cudaStream_t s) {
   gemm_dispatch<bf16>(y, w, x, batch, n_rows, k, s);
 }

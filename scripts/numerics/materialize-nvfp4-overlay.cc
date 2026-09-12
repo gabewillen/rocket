@@ -92,10 +92,11 @@ static std::vector<TensorView> load_tensors(Checkpoint& ckpt, const std::string&
 }
 
 int main(int argc, char** argv) {
-  if (argc != 5) {
-    std::cerr << "usage: materialize-nvfp4-overlay SNAPSHOT OUTPUT SNAPSHOT_KEY T0=SHA0,T1=SHA1,...\n";
+  if (argc != 5 && argc != 6) {
+    std::cerr << "usage: materialize-nvfp4-overlay SNAPSHOT OUTPUT SNAPSHOT_KEY T0=SHA0,T1=SHA1,... [--fp8-row]\n";
     return 2;
   }
+  const bool fp8_row = argc == 6 && std::string(argv[5]) == "--fp8-row";
   try {
     Checkpoint checkpoint(argv[1]);
     const fs::path output(argv[2]);
@@ -106,6 +107,77 @@ int main(int argc, char** argv) {
 
     std::int64_t n = 0, k = 0;
     const std::vector<std::uint16_t> source = concat_bf16(tensors, n, k);
+    if (fp8_row) {
+      // FP8 e4m3 payload with one f32 scale per output row: half the bytes
+      // of BF16 at ~1.7 percent relative L2 (versus 9.4 percent for NVFP4),
+      // the recipe the KDA-Q NVFP4 rejection pointed at as the gentler next
+      // step for the attention families.
+      const std::size_t elements = static_cast<std::size_t>(n) * k;
+      std::vector<std::uint8_t> payload(elements);
+      std::vector<float> row_scales(static_cast<std::size_t>(n));
+      double error_sq = 0.0, reference_sq = 0.0;
+      std::vector<double> member_err(tensors.size(), 0.0), member_ref(tensors.size(), 0.0);
+      std::vector<std::int64_t> row_of(tensors.size() + 1, 0);
+      for (std::size_t i = 0; i < tensors.size(); ++i)
+        row_of[i + 1] = row_of[i] + tensors[i].shape[0];
+      for (std::int64_t r = 0; r < n; ++r) {
+        std::size_t member = 0;
+        while (member + 1 < tensors.size() && r >= row_of[member + 1]) ++member;
+        const std::size_t base = static_cast<std::size_t>(r) * k;
+        float rowmax = 0.0f;
+        for (std::int64_t j = 0; j < k; ++j)
+          rowmax = std::max(rowmax, std::fabs(rocket::fuel::bf16_to_float(source[base + static_cast<std::size_t>(j)])));
+        const float scale = rowmax / 448.0f;
+        row_scales[static_cast<std::size_t>(r)] = scale;
+        for (std::int64_t j = 0; j < k; ++j) {
+          const float original = rocket::fuel::bf16_to_float(source[base + static_cast<std::size_t>(j)]);
+          const float target = scale > 0.0f ? original / scale : 0.0f;
+          const std::uint8_t bits = rocket::fuel::float_to_e4m3(target);
+          payload[base + static_cast<std::size_t>(j)] = bits;
+          const double error = static_cast<double>(rocket::fuel::e4m3_to_float(bits)) * scale - original;
+          member_err[member] += error * error;
+          member_ref[member] += static_cast<double>(original) * original;
+          error_sq += error * error;
+          reference_sq += static_cast<double>(original) * original;
+        }
+      }
+      write_file(output / "weight.u8", payload.data(), payload.size());
+      write_file(output / "weight_scale.f32", row_scales.data(), row_scales.size() * sizeof(float));
+      const float one = 1.0f;
+      write_file(output / "weight_scale_2.f32", &one, sizeof(one));
+      std::ofstream meta(output / "metadata.json", std::ios::trunc);
+      meta << "{\n"
+           << "  \"schema\": \"rocket.fp8-row-overlay.v1\",\n"
+           << "  \"source_tensors\": [";
+      for (std::size_t i = 0; i < tensors.size(); ++i) {
+        if (i) meta << ",\n                    ";
+        meta << "\"" << tensors[i].name << "\"";
+      }
+      meta << "],\n"
+           << "  \"source_sha256\": [";
+      for (std::size_t i = 0; i < shas.size(); ++i) {
+        if (i) meta << ",\n                    ";
+        meta << "\"" << shas[i] << "\"";
+      }
+      meta << "],\n"
+           << "  \"source_snapshot_key\": \"" << snapshot_key << "\",\n"
+           << "  \"source_dtype\": \"BF16\",\n"
+           << "  \"shape\": [" << n << ", " << k << "],\n"
+           << "  \"payload\": \"e4m3\",\n"
+           << "  \"scale\": \"f32_per_row\",\n"
+           << "  \"relative_l2_weight_error\": "
+           << std::sqrt(error_sq / std::max(reference_sq, 1e-300)) << ",\n"
+           << "  \"per_tensor_relative_l2\": [";
+      for (std::size_t i = 0; i < tensors.size(); ++i) {
+        if (i) meta << ", ";
+        meta << std::sqrt(member_err[i] / std::max(member_ref[i], 1e-300));
+      }
+      meta << "]\n}\n";
+      if (!meta) throw std::runtime_error("metadata write failed");
+      std::cout << "fp8-row\t" << elements << "\t"
+                << std::sqrt(error_sq / std::max(reference_sq, 1e-300)) << '\n';
+      return 0;
+    }
     if (k % 16 != 0)
       throw std::runtime_error("concat does not satisfy K%16=0");
     const std::size_t elements = static_cast<std::size_t>(n) * k;
