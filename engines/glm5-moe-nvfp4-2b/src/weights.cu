@@ -501,6 +501,47 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
   }
 
   // --- streamed expert cache ----------------------------------------------
+  // EXL3 fuel: routed experts are trellis blobs (per projection:
+  // trellis [k/16, n/16, bits*16] int16 + suh [k] f16 + svh [n] f16), 12.6
+  // MiB per expert at K4; attention and dense stay BF16 in the checkpoint.
+  // The slot holds the nine blobs back to back in gate, up, down order.
+  exl3_fuel_ = cfg_.quant_method == "exl3";
+  if (exl3_fuel_) {
+    const std::size_t gt = static_cast<std::size_t>(cfg_.moe_intermediate_size) * H / 2;
+    const std::size_t dt = static_cast<std::size_t>(H) * cfg_.moe_intermediate_size / 2;
+    const std::size_t suh_g = H * 2, svh_g = cfg_.moe_intermediate_size * 2;
+    const std::size_t suh_d = cfg_.moe_intermediate_size * 2, svh_d = H * 2;
+    exl3_slot_bytes_ = align_up(2 * (gt + suh_g + svh_g) + dt + suh_d + svh_d, 512);
+    std::size_t n_slots = expert_cache_bytes / exl3_slot_bytes_;
+    if (n_slots < static_cast<std::size_t>(cfg_.num_experts_per_tok))
+      fail("expert cache is smaller than one token's top-k working set");
+    exl3_slots_.resize(n_slots);
+    exl3_lru_pos_.resize(n_slots);
+    for (std::size_t i = 0; i < n_slots; ++i) {
+      auto* base = static_cast<std::uint8_t*>(device_alloc(exl3_slot_bytes_));
+      exl3_owned_.push_back(base);
+      std::size_t off = 0;
+      auto seg = [&](std::size_t bytes) {
+        void* p = base + off;
+        off += bytes;
+        return p;
+      };
+      auto& v = exl3_slots_[i];
+      v.gate_trellis = seg(gt);  v.gate_suh = seg(suh_g);  v.gate_svh = seg(svh_g);
+      v.up_trellis = seg(gt);    v.up_suh = seg(suh_g);    v.up_svh = seg(svh_g);
+      v.down_trellis = seg(dt);  v.down_suh = seg(suh_d);  v.down_svh = seg(svh_d);
+    }
+    for (std::size_t i = 0; i < n_slots; ++i) {
+      exl3_lru_.push_front(static_cast<int>(i));
+      exl3_lru_pos_[i] = exl3_lru_.begin();
+    }
+    resident_bytes_ += n_slots * exl3_slot_bytes_;
+    // NVFP4 slot pool skipped entirely on this fuel.
+    slot_bytes_ = 0;
+    slots_.clear();
+    slot_view_.clear();
+  }
+  if (!exl3_fuel_) {
   // Layout, in order: gate_packed and up_packed sit back to back so the pair
   // doubles as the fused w13 grouped-GEMM B operand (weights.h::ExpertDev);
   // gate_scale/up_scale are the checkpoint's own linear layout for the GEMV
@@ -539,6 +580,7 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
     v.down_scale_swizzled = base + off; off += down_scale;
     lru_.push_front(static_cast<int>(i));
     lru_pos_[i] = lru_.begin();
+  }
   }
   guard.armed = false;
 }

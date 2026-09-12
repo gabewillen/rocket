@@ -244,6 +244,12 @@ ModelConfig load_model_config(const std::filesystem::path& attention_yaml,
   json::JsonParser parser(text.data(), text.data() + text.size());
   const json::JsonValue root = parser.parse_document();
   const json::JsonValue& t = member(root, "text_config");
+  const json::JsonValue* qc = root.member("quant_config");
+  c.quant_method = "nvfp4";
+  if (qc != nullptr && qc->kind == json::JsonValue::Kind::kObject) {
+    const json::JsonValue* qm = qc->member("quant_method");
+    if (qm != nullptr && qm->kind == json::JsonValue::Kind::kString) c.quant_method = qm->str;
+  }
 
   expect(json_int(t, "hidden_size") == c.hidden_size, "hidden_size");
   expect(json_int(t, "num_hidden_layers") == c.text_layers, "num_hidden_layers");

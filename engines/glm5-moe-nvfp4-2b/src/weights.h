@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <list>
 #include <memory>
 #include <string>
@@ -143,6 +144,18 @@ struct LayerW {
 // the fused matrix directly because moe_intermediate_size is a multiple of
 // SfLayout's 128-row atom (nvfp4.h) and the atom index is purely additive in
 // the row-tile number.
+struct Exl3ExpertView {
+  const void* gate_trellis = nullptr;
+  const void* gate_suh = nullptr;
+  const void* gate_svh = nullptr;
+  const void* up_trellis = nullptr;
+  const void* up_suh = nullptr;
+  const void* up_svh = nullptr;
+  const void* down_trellis = nullptr;
+  const void* down_suh = nullptr;
+  const void* down_svh = nullptr;
+};
+
 struct ExpertDev {
   const std::uint8_t* gate_packed = nullptr;
   const std::uint8_t* gate_scale = nullptr;  // linear, GEMV
@@ -179,6 +192,13 @@ class WeightStore {
 
   // Returns the expert, fetching it from the checkpoint if it is not resident.
   const ExpertDev& expert(int layer, int expert_id, cudaStream_t s);
+  // EXL3-fuel expert view (trellis blobs + fp16 side scales); requires
+  // quant_method == "exl3" in the checkpoint config.
+  const Exl3ExpertView& exl3_expert(int layer, int expert_id, cudaStream_t s);
+  bool exl3_fuel() const { return exl3_fuel_; }
+  std::size_t exl3_slot_bytes() const { return exl3_slot_bytes_; }
+  std::size_t exl3_slots() const { return exl3_slots_.size(); }
+  std::size_t exl3_cache_bytes() const { return exl3_slot_bytes_ * exl3_slots_.size(); }
 
   // --- two-booster expert parallelism (src/fabric/expert_parallel.h) -------
   //
@@ -251,6 +271,13 @@ class WeightStore {
   std::size_t resident_bytes_ = 0;
 
   // --- streamed experts ---
+  bool exl3_fuel_ = false;
+  std::size_t exl3_slot_bytes_ = 0;
+  std::vector<Exl3ExpertView> exl3_slots_;
+  std::vector<std::deque<int>::iterator> exl3_lru_pos_;
+  std::deque<int> exl3_lru_;
+  std::unordered_map<std::uint64_t, int> exl3_resident_;
+  std::vector<void*> exl3_owned_;
   struct Slot {
     std::uint8_t* base = nullptr;
     long long key = -1;  // layer * n_experts + expert
