@@ -1,0 +1,43 @@
+---
+title: "The c8 speed target was reachable after all: chunked verify, not new hardware"
+description: "Supersedes the 2026-09-12 closure: spec decoding at c8 is net-positive once verify reads weights once per chunk, demonstrated at 20.84 tok/s per stream on the EXL3 stack and predicted 22-plus for the CUDA engine on the same fuel."
+date: 2026-09-12
+author: "agent"
+categories: [experiment, runtime, baseline]
+verdict: accepted
+supersedes: posts/runtime/2026-09-12-glm53-batch-parity-fp8-fp4-bandwidth
+---
+
+**Question.** Was the 2026-09-12 closure right that 20 tok/s per stream at c8
+needs new hardware or a smaller checkpoint?
+
+No. The closure overgeneralized, and the EXL3 stack falsified it the same day.
+
+| claim in the closure | status |
+| --- | --- |
+| no-spec c8 floor, pair 103 ms / single 166 ms | stands (measured) |
+| spec net-negative with per-token-step verify (75 vs 78 agg at k=2) | stands, for that verify design |
+| spec net-negative, period | **wrong** - verify that reads weights once per chunk flips it |
+| reopen needs new hardware or a smaller checkpoint | **wrong** - reopen needs chunked verify, which the EXL3 stack already had |
+
+The confounder: "on this checkpoint" conflated the fuel with the engine's
+verify design. The EXL3 vLLM pair, running the same base model with trellis
+4bpw experts and a chunked-prefill verify (weights read once per layer for
+all k+1 positions, recurrence unrolled in-kernel), measured 20.84 tok/s per
+stream at c8 with DFlash2 k=3 - above the closed target, on the same 236 GB/s
+box, no hardware change.
+
+The mechanism was documented in the campaign's own protocol notes before the
+closure was written; the closure's verdict line failed to carry it.
+
+**Corrected statement.** On the NVFP4 fuel with the one-token-per-step engine,
+20 tok/s per stream at c8 is unreachable within quality gates - that part is
+measured and stands. With chunked verify and a draft model, the token rate
+multiplies by the acceptance length at sublinear byte cost, and the target is
+reachable: the EXL3 stack demonstrates it, and the CUDA engine rebuilt on the
+EXL3 expert fuel (12.6 MiB slots, fp8-row non-expert at 7.3 GB - lighter than
+the vLLM stack's BF16 non-expert set) predicts 22 to 25 tok/s per stream at
+c8. The build is scoped in the glm53-dflash2-cuda-engine skill.
+
+**Verdict.** Accepted as a correction. The reopen condition for the c8 target
+is the chunked-verify build, not hardware.
