@@ -5,6 +5,7 @@
 #   scripts/fabric/static-fire.sh [--refresh-reference] [--sweep 1,8]
 #                                 [--expert-cache-gib 20] [--expert-histogram-out PATH]
 #                                 [--expert-histogram-in PATH] [--overlap 0|1] [--cuda-graph 0|1]
+#                                 [--preload-owned]
 #
 # rank 0 runs here, rank 1 on the peer over ssh. Both nodes have the same $HOME
 # and the same NIM snapshot, so the binary and the fuel description are copied
@@ -25,6 +26,7 @@ HIST_OUT=
 HIST_IN=
 OVERLAP=0
 GRAPH=0
+PRELOAD=0
 REF=${ROCKET_REFERENCE_TOKENS:-/tmp/rocket-static-fire-reference.txt}
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -46,6 +48,7 @@ while [[ $# -gt 0 ]]; do
     --overlap) OVERLAP=$2; shift 2 ;;
     # CUDA graph capture of the decode step's non-routing work.
     --cuda-graph) GRAPH=$2; shift 2 ;;
+    --preload-owned) PRELOAD=1; shift ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -86,9 +89,18 @@ echo "== expert-parallel, rank 0 here, rank 1 on $PEER =="
 rsync -a "$REF" "$PEER:$REF"
 common_args="--sweep $SWEEP --expert-cache-gib $CACHE_GIB --skip-parity $SKIP_PARITY"
 common_args="$common_args --overlap $OVERLAP --cuda-graph $GRAPH"
+common_args="$common_args --preload-owned $PRELOAD"
 [[ -n $HIST_IN ]] && common_args="$common_args --expert-histogram-in $HIST_IN"
+# Env passthrough: ssh does not inherit the caller's environment, and the
+# fuel/overlay paths must agree on both ranks.
+env_prefix=""
+for v in ROCKET_FUEL_NVFP4_DIR ROCKET_ATTENTION_YAML ROCKET_PACKED_WEIGHTS \
+         ROCKET_FP8_ATTN_DIR ROCKET_KDA_QKV_FP8_DIR ROCKET_RDMA_WAIT_S; do
+  if [[ -n ${!v:-} ]]; then env_prefix+="$v=${!v} "; fi
+done
+
 ssh -o BatchMode=yes -n "$PEER" \
-  "$bin --mode parallel --rank 1 --host $HEAD --port $PORT --tokens-file $REF \
+  "$env_prefix $bin --mode parallel --rank 1 --host $HEAD --port $PORT --tokens-file $REF \
         $common_args" >/tmp/rocket-static-fire-rank1.log 2>&1 &
 peer_pid=$!
 trap 'kill $peer_pid 2>/dev/null || true' EXIT
