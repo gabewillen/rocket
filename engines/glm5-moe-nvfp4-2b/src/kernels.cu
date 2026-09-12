@@ -973,6 +973,17 @@ __global__ void add_kernel(bf16* __restrict__ acc, const bf16* __restrict__ v, i
   if (i < n) acc[i] = b(f(acc[i]) + f(v[i]));
 }
 
+__global__ void bf16_to_fp16_kernel(void* __restrict__ out, const bf16* __restrict__ in,
+                                    int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) reinterpret_cast<__half*>(out)[i] = __float2half(f(in[i]));
+}
+
+__global__ void fp32_to_bf16_kernel(bf16* __restrict__ out, const float* __restrict__ in, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = b(in[i]);
+}
+
 __global__ void mul_scalar_kernel(bf16* __restrict__ out, const bf16* __restrict__ in,
                                   float scalar, int n) {
   const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1072,6 +1083,15 @@ void gemm_dispatch(Out* y, const bf16* w, const bf16* x, int batch, int n_rows, 
     m0 += b;
   }
 }
+void bf16_to_fp16_rows(void* dst, const void* src, long long n, cudaStream_t s) {
+  bf16_to_fp16_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(
+      dst, static_cast<const bf16*>(src), static_cast<int>(n));
+}
+void fp32_to_bf16_rows(void* dst, const void* src, long long n, cudaStream_t s) {
+  fp32_to_bf16_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(
+      static_cast<bf16*>(dst), static_cast<const float*>(src), static_cast<int>(n));
+}
+
 void mul_scalar_bf16(bf16* out, const bf16* in, float scalar, long long n, cudaStream_t s) {
   if (n <= 0) return;
   mul_scalar_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(out, in, scalar,

@@ -590,6 +590,63 @@ WeightStore::~WeightStore() {
   if (pinned_ != nullptr) cudaFreeHost(pinned_);
 }
 
+// EXL3 slot streaming: same LRU discipline as the NVFP4 fetch, nine blobs
+// per expert (trellis + suh + svh per projection) staged through the pinned
+// buffer.
+const Exl3ExpertView& WeightStore::exl3_expert(int layer, int expert_id, cudaStream_t s) {
+  const std::uint64_t key =
+      static_cast<std::uint64_t>(layer) * cfg_.n_routed_experts + expert_id;
+  auto rit = exl3_resident_.find(key);
+  if (rit != exl3_resident_.end()) {
+    ++hits_;
+    const int slot = rit->second;
+    exl3_lru_.erase(exl3_lru_pos_[slot]);
+    exl3_lru_.push_front(slot);
+    exl3_lru_pos_[slot] = exl3_lru_.begin();
+    return exl3_slots_[slot];
+  }
+  ++misses_;
+  int slot;
+  if (!exl3_lru_.empty() && exl3_resident_.size() >= exl3_slots_.size()) {
+    slot = exl3_lru_.back();
+    exl3_lru_.pop_back();
+    for (auto it = exl3_resident_.begin(); it != exl3_resident_.end(); ++it)
+      if (it->second == slot) { exl3_resident_.erase(it); break; }
+  } else {
+    slot = static_cast<int>(exl3_resident_.size());
+  }
+  const std::string p = layer_prefix(layer) + "mlp.experts." + std::to_string(expert_id) + ".";
+  const std::size_t H = cfg_.hidden_size;
+  const std::size_t SI = cfg_.moe_intermediate_size;
+  const std::size_t gt = SI * H / 2;
+  const std::size_t dt = H * SI / 2;
+  Exl3ExpertView& v = exl3_slots_[slot];
+  struct Blob { const char* suffix; std::size_t bytes; const void** dst; };
+  const Blob blobs[9] = {
+      {"gate_proj.trellis", gt, &v.gate_trellis},
+      {"gate_proj.suh", H * 2, &v.gate_suh},
+      {"gate_proj.svh", SI * 2, &v.gate_svh},
+      {"up_proj.trellis", gt, &v.up_trellis},
+      {"up_proj.suh", H * 2, &v.up_suh},
+      {"up_proj.svh", SI * 2, &v.up_svh},
+      {"down_proj.trellis", dt, &v.down_trellis},
+      {"down_proj.suh", SI * 2, &v.down_suh},
+      {"down_proj.svh", H * 2, &v.down_svh},
+  };
+  for (const auto& b : blobs) {
+    const fuel::TensorView& t = ckpt_.tensor(p + b.suffix);
+    std::memcpy(pinned_, t.data, t.nbytes);
+    cuda_check(cudaMemcpyAsync(const_cast<void*>(*b.dst), pinned_, t.nbytes,
+                               cudaMemcpyHostToDevice, s), "exl3 blob H2D");
+    streamed_bytes_ += t.nbytes;
+  }
+  cuda_check(cudaStreamSynchronize(s), "exl3 stream sync");
+  exl3_resident_[key] = slot;
+  exl3_lru_.push_front(slot);
+  exl3_lru_pos_[slot] = exl3_lru_.begin();
+  return v;
+}
+
 void WeightStore::set_expert_range(int first, int count) {
   if (first < 0 || count <= 0 || first + count > cfg_.n_routed_experts)
     fail("expert range [" + std::to_string(first) + ", " + std::to_string(first + count) +

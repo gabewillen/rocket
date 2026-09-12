@@ -19,14 +19,7 @@
 #include <cuda_fp16.h>
 
 // From exl3_moe_common.cuh (ported verbatim)
-#ifndef MOE_ACT_SILU
-#define MOE_ACT_SILU 0
-#define MOE_ACT_GELU 1
-#endif
-
-#ifndef MOE_SMS_PER_EXPERT
-#define MOE_SMS_PER_EXPERT 12
-#endif
+#include "exl3_moe_common.cuh"  // MOE_ACT_SILU, MOE_SMS_PER_EXPERT
 
 struct Exl3MoeLayerPtrs
 {

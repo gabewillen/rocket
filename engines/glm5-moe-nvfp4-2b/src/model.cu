@@ -3,16 +3,26 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 
 #include "kernels.h"
 #include "fabric/expert_parallel.h"
 #include "moe_grouped.h"
+#include "exl3_moe_bridge.h"
 
 namespace rocket::engine {
 namespace {
+
+inline std::uint16_t fp16_bits(float v) {
+  __half h = __float2half(v);
+  std::uint16_t u;
+  std::memcpy(&u, &h, 2);
+  return u;
+}
 
 [[noreturn]] void fail(const std::string& what) {
   throw std::runtime_error("rocket::engine::model: " + what);
@@ -254,6 +264,34 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   dense_a2_sf_ = U8(192 * 512);  // k_tiles(I=12288)=192
   dense_down_raw_ = A(static_cast<std::size_t>(MB) * H);
   shared_gu_ = A(static_cast<std::size_t>(MB) * 2 * MI * cfg_.n_shared_experts);
+
+  // --- EXL3-fuel routed-expert scratch ---
+  if (w_.exl3_fuel()) {
+    exl3_hidden_fp16_ = nullptr;
+    cuda_check(cudaMalloc(&exl3_hidden_fp16_,
+                          static_cast<std::size_t>(MB) * H * 2), "exl3 hidden fp16");
+    cuda_check(cudaMalloc(&exl3_out_fp32_,
+                          static_cast<std::size_t>(MB) * H * 4), "exl3 out fp32");
+    cuda_check(cudaMalloc(&exl3_tok_sorted_,
+                          static_cast<std::size_t>(MR) * 8), "exl3 tok sorted");
+    cuda_check(cudaMalloc(&exl3_w_sorted_,
+                          static_cast<std::size_t>(MR) * 2), "exl3 w sorted");
+    cuda_check(cudaMalloc(&exl3_expert_count_,
+                          static_cast<std::size_t>(cfg_.n_routed_experts) * 8),
+               "exl3 expert count");
+    cuda_check(cudaMalloc(&exl3_ptrs_dev_,
+                          static_cast<std::size_t>(cfg_.n_routed_experts) * 9 * 8),
+               "exl3 ptrs dev");
+    cuda_check(cudaHostAlloc(&exl3_ptrs_stage_,
+                             static_cast<std::size_t>(cfg_.n_routed_experts) * 9 * 8,
+                             cudaHostAllocDefault), "exl3 ptrs stage");
+    cuda_check(cudaHostAlloc(&exl3_counts_stage_,
+                             static_cast<std::size_t>(cfg_.n_routed_experts) * 8,
+                             cudaHostAllocDefault), "exl3 counts stage");
+    cuda_check(cudaHostAlloc(&exl3_tok_stage_,
+                             static_cast<std::size_t>(MR) * 10,
+                             cudaHostAllocDefault), "exl3 tok stage");
+  }
   dense_row_in_group_ = I(MB);
   dense_group_of_row_ = I(MB);
   dense_sf_base_ = I64(1);
@@ -1103,6 +1141,71 @@ void DecodeEngine::record_expert_fire(const std::vector<int>& idx) {
       ++expert_fire_[static_cast<std::size_t>(e)];
 }
 
+// EXL3-fuel routed experts through the ported batched trellis kernel: one
+// launch per layer (gather, gate|up, silu+clamp, down, scatter-accumulate).
+// The host walk emits the expert-sorted arrays the kernel consumes and the
+// per-expert device pointer arrays from the streaming slots.
+void DecodeEngine::run_moe_exl3(int layer, int batch, const std::vector<int>& idx,
+                                const std::vector<float>& wts) {
+  const int H = cfg_.hidden_size;
+  const int MI = cfg_.moe_intermediate_size;
+  const int K = cfg_.num_experts_per_tok;
+  const int rows = batch * K;
+  const int NE = cfg_.n_routed_experts;
+
+  auto* stage_ptrs = static_cast<Exl3MoeLayerPtrs*>(exl3_ptrs_stage_);
+  std::memset(stage_ptrs, 0, sizeof(Exl3MoeLayerPtrs));
+  auto* counts = static_cast<std::int64_t*>(exl3_counts_stage_);
+  std::memset(counts, 0, NE * sizeof(std::int64_t));
+  auto* tok_stage = static_cast<std::int64_t*>(exl3_tok_stage_);
+  auto* w_stage = reinterpret_cast<std::uint16_t*>(tok_stage + rows);
+
+  // Pass 1: bincount + fetch every fired expert (streaming places the blobs).
+  for (int slot = 0; slot < rows; ++slot) ++counts[idx[static_cast<std::size_t>(slot)]];
+  std::vector<std::int64_t> off(NE + 1, 0);
+  for (int e = 0; e < NE; ++e) off[e + 1] = off[e] + counts[e];
+  for (int e = 0; e < NE; ++e) {
+    if (counts[e] == 0) continue;
+    const Exl3ExpertView& v = w_.exl3_expert(layer, e, stream_);
+    stage_ptrs->gate_trellis[e] = v.gate_trellis;
+    stage_ptrs->gate_suh[e] = v.gate_suh;
+    stage_ptrs->gate_svh[e] = v.gate_svh;
+    stage_ptrs->up_trellis[e] = v.up_trellis;
+    stage_ptrs->up_suh[e] = v.up_suh;
+    stage_ptrs->up_svh[e] = v.up_svh;
+    stage_ptrs->down_trellis[e] = v.down_trellis;
+    stage_ptrs->down_suh[e] = v.down_suh;
+    stage_ptrs->down_svh[e] = v.down_svh;
+  }
+  // Pass 2: fill the expert-major sorted arrays.
+  for (int slot = 0; slot < rows; ++slot) {
+    const int e = idx[static_cast<std::size_t>(slot)];
+    const std::int64_t at = off[e]++;
+    tok_stage[at] = slot / K;  // token index
+    w_stage[at] = fp16_bits(wts[static_cast<std::size_t>(slot)]);
+  }
+
+  cuda_check(cudaMemcpyAsync(exl3_expert_count_, counts, NE * sizeof(std::int64_t),
+                             cudaMemcpyHostToDevice, stream_), "exl3 counts H2D");
+  cuda_check(cudaMemcpyAsync(exl3_tok_sorted_, tok_stage, rows * 8, cudaMemcpyHostToDevice,
+                             stream_), "exl3 tok H2D");
+  cuda_check(cudaMemcpyAsync(exl3_w_sorted_, w_stage, rows * 2, cudaMemcpyHostToDevice,
+                             stream_), "exl3 w H2D");
+  cuda_check(cudaMemcpyAsync(exl3_ptrs_dev_, stage_ptrs, sizeof(Exl3MoeLayerPtrs),
+                             cudaMemcpyHostToDevice, stream_), "exl3 ptrs H2D");
+
+  bf16_to_fp16_rows(exl3_hidden_fp16_, normed_, static_cast<long long>(batch) * H, stream_);
+  cuda_check(cudaMemsetAsync(exl3_out_fp32_, 0, static_cast<std::size_t>(batch) * H * 4,
+                             stream_), "exl3 out zero");
+  int num_sms = 0;
+  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+  exl3_moe_raw(exl3_hidden_fp16_, exl3_out_fp32_, exl3_expert_count_, exl3_tok_sorted_,
+               exl3_w_sorted_, nullptr, nullptr, nullptr, nullptr,
+               static_cast<const Exl3MoeLayerPtrs*>(exl3_ptrs_dev_), batch, H, MI, NE, K,
+               rows, num_sms, cfg_.swiglu_limit, 4, stream_);
+  fp32_to_bf16_rows(acc_, exl3_out_fp32_, static_cast<long long>(batch) * H, stream_);
+}
+
 void DecodeEngine::run_moe(int layer, int batch) {
   const bool mdbg = std::getenv("ROCKET_DEBUG_MOE") != nullptr && layer == 4;
   const auto m_t0 = Clock::now();
@@ -1138,6 +1241,11 @@ void DecodeEngine::run_moe(int layer, int batch) {
   }
   router_entropy_ += ent;
   record_expert_fire(idx);
+
+  if (w_.exl3_fuel()) {
+    run_moe_exl3(layer, batch, idx, wts);
+    return;
+  }
 
   cudaMemsetAsync(acc_, 0, static_cast<std::size_t>(batch) * H * sizeof(bf16), stream_);
   const bool want_grouped =
