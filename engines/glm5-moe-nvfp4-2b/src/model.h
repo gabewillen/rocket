@@ -363,7 +363,8 @@ class DecodeEngine {
   void* exl3_temp_ig_ = nullptr;          // [conc, max_tpe, MI] fp16
   void* exl3_temp_iu_ = nullptr;
   int exl3_conc_ = 0, exl3_max_tpe_ = 0;
-  void* exl3_a_had_ = nullptr;            // [MB, H] fp16 hadamard scratch
+  void* exl3_a_had_ = nullptr;
+  void* exl3_a_had_mi_ = nullptr;            // [MB, H] fp16 hadamard scratch
   std::int64_t* exl3_counts_stage_ = nullptr;  // pinned staging
   void* exl3_tok_stage_ = nullptr;        // pinned staging (tok + w)
   int *dense_row_in_group_ = nullptr, *dense_group_of_row_ = nullptr;

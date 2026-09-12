@@ -13,6 +13,7 @@
 #include "fabric/expert_parallel.h"
 #include "moe_grouped.h"
 #include "exl3_moe_bridge.h"
+#include "exl3_bridge.h"
 
 namespace rocket::engine {
 namespace {
@@ -1172,66 +1173,83 @@ void DecodeEngine::run_moe_exl3(int layer, int batch, const std::vector<int>& id
   const int rows = batch * K;
   const int NE = cfg_.n_routed_experts;
 
-  auto* stage_ptrs = static_cast<Exl3MoeLayerPtrs*>(exl3_ptrs_stage_);
-  std::memset(stage_ptrs, 0, sizeof(Exl3MoeLayerPtrs));
-  auto* counts = static_cast<std::int64_t*>(exl3_counts_stage_);
-  std::memset(counts, 0, NE * sizeof(std::int64_t));
-  auto* tok_stage = static_cast<std::int64_t*>(exl3_tok_stage_);
-  auto* w_stage = reinterpret_cast<std::uint16_t*>(tok_stage + rows);
+  // Per-expert exl3_gemm_raw path: 3 launches per fired expert (fused
+  // gate|up trellis slab, then down), with fp16 conversion bridges. This is
+  // the correctness baseline; the batched MoE kernel replaces it for speed
+  // once the outputs match the vLLM oracle.
+  cuda_check(cudaMemsetAsync(acc_, 0, static_cast<std::size_t>(batch) * H * sizeof(bf16),
+                             stream_), "exl3 acc zero");
 
-  // Pass 1: bincount + fetch every fired expert (streaming places the blobs).
-  for (int slot = 0; slot < rows; ++slot) ++counts[idx[static_cast<std::size_t>(slot)]];
+  // fp16 activation scratch
+  bf16_to_fp16_rows(exl3_hidden_fp16_, normed_, static_cast<std::size_t>(batch) * H, stream_);
+
+  // Per-expert: gather rows, gemm gate, gemm up, swiglu, gemm down,
+  // scatter-add with the router weight into acc_.
   std::vector<std::int64_t> off(NE + 1, 0);
-  for (int e = 0; e < NE; ++e) off[e + 1] = off[e] + counts[e];
+  for (int slot = 0; slot < rows; ++slot) ++off[idx[static_cast<std::size_t>(slot)] + 1];
+  for (int e = 0; e < NE; ++e) off[e + 1] += off[e];
+
   for (int e = 0; e < NE; ++e) {
-    if (counts[e] == 0) continue;
+    const int cnt = static_cast<int>(off[e + 1] - off[e]);
+    if (cnt == 0) continue;
     const Exl3ExpertView& v = w_.exl3_expert(layer, e, stream_);
-    stage_ptrs->gate_trellis[e] = v.gate_trellis;
-    stage_ptrs->gate_suh[e] = v.gate_suh;
-    stage_ptrs->gate_svh[e] = v.gate_svh;
-    stage_ptrs->up_trellis[e] = v.up_trellis;
-    stage_ptrs->up_suh[e] = v.up_suh;
-    stage_ptrs->up_svh[e] = v.up_svh;
-    stage_ptrs->down_trellis[e] = v.down_trellis;
-    stage_ptrs->down_suh[e] = v.down_suh;
-    stage_ptrs->down_svh[e] = v.down_svh;
-  }
-  // Pass 2: fill the expert-major sorted arrays.
-  for (int slot = 0; slot < rows; ++slot) {
-    const int e = idx[static_cast<std::size_t>(slot)];
-    const std::int64_t at = off[e]++;
-    tok_stage[at] = slot / K;  // token index
-    w_stage[at] = fp16_bits(wts[static_cast<std::size_t>(slot)]);
-  }
 
-  cuda_check(cudaMemcpyAsync(exl3_expert_count_, counts, NE * sizeof(std::int64_t),
-                             cudaMemcpyHostToDevice, stream_), "exl3 counts H2D");
-  cuda_check(cudaMemcpyAsync(exl3_tok_sorted_, tok_stage, rows * 8, cudaMemcpyHostToDevice,
-                             stream_), "exl3 tok H2D");
-  cuda_check(cudaMemcpyAsync(exl3_w_sorted_, w_stage, rows * 2, cudaMemcpyHostToDevice,
-                             stream_), "exl3 w H2D");
-  cuda_check(cudaMemcpyAsync(exl3_ptrs_dev_, stage_ptrs, sizeof(Exl3MoeLayerPtrs),
-                             cudaMemcpyHostToDevice, stream_), "exl3 ptrs H2D");
-  // The host staging buffer is reused on the next run_moe_exl3 call; the
-  // H2D must complete before the host overwrites it. The sync cost is
-  // negligible next to the expert streaming that just finished.
-  cuda_check(cudaStreamSynchronize(stream_), "exl3 staging sync");
+    // Gather the input rows for this expert into contiguous fp16 scratch.
+    for (int si = 0; si < cnt; ++si) {
+      const int slot = idx[static_cast<std::size_t>(off[e] + si)];
+      const int tok = slot / K;
+      bf16_to_fp16_rows(static_cast<char*>(exl3_hidden_fp16_) + static_cast<std::size_t>(si) * H * 2,
+                        normed_ + static_cast<std::size_t>(tok) * H, H, stream_);
+    }
 
-  bf16_to_fp16_rows(exl3_hidden_fp16_, normed_, static_cast<long long>(batch) * H, stream_);
-  cuda_check(cudaMemsetAsync(exl3_out_fp32_, 0, static_cast<std::size_t>(batch) * H * 4,
-                             stream_), "exl3 out zero");
-  int num_sms = 0;
-  cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
-  exl3_moe_raw(exl3_hidden_fp16_, exl3_out_fp32_, exl3_expert_count_, exl3_tok_sorted_,
-               exl3_w_sorted_, exl3_temp_g_, exl3_temp_u_, exl3_temp_ig_, exl3_temp_iu_,
-               static_cast<const Exl3MoeLayerPtrs*>(exl3_ptrs_dev_), batch, H, MI, NE, K,
-               exl3_max_tpe_, num_sms, cfg_.swiglu_limit, 4, stream_);
-  { const cudaError_t le = cudaGetLastError();
-    if (le != cudaSuccess)
-      std::fprintf(stderr, "[exl3-moe-kernel] layer %d: %s\n", layer, cudaGetErrorString(le));
+    // gate: [cnt, 4096] @ [2048, 4096]^T -> [cnt, 2048] fp16
+    // (gate and up trellis blobs are separate; call per projection)
+    exl3_gemm_raw(exl3_hidden_fp16_, v.gate_trellis, exl3_temp_ig_,
+                  v.gate_suh, exl3_a_had_, v.gate_svh,
+                  cnt, H, MI, 4, true, false, stream_);
+    if (std::getenv("ROCKET_TRACE_COPY") && e == idx[0]) {
+      // Check the gate output is non-zero
+      static bool checked = false;
+      if (!checked) {
+        checked = true;
+        cuda_check(cudaStreamSynchronize(stream_), "gate sync");
+        float sum = 0;
+        // copy a few values to host
+        std::vector<__half> h(16);
+        cudaMemcpy(h.data(), exl3_temp_ig_, 16 * sizeof(__half), cudaMemcpyDeviceToHost);
+        for (int i = 0; i < 16; ++i) sum += __half2float(h[i]);
+        std::fprintf(stderr, "[exl3-dequant] gate output sum (first 16) = %f\n", sum);
+        std::fprintf(stderr, "\n");
+      }
+    }
+    exl3_gemm_raw(exl3_hidden_fp16_, v.up_trellis, exl3_temp_iu_,
+                  v.up_suh, exl3_a_had_, v.up_svh,
+                  cnt, H, MI, 4, true, false, stream_);
+
+    // swiglu on fp16: silu(gate) * clamp(up, ±limit)
+    swiglu_fp16(exl3_temp_ig_, exl3_temp_ig_, exl3_temp_iu_,
+                static_cast<long long>(cnt) * MI, cfg_.swiglu_limit, stream_);
+
+    // down: [cnt, 2048] @ [4096, 2048]^T -> [cnt, 4096] fp16
+    // (reuse temp_state_u as the output scratch)
+    exl3_gemm_raw(exl3_temp_ig_, v.down_trellis, exl3_temp_iu_,
+                  v.down_suh, exl3_a_had_mi_, v.down_svh,
+                  cnt, MI, H, 4, true, false, stream_);
+
+    // scatter-add: acc_[tok] += wts[slot] * fp32(down_out[si])
+    for (int si = 0; si < cnt; ++si) {
+      const int slot = idx[static_cast<std::size_t>(off[e] + si)];
+      const int tok = slot / K;
+      const float w = wts[static_cast<std::size_t>(slot)];
+      // axpy: acc_[tok] += w * fp16_out[si]
+      const __half* src = reinterpret_cast<const __half*>(exl3_temp_iu_) +
+                          static_cast<std::size_t>(si) * H;
+      bf16* dst = acc_ + static_cast<std::size_t>(tok) * H;
+      axpy_bf16_scalar(dst, src, w, H, stream_);
+    }
   }
-  fp32_to_bf16_rows(acc_, exl3_out_fp32_, static_cast<long long>(batch) * H, stream_);
 }
+
 
 void DecodeEngine::run_moe(int layer, int batch) {
   const bool mdbg = std::getenv("ROCKET_DEBUG_MOE") != nullptr && layer == 4;
@@ -1270,7 +1288,8 @@ void DecodeEngine::run_moe(int layer, int batch) {
   record_expert_fire(idx);
 
   if (w_.exl3_fuel()) {
-    run_moe_exl3(layer, batch, idx, wts);
+    // DEBUG: no-op MoE to isolate the sticky error source
+    cudaMemsetAsync(acc_, 0, static_cast<std::size_t>(batch) * H * sizeof(bf16), stream_);
     return;
   }
 

@@ -979,6 +979,27 @@ __global__ void bf16_to_fp16_kernel(void* __restrict__ out, const bf16* __restri
   if (i < n) reinterpret_cast<__half*>(out)[i] = __float2half(f(in[i]));
 }
 
+__global__ void axpy_bf16_fp16_kernel(bf16* __restrict__ acc, const __half* __restrict__ src,
+                                      float w, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    const float a = __bfloat162float(acc[i]);
+    const float s = __half2float(src[i]);
+    acc[i] = __float2bfloat16(a + w * s);
+  }
+}
+
+__global__ void swiglu_fp16_kernel(__half* __restrict__ out, const __half* __restrict__ gate,
+                                   const __half* __restrict__ up, int n, float limit) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float g = __half2float(gate[i]);
+  const float u = __half2float(up[i]);
+  const float gu = fminf(g, limit);
+  const float uu = fminf(fmaxf(u, -limit), limit);
+  out[i] = __float2half(gu / (1.0f + __expf(-gu)) * uu);
+}
+
 __global__ void fp32_to_bf16_kernel(bf16* __restrict__ out, const float* __restrict__ in, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) out[i] = b(in[i]);
@@ -1087,6 +1108,18 @@ void bf16_to_fp16_rows(void* dst, const void* src, long long n, cudaStream_t s) 
   bf16_to_fp16_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(
       dst, static_cast<const bf16*>(src), static_cast<int>(n));
 }
+void axpy_bf16_scalar(bf16* acc, const void* src, float w, long long n, cudaStream_t s) {
+  axpy_bf16_fp16_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(
+      acc, static_cast<const __half*>(src), w, static_cast<int>(n));
+}
+
+void swiglu_fp16(void* out, const void* gate, const void* up, long long n, float limit,
+                 cudaStream_t s) {
+  swiglu_fp16_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(
+      static_cast<__half*>(out), static_cast<const __half*>(gate),
+      static_cast<const __half*>(up), static_cast<int>(n), limit);
+}
+
 void fp32_to_bf16_rows(void* dst, const void* src, long long n, cudaStream_t s) {
   fp32_to_bf16_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(
       static_cast<bf16*>(dst), static_cast<const float*>(src), static_cast<int>(n));

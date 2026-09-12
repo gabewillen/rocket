@@ -545,10 +545,29 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
     std::size_t n_slots = expert_cache_bytes / exl3_slot_bytes_;
     if (n_slots < static_cast<std::size_t>(cfg_.num_experts_per_tok))
       fail("expert cache is smaller than one token's top-k working set");
-    // Slots are allocated lazily in exl3_expert on first use; only the
-    // capacity is decided here.
+    // One contiguous slab for all slots: avoids many small cudaMallocs
+    // that can behave badly on this unified-memory platform.
+    auto* slab = static_cast<std::uint8_t*>(device_alloc(n_slots * exl3_slot_bytes_));
+    exl3_owned_.push_back(slab);
+    resident_bytes_ += n_slots * exl3_slot_bytes_;
     exl3_slots_.resize(n_slots);
     exl3_lru_pos_.resize(n_slots);
+    for (std::size_t i = 0; i < n_slots; ++i) {
+      std::size_t off = 0;
+      auto seg = [&](std::size_t bytes) {
+        void* p = slab + i * exl3_slot_bytes_ + off;
+        off += bytes;
+        return p;
+      };
+      auto& v = exl3_slots_[i];
+      v.gate_trellis = seg(gt);  v.gate_suh = seg(suh_g);  v.gate_svh = seg(svh_g);
+      v.up_trellis = seg(gt);    v.up_suh = seg(suh_g);    v.up_svh = seg(svh_g);
+      v.down_trellis = seg(dt);  v.down_suh = seg(suh_d);  v.down_svh = seg(svh_d);
+    }
+    for (std::size_t i = 0; i < n_slots; ++i) {
+      exl3_lru_.push_front(static_cast<int>(i));
+      exl3_lru_pos_[i] = exl3_lru_.begin();
+    }
     // NVFP4 slot pool skipped entirely on this fuel.
     slot_bytes_ = 0;
     slots_.clear();
@@ -601,10 +620,6 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
     else
       std::fprintf(stderr, "[ctor-end] clean\n"); }
   guard.armed = false;
-  { const cudaError_t ce = cudaGetLastError();
-    std::fprintf(stderr, "[ctor-end2] %s\n", cudaGetErrorString(ce)); }
-    if (ce != cudaSuccess)
-      std::fprintf(stderr, "[ctor-end] sticky CUDA error: %s\n", cudaGetErrorString(ce)); }
 }
 
 WeightStore::~WeightStore() {
@@ -643,20 +658,6 @@ const Exl3ExpertView& WeightStore::exl3_expert(int layer, int expert_id, cudaStr
   const std::size_t gt = SI * H / 2;
   const std::size_t dt = H * SI / 2;
   Exl3ExpertView& v = exl3_slots_[slot];
-  if (v.gate_trellis == nullptr) {
-    // Lazy slot allocation on first use
-    auto* base = static_cast<std::uint8_t*>(device_alloc(exl3_slot_bytes_));
-    exl3_owned_.push_back(base);
-    std::size_t off = 0;
-    auto seg = [&](std::size_t bytes) {
-      void* ptr = base + off;
-      off += bytes;
-      return ptr;
-    };
-    v.gate_trellis = seg(gt);  v.gate_suh = seg(H * 2);  v.gate_svh = seg(SI * 2);
-    v.up_trellis = seg(gt);    v.up_suh = seg(H * 2);    v.up_svh = seg(SI * 2);
-    v.down_trellis = seg(dt);  v.down_suh = seg(SI * 2);  v.down_svh = seg(H * 2);
-  }
   struct Blob { const char* suffix; std::size_t bytes; const void** dst; };
   const Blob blobs[9] = {
       {"gate_proj.trellis", gt, &v.gate_trellis},
@@ -675,11 +676,10 @@ const Exl3ExpertView& WeightStore::exl3_expert(int layer, int expert_id, cudaStr
       std::fprintf(stderr, "[exl3-blob] L%d.E%d %s dst=%p bytes=%zu\n",
                    layer, expert_id, b.suffix, *b.dst, t.nbytes);
     std::memcpy(pinned_, t.data, t.nbytes);
-    cuda_check(cudaMemcpyAsync(const_cast<void*>(*b.dst), pinned_, t.nbytes,
-                               cudaMemcpyHostToDevice, s), "exl3 blob H2D");
+    cuda_check(cudaMemcpy(const_cast<void*>(*b.dst), pinned_, t.nbytes,
+                          cudaMemcpyHostToDevice), "exl3 blob H2D");
     streamed_bytes_ += t.nbytes;
   }
-  cuda_check(cudaStreamSynchronize(s), "exl3 stream sync");
   if (std::getenv("ROCKET_TRACE_COPY"))
     std::fprintf(stderr, "[exl3-expert] L%d.E%d slot=%d/%zu base=%p gt=%p up_t=%p dn_t=%p\n",
                  layer, expert_id, slot, exl3_slots_.size(),

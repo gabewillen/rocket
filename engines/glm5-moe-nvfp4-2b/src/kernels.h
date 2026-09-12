@@ -47,6 +47,9 @@ struct KvPages {
 // y[m, n_rows] = x[m, k] . W[n_rows, k]^T.  W is row-major [n_rows, k] and is
 // shared by every stream.
 void bf16_to_fp16_rows(void* dst, const void* src, long long n, cudaStream_t s);
+void axpy_bf16_scalar(bf16* acc, const void* src, float w, long long n, cudaStream_t s);
+void swiglu_fp16(void* out, const void* gate, const void* up, long long n,
+                   float limit, cudaStream_t s);
 void fp32_to_bf16_rows(void* dst, const void* src, long long n, cudaStream_t s);
 void mul_scalar_bf16(bf16* out, const bf16* in, float scalar, long long n, cudaStream_t s);
 void gemm_fp8_row(bf16* y, const std::uint8_t* w, const float* scales, const bf16* x,
