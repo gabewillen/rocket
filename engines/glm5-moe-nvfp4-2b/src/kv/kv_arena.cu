@@ -49,6 +49,12 @@ KvArena::KvArena(const KvGeometry& geom, int num_pages, int max_streams, int max
 }
 
 KvArena::~KvArena() {
+  // Consumer contract, not enforced here: the owner of `stream_` must drain
+  // (cudaStreamSynchronize) before the arena is destroyed. Freeing a slab a
+  // deferred copy_page/upload_table still addresses is UB. A sync inside this
+  // dtor was tried and segfaults inside cuStreamSynchronize on this GB10
+  // test-build stack (the rest of the test suite avoids stream syncs for
+  // exactly this reason), so the drain lives with the engine lifecycle instead.
   for (void* p : owned_) cudaFree(p);
 }
 

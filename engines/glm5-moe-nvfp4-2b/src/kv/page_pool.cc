@@ -202,7 +202,16 @@ int KvCache::open(int slot) {
   }
   seqs_[id].live = true;
   seqs_[id].slot = slot;
-  if (slot >= 0) seq_of_slot_[slot] = id;
+  if (slot >= 0) {
+    // Same occupancy guard as attach(): silently repointing seq_of_slot_ to a
+    // new seq while a live sequence still holds the slot leaves that sequence's
+    // later detach() erasing the wrong mapping and hands the slot out twice.
+    const auto it = seq_of_slot_.find(slot);
+    if (it != seq_of_slot_.end())
+      fail("open: slot " + std::to_string(slot) + " is held by seq " +
+           std::to_string(it->second) + "; detach it first");
+    seq_of_slot_[slot] = id;
+  }
   return id;
 }
 

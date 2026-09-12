@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cmath>
 #include <numeric>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,15 @@ int main(int argc, char** argv) {
   const int n_new = std::atoi(arg_value(argc, argv, "--tokens", "20"));
   const double cache_gib = std::atof(arg_value(argc, argv, "--expert-cache-gib", "56"));
   const int max_tokens = std::atoi(arg_value(argc, argv, "--max-tokens", "4096"));
+  const bool telemetry = arg_value(argc, argv, "--telemetry", "0")[0] == '1';
+  if (n_new <= 0 || max_tokens <= 0 || cache_gib < 0.0) {
+    std::fprintf(stderr, "bad sizing: --tokens %d --max-tokens %d --expert-cache-gib %g "
+                         "(all > 0, cache >= 0)\n",
+                 n_new, max_tokens, cache_gib);
+    return 2;
+  }
+
+  try {
 
   const rocket::fuel::ModelConfig cfg = rocket::fuel::load_model_config(attn, snapshot);
   std::printf("fuel      glm-5.3-flash, %d text layers (%d KDA, %d sparse-MLA), %d experts top-%d\n",
@@ -71,6 +81,7 @@ int main(int argc, char** argv) {
   rocket::engine::DecodeEngine engine(cfg, snapshot,
                                       static_cast<std::size_t>(cache_gib * (1ull << 30)),
                                       max_tokens, /*max_batch=*/1);
+  engine.set_telemetry(telemetry);
   const double load_ms = ms_since(t_load);
   std::printf("resident  %.2f GiB   expert cache %zu slots x %.2f MiB = %.2f GiB\n",
               engine.weights().resident_bytes() / 1073741824.0, engine.weights().expert_slots(),
@@ -175,5 +186,16 @@ int main(int argc, char** argv) {
               static_cast<unsigned long long>(engine.weights().expert_hits()),
               static_cast<unsigned long long>(engine.weights().expert_misses()),
               engine.weights().expert_bytes_streamed() / 1073741824.0);
+  if (telemetry) {
+    std::map<std::string, float> ordered(engine.telemetry_absmax().begin(),
+                                         engine.telemetry_absmax().end());
+    std::printf("\n--- quantization telemetry (fixed family vocabulary) -----------\n");
+    for (const auto& [name, value] : ordered)
+      std::printf("telemetry_absmax %-48s %.9g\n", name.c_str(), value);
+  }
   return 0;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "fatal: %s\n", e.what());
+    return 1;
+  }
 }

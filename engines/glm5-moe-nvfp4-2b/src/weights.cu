@@ -3,9 +3,14 @@
 #include "nvfp4.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <vector>
 
 namespace rocket::engine {
 namespace {
@@ -23,6 +28,29 @@ std::string layer_prefix(int l) {
 }
 
 std::size_t align_up(std::size_t v, std::size_t a) { return (v + a - 1) / a * a; }
+
+float optional_input_scale(fuel::Checkpoint& ckpt, const std::string& name) {
+  if (!ckpt.has(name)) return 1.0f;
+  const fuel::TensorView& scale = ckpt.tensor(name);
+  if (scale.dtype != fuel::DType::kF32 || scale.numel() != 1)
+    fail(name + ": input_scale must be one F32 value");
+  float value = 1.0f;
+  std::memcpy(&value, scale.data, sizeof(value));
+  if (!std::isfinite(value) || value <= 0.0f)
+    fail(name + ": input_scale must be finite and positive");
+  return value;
+}
+
+std::vector<std::uint8_t> read_file(const std::filesystem::path& path, std::size_t expected) {
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  if (!in || static_cast<std::size_t>(in.tellg()) != expected)
+    fail(path.string() + " has the wrong byte count");
+  std::vector<std::uint8_t> bytes(expected);
+  in.seekg(0);
+  if (!in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(expected)))
+    fail("read " + path.string());
+  return bytes;
+}
 
 }  // namespace
 
@@ -70,9 +98,42 @@ const bf16* WeightStore::upload_bf16(std::string_view name, std::int64_t expect_
 
 const float* WeightStore::upload_f32(std::string_view name, std::int64_t expect_numel) {
   const fuel::TensorView& t = ckpt_.tensor(name);
-  if (t.dtype != fuel::DType::kF32) fail(std::string(name) + " is not F32");
+  // Hub and NIM snapshots of this fuel disagree on the dtype of tiny scalar
+  // tensors (hyper-connection bases/scales ship BF16 on the hub, F32 in the
+  // NIM bundle). The upcast is exact, so accepting BF16 here is lossless -
+  // but only for the whitelisted tensors, and the served family is still
+  // recorded as F32 because that is the serving dtype.
+  static const std::vector<std::string> kF32FromBf16 = {
+      "hc_attn_base", "hc_attn_scale", "hc_ffn_base", "hc_ffn_scale",
+  };
+  const bool needs_upcast =
+      t.dtype == fuel::DType::kBF16 &&
+      std::any_of(kF32FromBf16.begin(), kF32FromBf16.end(), [&](const std::string& s) {
+        return std::string_view(name).ends_with(s);
+      });
+  if (t.dtype != fuel::DType::kF32 && !needs_upcast)
+    fail(std::string(name) + " is not F32");
   if (t.numel() != expect_numel)
     fail(std::string(name) + " has the wrong element count");
+  if (needs_upcast) {
+    // Exact widening: f32 bits(p0xx...) per bf16 element.
+    const std::size_t bytes = static_cast<std::size_t>(expect_numel) * 4;
+    std::vector<float> host(static_cast<std::size_t>(expect_numel));
+    const auto* src = reinterpret_cast<const std::uint16_t*>(t.data);
+    for (int64_t i = 0; i < expect_numel; ++i) {
+      const std::uint16_t raw = src[i];
+      const std::uint32_t bits = std::uint32_t(raw) << 16;
+      float f;
+      std::memcpy(&f, &bits, sizeof(f));
+      host[i] = f;
+    }
+    void* d = device_alloc(bytes);
+    copy_in(d, host.data(), bytes);
+    record_dtype(name, fuel::DType::kF32);
+    return static_cast<const float*>(d);
+  }
+  if (t.dtype != fuel::DType::kF32)
+    fail(std::string(name) + " is not F32");
   void* d = device_alloc(t.nbytes);
   copy_in(d, t.data, t.nbytes);
   record_dtype(name, fuel::DType::kF32);
@@ -83,10 +144,18 @@ const bf16* WeightStore::upload_concat(const std::vector<std::string>& names,
                                        std::int64_t expect_numel) {
   std::size_t total = 0;
   std::int64_t numel = 0;
+  // Hub fuel ships KDA conv taps F32 where the NIM bundle had BF16. Round to
+  // BF16 here (lossy); the family journal records it and the decode token-
+  // divergence check is the gate.
+  const bool f32_from_conv =
+      std::all_of(names.begin(), names.end(), [](const std::string& n) {
+        return n.ends_with("conv1d.weight");
+      });
   for (const std::string& n : names) {
     const fuel::TensorView& t = ckpt_.tensor(n);
-    if (t.dtype != fuel::DType::kBF16) fail(n + " is not BF16");
-    total += t.nbytes;
+    if (!(t.dtype == fuel::DType::kBF16 || (f32_from_conv && t.dtype == fuel::DType::kF32)))
+      fail(n + " is not BF16");
+    total += f32_from_conv ? t.nbytes / 2 : t.nbytes;
     numel += t.numel();
   }
   if (numel != expect_numel) fail(names.front() + " concat has the wrong element count");
@@ -94,7 +163,18 @@ const bf16* WeightStore::upload_concat(const std::vector<std::string>& names,
   std::size_t off = 0;
   for (const std::string& n : names) {
     const fuel::TensorView& t = ckpt_.tensor(n);
+    if (f32_from_conv && t.dtype == fuel::DType::kF32) {
+      std::vector<std::uint16_t> host(t.numel());
+      const auto* src = reinterpret_cast<const std::uint32_t*>(t.data);
+      for (std::size_t i = 0; i < t.numel(); ++i)
+        host[i] = rocket::fuel::float_to_bf16(static_cast<float>(src[i]));
+      copy_in(d + off, host.data(), host.size() * 2);
+      record_dtype(n, fuel::DType::kBF16);
+      off += host.size() * 2;
+      continue;
+    }
     copy_in(d + off, t.data, t.nbytes);
+    record_dtype(n, t.dtype);
     off += t.nbytes;
   }
   return reinterpret_cast<const bf16*>(d);
@@ -103,6 +183,21 @@ const bf16* WeightStore::upload_concat(const std::vector<std::string>& names,
 WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::path& snapshot_dir,
                          std::size_t expert_cache_bytes)
     : cfg_(cfg), ckpt_(snapshot_dir) {
+  // Frees every resident allocation if the ctor throws mid-load. Without it a
+  // cuda_check failure past the first cudaMalloc leaks tens of GiB in an
+  // embedder or test process that catches the error and keeps running;
+  // ~WeightStore only runs after a completed construction.
+  struct CtorGuard {
+    std::vector<void*>& owned;
+    std::uint8_t*& pinned;
+    bool armed = true;
+    ~CtorGuard() {
+      if (!armed) return;
+      for (void* p : owned) cudaFree(p);
+      if (pinned != nullptr) cudaFreeHost(pinned);
+    }
+  } guard{owned_, pinned_};
+
   pinned_bytes_ = 64u << 20;
   cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&pinned_), pinned_bytes_, cudaHostAllocDefault),
              "cudaHostAlloc staging");
@@ -136,6 +231,24 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
       const std::string a = p + "self_attn.";
       w.kda.qkv = upload_concat({a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"},
                                 static_cast<std::int64_t>(3) * qkv * H);
+      if (const char* overlay = std::getenv("ROCKET_KDA_Q_NVFP4_OBJECT")) {
+        const int overlay_layer = std::atoi(std::getenv("ROCKET_KDA_Q_NVFP4_LAYER")
+                                                ? std::getenv("ROCKET_KDA_Q_NVFP4_LAYER") : "-1");
+        if (l == overlay_layer) {
+          const std::filesystem::path object(overlay);
+          const auto packed = read_file(object / "weight.u8", static_cast<std::size_t>(qkv) * H / 2);
+          const auto scale = read_file(object / "weight_scale.f8_e4m3",
+                                       static_cast<std::size_t>(qkv) * H / 16);
+          const auto global = read_file(object / "weight_scale_2.f32", sizeof(float));
+          auto* packed_dev = static_cast<std::uint8_t*>(device_alloc(packed.size()));
+          auto* scale_dev = static_cast<std::uint8_t*>(device_alloc(scale.size()));
+          copy_in(packed_dev, packed.data(), packed.size());
+          copy_in(scale_dev, scale.data(), scale.size());
+          w.kda.q_overlay.packed = packed_dev;
+          w.kda.q_overlay.scale = scale_dev;
+          std::memcpy(&w.kda.q_overlay.global, global.data(), sizeof(float));
+        }
+      }
       w.kda.conv = upload_concat({a + "q_conv1d.weight", a + "k_conv1d.weight", a + "v_conv1d.weight"},
                                  static_cast<std::int64_t>(3) * qkv * cfg_.kda_conv_kernel);
       w.kda.f_a = upload_bf16(a + "f_a_proj.weight", static_cast<std::int64_t>(hd) * H);
@@ -177,9 +290,37 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
 
     if (cfg_.layers[l].mlp == fuel::MlpKind::kDense) {
       const int I = cfg_.intermediate_size;
+      const fuel::TensorView& probe = ckpt_.tensor(p + "mlp.gate_proj.weight");
+      if (probe.dtype == fuel::DType::kU8) {
+        // Hub fuel packs the dense MLP NVFP4. Scale is raw per-16-block e4m3
+        // plus one f32 global and one f32 activation scale per projection,
+        // matching ExpertDev's gemv operand convention.
+        auto dense_fp4 = [&](int n, int k_true, Nvfp4W& w4, float& a_in, const char* base) {
+          const std::string p_full = p + base;
+          const fuel::TensorView& wt = ckpt_.tensor(p_full + ".weight");
+          if (wt.numel() != static_cast<std::int64_t>(n) * k_true / 2)
+            fail(p_full + " has unexpected packed element count");
+          auto* pd = static_cast<std::uint8_t*>(device_alloc(wt.numel()));
+          copy_in(pd, wt.data, wt.numel());
+          w4.packed = pd;
+          const fuel::TensorView& sc = ckpt_.tensor(p_full + ".weight_scale");
+          auto* sd = static_cast<std::uint8_t*>(device_alloc(sc.numel()));
+          copy_in(sd, sc.data, sc.numel());
+          w4.scale = sd;
+          const fuel::TensorView& g2 = ckpt_.tensor(p_full + ".weight_scale_2");
+          std::memcpy(&w4.global, g2.data, sizeof(float));
+          const fuel::TensorView& is = ckpt_.tensor(p_full + ".input_scale");
+          std::memcpy(&a_in, is.data, sizeof(float));
+        };
+        w.dense = DenseMlpW{};
+        dense_fp4(I, H, w.dense.fp4_gate, w.dense.fp4_gate_in, "mlp.gate_proj");
+        dense_fp4(I, H, w.dense.fp4_up, w.dense.fp4_up_in, "mlp.up_proj");
+        dense_fp4(H, I, w.dense.fp4_down, w.dense.fp4_down_in, "mlp.down_proj");
+      } else {
       w.dense.gate = upload_bf16(p + "mlp.gate_proj.weight", static_cast<std::int64_t>(I) * H);
       w.dense.up = upload_bf16(p + "mlp.up_proj.weight", static_cast<std::int64_t>(I) * H);
       w.dense.down = upload_bf16(p + "mlp.down_proj.weight", static_cast<std::int64_t>(H) * I);
+      }
     } else {
       const int SI = cfg_.moe_intermediate_size * cfg_.n_shared_experts;
       w.moe.router = upload_bf16(p + "mlp.gate.weight",
@@ -234,6 +375,7 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
     lru_.push_front(static_cast<int>(i));
     lru_pos_[i] = lru_.begin();
   }
+  guard.armed = false;
 }
 
 WeightStore::~WeightStore() {
@@ -259,6 +401,8 @@ void WeightStore::set_expert_set(const std::vector<int>& expert_ids) {
   // are 4 bytes each out of tensors whose packed weights are never touched on
   // this rank, so this faults one checkpoint page per expert and nothing more.
   down_global_.assign(static_cast<std::size_t>(cfg_.text_layers) * cfg_.n_routed_experts, 0.0f);
+  down_input_scale_.assign(static_cast<std::size_t>(cfg_.text_layers) * cfg_.n_routed_experts,
+                           1.0f);
   for (int l = 0; l < cfg_.text_layers; ++l) {
     if (cfg_.layers[l].mlp != fuel::MlpKind::kSparse) continue;
     const std::string p = layer_prefix(l) + "mlp.experts.";
@@ -266,6 +410,8 @@ void WeightStore::set_expert_set(const std::vector<int>& expert_ids) {
       const fuel::TensorView& g2 = ckpt_.tensor(p + std::to_string(e) + ".down_proj.weight_scale_2");
       std::memcpy(&down_global_[static_cast<std::size_t>(l) * cfg_.n_routed_experts + e], g2.data,
                   sizeof(float));
+      down_input_scale_[static_cast<std::size_t>(l) * cfg_.n_routed_experts + e] =
+          optional_input_scale(ckpt_, p + std::to_string(e) + ".down_proj.input_scale");
     }
   }
 }
@@ -287,6 +433,29 @@ void WeightStore::build_expert_ownership(const std::vector<int>& expert_ids) {
 float WeightStore::expert_down_global(int layer, int expert_id) const {
   const std::size_t i = static_cast<std::size_t>(layer) * cfg_.n_routed_experts + expert_id;
   return i < down_global_.size() ? down_global_[i] : 0.0f;
+}
+
+float WeightStore::expert_down_input_scale(int layer, int expert_id) const {
+  const std::size_t i = static_cast<std::size_t>(layer) * cfg_.n_routed_experts + expert_id;
+  return i < down_input_scale_.size() ? down_input_scale_[i] : 1.0f;
+}
+
+std::size_t WeightStore::preload_owned_experts(cudaStream_t s) {
+  if (expert_count_ <= 0) fail("preload_owned_experts needs an owned expert set");
+  std::size_t needed = 0;
+  for (int l = 0; l < cfg_.text_layers; ++l)
+    if (cfg_.layers[l].mlp == fuel::MlpKind::kSparse)
+      needed += static_cast<std::size_t>(expert_count_);
+  if (slots_.size() < needed)
+    fail("expert cache has " + std::to_string(slots_.size()) + " slots; preload needs " +
+         std::to_string(needed));
+  const std::size_t before = resident_expert_.size();
+  for (int l = 0; l < cfg_.text_layers; ++l) {
+    if (cfg_.layers[l].mlp != fuel::MlpKind::kSparse) continue;
+    for (int e = 0; e < cfg_.n_routed_experts; ++e)
+      if (owns_expert(e)) (void)expert(l, e, s);
+  }
+  return resident_expert_.size() - before;
 }
 
 const ExpertDev& WeightStore::expert(int layer, int expert_id, cudaStream_t s) {
@@ -317,12 +486,15 @@ const ExpertDev& WeightStore::expert(int layer, int expert_id, cudaStream_t s) {
     const std::uint8_t* dst_scale;     // linear, GEMV
     const std::uint8_t* dst_scale_sw;  // swizzled, grouped GEMM
     float* global;
+    float* input_scale;
     std::int64_t n, k;  // this projection's [out_features, in_features]
   };
   const Piece pieces[3] = {
-      {"gate_proj", v.gate_packed, v.gate_scale, v.w13_scale, &v.gate_global, MI, H},
-      {"up_proj", v.up_packed, v.up_scale, v.w13_scale, &v.up_global, MI, H},
-      {"down_proj", v.down_packed, v.down_scale, v.down_scale_swizzled, &v.down_global, H, MI},
+      {"gate_proj", v.gate_packed, v.gate_scale, v.w13_scale, &v.gate_global,
+       &v.gate_input_scale, MI, H},
+      {"up_proj", v.up_packed, v.up_scale, v.w13_scale, &v.up_global, &v.up_input_scale, MI, H},
+      {"down_proj", v.down_packed, v.down_scale, v.down_scale_swizzled, &v.down_global,
+       &v.down_input_scale, H, MI},
   };
   for (int pi = 0; pi < 3; ++pi) {
     const Piece& pc = pieces[pi];
@@ -359,6 +531,7 @@ const ExpertDev& WeightStore::expert(int layer, int expert_id, cudaStream_t s) {
                "expert scale (swizzled) H2D");
     cuda_check(cudaStreamSynchronize(s), "expert stage sync");
     std::memcpy(pc.global, g2.data, sizeof(float));
+    *pc.input_scale = optional_input_scale(ckpt_, p + pc.proj + ".input_scale");
     streamed_bytes_ += packed.nbytes + scale.nbytes + swizzled.size();
   }
 

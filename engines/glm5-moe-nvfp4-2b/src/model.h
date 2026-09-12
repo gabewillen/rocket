@@ -81,17 +81,19 @@ class DecodeEngine {
  public:
   // max_batch bounds every per-stream buffer.
   //
-  // kv_pool_pages selects the KV backend. Zero keeps the stage-1 allocator:
-  // one physical page per stream slot, sized to the whole context, no sharing
-  // (see model.cu). A positive value allocates that many fixed-size pages of
-  // kv_page_tokens tokens into a refcounted pool with a radix tree over token
-  // sequences (src/kv/page_pool.h), which is what fork/detach/resume need.
-  //
-  // The pool is opt-in rather than the default because the cutover is gated
-  // on a token-parity run against the real checkpoint, which this lane could
-  // not make: see the log entry's Next list. Nothing about the kernels
-  // differs between the two backends, only max_pages and what the block
-  // table points at.
+  // The paged KV pool (src/kv/page_pool.h) is the only backend: a refcounted
+  // pool of fixed-size kv_page_tokens-token pages behind a radix tree over
+  // token sequences, which is what fork/detach/resume need. kv_pool_pages
+  // is the pool's total page budget; kv_pool_pages <= 0 auto-sizes it to
+  // max_batch * (max_tokens / kv_page_tokens), i.e. one full private
+  // context's worth of pages per stream slot with nothing forced to share
+  // -- the same worst-case memory the deleted stage-1 one-page-per-stream
+  // allocator used, so every existing caller keeps its old footprint. Pass
+  // a smaller budget to make sharing load-bearing instead of incidental.
+  // Token-parity against the real checkpoint (blog/posts/cache/2026-09-08-
+  // shared-prefixes-hold-93-streams-at-262k/'s Next list) is what promoted
+  // this from opt-in to the only path; see tests/test_kv_fork_real.cu and
+  // tests/test_batch_parity.cu, which now run through it unconditionally.
   DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::path& snapshot_dir,
                std::size_t expert_cache_bytes, int max_tokens, int max_batch,
                int kv_pool_pages = 0, int kv_page_tokens = 128);
@@ -110,8 +112,7 @@ class DecodeEngine {
   // batching (its KV was never cleared here either).
   void reset();
 
-  // ---- paged KV, only when the engine was built with kv_pool_pages > 0 ----
-  bool kv_pooled() const { return kv_cache_ != nullptr; }
+  // ---- paged KV: fork/detach/resume against the pool above ----
   // Binds `child_slot` to a new sequence sharing every full page of
   // `parent_slot` below `fork_pos`, and copies the parent's KDA state, which
   // is a recurrent hidden state and cannot be shared. Returns the child's
@@ -127,9 +128,8 @@ class DecodeEngine {
   void kv_destroy(int session);
   int kv_session_in_slot(int slot) const;
   int kv_pinned_pages() const;
-  // One stream's KDA recurrent + conv state. FP32 recurrent state, which is
-  // what this engine allocates, so this is attention.yaml's fp32 figure and
-  // not its bf16 one.
+  // One stream's KDA recurrent + conv state. Persistent recurrent state is
+  // FP32, so this is attention.yaml's FP32 figure, 147619840 B.
   std::size_t kda_bytes_per_stream() const;
 
   const StageMs& stages() const { return stages_; }
@@ -270,13 +270,10 @@ class DecodeEngine {
   bf16 *q_conv_state_ = nullptr, *k_conv_state_ = nullptr, *v_conv_state_ = nullptr;  // [kda_layers][max_batch][qkv][taps]
   float* kda_state_ = nullptr;  // [kda_layers][max_batch][heads][hd][hd]
 
-  // --- paged MLA latent + indexer key/gate, one physical page per stream
-  // slot (max_pages = 1, page_tokens = max_tokens). ---
+  // --- paged MLA latent + indexer key/gate: the arena's KvPages, always,
+  // one radix-tree-backed pool behind every stream slot's block table
+  // (src/kv/page_pool.h; see the constructor comment above for sizing). ---
   KvPages mla_kv_;
-  int* kv_table_ = nullptr;  // [max_batch], table[m] = m
-
-  // --- paged KV pool (kv_pool_pages > 0). mla_kv_ above is then the arena's
-  // KvPages and kv_table_ is unused. ---
   std::unique_ptr<kv::PagePool> kv_pool_;
   std::unique_ptr<kv::PrefixTree> kv_tree_;
   std::unique_ptr<kv::KvArena> kv_arena_;
@@ -329,6 +326,8 @@ class DecodeEngine {
   long long* moe_sf2_base_ = nullptr;  // [rows] per-group SFA byte offset, w2
   float* moe_gate_global_ = nullptr;   // [rows] per-group gate weight_scale_2
   float* moe_up_global_ = nullptr;     // [rows] per-group up weight_scale_2
+  float* moe_gate_input_scale_ = nullptr;  // [rows] per-group ModelOpt W4A4 scale
+  float* moe_up_input_scale_ = nullptr;
   float* moe_scatter_w_ = nullptr;     // [rows] topk_w * down weight_scale_2
   int* moe_crow_of_ = nullptr;         // [rows] compact row -> stream slot, owned rows only
   int* moe_send_rows_ = nullptr;       // [rows] owned rows, true-row ascending

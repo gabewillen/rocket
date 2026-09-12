@@ -36,7 +36,18 @@ double ms_since(Clock::time_point t) {
 // they are spread a cache line apart: two rails landing in one line would put
 // the NIC's writes for rail 0 and rail 1 in the same coherence unit.
 constexpr std::size_t kDoorStride = 64;
-constexpr int kWaitTimeoutSeconds = 120;
+// Doorbell / completion wait cap. 120 s is dialed for the static-fire
+// microbench; serving with a cold expert cache stages gigabytes and can
+// legitimately exceed it, which used to tear the pair down. Set
+// ROCKET_RDMA_WAIT_S to raise it without a rebuild.
+static int wait_timeout_seconds() {
+  static const int seconds = [] {
+    const char* env = std::getenv("ROCKET_RDMA_WAIT_S");
+    int v = env != nullptr ? std::atoi(env) : 0;
+    return v > 0 ? v : 120;
+  }();
+  return seconds;
+}
 
 // Exchanged over the bootstrap socket. Fixed-width and byte-copied; both ends
 // are the same aarch64 build, so no conversion is done and none is implied.
@@ -424,7 +435,7 @@ void Fabric::flush() {
           fail("completion on " + rail.name + ": " + ibv_wc_status_str(wc[i].status));
       }
       rail.outstanding -= n;
-      if (n == 0 && ms_since(t0) > kWaitTimeoutSeconds * 1000.0)
+      if (n == 0 && ms_since(t0) > wait_timeout_seconds() * 1000.0)
         fail("send completion on " + rail.name + " timed out");
     }
   }
@@ -437,7 +448,7 @@ void Fabric::wait_peer(std::uint64_t seq) {
     unsigned spins = 0;
     while (*w < seq) {
       if ((++spins & 0x3ff) == 0) {
-        if (ms_since(t0) > kWaitTimeoutSeconds * 1000.0)
+        if (ms_since(t0) > wait_timeout_seconds() * 1000.0)
           fail("peer doorbell " + std::to_string(seq) + " on rail " + std::to_string(r) +
                " timed out (peer stalled or died)");
       }

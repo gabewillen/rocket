@@ -40,8 +40,15 @@ struct HyperConnW {
   const float* scale = nullptr; // [3]
 };
 
+struct Nvfp4W {
+  const std::uint8_t* packed = nullptr;
+  const std::uint8_t* scale = nullptr;
+  float global = 0.0f;
+};
+
 struct KdaW {
   const bf16* qkv = nullptr;      // [3*qkv_dim, hidden], q then k then v
+  Nvfp4W q_overlay;               // optional isolated W4A16 quality experiment
   const bf16* conv = nullptr;     // [3*qkv_dim, kernel]
   const bf16* f_a = nullptr;      // [head_dim, hidden]
   const bf16* f_b = nullptr;      // [qkv_dim, head_dim]
@@ -75,6 +82,11 @@ struct DenseMlpW {
   const bf16* gate = nullptr;  // [inter, hidden]
   const bf16* up = nullptr;
   const bf16* down = nullptr;  // [hidden, inter]
+  // Hub-fuel path: the dense MLPs ship NVFP4 (packed u8 + e4m3 block scales
+  // + f32 global + f32 activation scale). When fp4_gate.packed is set, the
+  // bf16 members are null and run_dense_mlp uses the fp4 GEMV loop.
+  Nvfp4W fp4_gate, fp4_up, fp4_down;
+  float fp4_gate_in = 1.0f, fp4_up_in = 1.0f, fp4_down_in = 1.0f;
 };
 
 struct MoeW {
@@ -115,12 +127,17 @@ struct ExpertDev {
   const std::uint8_t* gate_packed = nullptr;
   const std::uint8_t* gate_scale = nullptr;  // linear, GEMV
   float gate_global = 0.0f;
+  // ModelOpt's W4A4 static activation alpha. The block scale remains dynamic
+  // in nvfp4_quantize_rows; this alpha is applied after the GEMM.
+  float gate_input_scale = 1.0f;
   const std::uint8_t* up_packed = nullptr;
   const std::uint8_t* up_scale = nullptr;  // linear, GEMV
   float up_global = 0.0f;
+  float up_input_scale = 1.0f;
   const std::uint8_t* down_packed = nullptr;
   const std::uint8_t* down_scale = nullptr;  // linear, GEMV
   float down_global = 0.0f;
+  float down_input_scale = 1.0f;
 
   // Grouped-GEMM (stage 2) operands.
   const std::uint8_t* w13_scale = nullptr;            // fused gate+up SFB, swizzled
@@ -169,6 +186,13 @@ class WeightStore {
   // weights, so the range filter does not apply to it. Built by
   // set_expert_range; returns 0 if no range was set.
   float expert_down_global(int layer, int expert_id) const;
+  float expert_down_input_scale(int layer, int expert_id) const;
+
+  // Fill every sparse-layer weight for this rank's owned expert set before
+  // serving. This is only possible when the cache has at least one slot per
+  // owned (layer, expert) pair. It turns NVMe traffic into a measured restore
+  // phase instead of mixing cold faults into generated-token throughput.
+  std::size_t preload_owned_experts(cudaStream_t s);
 
   // Seam for a future BF16 -> FP8 flip (fuels/glm-5.3-flash/fuel.yaml,
   // serving_regime.quantization_plan): every uploaded resident tensor is
@@ -226,6 +250,7 @@ class WeightStore {
   std::vector<char> owned_expert_;  // [n_routed_experts], 1 = this rank fetches it
   int expert_count_ = 0;  // 0 means "every expert", the single-booster case
   std::vector<float> down_global_;  // [text_layers * n_routed_experts]
+  std::vector<float> down_input_scale_;  // [text_layers * n_routed_experts]
 };
 
 }  // namespace rocket::engine

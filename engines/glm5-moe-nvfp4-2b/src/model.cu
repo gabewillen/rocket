@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <map>
-#include <numeric>
 #include <stdexcept>
 
 #include "kernels.h"
@@ -112,21 +112,44 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   v_conv_state_ = A(static_cast<std::size_t>(nk) * MB * qkv * taps);
   kda_state_ = F(static_cast<std::size_t>(nk) * MB * heads_kda * hd * hd);
 
-  // --- MLA latent + indexer key/gate. Two backends behind the same KvPages
-  // block table the kernels already read through kv_locate(). ---
-  if (kv_pool_pages > 0) {
-    // Refcounted page pool: fixed-size pages shared across streams, one
-    // block-table row per stream slot (src/kv/page_pool.h).
+  // Exact-byte guard against fuels/glm-5.3-flash/attention.yaml's own
+  // bytes.kda_state_per_stream accounting: recurrent_per_layer is
+  // heads * head_dim * head_dim * 2 B (2097152 for this fuel's 64/128/128),
+  // conv_per_layer is 3 tensors * qkv_width * conv_state_taps * 2 B
+  // (147456). A missing factor here (e.g. one head_dim term dropped) would
+  // silently underallocate kda_state_ and kda_stage_ (model.cu::kda_pack /
+  // kda_unpack, used by kv_fork/kv_detach/kv_resume) by exactly that
+  // dropped factor, so this is checked once at construction rather than
+  // trusted from the arithmetic alone.
+  {
+    const std::size_t recurrent_per_layer =
+        static_cast<std::size_t>(heads_kda) * hd * hd * sizeof(bf16);
+    const std::size_t conv_per_layer =
+        3ull * cfg_.kda_qkv_dim() * cfg_.conv_state_taps() * sizeof(bf16);
+    if (recurrent_per_layer != 2097152ull || conv_per_layer != 147456ull)
+      fail("KDA state byte accounting drifted from fuels/glm-5.3-flash/attention.yaml "
+          "bytes.kda_state_per_stream (recurrent_per_layer=" +
+          std::to_string(recurrent_per_layer) + ", conv_per_layer=" +
+          std::to_string(conv_per_layer) + ", expected 2097152 / 147456)");
+  }
+
+  // --- MLA latent + indexer key/gate: the radix-tree paged pool
+  // (src/kv/page_pool.h), the only backend the kernels' block table reads
+  // through kv_locate(). kv_pool_pages <= 0 auto-sizes to one full private
+  // context's worth of pages per stream slot (see model.h's constructor
+  // comment), matching the deleted stage-1 allocator's worst-case memory.
+  {
     const kv::KvGeometry geom{kv_page_tokens, nm, kvl, ihd, cfg_.index_kpool};
     const std::string bad = geom.why_invalid();
     if (!bad.empty()) fail("kv pool geometry: " + bad);
     if (max_tokens % kv_page_tokens != 0)
       fail("max_tokens must be a whole number of KV pages");
     const int pages_per_stream = max_tokens / kv_page_tokens;
-    if (kv_pool_pages < pages_per_stream)
+    const int pool_pages = kv_pool_pages > 0 ? kv_pool_pages : MB * pages_per_stream;
+    if (pool_pages < pages_per_stream)
       fail("kv_pool_pages cannot back even one full-context stream");
-    kv_arena_ = std::make_unique<kv::KvArena>(geom, kv_pool_pages, MB, pages_per_stream, stream_);
-    kv_pool_ = std::make_unique<kv::PagePool>(kv_pool_pages, kv_page_tokens);
+    kv_arena_ = std::make_unique<kv::KvArena>(geom, pool_pages, MB, pages_per_stream, stream_);
+    kv_pool_ = std::make_unique<kv::PagePool>(pool_pages, kv_page_tokens);
     kv_tree_ = std::make_unique<kv::PrefixTree>();
     kv_cache_ = std::make_unique<kv::KvCache>(geom, kv_pool_.get(), kv_tree_.get(),
                                               kv_arena_.get());
@@ -135,25 +158,6 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
     kv_seq_of_slot_.assign(MB, -1);
     for (int m = 0; m < MB; ++m) kv_seq_of_slot_[m] = kv_cache_->open(m);
     kda_stage_ = alloc(kda_bytes_per_stream());
-  } else {
-    // Stage 1: one physical page per stream slot, sized to the whole context
-    // window, so table[m] = m and nothing is ever shared or evicted.
-    mla_kv_.latent = A(static_cast<std::size_t>(MB) * nm * max_tokens * kvl);
-    mla_kv_.key = A(static_cast<std::size_t>(MB) * nm * max_tokens * ihd);
-    mla_kv_.gate = A(static_cast<std::size_t>(MB) * nm * max_tokens * ihd);
-    mla_kv_.max_pages = 1;
-    mla_kv_.page_tokens = max_tokens;
-    mla_kv_.layers = nm;
-    mla_kv_.kv_lora = kvl;
-    mla_kv_.index_head_dim = ihd;
-    kv_table_ = I(MB);
-    {
-      std::vector<int> table(MB);
-      std::iota(table.begin(), table.end(), 0);
-      cuda_check(cudaMemcpy(kv_table_, table.data(), MB * sizeof(int), cudaMemcpyHostToDevice),
-                "kv table upload");
-    }
-    mla_kv_.table = kv_table_;
   }
 
   tokens_dev_ = I(MB);
@@ -238,6 +242,8 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   moe_sf2_base_ = I64(MR);
   moe_gate_global_ = F(MR);
   moe_up_global_ = F(MR);
+  moe_gate_input_scale_ = F(MR);
+  moe_up_input_scale_ = F(MR);
   moe_scatter_w_ = F(MR);
   cuda_check(cudaHostAlloc(&moe_idx_pinned_, MR * sizeof(int), cudaHostAllocDefault),
             "pinned moe idx");
@@ -305,15 +311,13 @@ void DecodeEngine::reset() {
                   stream_);
   cudaStreamSynchronize(stream_);
 
-  // With the stage-1 allocator the paged KV is deliberately not cleared:
-  // positions restart at 0 and nothing reads above a stream's position. A
-  // pool cannot do that, because the stale pages are refcounted and would
-  // never come back. Every slot gets a fresh empty sequence instead.
-  if (kv_cache_) {
-    for (int m = 0; m < MB; ++m) {
-      if (kv_seq_of_slot_[m] >= 0) kv_cache_->destroy(kv_seq_of_slot_[m]);
-      kv_seq_of_slot_[m] = kv_cache_->open(m);
-    }
+  // The paged KV pool cannot leave stale pages behind the way a cleared
+  // stage-1 buffer could: they are refcounted and would never come back
+  // without an explicit destroy. Every slot gets a fresh empty sequence
+  // instead.
+  for (int m = 0; m < MB; ++m) {
+    if (kv_seq_of_slot_[m] >= 0) kv_cache_->destroy(kv_seq_of_slot_[m]);
+    kv_seq_of_slot_[m] = kv_cache_->open(m);
   }
 }
 
@@ -326,10 +330,10 @@ std::size_t DecodeEngine::kda_bytes_per_stream() const {
   return static_cast<std::size_t>(kda_layers_) * (conv + state);
 }
 
-int DecodeEngine::kv_pinned_pages() const { return kv_pool_ ? kv_pool_->pinned_pages() : 0; }
+int DecodeEngine::kv_pinned_pages() const { return kv_pool_->pinned_pages(); }
 
 int DecodeEngine::kv_session_in_slot(int slot) const {
-  if (!kv_cache_ || slot < 0 || slot >= max_batch_) return -1;
+  if (slot < 0 || slot >= max_batch_) return -1;
   return kv_seq_of_slot_[slot];
 }
 
@@ -384,7 +388,6 @@ void DecodeEngine::kda_copy_slot(int dst_slot, int src_slot) {
 }
 
 int DecodeEngine::kv_fork(int parent_slot, int fork_pos, int child_slot) {
-  if (!kv_cache_) fail("kv_fork needs an engine built with kv_pool_pages > 0");
   if (parent_slot < 0 || parent_slot >= max_batch_) fail("kv_fork: parent slot out of range");
   if (child_slot < 0 || child_slot >= max_batch_) fail("kv_fork: child slot out of range");
   if (kv_seq_of_slot_[parent_slot] < 0) fail("kv_fork: parent slot holds no sequence");
@@ -399,7 +402,6 @@ int DecodeEngine::kv_fork(int parent_slot, int fork_pos, int child_slot) {
 }
 
 int DecodeEngine::kv_detach(int slot) {
-  if (!kv_cache_) fail("kv_detach needs an engine built with kv_pool_pages > 0");
   if (slot < 0 || slot >= max_batch_ || kv_seq_of_slot_[slot] < 0)
     fail("kv_detach: slot holds no sequence");
   const int session = kv_seq_of_slot_[slot];
@@ -411,7 +413,6 @@ int DecodeEngine::kv_detach(int slot) {
 }
 
 void DecodeEngine::kv_resume(int session, int slot) {
-  if (!kv_cache_) fail("kv_resume needs an engine built with kv_pool_pages > 0");
   if (slot < 0 || slot >= max_batch_) fail("kv_resume: slot out of range");
   if (kv_seq_of_slot_[slot] >= 0) fail("kv_resume: slot is occupied");
   kv_cache_->attach(session, slot);
@@ -423,7 +424,6 @@ void DecodeEngine::kv_resume(int session, int slot) {
 }
 
 void DecodeEngine::kv_destroy(int session) {
-  if (!kv_cache_) fail("kv_destroy needs an engine built with kv_pool_pages > 0");
   const int slot = kv_cache_->slot_of(session);
   if (slot >= 0) kv_seq_of_slot_[slot] = -1;
   kv_cache_->destroy(session);
@@ -434,7 +434,6 @@ void DecodeEngine::kv_destroy(int session) {
 // table of any slot whose table changed, which is one slot in every
 // page_tokens steps plus whatever copy on extend privatised.
 void DecodeEngine::kv_advance(const std::vector<int>& tokens, int batch) {
-  if (!kv_cache_) return;
   for (int m = 0; m < batch; ++m) {
     const int seq = kv_seq_of_slot_[m];
     if (seq < 0) fail("step: stream slot holds no KV sequence");
@@ -477,9 +476,22 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
   const int heads = cfg_.kda_heads;
   const int MB = max_batch_;
 
-  gemm_bf16(q_raw_, k.qkv, normed_, batch, qkv, H, stream_);
+  if (k.q_overlay.packed) {
+    for (int m = 0; m < batch; ++m)
+      gemv_nvfp4(q_raw_ + static_cast<std::size_t>(m) * qkv, k.q_overlay.packed,
+                 k.q_overlay.scale, k.q_overlay.global,
+                 normed_ + static_cast<std::size_t>(m) * H, qkv, H, stream_);
+  } else {
+    gemm_bf16(q_raw_, k.qkv, normed_, batch, qkv, H, stream_);
+  }
   gemm_bf16(k_raw_, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, batch, qkv, H, stream_);
   gemm_bf16(v_raw_, k.qkv + static_cast<std::size_t>(2) * qkv * H, normed_, batch, qkv, H, stream_);
+  if (telemetry_) {
+    const std::string p = "layer" + std::to_string(layer) + ".";
+    record_absmax(p + "kda_q.output", q_raw_, batch, qkv);
+    record_absmax(p + "kda_k.output", k_raw_, batch, qkv);
+    record_absmax(p + "kda_v.output", v_raw_, batch, qkv);
+  }
 
   bf16* qstate = q_conv_state_ + static_cast<std::size_t>(slot) * MB * qkv * taps;
   bf16* kstate = k_conv_state_ + static_cast<std::size_t>(slot) * MB * qkv * taps;
@@ -494,6 +506,9 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
 
   gemm_bf16(lr_a_, k.f_a, normed_, batch, hd, H, stream_);
   gemm_bf16(lr_b_, k.f_b, lr_a_, batch, qkv, hd, stream_);
+  if (telemetry_)
+    record_absmax("layer" + std::to_string(layer) + ".kda_gates.decay_output", lr_b_, batch,
+                  qkv);
   kda_forget_gate(gate_, lr_b_, k.dt_bias, k.a_log, batch, heads, hd, cfg_.kda_gate_lower_bound,
                   stream_);
 
@@ -506,8 +521,13 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
 
   gemm_bf16(lr_a_, k.g_a, normed_, batch, hd, H, stream_);
   gemm_bf16(lr_b_, k.g_b, lr_a_, batch, qkv, hd, stream_);
+  if (telemetry_)
+    record_absmax("layer" + std::to_string(layer) + ".kda_gates.output_gate", lr_b_, batch,
+                  qkv);
   kda_gated_norm(kda_on_, kda_o_, lr_b_, k.o_norm, batch, heads, hd, cfg_.rms_norm_eps, stream_);
   gemm_bf16(sublayer_out_, k.o_proj, kda_on_, batch, H, qkv, stream_);
+  if (telemetry_)
+    record_absmax("layer" + std::to_string(layer) + ".kda_o.output", sublayer_out_, batch, H);
 
   if (telemetry_)
     record_absmax("layer" + std::to_string(layer) + ".attn.normed", normed_, batch, H);
@@ -526,14 +546,24 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   gemm_bf16(q_resid_raw_, m.q_a, normed_, batch, cfg_.q_lora_rank, H, stream_);
   rmsnorm(q_resid_, q_resid_raw_, m.q_a_norm, batch, cfg_.q_lora_rank, cfg_.rms_norm_eps, stream_);
   gemm_bf16(q_, m.q_b, q_resid_, batch, heads * cfg_.qk_head_dim(), cfg_.q_lora_rank, stream_);
+  if (telemetry_)
+    record_absmax("layer" + std::to_string(layer) + ".mla_q.output", q_, batch,
+                  heads * cfg_.qk_head_dim());
 
   gemm_bf16(ckv_, m.kv_a, normed_, batch, kvl, H, stream_);
+  if (telemetry_)
+    record_absmax("layer" + std::to_string(layer) + ".mla_kv.output", ckv_, batch, kvl);
   rmsnorm(latent_stage_, ckv_, m.kv_a_norm, batch, kvl, cfg_.rms_norm_eps, stream_);
 
   gemm_bf16(q_idx_, m.idx_wq_b, q_resid_, batch, ih * ihd, cfg_.q_lora_rank, stream_);
   gemm_bf16(idx_k_raw_, m.idx_wk, normed_, batch, ihd, H, stream_);
   layernorm(idx_k_stage_, idx_k_raw_, m.idx_k_norm_w, m.idx_k_norm_b, batch, ihd, 1e-6f, stream_);
   gemm_bf16(idx_g_stage_, m.idx_gate, normed_, batch, ihd, H, stream_);
+  if (telemetry_) {
+    const std::string p = "layer" + std::to_string(layer) + ".mla_indexer.";
+    record_absmax(p + "key_output", idx_k_raw_, batch, ihd);
+    record_absmax(p + "gate_output", idx_g_stage_, batch, ihd);
+  }
   // The reference scales these by index_n_heads^-0.5 before the weighted sum.
   // A positive constant multiplies every pool score equally, so it cannot
   // move the top-k, and the scores are used for nothing else.
@@ -566,6 +596,8 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   mla_expand_v(v_out_, m.kv_b, ctx_, batch, heads, cfg_.qk_nope_head_dim, cfg_.v_head_dim, kvl,
               stream_);
   gemm_bf16(sublayer_out_, m.o_proj, v_out_, batch, H, heads * cfg_.v_head_dim, stream_);
+  if (telemetry_)
+    record_absmax("layer" + std::to_string(layer) + ".mla_o.output", sublayer_out_, batch, H);
 
   if (telemetry_)
     record_absmax("layer" + std::to_string(layer) + ".attn.normed", normed_, batch, H);
@@ -575,10 +607,28 @@ void DecodeEngine::run_dense_mlp(int layer, int batch) {
   const DenseMlpW& d = w_.layer(layer).dense;
   const int H = cfg_.hidden_size;
   const int I = cfg_.intermediate_size;
-  gemm_bf16(mlp_gate_, d.gate, normed_, batch, I, H, stream_);
-  gemm_bf16(mlp_up_, d.up, normed_, batch, I, H, stream_);
-  swiglu_clamped(mlp_h_, mlp_gate_, mlp_up_, batch * I, cfg_.swiglu_limit, stream_);
-  gemm_bf16(sublayer_out_, d.down, mlp_h_, batch, H, I, stream_);
+  if (d.gate == nullptr && d.fp4_gate.packed != nullptr) {
+    // NVFP4 dense MLP (hub fuel): same fp4 GEMV operand convention as the
+    // MoE experts. m=1..16 rows per step; one launch per projection row.
+    for (int m = 0; m < batch; ++m) {
+      gemv_nvfp4(mlp_gate_ + static_cast<std::size_t>(m) * I, d.fp4_gate.packed,
+                 d.fp4_gate.scale, d.fp4_gate.global * d.fp4_gate_in,
+                 normed_ + static_cast<std::size_t>(m) * H, I, H, stream_);
+      gemv_nvfp4(mlp_up_ + static_cast<std::size_t>(m) * I, d.fp4_up.packed,
+                 d.fp4_up.scale, d.fp4_up.global * d.fp4_up_in,
+                 normed_ + static_cast<std::size_t>(m) * H, I, H, stream_);
+    }
+    swiglu_clamped(mlp_h_, mlp_gate_, mlp_up_, batch * I, cfg_.swiglu_limit, stream_);
+    for (int m = 0; m < batch; ++m)
+      gemv_nvfp4(sublayer_out_ + static_cast<std::size_t>(m) * H, d.fp4_down.packed,
+                 d.fp4_down.scale, d.fp4_down.global * d.fp4_down_in,
+                 mlp_h_ + static_cast<std::size_t>(m) * I, H, I, stream_);
+  } else {
+    gemm_bf16(mlp_gate_, d.gate, normed_, batch, I, H, stream_);
+    gemm_bf16(mlp_up_, d.up, normed_, batch, I, H, stream_);
+    swiglu_clamped(mlp_h_, mlp_gate_, mlp_up_, batch * I, cfg_.swiglu_limit, stream_);
+    gemm_bf16(sublayer_out_, d.down, mlp_h_, batch, H, I, stream_);
+  }
   if (telemetry_)
     record_absmax("layer" + std::to_string(layer) + ".ffn.normed", normed_, batch, H);
 }
@@ -598,10 +648,13 @@ void DecodeEngine::run_moe_gemv(int layer, int batch, const std::vector<int>& id
       const ExpertDev& e = w_.expert(layer, expert_id, stream_);
       stages_.expert_stream +=
           std::chrono::duration<double, std::milli>(Clock::now() - t_stream).count();
-      gemv_nvfp4(exp_gate_, e.gate_packed, e.gate_scale, e.gate_global, x_row, MI, H, stream_);
-      gemv_nvfp4(exp_up_, e.up_packed, e.up_scale, e.up_global, x_row, MI, H, stream_);
+      gemv_nvfp4(exp_gate_, e.gate_packed, e.gate_scale, e.gate_global * e.gate_input_scale, x_row,
+                 MI, H, stream_);
+      gemv_nvfp4(exp_up_, e.up_packed, e.up_scale, e.up_global * e.up_input_scale, x_row, MI, H,
+                 stream_);
       swiglu_clamped(exp_h_, exp_gate_, exp_up_, MI, cfg_.swiglu_limit, stream_);
-      gemv_nvfp4(exp_out_, e.down_packed, e.down_scale, e.down_global, exp_h_, H, MI, stream_);
+      gemv_nvfp4(exp_out_, e.down_packed, e.down_scale, e.down_global * e.down_input_scale, exp_h_,
+                 H, MI, stream_);
       axpy_bf16(acc_ + static_cast<std::size_t>(m) * H, exp_out_, topk_w_ + static_cast<std::size_t>(m) * K,
                t, K, /*batch=*/1, H, stream_);
     }
@@ -654,7 +707,8 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
   send_rows.reserve(static_cast<std::size_t>(rows));
   recv_rows.reserve(static_cast<std::size_t>(rows));
   std::vector<long long> sf1_base, sf2_base;
-  std::vector<float> gate_global, up_global;
+  std::vector<float> gate_global, up_global, gate_input_scale, up_input_scale;
+  std::vector<int> group_expert, group_crow_start, group_row_start;
   std::vector<GroupedGemmGroup> groups1, groups2;
   groups1.reserve(by_expert.size());
   groups2.reserve(by_expert.size());
@@ -669,6 +723,7 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
     const bool mine = ep_ == nullptr || ep_->owns(expert_id);
     if (ep_ != nullptr && ep_->owner_of(expert_id) == 0) rank0_rows += Mg;
     float down_global = 0.0f;
+    float down_input_scale = 1.0f;
 
     if (mine) {
       const auto t_stream = Clock::now();
@@ -676,12 +731,23 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
       stages_.expert_stream +=
           std::chrono::duration<double, std::milli>(Clock::now() - t_stream).count();
       down_global = e.down_global;
+      down_input_scale = e.down_input_scale;
+
+      // Parallel indexes for the GEMV fallback (see the grouped launch below):
+      // per group, which expert's packed weights to use, where its compact rows
+      // start, and where its true rows start. All three are pure functions of
+      // the ordered walk this loop already performs.
+      group_expert.push_back(expert_id);
+      group_crow_start.push_back(crow);
+      group_row_start.push_back(row_start);
 
       const long long mn_tiles = (Mg + 127) / 128;
       sf1_base.push_back(sf1_off);
       sf2_base.push_back(sf2_off);
       gate_global.push_back(e.gate_global);
       up_global.push_back(e.up_global);
+      gate_input_scale.push_back(e.gate_input_scale);
+      up_input_scale.push_back(e.up_input_scale);
 
       GroupedGemmGroup gr1;
       gr1.m = Mg;
@@ -711,6 +777,7 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
       // table (weights.h::expert_down_global) rather than the expert cache it
       // is not allowed to fetch into.
       down_global = w_.expert_down_global(layer, expert_id);
+      down_input_scale = w_.expert_down_input_scale(layer, expert_id);
     }
 
     for (int li = 0; li < Mg; ++li) {
@@ -722,7 +789,7 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
       // per-row kernel pass; the router weight and this global both apply
       // once per row with no elementwise interaction, so one multiply on
       // the host, once per (stream, expert) pair, covers both.
-      scatter_w[row] = wts[static_cast<std::size_t>(slot)] * down_global;
+      scatter_w[row] = wts[static_cast<std::size_t>(slot)] * down_global * down_input_scale;
       if (mine) {
         crow_of.push_back(slot / K);
         row_in_group.push_back(li);
@@ -760,6 +827,10 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
                     cudaMemcpyHostToDevice, stream_);
     cudaMemcpyAsync(moe_up_global_, up_global.data(), up_global.size() * sizeof(float),
                     cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(moe_gate_input_scale_, gate_input_scale.data(),
+                    gate_input_scale.size() * sizeof(float), cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(moe_up_input_scale_, up_input_scale.data(),
+                    up_input_scale.size() * sizeof(float), cudaMemcpyHostToDevice, stream_);
   }
   if (!recv_rows.empty())
     cudaMemcpyAsync(moe_recv_rows_, recv_rows.data(), recv_rows.size() * sizeof(int),
@@ -767,16 +838,59 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
 
   // Every operand below is compact-indexed. On one booster own_n is rows and
   // the compact space is the true space, so these are the same calls as before.
+  //
+  // Pair-mode fallback: if the grouped launcher cannot run a shape, do not
+  // unwind. Both ranks must advance the fabric's shared doorbell sequence
+  // exactly once per layer, and the missing half must come out of the exchange,
+  // so the GEMV loop below produces the same owned rows into the same buffers
+  // (moe_gu_ / moe_out_, raw GEMM outputs, globals left to the shared tail)
+  // and control reaches exchange_begin on every path. The peer's sequence
+  // arithmetic and the static-fire bit parity are unchanged because the swap
+  // is local to this rank (the gather/scatter maps and row order are shared).
+  static const bool force_grouped_fail =
+      std::getenv("ROCKET_MOE_FORCE_FALLBACK") != nullptr;
+  bool gemv_fallback = false;
   if (own_n > 0) {
     moe_gather_rows(moe_x_, normed_, moe_crow_of_, own_n, H, stream_);
     nvfp4_quantize_rows(moe_a1_packed_, moe_a1_sf_, moe_x_, moe_row_in_group_, moe_group_of_row_,
                         moe_sf1_base_, own_n, H, stream_);
-    if (!grouped_gemm_nvfp4(groups1, 2 * MI, H, stream_)) return false;
-    swiglu_grouped(moe_h_, moe_gu_, moe_gate_global_, moe_up_global_, moe_group_of_row_, own_n, MI,
-                   cfg_.swiglu_limit, stream_);
+    gemv_fallback =
+        force_grouped_fail || !grouped_gemm_nvfp4(groups1, 2 * MI, H, stream_);
+    if (gemv_fallback) {
+      for (std::size_t g_fb = 0; g_fb < group_expert.size(); ++g_fb) {
+        const ExpertDev& e = w_.expert(layer, group_expert[g_fb], stream_);
+        for (int li = 0; li < groups1[g_fb].m; ++li) {
+          const int crow = group_crow_start[g_fb] + li;
+          gemv_nvfp4(moe_gu_ + static_cast<std::size_t>(crow) * (2 * MI), e.gate_packed,
+                     e.gate_scale, 1.0f, moe_x_ + static_cast<std::size_t>(crow) * H, MI, H,
+                     stream_);
+          gemv_nvfp4(moe_gu_ + static_cast<std::size_t>(crow) * (2 * MI) + MI, e.up_packed,
+                     e.up_scale, 1.0f, moe_x_ + static_cast<std::size_t>(crow) * H, MI, H,
+                     stream_);
+        }
+      }
+    }
+  }
+  if (own_n > 0) {
+    // Shared tail in both paths: moe_gu_ is complete by now (grouped GEMM or
+    // the stage-1 GEMV fallback above), so the activation variant of the
+    // swiglu and the second quantize run unconditionally.
+    swiglu_grouped(moe_h_, moe_gu_, moe_gate_global_, moe_up_global_, moe_gate_input_scale_,
+                   moe_up_input_scale_, moe_group_of_row_, own_n, MI, cfg_.swiglu_limit, stream_);
     nvfp4_quantize_rows(moe_a2_packed_, moe_a2_sf_, moe_h_, moe_row_in_group_, moe_group_of_row_,
                         moe_sf2_base_, own_n, MI, stream_);
-    if (!grouped_gemm_nvfp4(groups2, H, MI, stream_)) return false;
+    gemv_fallback = gemv_fallback || !grouped_gemm_nvfp4(groups2, H, MI, stream_);
+  }
+  if (gemv_fallback) {
+    for (std::size_t g_fb = 0; g_fb < group_expert.size(); ++g_fb) {
+      const ExpertDev& e = w_.expert(layer, group_expert[g_fb], stream_);
+      for (int li = 0; li < groups2[g_fb].m; ++li) {
+        const int crow = group_crow_start[g_fb] + li;
+        gemv_nvfp4(moe_out_ + static_cast<std::size_t>(group_row_start[g_fb] + li) * H,
+                   e.down_packed, e.down_scale, 1.0f,
+                   moe_h_ + static_cast<std::size_t>(crow) * MI, H, MI, stream_);
+      }
+    }
   }
 
   if (ep_ == nullptr) {
