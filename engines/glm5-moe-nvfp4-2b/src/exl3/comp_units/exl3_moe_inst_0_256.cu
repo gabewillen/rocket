@@ -1,0 +1,5 @@
+#include "torch_check_shim.h"
+#include "exl3_moe_instances.cuh"
+#include "exl3_moe_kernel.cuh"
+
+fp_exl3_moe_kernel exl3_moe_kernel_k0_n256() { return exl3_moe_kernel<0, 256>; }

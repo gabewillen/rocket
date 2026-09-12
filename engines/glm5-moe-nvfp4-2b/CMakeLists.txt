@@ -12,6 +12,7 @@
 cmake_minimum_required(VERSION 3.28)
 
 project(rocket_glm5_moe_nvfp4_2b LANGUAGES CXX CUDA)
+find_package(CUDAToolkit REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,12 +45,17 @@ add_library(rocket_engine STATIC
   src/kv/page_pool.cc
   src/kv/kv_arena.cu
 )
-target_include_directories(rocket_engine PUBLIC src)
+target_include_directories(rocket_engine PUBLIC src src/exl3)
+# Ported exllamav3 EXL3 kernels (torch-free subset) + bridges
+file(GLOB EXL3_BRIDGE_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/exl3_bridge.cu
+                             ${CMAKE_CURRENT_SOURCE_DIR}/src/exl3_moe_bridge.cu)
+file(GLOB_RECURSE EXL3_UNIT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/exl3/*.cu)
+target_sources(rocket_engine PRIVATE ${EXL3_BRIDGE_SOURCES} ${EXL3_UNIT_SOURCES})
 target_compile_definitions(rocket_engine PUBLIC
   ROCKET_PAGE_BYTES=${ROCKET_PAGE_BYTES}
   ROCKET_CUDA_ARCH=${ROCKET_CUDA_ARCH}
 )
-target_link_libraries(rocket_engine PUBLIC rocket_fuel)
+target_link_libraries(rocket_engine PUBLIC rocket_fuel CUDA::cublas)
 target_compile_options(rocket_engine PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>
 )
