@@ -942,6 +942,12 @@ __global__ void add_kernel(bf16* __restrict__ acc, const bf16* __restrict__ v, i
   if (i < n) acc[i] = b(f(acc[i]) + f(v[i]));
 }
 
+__global__ void mul_scalar_kernel(bf16* __restrict__ out, const bf16* __restrict__ in,
+                                  float scalar, int n) {
+  const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = b(f(in[i]) * scalar);
+}
+
 __global__ void argmax_kernel(int* __restrict__ idx_out, float* __restrict__ val_out,
                               const float* __restrict__ x, int n) {
   __shared__ float vs[1024];
@@ -1034,6 +1040,11 @@ void gemm_dispatch(Out* y, const bf16* w, const bf16* x, int batch, int n_rows, 
       gemm_batched_kernel<Out, 16><<<n_rows, 256, 0, s>>>(y_part, w, x_part, n_rows, k, b);
     m0 += b;
   }
+}
+void mul_scalar_bf16(bf16* out, const bf16* in, float scalar, long long n, cudaStream_t s) {
+  if (n <= 0) return;
+  mul_scalar_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(out, in, scalar,
+                                                                          static_cast<int>(n));
 }
 void gemm_bf16(bf16* y, const bf16* w, const bf16* x, int batch, int n_rows, int k, cudaStream_t s) {
   gemm_dispatch<bf16>(y, w, x, batch, n_rows, k, s);

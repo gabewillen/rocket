@@ -38,6 +38,14 @@ struct GroupedGemmGroup {
   const std::uint8_t* b_packed = nullptr;  // expert weight, [n, k/2]
   const std::uint8_t* b_scale = nullptr;   // expert weight SFB, from the cache
   bf16* d_out = nullptr;                   // this group's output rows, [m, n]
+
+  // Descriptor equality for the sticky (capture-safe) path: byte-identical
+  // descriptors mean the device-side metadata upload can be skipped.
+  bool operator==(const GroupedGemmGroup& o) const {
+    return m == o.m && a_packed == o.a_packed && a_scale == o.a_scale &&
+           b_packed == o.b_packed && b_scale == o.b_scale && d_out == o.d_out;
+  }
+  bool operator!=(const GroupedGemmGroup& o) const { return !(*this == o); }
 };
 
 // Runs one grouped NVFP4 GEMM over `groups`, all sharing (n, k). Groups with
@@ -45,5 +53,14 @@ struct GroupedGemmGroup {
 // implement this problem; model.cu treats that as "fall back to the
 // per-(stream, expert) GEMV path for this step" rather than a hard error.
 bool grouped_gemm_nvfp4(const std::vector<GroupedGemmGroup>& groups, int n, int k, cudaStream_t s);
+
+// Capture-safe variant for graph-segment use: keeps its own scratch and a
+// per-(n, k) fingerprint of the last metadata upload. When the caller passes
+// byte-identical group descriptors (same pointers, same m), the H2D metadata
+// copies are skipped, so a call inside a stream capture issues only the
+// kernel launch. The FIRST call for a shape must happen outside capture (the
+// engine's graph warm-up does this) because it allocates and uploads.
+bool grouped_gemm_nvfp4_sticky(const std::vector<GroupedGemmGroup>& groups, int n, int k,
+                               cudaStream_t s);
 
 }  // namespace rocket::engine

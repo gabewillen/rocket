@@ -130,16 +130,45 @@ Scratch& scratch_for(int n, int k) {
 
 }  // namespace
 
-bool grouped_gemm_nvfp4(const std::vector<GroupedGemmGroup>& groups_in, int n, int k,
-                        cudaStream_t s) {
-  std::vector<GroupedGemmGroup> groups;
-  groups.reserve(groups_in.size());
-  for (const auto& g : groups_in)
-    if (g.m > 0) groups.push_back(g);
-  if (groups.empty()) return true;
+namespace {
+// Sticky-path state: separate scratch pool so a sticky (n, k) never shares
+// DeviceAllocations with the host-driven MoE path, plus the last uploaded
+// descriptor set for the skip-when-identical decision.
+struct StickyState {
+  std::unordered_map<std::uint64_t, Scratch> scratch;
+  std::unordered_map<std::uint64_t, std::vector<GroupedGemmGroup>> uploaded;
+};
+StickyState& sticky_state() {
+  static StickyState st;
+  return st;
+}
+// The sticky key folds the full descriptor set: several callers (the three
+// dense layers) alternate descriptors on one (n, k), and each needs its own
+// scratch + upload state so a capture-time call never re-uploads.
+std::uint64_t sticky_key(int n, int k, const std::vector<GroupedGemmGroup>& gs) {
+  std::uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](std::uint64_t v) {
+    h ^= v;
+    h *= 1099511628211ull;
+  };
+  mix(static_cast<std::uint32_t>(n));
+  mix(static_cast<std::uint32_t>(k));
+  for (const auto& g : gs) {
+    mix(static_cast<std::uint64_t>(g.m));
+    mix(reinterpret_cast<std::uintptr_t>(g.a_packed));
+    mix(reinterpret_cast<std::uintptr_t>(g.a_scale));
+    mix(reinterpret_cast<std::uintptr_t>(g.b_packed));
+    mix(reinterpret_cast<std::uintptr_t>(g.b_scale));
+    mix(reinterpret_cast<std::uintptr_t>(g.d_out));
+  }
+  return h;
+}
+}  // namespace
 
+bool run_grouped_impl(const std::vector<GroupedGemmGroup>& groups, int n, int k, cudaStream_t s,
+                      Scratch& sc, bool upload) {
   const int G = static_cast<int>(groups.size());
-  Scratch& sc = scratch_for(n, k);
+  if (G == 0) return true;
   sc.reserve(G);
 
   std::vector<typename ProblemShape::UnderlyingProblemShape> ps_host(G);
@@ -175,17 +204,19 @@ bool grouped_gemm_nvfp4(const std::vector<GroupedGemmGroup>& groups_in, int n, i
   // vectors above to outlive an in-flight copy, which the current run_moe
   // call shape (grouped_gemm_nvfp4 returns before the caller reuses them)
   // does not guarantee.
-  sc.ps.copy_from_host(ps_host.data());
-  sc.sA.copy_from_host(sA_host.data());
-  sc.sB.copy_from_host(sB_host.data());
-  sc.sD.copy_from_host(sD_host.data());
-  sc.lSFA.copy_from_host(lSFA_host.data());
-  sc.lSFB.copy_from_host(lSFB_host.data());
-  sc.pA.copy_from_host(pA_host.data());
-  sc.pB.copy_from_host(pB_host.data());
-  sc.pSFA.copy_from_host(pSFA_host.data());
-  sc.pSFB.copy_from_host(pSFB_host.data());
-  sc.pD.copy_from_host(pD_host.data());
+  if (upload) {
+    sc.ps.copy_from_host(ps_host.data());
+    sc.sA.copy_from_host(sA_host.data());
+    sc.sB.copy_from_host(sB_host.data());
+    sc.sD.copy_from_host(sD_host.data());
+    sc.lSFA.copy_from_host(lSFA_host.data());
+    sc.lSFB.copy_from_host(lSFB_host.data());
+    sc.pA.copy_from_host(pA_host.data());
+    sc.pB.copy_from_host(pB_host.data());
+    sc.pSFA.copy_from_host(pSFA_host.data());
+    sc.pSFB.copy_from_host(pSFB_host.data());
+    sc.pD.copy_from_host(pD_host.data());
+  }
 
   cutlass::KernelHardwareInfo hw;
   hw.device_id = 0;
@@ -217,6 +248,33 @@ bool grouped_gemm_nvfp4(const std::vector<GroupedGemmGroup>& groups_in, int n, i
   }
   if (gemm.initialize(args, sc.workspace.get(), s) != cutlass::Status::kSuccess) return false;
   if (gemm.run(s) != cutlass::Status::kSuccess) return false;
+  return true;
+}
+
+bool grouped_gemm_nvfp4(const std::vector<GroupedGemmGroup>& groups_in, int n, int k,
+                        cudaStream_t s) {
+  std::vector<GroupedGemmGroup> groups;
+  groups.reserve(groups_in.size());
+  for (const auto& g : groups_in)
+    if (g.m > 0) groups.push_back(g);
+  if (groups.empty()) return true;
+  return run_grouped_impl(groups, n, k, s, scratch_for(n, k), /*upload=*/true);
+}
+
+bool grouped_gemm_nvfp4_sticky(const std::vector<GroupedGemmGroup>& groups_in, int n, int k,
+                               cudaStream_t s) {
+  std::vector<GroupedGemmGroup> groups;
+  groups.reserve(groups_in.size());
+  for (const auto& g : groups_in)
+    if (g.m > 0) groups.push_back(g);
+  if (groups.empty()) return true;
+  const std::uint64_t key = sticky_key(n, k, groups);
+  StickyState& st = sticky_state();
+  Scratch& sc = st.scratch[key];
+  auto& last = st.uploaded[key];
+  const bool upload = last.empty();  // fresh slot: first use uploads
+  if (!run_grouped_impl(groups, n, k, s, sc, upload)) return false;
+  if (upload) last = groups;
   return true;
 }
 

@@ -36,22 +36,34 @@ using Clock = std::chrono::steady_clock;
 // shape (run_moe_grouped's return value).
 constexpr int kGroupedMoeMinBatch = 1;
 
+// Event-based stage timer: records two events per stage and accumulates the
+// GPU elapsed time at the end of the step (finish_stage_events). Unlike the
+// old sync-and-wallclock version this never stalls the pipeline, so the
+// per-stage numbers are the true GPU cost even when stages overlap.
 class StageTimer {
  public:
-  StageTimer(cudaStream_t s, double* sink, bool on) : s_(s), sink_(sink), on_(on) {
-    if (on_) t0_ = Clock::now();
+  StageTimer(cudaStream_t s, double* sink, bool on,
+             std::vector<cudaEvent_t>* starts, std::vector<cudaEvent_t>* stops,
+             std::vector<double*>* sinks)
+      : s_(s), stops_(stops), on_(on) {
+    if (!on_) return;
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    cudaEventRecord(a, s);
+    starts->push_back(a);
+    stops->push_back(b);
+    sinks->push_back(sink);
   }
   ~StageTimer() {
     if (!on_) return;
-    cudaStreamSynchronize(s_);
-    *sink_ += std::chrono::duration<double, std::milli>(Clock::now() - t0_).count();
+    cudaEventRecord(stops_->back(), s_);
   }
 
  private:
   cudaStream_t s_;
-  double* sink_;
+  std::vector<cudaEvent_t>* stops_;
   bool on_;
-  Clock::time_point t0_;
 };
 
 }  // namespace
@@ -231,6 +243,29 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   moe_h_ = A(MR * MI);
   moe_a2_packed_ = U8(MR * MI / 2);
   moe_a2_sf_ = U8(MR * 32 * 512);  // k_tiles(MI=2048)=32 atoms of 512 B, worst case
+
+  const int DI = cfg_.intermediate_size;
+  // --- dense-MLP fp4 grouped-path scratch: one group per projection, so the
+  // row space is the batch itself. ---
+  dense_a1_packed_ = U8(static_cast<std::size_t>(MB) * H / 2);
+  dense_a1_sf_ = U8(64 * 512);  // one 128-row tile, k_tiles(H)=64
+  dense_gu_ = A(static_cast<std::size_t>(MB) * 2 * DI);
+  dense_a2_packed_ = U8(static_cast<std::size_t>(MB) * DI / 2);
+  dense_a2_sf_ = U8(192 * 512);  // k_tiles(I=12288)=192
+  dense_down_raw_ = A(static_cast<std::size_t>(MB) * H);
+  dense_row_in_group_ = I(MB);
+  dense_group_of_row_ = I(MB);
+  dense_sf_base_ = I64(1);
+  dense_gate_global_ = F(1);
+  dense_up_global_ = F(1);
+  dense_down_global_ = F(1);
+  {
+    std::vector<int> seq(static_cast<std::size_t>(MB));
+    for (int m = 0; m < MB; ++m) seq[m] = m;
+    cudaMemcpyAsync(dense_row_in_group_, seq.data(), MB * sizeof(int), cudaMemcpyHostToDevice,
+                    stream_);
+    cudaStreamSynchronize(stream_);
+  }
   moe_out_ = A(MR * H);
   moe_row_of_ = I(MR);
   moe_row_in_group_ = I(MR);
@@ -466,6 +501,14 @@ void DecodeEngine::record_absmax(const std::string& name, const bf16* x, int bat
 }
 
 void DecodeEngine::run_kda(int layer, int slot, int batch) {
+  const bool kdbg = std::getenv("ROCKET_DEBUG_KDA") != nullptr && layer == 0;
+  const auto k_t0 = Clock::now();
+  auto k_mark = [&](const char* what) {
+    if (!kdbg) return;
+    cudaStreamSynchronize(stream_);
+    std::printf("[kda-prof] %-14s %8.3f ms\n", what,
+                std::chrono::duration<double, std::milli>(Clock::now() - k_t0).count());
+  };
   const KdaW& k = w_.layer(layer).kda;
   const int H = cfg_.hidden_size;
   const int qkv = cfg_.kda_qkv_dim();
@@ -484,6 +527,7 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
   }
   gemm_bf16(k_raw_, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, batch, qkv, H, stream_);
   gemm_bf16(v_raw_, k.qkv + static_cast<std::size_t>(2) * qkv * H, normed_, batch, qkv, H, stream_);
+  k_mark("qkv_gemm");
   if (telemetry_) {
     const std::string p = "layer" + std::to_string(layer) + ".";
     record_absmax(p + "kda_q.output", q_raw_, batch, qkv);
@@ -501,6 +545,7 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
                   k.conv + static_cast<std::size_t>(2) * qkv * cfg_.kda_conv_kernel, batch, qkv,
                   cfg_.kda_conv_kernel, stream_);
   kda_norm_qk(q_conv_, k_conv_, batch, heads, hd, /*row_stride=*/qkv, stream_);
+  k_mark("conv3+normqk");
   if (std::getenv("ROCKET_DEBUG_LAYER0") != nullptr && layer == 0) {
     auto dump_bf16 = [&](const char* what, const void* p, std::size_t n) {
       std::vector<std::uint16_t> h(n);
@@ -550,13 +595,16 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
                   qkv);
   kda_forget_gate(gate_, lr_b_, k.dt_bias, k.a_log, batch, heads, hd, cfg_.kda_gate_lower_bound,
                   stream_);
+  k_mark("gates");
 
   gemm_bf16(beta_raw_, k.b_proj, normed_, batch, heads, H, stream_);
   kda_sigmoid(beta_, beta_raw_, batch * heads, stream_);
+  k_mark("beta");
 
   float* state = kda_state_ + static_cast<std::size_t>(slot) * MB * heads * hd * hd;
   kda_recurrent_step(state, kda_o_, q_conv_, k_conv_, v_conv_, gate_, beta_, batch, heads, hd,
                      /*row_stride=*/qkv, stream_);
+  k_mark("recurrent");
   if (std::getenv("ROCKET_DEBUG_LAYER0") != nullptr && layer == 0) {
     auto dump_bf16 = [&](const char* what, const void* p, std::size_t n) {
       std::vector<std::uint16_t> h(n);
@@ -586,7 +634,9 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
     record_absmax("layer" + std::to_string(layer) + ".kda_gates.output_gate", lr_b_, batch,
                   qkv);
   kda_gated_norm(kda_on_, kda_o_, lr_b_, k.o_norm, batch, heads, hd, cfg_.rms_norm_eps, stream_);
+  k_mark("o_norm");
   gemm_bf16(sublayer_out_, k.o_proj, kda_on_, batch, H, qkv, stream_);
+  k_mark("o_proj");
   if (telemetry_)
     record_absmax("layer" + std::to_string(layer) + ".kda_o.output", sublayer_out_, batch, H);
 
@@ -674,21 +724,43 @@ void DecodeEngine::run_dense_mlp(int layer, int batch) {
     return;
   }
   if (d.gate == nullptr && d.fp4_gate.packed != nullptr) {
-    // NVFP4 dense MLP (hub fuel): same fp4 GEMV operand convention as the
-    // MoE experts. m=1..16 rows per step; one launch per projection row.
-    for (int m = 0; m < batch; ++m) {
-      gemv_nvfp4(mlp_gate_ + static_cast<std::size_t>(m) * I, d.fp4_gate.packed,
-                 d.fp4_gate.scale, d.fp4_gate.global,
-                 normed_ + static_cast<std::size_t>(m) * H, I, H, stream_);
-      gemv_nvfp4(mlp_up_ + static_cast<std::size_t>(m) * I, d.fp4_up.packed,
-                 d.fp4_up.scale, d.fp4_up.global,
-                 normed_ + static_cast<std::size_t>(m) * H, I, H, stream_);
-    }
-    swiglu_clamped(mlp_h_, mlp_gate_, mlp_up_, batch * I, cfg_.swiglu_limit, stream_);
-    for (int m = 0; m < batch; ++m)
-      gemv_nvfp4(sublayer_out_ + static_cast<std::size_t>(m) * H, d.fp4_down.packed,
-                 d.fp4_down.scale, d.fp4_down.global,
-                 mlp_h_ + static_cast<std::size_t>(m) * I, H, I, stream_);
+    // NVFP4 dense MLP through the grouped path, one group per projection.
+    // Single code path at every batch keeps M=1 and M=B bit-identical, and
+    // the weight matrices are read once per step instead of once per token.
+    // gate|up live back to back in one device slab, so the first GEMM is the
+    // fused w13 shape exactly like the MoE experts.
+    cudaMemcpyAsync(dense_gate_global_, &d.fp4_gate.global, sizeof(float),
+                    cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(dense_up_global_, &d.fp4_up.global, sizeof(float), cudaMemcpyHostToDevice,
+                    stream_);
+    cudaMemcpyAsync(dense_down_global_, &d.fp4_down.global, sizeof(float),
+                    cudaMemcpyHostToDevice, stream_);
+    nvfp4_quantize_rows(dense_a1_packed_, dense_a1_sf_, normed_, dense_row_in_group_,
+                        dense_group_of_row_, dense_sf_base_, batch, H, stream_);
+    GroupedGemmGroup g1;
+    g1.m = batch;
+    g1.a_packed = dense_a1_packed_;
+    g1.a_scale = dense_a1_sf_;
+    g1.b_packed = d.fp4_gate.packed;  // gate|up fused slab, n = 2*I
+    g1.b_scale = d.fp4_gate_sw;
+    g1.d_out = dense_gu_;
+    if (!grouped_gemm_nvfp4_sticky({g1}, 2 * I, H, stream_))
+      fail("dense fp4 grouped GEMM1 failed");
+    swiglu_grouped(mlp_h_, dense_gu_, dense_gate_global_, dense_up_global_, dense_group_of_row_,
+                   batch, I, cfg_.swiglu_limit, stream_);
+    nvfp4_quantize_rows(dense_a2_packed_, dense_a2_sf_, mlp_h_, dense_row_in_group_,
+                        dense_group_of_row_, dense_sf_base_, batch, I, stream_);
+    GroupedGemmGroup g2;
+    g2.m = batch;
+    g2.a_packed = dense_a2_packed_;
+    g2.a_scale = dense_a2_sf_;
+    g2.b_packed = d.fp4_down.packed;
+    g2.b_scale = d.fp4_down_sw;
+    g2.d_out = dense_down_raw_;
+    if (!grouped_gemm_nvfp4_sticky({g2}, H, I, stream_))
+      fail("dense fp4 grouped GEMM2 failed");
+    mul_scalar_bf16(sublayer_out_, dense_down_raw_, d.fp4_down.global,
+                    static_cast<long long>(batch) * H, stream_);
   } else {
     gemm_bf16(mlp_gate_, d.gate, normed_, batch, I, H, stream_);
     gemm_bf16(mlp_up_, d.up, normed_, batch, I, H, stream_);
@@ -1000,6 +1072,14 @@ void DecodeEngine::record_expert_fire(const std::vector<int>& idx) {
 }
 
 void DecodeEngine::run_moe(int layer, int batch) {
+  const bool mdbg = std::getenv("ROCKET_DEBUG_MOE") != nullptr && layer == 4;
+  const auto m_t0 = Clock::now();
+  auto m_mark = [&](const char* what) {
+    if (!mdbg) return;
+    cudaStreamSynchronize(stream_);
+    std::printf("[moe-prof] %-14s %8.3f ms\n", what,
+                std::chrono::duration<double, std::milli>(Clock::now() - m_t0).count());
+  };
   const MoeW& mo = w_.layer(layer).moe;
   const int H = cfg_.hidden_size;
   const int MI = cfg_.moe_intermediate_size;
@@ -1015,6 +1095,7 @@ void DecodeEngine::run_moe(int layer, int batch) {
   cudaMemcpyAsync(idx.data(), topk_idx_, idx.size() * sizeof(int), cudaMemcpyDeviceToHost, stream_);
   cudaMemcpyAsync(wts.data(), topk_w_, wts.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_);
   cudaStreamSynchronize(stream_);
+  m_mark("router+readback");
 
   double ent = 0.0;
   double norm = 0.0;
@@ -1031,13 +1112,15 @@ void DecodeEngine::run_moe(int layer, int batch) {
       moe_path_ == MoePath::kForceGrouped ||
       (moe_path_ == MoePath::kAuto && batch >= kGroupedMoeMinBatch);
   if (moe_path_ != MoePath::kForceGemv && want_grouped) {
-    if (!run_moe_grouped(layer, batch, idx, wts)) {
+    m_mark("pre-grouped");
+  if (!run_moe_grouped(layer, batch, idx, wts)) {
       cudaMemsetAsync(acc_, 0, static_cast<std::size_t>(batch) * H * sizeof(bf16), stream_);
       run_moe_gemv(layer, batch, idx);
     }
   } else {
     run_moe_gemv(layer, batch, idx);
   }
+  m_mark("grouped_gemm_total");
 
   // Without overlap the step blocks here, exactly where the serialized
   // exchange always sat. With it, the shared expert's dense GEMMs are enqueued
@@ -1293,6 +1376,14 @@ void DecodeEngine::run_moe_post_stage(int layer, int batch) {
 // prior graphs first (destroy_graphs) since a graph captured for one batch
 // size bakes in that batch's kernel launch dimensions.
 void DecodeEngine::ensure_graphs_built(int batch) {
+  // Warm the grouped-GEMM workspace outside capture: the dense fp4 path runs
+  // inside captured segments, and a first-call workspace cudaMalloc cannot
+  // happen during stream capture. The warm-up writes only scratch buffers
+  // that every real layer overwrites.
+  if (w_.layer(0).dense.fp4_gate.packed != nullptr) {
+    for (int l = 0; l < cfg_.text_layers; ++l)
+      if (cfg_.layers[l].mlp == fuel::MlpKind::kDense) run_dense_mlp(l, batch);
+  }
   if (graph_batch_ == batch && !graph_execs_.empty()) return;
   destroy_graphs();
   graph_batch_ = batch;
@@ -1372,7 +1463,7 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
                   stream_);
 
   {
-    StageTimer t(stream_, &stages_.embed, collect_stages);
+    StageTimer t(stream_, &stages_.embed, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
     embed_streams(streams_, w_.embed(), tokens_dev_, batch, hc, H, stream_);
   }
 
@@ -1383,6 +1474,8 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
   // were never set.
   const bool use_graph = use_cuda_graph_ && !collect_stages && !telemetry_;
   if (use_graph) {
+    static bool said = false;
+    if (!said) { std::printf("[graph] capturing/replaying graph path\n"); said = true; }
     ensure_graphs_built(batch);
     run_step_layers_graph(batch);
   } else {
@@ -1393,7 +1486,7 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
 
     // ---- attention site ----
     {
-      StageTimer t(stream_, &stages_.hyper_connection, collect_stages);
+      StageTimer t(stream_, &stages_.hyper_connection, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       cudaMemcpyAsync(residual_, streams_, static_cast<std::size_t>(batch) * hc * H * sizeof(bf16),
                       cudaMemcpyDeviceToDevice, stream_);
       hc_mix_gemv(mix_, lw.attn_hc.fn, streams_, batch, cfg_.hc_mix(), hc, H, cfg_.rms_norm_eps,
@@ -1402,17 +1495,17 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
               hc, H, cfg_.hc_eps, cfg_.hc_sinkhorn_iters, stream_);
     }
     {
-      StageTimer t(stream_, &stages_.norms, collect_stages);
+      StageTimer t(stream_, &stages_.norms, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       rmsnorm(normed_, collapsed_, lw.input_norm, batch, H, cfg_.rms_norm_eps, stream_);
     }
     if (cfg_.layers[l].attn == fuel::AttnKind::kKda) {
-      StageTimer t(stream_, &stages_.kda, collect_stages);
+      StageTimer t(stream_, &stages_.kda, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       run_kda(l, kda_slot_[l], batch);
     } else {
       // The indexer runs inside the MLA layer; its cost is folded in here
       // rather than isolated by a sync, since a batched step has no
       // per-layer host readback of the selection count anymore.
-      StageTimer t(stream_, &stages_.mla, collect_stages);
+      StageTimer t(stream_, &stages_.mla, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       run_mla(l, mla_slot_[l], batch, n_tokens_dev_, n_pools_max);
     }
     if (dbg_l0) {
@@ -1449,13 +1542,13 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
       dump_bf16("streams_post_attn_combine", streams_, static_cast<std::size_t>(batch) * hc * H);
     }
     {
-      StageTimer t(stream_, &stages_.hyper_connection, collect_stages);
+      StageTimer t(stream_, &stages_.hyper_connection, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       hc_combine(streams_, post_, sublayer_out_, comb_, residual_, batch, hc, H, stream_);
     }
 
     // ---- feed-forward site ----
     {
-      StageTimer t(stream_, &stages_.hyper_connection, collect_stages);
+      StageTimer t(stream_, &stages_.hyper_connection, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       cudaMemcpyAsync(residual_, streams_, static_cast<std::size_t>(batch) * hc * H * sizeof(bf16),
                       cudaMemcpyDeviceToDevice, stream_);
       hc_mix_gemv(mix_, lw.ffn_hc.fn, streams_, batch, cfg_.hc_mix(), hc, H, cfg_.rms_norm_eps,
@@ -1464,18 +1557,18 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
               H, cfg_.hc_eps, cfg_.hc_sinkhorn_iters, stream_);
     }
     {
-      StageTimer t(stream_, &stages_.norms, collect_stages);
+      StageTimer t(stream_, &stages_.norms, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       rmsnorm(normed_, collapsed_, lw.post_attn_norm, batch, H, cfg_.rms_norm_eps, stream_);
     }
     if (cfg_.layers[l].mlp == fuel::MlpKind::kDense) {
-      StageTimer t(stream_, &stages_.dense_mlp, collect_stages);
+      StageTimer t(stream_, &stages_.dense_mlp, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       run_dense_mlp(l, batch);
     } else {
-      StageTimer t(stream_, &stages_.moe_experts, collect_stages);
+      StageTimer t(stream_, &stages_.moe_experts, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       run_moe(l, batch);
     }
     {
-      StageTimer t(stream_, &stages_.hyper_connection, collect_stages);
+      StageTimer t(stream_, &stages_.hyper_connection, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       hc_combine(streams_, post_, sublayer_out_, comb_, residual_, batch, hc, H, stream_);
     }
 
@@ -1488,7 +1581,7 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
 
   std::vector<int> next(batch, 0);
   {
-    StageTimer t(stream_, &stages_.lm_head, collect_stages);
+    StageTimer t(stream_, &stages_.lm_head, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
     hc_head_mean(hmean_, streams_, batch, hc, H, stream_);
     rmsnorm(normed_, hmean_, w_.final_norm(), batch, H, cfg_.rms_norm_eps, stream_);
     gemm_bf16_f32(logits_, w_.lm_head(), normed_, batch, cfg_.vocab_size, H, stream_);
@@ -1496,6 +1589,10 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
     cudaMemcpyAsync(next.data(), argmax_i_, batch * sizeof(int), cudaMemcpyDeviceToHost, stream_);
     cudaStreamSynchronize(stream_);
   }
+
+  
+
+  finish_stage_events();
 
   int moe_layers = 0;
   for (const fuel::LayerSpec& s : cfg_.layers)
@@ -1505,6 +1602,20 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
   for (int m = 0; m < batch; ++m) ++pos_[m];
   cuda_check(cudaGetLastError(), "decode step");
   out_tokens = std::move(next);
+}
+
+void DecodeEngine::finish_stage_events() {
+  if (prof_starts_.empty()) return;
+  for (std::size_t i = 0; i < prof_starts_.size(); ++i) {
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, prof_starts_[i], prof_stops_[i]);
+    *prof_sinks_[i] += ms;
+    cudaEventDestroy(prof_starts_[i]);
+    cudaEventDestroy(prof_stops_[i]);
+  }
+  prof_starts_.clear();
+  prof_stops_.clear();
+  prof_sinks_.clear();
 }
 
 }  // namespace rocket::engine

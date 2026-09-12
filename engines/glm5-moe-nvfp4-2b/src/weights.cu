@@ -317,7 +317,8 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
         // Hub fuel packs the dense MLP NVFP4. Scale is raw per-16-block e4m3
         // plus one f32 global and one f32 activation scale per projection,
         // matching ExpertDev's gemv operand convention.
-        auto dense_fp4 = [&](int n, int k_true, Nvfp4W& w4, float& a_in, const char* base) {
+        auto dense_fp4 = [&](int n, int k_true, Nvfp4W& w4, const std::uint8_t** sw,
+                             float& a_in, const char* base) {
           const std::string p_full = p + base;
           const fuel::TensorView& wt = ckpt_.tensor(p_full + ".weight");
           if (wt.numel() != static_cast<std::int64_t>(n) * k_true / 2)
@@ -329,15 +330,53 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
           auto* sd = static_cast<std::uint8_t*>(device_alloc(sc.numel()));
           copy_in(sd, sc.data, sc.numel());
           w4.scale = sd;
+          const fuel::SfLayout layout = fuel::sf_layout(n, k_true, 16);
+          if (layout.bytes() != sc.nbytes)
+            fail(p_full + ": scale size does not match the grouped SfLayout");
+          std::vector<std::uint8_t> swizzled(layout.bytes());
+          fuel::swizzle_block_scales(sc.data, layout, swizzled.data());
+          auto* swd = static_cast<std::uint8_t*>(device_alloc(swizzled.size()));
+          copy_in(swd, swizzled.data(), swizzled.size());
+          *sw = swd;
           const fuel::TensorView& g2 = ckpt_.tensor(p_full + ".weight_scale_2");
           std::memcpy(&w4.global, g2.data, sizeof(float));
           const fuel::TensorView& is = ckpt_.tensor(p_full + ".input_scale");
           std::memcpy(&a_in, is.data, sizeof(float));
         };
         w.dense = DenseMlpW{};
-        dense_fp4(I, H, w.dense.fp4_gate, w.dense.fp4_gate_in, "mlp.gate_proj");
-        dense_fp4(I, H, w.dense.fp4_up, w.dense.fp4_up_in, "mlp.up_proj");
-        dense_fp4(H, I, w.dense.fp4_down, w.dense.fp4_down_in, "mlp.down_proj");
+        // gate|up in one contiguous slab so the grouped GEMM reads them as
+        // the fused w13 operand, exactly like the MoE expert slots.
+        {
+          const fuel::TensorView& gw = ckpt_.tensor(p + "mlp.gate_proj.weight");
+          const fuel::TensorView& uw = ckpt_.tensor(p + "mlp.up_proj.weight");
+          const std::size_t per = static_cast<std::size_t>(I) * H / 2;
+          auto* w13 = static_cast<std::uint8_t*>(device_alloc(2 * per));
+          copy_in(w13, gw.data, per);
+          copy_in(w13 + per, uw.data, per);
+          w.dense.fp4_gate.packed = w13;
+          w.dense.fp4_up.packed = w13 + per;
+          const fuel::SfLayout lay = fuel::sf_layout(I, H, 16);
+          auto* w13s = static_cast<std::uint8_t*>(device_alloc(2 * lay.bytes()));
+          std::vector<std::uint8_t> sw(lay.bytes());
+          fuel::swizzle_block_scales(ckpt_.tensor(p + "mlp.gate_proj.weight_scale").data, lay,
+                                     sw.data());
+          copy_in(w13s, sw.data(), sw.size());
+          fuel::swizzle_block_scales(ckpt_.tensor(p + "mlp.up_proj.weight_scale").data, lay,
+                                     sw.data());
+          copy_in(w13s + lay.bytes(), sw.data(), sw.size());
+          w.dense.fp4_gate_sw = w13s;
+          w.dense.fp4_up_sw = w13s + lay.bytes();
+          const fuel::TensorView& gg = ckpt_.tensor(p + "mlp.gate_proj.weight_scale_2");
+          std::memcpy(&w.dense.fp4_gate.global, gg.data, sizeof(float));
+          const fuel::TensorView& gi = ckpt_.tensor(p + "mlp.gate_proj.input_scale");
+          std::memcpy(&w.dense.fp4_gate_in, gi.data, sizeof(float));
+          const fuel::TensorView& ug = ckpt_.tensor(p + "mlp.up_proj.weight_scale_2");
+          std::memcpy(&w.dense.fp4_up.global, ug.data, sizeof(float));
+          const fuel::TensorView& ui = ckpt_.tensor(p + "mlp.up_proj.input_scale");
+          std::memcpy(&w.dense.fp4_up_in, ui.data, sizeof(float));
+        }
+        dense_fp4(H, I, w.dense.fp4_down, &w.dense.fp4_down_sw, w.dense.fp4_down_in,
+                  "mlp.down_proj");
       } else {
       w.dense.gate = upload_bf16(p + "mlp.gate_proj.weight", static_cast<std::int64_t>(I) * H);
       w.dense.up = upload_bf16(p + "mlp.up_proj.weight", static_cast<std::int64_t>(I) * H);

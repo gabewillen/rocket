@@ -46,6 +46,7 @@ struct KvPages {
 // --- batched dense GEMM ----------------------------------------------------
 // y[m, n_rows] = x[m, k] . W[n_rows, k]^T.  W is row-major [n_rows, k] and is
 // shared by every stream.
+void mul_scalar_bf16(bf16* out, const bf16* in, float scalar, long long n, cudaStream_t s);
 void gemm_bf16(bf16* y, const bf16* w, const bf16* x, int batch, int n_rows, int k, cudaStream_t s);
 // Same, accumulating into an FP32 destination instead of BF16.
 void gemm_bf16_f32(float* y, const bf16* w, const bf16* x, int batch, int n_rows, int k,

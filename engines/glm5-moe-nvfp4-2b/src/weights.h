@@ -87,6 +87,11 @@ struct DenseMlpW {
   // bf16 members are null and run_dense_mlp uses the fp4 GEMV loop.
   Nvfp4W fp4_gate, fp4_up, fp4_down;
   float fp4_gate_in = 1.0f, fp4_up_in = 1.0f, fp4_down_in = 1.0f;
+  // Swizzled SFB copies for the grouped path (one group per projection);
+  // the raw scales above stay for provenance/debug.
+  const std::uint8_t* fp4_gate_sw = nullptr;
+  const std::uint8_t* fp4_up_sw = nullptr;
+  const std::uint8_t* fp4_down_sw = nullptr;
 };
 
 struct MoeW {

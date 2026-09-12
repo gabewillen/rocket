@@ -58,11 +58,12 @@ int main(int argc, char** argv) {
   const int n_new = std::atoi(arg_value(argc, argv, "--tokens", "20"));
   const double cache_gib = std::atof(arg_value(argc, argv, "--expert-cache-gib", "56"));
   const int max_tokens = std::atoi(arg_value(argc, argv, "--max-tokens", "4096"));
+  const int batch = std::atoi(arg_value(argc, argv, "--batch", "1"));
   const bool telemetry = arg_value(argc, argv, "--telemetry", "0")[0] == '1';
-  if (n_new <= 0 || max_tokens <= 0 || cache_gib < 0.0) {
+  if (n_new <= 0 || max_tokens <= 0 || cache_gib < 0.0 || batch <= 0) {
     std::fprintf(stderr, "bad sizing: --tokens %d --max-tokens %d --expert-cache-gib %g "
-                         "(all > 0, cache >= 0)\n",
-                 n_new, max_tokens, cache_gib);
+                         "--batch %d (all > 0, cache >= 0)\n",
+                 n_new, max_tokens, cache_gib, batch);
     return 2;
   }
 
@@ -80,8 +81,9 @@ int main(int argc, char** argv) {
   auto t_load = Clock::now();
   rocket::engine::DecodeEngine engine(cfg, snapshot,
                                       static_cast<std::size_t>(cache_gib * (1ull << 30)),
-                                      max_tokens, /*max_batch=*/1);
+                                      max_tokens, batch);
   engine.set_telemetry(telemetry);
+  if (arg_value(argc, argv, "--cuda-graph", "0")[0] == '1') engine.set_use_cuda_graph(true);
   const double load_ms = ms_since(t_load);
   std::printf("resident  %.2f GiB   expert cache %zu slots x %.2f MiB = %.2f GiB\n",
               engine.weights().resident_bytes() / 1073741824.0, engine.weights().expert_slots(),
@@ -94,31 +96,32 @@ int main(int argc, char** argv) {
 
   engine.reset();
 
-  // Prefill runs the decode path once per prompt token.
+  // Prefill runs the decode path once per prompt token; every stream gets
+  // the same prompt so the batch is full from the first step.
   auto t_prefill = Clock::now();
-  int next = 0;
   std::vector<int> next_batch;
+  std::vector<int> last(batch, 0);
   for (const int id : prompt_ids) {
-    engine.step(std::vector<int>{id}, next_batch, false);
-    next = next_batch[0];
+    engine.step(std::vector<int>(batch, id), next_batch, false);
+    for (int m = 0; m < batch; ++m) last[m] = next_batch[m];
   }
   const double prefill_ms = ms_since(t_prefill);
 
-  std::vector<int> generated;
+  std::vector<std::vector<int>> generated(batch);
   std::vector<double> token_ms;
-  const int instrument_at = std::max(0, std::min(n_new - 2, 9));
+  const int instrument_at = n_new > 12 ? n_new - 6 : std::max(0, n_new - 2);
   rocket::engine::StageMs stages;
   std::vector<float> rms;
   double entropy = 0.0;
 
   for (int i = 0; i < n_new; ++i) {
-    generated.push_back(next);
-    const bool last = (i == n_new - 1);
-    if (last) break;
+    for (int m = 0; m < batch; ++m) generated[m].push_back(last[m]);
+    const bool last_tok = (i == n_new - 1);
+    if (last_tok) break;
     const bool instrument = (i == instrument_at);
     const auto t0 = Clock::now();
-    engine.step(std::vector<int>{next}, next_batch, instrument);
-    next = next_batch[0];
+    engine.step(last, next_batch, instrument);
+    for (int m = 0; m < batch; ++m) last[m] = next_batch[m];
     const double dt = ms_since(t0);
     if (instrument) {
       stages = engine.stages();
@@ -130,19 +133,25 @@ int main(int argc, char** argv) {
   }
 
   std::printf("\n--- output ------------------------------------------------------\n");
-  std::printf("%s%s\n", prompt.c_str(), tok.decode(generated).c_str());
-  std::printf("--- token ids ---------------------------------------------------\n");
-  for (std::size_t i = 0; i < generated.size(); ++i)
-    std::printf("%d:%d |%s|%s", static_cast<int>(i), generated[i],
-                printable(tok.decode_one(generated[i])).c_str(), (i % 4 == 3) ? "\n" : "  ");
-  std::printf("\n");
+  if (batch == 1) {
+    std::printf("%s%s\n", prompt.c_str(), tok.decode(generated[0]).c_str());
+    std::printf("--- token ids ---------------------------------------------------\n");
+    for (std::size_t i = 0; i < generated[0].size(); ++i)
+      std::printf("%d:%d |%s|%s", static_cast<int>(i), generated[0][i],
+                  printable(tok.decode_one(generated[0][i])).c_str(), (i % 4 == 3) ? "\n" : "  ");
+    std::printf("\n");
+  } else {
+    std::printf("batch %d, stream 0: %s%s\n", batch, prompt.c_str(),
+                tok.decode(generated[0]).c_str());
+  }
 
   std::sort(token_ms.begin(), token_ms.end());
   const double median = token_ms.empty() ? 0.0 : token_ms[token_ms.size() / 2];
   std::printf("\n--- timing ------------------------------------------------------\n");
   std::printf("prefill              %8.1f ms for %zu tokens (%.1f ms/token)\n", prefill_ms,
               prompt_ids.size(), prefill_ms / static_cast<double>(prompt_ids.size()));
-  std::printf("decode median        %8.1f ms/token  (%.2f tok/s)\n", median,
+  std::printf("decode median        %8.1f ms/step  (%.2f agg tok/s at batch %d, %.2f tok/s/stream)\n",
+              median, median > 0 ? 1000.0 * batch / median : 0.0, batch,
               median > 0 ? 1000.0 / median : 0.0);
   if (!token_ms.empty())
     std::printf("decode min/max       %8.1f / %.1f ms\n", token_ms.front(), token_ms.back());

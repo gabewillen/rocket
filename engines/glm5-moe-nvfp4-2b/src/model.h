@@ -343,6 +343,18 @@ class DecodeEngine {
   // ---- CUDA graph capture (model.cu::ensure_graphs_built) ----
   std::vector<int> moe_layer_ids_;   // text-layer indices with sparse MLP, ascending
   bool use_cuda_graph_ = false;
+  // Dense-MLP fp4 grouped-path scratch (one group per projection).
+  std::uint8_t *dense_a1_packed_ = nullptr, *dense_a1_sf_ = nullptr;
+  std::uint8_t *dense_a2_packed_ = nullptr, *dense_a2_sf_ = nullptr;
+  bf16 *dense_gu_ = nullptr, *dense_down_raw_ = nullptr;
+  int *dense_row_in_group_ = nullptr, *dense_group_of_row_ = nullptr;
+  long long* dense_sf_base_ = nullptr;
+  float *dense_gate_global_ = nullptr, *dense_up_global_ = nullptr, *dense_down_global_ = nullptr;
+
+  // Event-based stage profiling storage (see StageTimer in model.cu).
+  std::vector<cudaEvent_t> prof_starts_, prof_stops_;
+  std::vector<double*> prof_sinks_;
+  void finish_stage_events();
   int graph_batch_ = -1;             // batch the cached graphs below were built for, -1 = none
   std::vector<cudaGraph_t> graphs_;
   std::vector<cudaGraphExec_t> graph_execs_;
