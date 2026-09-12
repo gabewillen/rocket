@@ -9,6 +9,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -249,6 +250,23 @@ Checkpoint::Checkpoint(std::filesystem::path snapshot_dir) : dir_(std::move(snap
   if (wm == nullptr || wm->kind != JsonValue::Kind::kObject)
     fail(index.string() + " has no weight_map object");
   for (const auto& [name, file] : *wm->object) weight_map_.emplace(name, file.str);
+
+  // Packed fast path: ROCKET_PACKED_WEIGHTS=<file.safetensors>. The packer
+  // (scripts/fuels/pack-resident-weights.py) re-emits the resident set as one
+  // safetensors file in upload order, so the packed file is just another
+  // shard: its tensor names take precedence over the index, everything else
+  // (routed experts) falls through to the shard path.
+  if (const char* packed = std::getenv("ROCKET_PACKED_WEIGHTS")) {
+    const std::filesystem::path pf(packed);
+    if (std::filesystem::exists(pf)) {
+      auto shard = std::make_unique<Shard>(pf);
+      for (const auto& [name, tv] : shard->tensors()) {
+        (void)tv;
+        weight_map_[name] = pf.filename().string();
+      }
+      shards_.emplace(pf.filename().string(), std::move(shard));
+    }
+  }
 }
 
 bool Checkpoint::has(std::string_view name) const {
@@ -260,8 +278,13 @@ Shard& Checkpoint::shard_for(std::string_view name) {
   if (it == weight_map_.end()) fail("tensor '" + std::string(name) + "' not in checkpoint index");
   const std::string& file = it->second;
   auto sit = shards_.find(file);
-  if (sit == shards_.end())
-    sit = shards_.emplace(file, std::make_unique<Shard>(dir_ / file)).first;
+  if (sit == shards_.end()) {
+    // The packed file lives outside dir_ when named by absolute path; the
+    // packer writes it into the fuel dir, so dir_/file resolves it.
+    std::filesystem::path p = dir_ / file;
+    if (!std::filesystem::exists(p)) p = file;  // absolute path fallback
+    sit = shards_.emplace(file, std::make_unique<Shard>(p)).first;
+  }
   return *sit->second;
 }
 

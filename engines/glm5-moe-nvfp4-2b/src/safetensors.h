@@ -99,6 +99,10 @@ class Checkpoint {
 
   std::filesystem::path dir_;
   std::map<std::string, std::string, std::less<>> weight_map_;
+  // Packed fast path (scripts/fuels/pack-resident-weights.py): one mmap for
+  // the whole resident set; tensors not in the manifest fall through to the
+  // shard path (routed experts always do, they stream on demand).
+  std::map<std::string, const TensorView*, std::less<>> tensors_from_packed_;
   std::map<std::string, std::unique_ptr<Shard>, std::less<>> shards_;
 };
 
