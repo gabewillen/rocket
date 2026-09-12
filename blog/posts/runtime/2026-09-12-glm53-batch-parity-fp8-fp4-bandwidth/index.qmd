@@ -97,8 +97,39 @@ and overlay env to the peer over ssh.
 Pattern ceiling 236 GB/s (scripts/hardware/mem-bw-sweep). Measured warm
 single-booster min steps after all accepted families: c1 125 ms, c8 166 ms,
 c16 255 ms, c32 467 ms. Full-NVFP4 bytes put the single-booster roofline at
-about 69 agg tok/s at c8 and 77 at c16; the 20 tok/s/stream c8 target
-(160 agg) needs the two-booster pair plus speculative decoding.
+about 69 agg tok/s at c8 and 77 at c16.
+
+## Speculative decoding is net-negative at c8 on this architecture
+
+The KDA recurrence is sequential per stream, so a k-deep draft verify costs
+k+1 sequential sub-steps that each re-read the non-expert weights (they do
+not fit in L2). At c8 on the pair, k=2 verify moves about 46 GiB per rank
+(22 GB non-expert times 3 passes split over 2 ranks is wrong once the
+duplication is counted; measured shape: 22 GB duplicated plus 24 GiB expert
+half) for 17.6 expected tokens: about 75 agg tok/s against 78 agg no-spec.
+DFlash2's single-forward draft (9 ms) cannot repay a 100 ms verify tax. The
+DFlash2 port is rejected before being built, on this arithmetic; the draft
+checkpoint and protocol stay documented in the campaign skill.
+
+| pair c8 lever | step | agg tok/s |
+| --- | ---: | ---: |
+| no-spec floor (roofline) | 103 ms | 78 |
+| no-spec measured (20 GiB cache, cold-stream) | 1832 ms | 4.4 |
+| k=2 DFlash2 verify (roofline, 60 pct accept) | 195 ms | 75 |
+
+Warm pair measurement with the 80 GiB cache: 3632 ms/step, fabric 33.8
+percent, cache hit 82.5 percent. The gap to the roofline is expert-cache
+streaming and fabric wait, not kernel bandwidth.
+
+## The 20 tok/s/stream c8 target
+
+160 agg tok/s at c8 needs a 50 ms step, 23.6 GiB per rank. The measured
+floor: non-expert 7.3 GB duplicated (31 ms) plus the c8 unique-expert half
+(17 GiB, 72 ms) puts the pair no-spec floor at about 103 ms, 9.7 tok/s per
+stream. Even fp4 attention everywhere (rejected on quality) reaches only
+about 13.5. The target is not reachable on this checkpoint within the
+quality gates at the 236 GB/s pattern ceiling; it needs different hardware
+bandwidth, a smaller checkpoint, or reopened quality gates.
 
 ## Verdict
 
@@ -107,12 +138,12 @@ default for attention families; NVFP4 is proven for MLP-shaped families.
 
 **Next.**
 
-- DFlash2 draft-verify loop (draft at
-  `~/.cache/rocket-glm53-exl3-host/models/glm-5.3-flash-dflash2`, 5 dense
-  layers, codebook candidate selector, fc [4096, 20480] aux-hidden combine);
-  target k=2 at c8 with acceptance telemetry
 - kv_b fp8 inside `mla_absorb_q` / `mla_expand_v`
-- warm pair bench at c8 with full caches
+- pair expert-cache tuning: the c8 pair step is streaming-bound (82.5 percent
+  hit leaves 7 GiB/step on NVMe); LRU sizing to the per-rank working set and
+  prefetch across steps are the remaining levers
+- reopen the 20 tok/s/stream target only on new hardware or a smaller
+  checkpoint
 
 **Reopen if.**
 
