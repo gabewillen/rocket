@@ -161,6 +161,15 @@ Shard::Shard(const std::filesystem::path& file) : path_(file) {
 
     tv.data = payload + begin;
     tv.nbytes = end - begin;
+    if (std::getenv("ROCKET_DEBUG_LAYER0") != nullptr && tv.dtype == DType::kF32 &&
+        tv.nbytes == 131072 && name.find("layers.0.") != std::string::npos &&
+        name.find("conv1d") != std::string::npos) {
+      const auto* f = reinterpret_cast<const float*>(tv.data);
+      std::printf("[dbg-st] %s\n  file=%s header_len=%zu begin=%zu end=%zu map=%p\n"
+                  "  f32[0..3]=%.6g %.6g %.6g %.6g\n",
+                  name.c_str(), file.string().c_str(), header_len, begin, end, map_,
+                  f[0], f[1], f[2], f[3]);
+    }
     tensors_.emplace(name, std::move(tv));
   }
 }
@@ -257,6 +266,37 @@ Shard& Checkpoint::shard_for(std::string_view name) {
 }
 
 const TensorView& Checkpoint::tensor(std::string_view name) { return shard_for(name).at(name); }
+
+void Checkpoint::debug_probe(std::string_view name) {
+  const TensorView& tv = shard_for(name).at(name);
+  const Shard& sh = shard_for(name);
+  const auto* f = reinterpret_cast<const float*>(tv.data);
+  std::printf("[dbg-probe] %s\n  mmap: %.6g %.6g %.6g %.6g\n", std::string(name).c_str(),
+              f[0], f[1], f[2], f[3]);
+  int fd = ::open(sh.path().c_str(), O_RDONLY);
+  if (fd >= 0) {
+    // recompute the file offset the same way the parser does: walk the header
+    // is expensive; instead seek by the tv.data delta from the map base is not
+    // available here, so re-parse just this tensor's offsets from the header.
+    // Cheap approximation: read 16 bytes at every 4-aligned offset in the
+    // first 4 MiB of the payload and report any that match the mmap garbage.
+    std::vector<char> buf(1u << 22);
+    ssize_t got = ::pread(fd, buf.data(), buf.size(), 0);
+    ::close(fd);
+    if (got > 0) {
+      int hits = 0;
+      for (std::size_t off = 8; off + 16 < static_cast<std::size_t>(got); off += 4) {
+        float v;
+        std::memcpy(&v, buf.data() + off, 4);
+        if (v == f[0] && f[0] > 1e8f) {
+          std::printf("  file byte %zu holds the garbage value %.6g\n", off, v);
+          if (++hits >= 3) break;
+        }
+      }
+      if (hits == 0) std::printf("  garbage value NOT found in first 4MiB of file\n");
+    }
+  }
+}
 
 const Shard& Checkpoint::mapped_shard_for(std::string_view name) const {
   auto it = weight_map_.find(name);

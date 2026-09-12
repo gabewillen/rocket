@@ -93,7 +93,12 @@ void kda_norm_qk(bf16* q, bf16* k, int batch, int heads, int head_dim, int row_s
                  cudaStream_t s);
 void kda_sigmoid(bf16* out, const bf16* in, int n, cudaStream_t s);
 // One recurrent step: S = diag(exp(g)) S; delta = beta*(v - S^T k); S += k delta^T; o = S^T q.
-// `state` is [batch, heads, head_dim, head_dim].
+// `state` is [batch, heads, head_dim, head_dim], stored FP32. The launcher
+// (kernels.cu) is the register-split kernel adopted from
+// bench/kda_step_dropin.cuh, which keeps each thread's slice of the state
+// tile in registers (not shared memory) and reduces partial sums through a
+// small shared buffer. Persistent state stays FP32 because the measured BF16
+// storage candidate diverged on 7/8 real prompts within 40 greedy tokens.
 void kda_recurrent_step(float* state, bf16* o, const bf16* q, const bf16* k, const bf16* v,
                         const bf16* g, const bf16* beta, int batch, int heads, int head_dim,
                         int row_stride, cudaStream_t s);
@@ -165,7 +170,8 @@ void swiglu_clamped(bf16* out, const bf16* gate, const bf16* up, int n, float li
 // Same, over the fused w13 output of the grouped path: `gu` is [rows, 2*inter]
 // with the gate half first, and each half carries its own NVFP4 per-tensor
 // scale, which the grouped GEMM leaves out of its epilogue (alpha is one
-// scalar per launch and the two halves do not share a scale).
+// scalar per launch and the two halves do not share a scale). The input-scale
+// arrays are ModelOpt's per-expert static activation alpha; nullptr means 1.
 void swiglu_grouped(bf16* out, const bf16* gu, const float* gate_global, const float* up_global,
                     const int* group_of_row, int rows, int inter, float limit, cudaStream_t s);
 

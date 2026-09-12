@@ -76,21 +76,30 @@ float sigmoidf_h(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 // ------------------------------------------------------------------ gemv
 void test_gemv() {
-  const int N = 257, K = 512;
-  const std::vector<float> w = randn(N * K), x = randn(K);
-  std::vector<float> ref(N);
-  for (int n = 0; n < N; ++n) {
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) acc += w[n * K + k] * x[k];
-    ref[n] = acc;
+  const int M = 8, N = 257, K = 512;
+  const std::vector<float> w = randn(N * K), x = randn(M * K);
+  std::vector<float> ref(M * N);
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; ++n) {
+      float acc = 0.0f;
+      for (int k = 0; k < K; ++k) acc += w[n * K + k] * x[m * K + k];
+      ref[m * N + n] = acc;
+    }
   }
   auto dw = to_dev(as_bf16(w));
   auto dx = to_dev(as_bf16(x));
   float* dy = nullptr;
-  cudaMalloc(&dy, N * sizeof(float));
-  rocket::engine::gemm_bf16_f32(dy, dw, dx, 1, N, K, nullptr);
+  cudaMalloc(&dy, M * N * sizeof(float));
+  rocket::engine::gemm_bf16_f32(dy, dw, dx, M, N, K, nullptr);
   cudaDeviceSynchronize();
-  check("gemv_bf16_f32", rel_err(to_host(dy, N), ref), 2e-3);
+  check("batched gemm bf16->f32", rel_err(to_host(dy, M * N), ref), 2e-3);
+
+  bf16* dy_bf16 = nullptr;
+  cudaMalloc(&dy_bf16, M * N * sizeof(bf16));
+  rocket::engine::gemm_bf16(dy_bf16, dw, dx, M, N, K, nullptr);
+  cudaDeviceSynchronize();
+  check("batched gemm bf16->bf16", rel_err(as_float(to_host(dy_bf16, M * N)), ref), 4e-3);
+  cudaFree(dy_bf16);
   cudaFree(dw); cudaFree(dx); cudaFree(dy);
 }
 
@@ -204,7 +213,11 @@ void test_hyperconnection() {
 // Reference: recurrent_kimi_delta_attention, plus the conv update, the forget
 // gate, and the gated output norm around it.
 void test_kda() {
-  const int heads = 8, hd = 128, qkv = heads * hd, kernel = 4, taps = 3;
+  // heads=64, hd=128: kda_recurrent_step's kernel is now the register-split
+  // drop-in (bench/kda_step_dropin.cuh), specialized to this fuel's checkpoint
+  // dims (fuels/glm-5.3-flash/attention.yaml) rather than a generic shape, so
+  // the synthetic check below has to run at the real dims to call it at all.
+  const int heads = 64, hd = 128, qkv = heads * hd, kernel = 4, taps = 3;
   const float lower = -5.0f, eps = 1e-5f;
   const std::vector<float> in = randn(3 * qkv), cw = randn(3 * qkv * kernel, 0.3f);
   std::vector<float> cstate = randn(3 * qkv * taps);
@@ -294,6 +307,8 @@ void test_kda() {
   cudaDeviceSynchronize();
   check("kda forget gate", rel_err(as_float(to_host(dg, qkv)), g), 5e-3);
 
+  // Persistent state remains FP32. The register-split kernel changes where
+  // the tile lives, without changing its arithmetic or storage contract.
   auto dstate = to_dev(state);
   auto dbeta = to_dev(as_bf16(beta));
   bf16* dout = nullptr;
@@ -536,25 +551,31 @@ void test_moe_grouped_kernels() {
   const std::vector<int> sg_group_of_row = {0, 1, 0, 1};
   const std::vector<float> gate_global = {1.3f, 0.4f};
   const std::vector<float> up_global = {0.7f, 2.1f};
+  const std::vector<float> gate_input_scale = {0.5f, 1.7f};
+  const std::vector<float> up_input_scale = {1.2f, 0.6f};
   const float limit = 6.0f;
   const std::vector<float> gu = randn(static_cast<std::size_t>(sg_rows) * 2 * inter, 4.0f);
   auto d_gu = to_dev(as_bf16(gu));
   auto d_gate_g = to_dev(gate_global);
   auto d_up_g = to_dev(up_global);
+  auto d_gate_a = to_dev(gate_input_scale);
+  auto d_up_a = to_dev(up_input_scale);
   auto d_sg_group = to_dev(sg_group_of_row);
   bf16* d_sg_out = nullptr;
   cudaMalloc(&d_sg_out, static_cast<std::size_t>(sg_rows) * inter * sizeof(bf16));
-  rocket::engine::swiglu_grouped(d_sg_out, d_gu, d_gate_g, d_up_g, d_sg_group, sg_rows, inter, limit,
-                                 nullptr);
+  rocket::engine::swiglu_grouped(d_sg_out, d_gu, d_gate_g, d_up_g, d_sg_group, sg_rows, inter,
+                                 limit, nullptr);
   cudaDeviceSynchronize();
   const auto sg_got = as_float(to_host(d_sg_out, static_cast<std::size_t>(sg_rows) * inter));
   std::vector<float> sg_ref(static_cast<std::size_t>(sg_rows) * inter);
   for (int r = 0; r < sg_rows; ++r) {
     const int g = sg_group_of_row[r];
     for (int c = 0; c < inter; ++c) {
-      const float gate = std::min(bf(gu[static_cast<std::size_t>(r) * 2 * inter + c]) * gate_global[g], limit);
+      const float gate = std::min(bf(gu[static_cast<std::size_t>(r) * 2 * inter + c]) * gate_global[g],
+                                  limit);
       const float up = std::min(
-          std::max(bf(gu[static_cast<std::size_t>(r) * 2 * inter + inter + c]) * up_global[g], -limit),
+          std::max(bf(gu[static_cast<std::size_t>(r) * 2 * inter + inter + c]) * up_global[g],
+                   -limit),
           limit);
       sg_ref[static_cast<std::size_t>(r) * inter + c] = gate * sigmoidf_h(gate) * up;
     }

@@ -166,9 +166,31 @@ const bf16* WeightStore::upload_concat(const std::vector<std::string>& names,
     if (f32_from_conv && t.dtype == fuel::DType::kF32) {
       std::vector<std::uint16_t> host(t.numel());
       const auto* src = reinterpret_cast<const std::uint32_t*>(t.data);
-      for (std::size_t i = 0; i < t.numel(); ++i)
-        host[i] = rocket::fuel::float_to_bf16(static_cast<float>(src[i]));
+      if (std::getenv("ROCKET_DEBUG_LAYER0") != nullptr && n.find("layers.0.") != std::string::npos) {
+        std::printf("[dbg-up] %s data=%p nbytes=%zu numel=%lld f32[0..3]=%.6g %.6g %.6g %.6g\n",
+                    n.c_str(), (const void*)t.data, t.nbytes, (long long)t.numel(),
+                    static_cast<float>(src[0]), static_cast<float>(src[1]),
+                    static_cast<float>(src[2]), static_cast<float>(src[3]));
+        ckpt_.debug_probe(n);
+      }
+      for (std::size_t i = 0; i < t.numel(); ++i) {
+        float bits;
+        std::memcpy(&bits, &src[i], 4);  // bit-reinterpret, not integer conversion
+        host[i] = rocket::fuel::float_to_bf16(bits);
+      }
+      if (std::getenv("ROCKET_DEBUG_LAYER0") != nullptr && n.find("layers.0.") != std::string::npos) {
+        std::printf("[dbg-up] %s host bf16[0..7] =", n.c_str());
+        for (int i = 0; i < 8; ++i) std::printf(" %04x", host[i]);
+        std::printf("\n");
+      }
       copy_in(d + off, host.data(), host.size() * 2);
+      if (std::getenv("ROCKET_DEBUG_LAYER0") != nullptr && n.find("layers.0.") != std::string::npos) {
+        std::vector<std::uint16_t> back(8);
+        cudaMemcpy(back.data(), d + off, 16, cudaMemcpyDeviceToHost);
+        std::printf("[dbg-up] %s device readback =", n.c_str());
+        for (int i = 0; i < 8; ++i) std::printf(" %04x", back[i]);
+        std::printf("  (d=%p off=%zu)\n", (void*)d, off);
+      }
       record_dtype(n, fuel::DType::kBF16);
       off += host.size() * 2;
       continue;

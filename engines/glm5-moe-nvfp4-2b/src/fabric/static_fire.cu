@@ -244,6 +244,15 @@ int main(int argc, char** argv) {
     engine.set_expert_parallel(ep.get());
     engine.set_expert_parallel_overlap(arg_value(argc, argv, "--overlap", "0")[0] == 0x31);
   }
+  if (parallel && arg_value(argc, argv, "--preload-owned", "0")[0] == 0x31) {
+    const auto preload_start = Clock::now();
+    const std::size_t bytes0 = engine.weights().expert_bytes_streamed();
+    const std::size_t loaded = engine.weights().preload_owned_experts(nullptr);
+    const std::size_t bytes = engine.weights().expert_bytes_streamed() - bytes0;
+    std::printf("rank %d: preloaded %zu owned expert-layer weights, %.2f GiB in %.1f s\n", rank,
+                loaded, bytes / 1073741824.0, ms_since(preload_start) / 1000.0);
+    std::fflush(stdout);
+  }
   engine.set_use_cuda_graph(arg_value(argc, argv, "--cuda-graph", "0")[0] == 0x31);
   std::printf("rank %d: overlap %s, cuda graph %s\n", rank,
               engine.expert_parallel_overlap() ? "on" : "off",

@@ -32,6 +32,20 @@ add_test(NAME batch-parity COMMAND test-batch-parity)
 # count, so the budget is doubled rather than padded arbitrarily.
 set_tests_properties(batch-parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 7200)
 
+# KDA recurrent-state dtype parity: BF16 storage / FP32 compute (this
+# change) against a hardcoded FP32-storage reference, 8 prompts x 40 greedy
+# tokens each. Real weights, one engine load at max_batch=1.
+# M=8 concurrent streams sharing pool pages (real weights) with a 30-token
+# shared prefix then a 20-token fork into two diverging continuations, each
+# checked bit-for-bit against an unforked reference of the same full
+# sequence. Real weights, real pool.
+add_executable(test-kv-fork-real test_kv_fork_real.cu)
+target_link_libraries(test-kv-fork-real PRIVATE rocket_engine rocket_fuel)
+set_target_properties(test-kv-fork-real PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME kv-fork-real COMMAND test-kv-fork-real)
+set_tests_properties(kv-fork-real PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
+
 # The balanced expert partition. Pure host code over a synthetic histogram, so
 # it needs no checkpoint and no peer and never skips.
 add_executable(test-expert-balance test_expert_balance.cc)

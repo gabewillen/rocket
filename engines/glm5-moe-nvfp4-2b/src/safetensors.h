@@ -86,6 +86,7 @@ class Checkpoint {
   bool has(std::string_view name) const;
   // Maps the owning shard if needed. Throws std::runtime_error if absent.
   const TensorView& tensor(std::string_view name);
+  void debug_probe(std::string_view name);
   std::vector<std::string> names_with_prefix(std::string_view prefix) const;
 
   const std::filesystem::path& dir() const { return dir_; }

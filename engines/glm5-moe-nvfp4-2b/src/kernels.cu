@@ -1,7 +1,18 @@
 #include "kernels.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_fp8.h>
 #include <math_constants.h>
+
+// Register-split KDA recurrent step, adopted from the kernels lane's bench
+// (bench/kda_step_dropin.cuh; blog/posts/kernels/2026-09-08-kda-state-tile-
+// out-of-shared-memory/): the FP32 128x128 state tile moves out of shared
+// memory into per-thread registers, which is what let the block count per SM
+// rise, 4.6x faster at M=8 with identical arithmetic. The header is
+// include-only (templates and device functions), so it is used directly
+// below rather than pulled in as a second engine source file.
+#include "../bench/kda_step_dropin.cuh"
 
 namespace rocket::engine {
 namespace {
@@ -56,6 +67,36 @@ __global__ void gemm_kernel(Out* __restrict__ y, const bf16* __restrict__ w,
       yr[row] = total;
     } else {
       yr[row] = b(total);
+    }
+  }
+}
+
+// Batched GEMM with batch-invariant reduction order: every output element
+// accumulates over k in the same thread-strided + block_sum order as the
+// batch-1 gemm_kernel above, so M=1 and M=B produce bit-identical results.
+// The weight row is read once per block and shared across the batch
+// accumulators, which keeps decode weight traffic at one pass per matrix.
+template <typename Out, int BATCH>
+__global__ void gemm_batched_kernel(Out* __restrict__ y, const bf16* __restrict__ w,
+                                    const bf16* __restrict__ x, int n_rows, int k, int batch) {
+  __shared__ float red[32];
+  const long long row = blockIdx.x;
+  const bf16* wr = w + row * static_cast<long long>(k);
+  float acc[BATCH];
+  for (int m = 0; m < BATCH; ++m) acc[m] = 0.0f;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    const float wv = f(wr[i]);
+    for (int m = 0; m < BATCH; ++m) acc[m] += wv * f(x[static_cast<long long>(m) * k + i]);
+  }
+  for (int m = 0; m < batch; ++m) {
+    const float total = block_sum(acc[m], red);
+    if (threadIdx.x == 0) {
+      Out* yr = y + static_cast<long long>(m) * n_rows;
+      if constexpr (sizeof(Out) == 4) {
+        yr[row] = total;
+      } else {
+        yr[row] = b(total);
+      }
     }
   }
 }
@@ -294,8 +335,7 @@ __global__ void sigmoid_kernel(bf16* __restrict__ out, const bf16* __restrict__ 
   if (i < n) out[i] = b(sigmoidf(f(in[i])));
 }
 
-// One block per (head, stream). Thread j owns value column j; the state tile
-// is staged in shared so the recurrence reads it once and writes it once.
+
 __global__ void kda_step_kernel(float* __restrict__ state, bf16* __restrict__ o,
                                 const bf16* __restrict__ q, const bf16* __restrict__ k,
                                 const bf16* __restrict__ v, const bf16* __restrict__ g,
@@ -969,12 +1009,38 @@ __global__ void absmax_kernel(float* __restrict__ out, const bf16* __restrict__ 
 
 // --------------------------------------------------------------- launchers
 
+template <typename Out>
+void gemm_dispatch(Out* y, const bf16* w, const bf16* x, int batch, int n_rows, int k,
+                   cudaStream_t s) {
+  if (batch <= 1) {
+    gemm_kernel<Out><<<n_rows, 256, 0, s>>>(y, w, x, n_rows, k);
+    return;
+  }
+  // Chunks of at most 16 streams; the per-element reduction order is
+  // chunk-invariant, so splitting a wide batch changes nothing bit-wise.
+  int m0 = 0;
+  while (m0 < batch) {
+    const int rem = batch - m0;
+    const int b = rem < 16 ? rem : 16;
+    Out* y_part = y + static_cast<std::size_t>(m0) * n_rows;
+    const bf16* x_part = x + static_cast<std::size_t>(m0) * k;
+    if (b <= 2)
+      gemm_batched_kernel<Out, 2><<<n_rows, 256, 0, s>>>(y_part, w, x_part, n_rows, k, b);
+    else if (b <= 4)
+      gemm_batched_kernel<Out, 4><<<n_rows, 256, 0, s>>>(y_part, w, x_part, n_rows, k, b);
+    else if (b <= 8)
+      gemm_batched_kernel<Out, 8><<<n_rows, 256, 0, s>>>(y_part, w, x_part, n_rows, k, b);
+    else
+      gemm_batched_kernel<Out, 16><<<n_rows, 256, 0, s>>>(y_part, w, x_part, n_rows, k, b);
+    m0 += b;
+  }
+}
 void gemm_bf16(bf16* y, const bf16* w, const bf16* x, int batch, int n_rows, int k, cudaStream_t s) {
-  gemm_kernel<bf16><<<dim3(n_rows, batch), 256, 0, s>>>(y, w, x, n_rows, k);
+  gemm_dispatch<bf16>(y, w, x, batch, n_rows, k, s);
 }
 void gemm_bf16_f32(float* y, const bf16* w, const bf16* x, int batch, int n_rows, int k,
                    cudaStream_t s) {
-  gemm_kernel<float><<<dim3(n_rows, batch), 256, 0, s>>>(y, w, x, n_rows, k);
+  gemm_dispatch<float>(y, w, x, batch, n_rows, k, s);
 }
 void rmsnorm(bf16* out, const bf16* x, const bf16* weight, int batch, int n, float eps,
             cudaStream_t s) {
@@ -1027,6 +1093,12 @@ void kda_norm_qk(bf16* q, bf16* k, int batch, int heads, int head_dim, int row_s
 void kda_sigmoid(bf16* out, const bf16* in, int n, cudaStream_t s) {
   sigmoid_kernel<<<(n + 255) / 256, 256, 0, s>>>(out, in, n);
 }
+// Register-split drop-in (bench/kda_step_dropin.cuh, adopted whole): the
+// state tile lives in per-thread registers instead of a 67 KiB shared-memory
+// block, R=4 rows x C=1 column per thread at this fuel's HEADS=64, DK=128
+// (fuels/glm-5.3-flash/attention.yaml), tuned for the FP32 state this engine
+// stores (kda_state_, model.h). Both dims are checkpoint constants, so a
+// mismatch is a build-time fact, not a runtime shape this kernel handles.
 void kda_recurrent_step(float* state, bf16* o, const bf16* q, const bf16* k, const bf16* v,
                         const bf16* g, const bf16* beta, int batch, int heads, int head_dim,
                         int row_stride, cudaStream_t s) {
