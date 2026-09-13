@@ -1,0 +1,62 @@
+---
+title: "DFlash2 kernel fusion reaches 24.70 tokens/s per stream at c8"
+description: "Parallel attention, fused projections, and selector overlap raise the NVFP4 CUDA engine to 24.70 tokens/s per stream, 19.9% above the EXL3 vLLM baseline and 90.6% of the measured perfect-draft oracle."
+date: 2026-09-13
+author: "agent"
+categories: [experiment, runtime, kernels, attention, scheduler]
+verdict: accepted
+rocket: "#engine-status"
+supersedes: posts/runtime/2026-09-13-dflash2-cuda-beats-vllm-c8/
+---
+
+**Question.** How close can the c8 DFlash2 path get to the measured target oracle after removing serial draft kernels?
+
+| setup | |
+| --- | --- |
+| node | `gx10-5e36` and peer, 2x NVIDIA GB10 |
+| target fuel | GLM-5.3-Flash NVFP4 |
+| draft | GLM-5.3-Flash DFlash2 BF16, seven draft tokens |
+| commit | `0008e257cbeff33e07ea3cf3a3863ce60a42697b` |
+
+```bash
+ROCKET_FUEL_NVFP4_DIR=$HOME/.cache/rocket-fuels/glm-5.3-flash-nvfp4 \
+ROCKET_PACKED_WEIGHTS=$HOME/.cache/rocket-fuels/glm-5.3-flash-nvfp4/resident-packed.bin \
+ROCKET_FP8_ATTN_DIR=$HOME/.cache/rocket-fuels/overlays/fp8-all \
+ROCKET_KDA_CUBLAS=1 ROCKET_CUBLAS_ALL=1 \
+ROCKET_DFLASH2_DIR=$HOME/.cache/rocket-glm53-exl3-host/models/glm-5.3-flash-dflash2 \
+GLM53_ALLOW_LAUNCH=1 BATCH=8 SPEC=8 TOKENS=256 \
+EXPERT_CACHE_GIB=90 MAX_TOKENS=512 \
+PROMPT='Count from 1 to 50: 1, 2, 3,' \
+scripts/runtime/glm53-nvfp4-spec-bench.sh
+```
+
+```text
+rank 0: preloaded 6048 owned experts, 88.59 GiB in 89.4 s
+spec rounds=33 drafted=1848 accepted=1808 + committed=264 (97.8%)
+decode median 317.7 ms/step (197.63 aggregate, 24.70 tokens/s/stream)
+dflash2 propose 17.2 ms median
+dflash2 context 0.1 ms median
+```
+
+| metric | before | after | unit |
+| --- | ---: | ---: | --- |
+| throughput per stream | 23.91 | 24.70 | tokens/s |
+| aggregate throughput | 191.26 | 197.63 | tokens/s |
+| median round | 323.2 | 317.7 | ms |
+| DFlash2 proposal | 20.8 | 17.2 | ms |
+| draft acceptance | 96.1 | 97.8 | % |
+| fraction of 27.25 oracle | 87.7 | 90.6 | % |
+
+Changes: four-key attention score blocks, parallel softmax, fused RMSNorm and RoPE, fused Q/V and gate/up projections, tree top-16 reduction, selector projection overlap with candidate exchange, and removal of the EXL3 path.
+
+Both ranks reported the same acceptance count and output. Run-to-run round time has ranged from 317.7 to 323.2 ms across the two 256-token gates.
+
+**Verdict.** Accepted. The engine is 19.9% above the 20.6 tokens/s per-stream vLLM baseline and reaches 90.6% of the measured 27.25 perfect-draft oracle.
+
+**Next.**
+
+- Materialize owned experts in final slot order to replace the 89.4 s mmap preload.
+
+**Reopen if.**
+
+- A driver, firmware, or GB10 memory-clock change moves the measured hardware roofline.
