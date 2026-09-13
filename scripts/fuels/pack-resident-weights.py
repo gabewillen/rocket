@@ -111,9 +111,10 @@ def main() -> int:
         print(f"missing {len(missing)} tensors, e.g. {missing[:3]}", file=sys.stderr)
         return 2
 
-    # Emit one safetensors file: JSON header with data_offsets, then the blob
-    # in shard order (each shard's region read sequentially).
-    plan.sort(key=lambda t: (t[1], t[2]))
+    # Emit one safetensors file in WeightStore upload order. Serving asks for
+    # tensors in exactly this sequence, so 64 KiB mmap faults advance through
+    # one file instead of seeking across a shard-sorted 17 GiB payload. Source
+    # locality matters only during this one-time materialization.
     header_entries = {}
     blob_off = 0
     for n, shard, s, nb in plan:
@@ -122,7 +123,9 @@ def main() -> int:
                              "data_offsets": [blob_off, blob_off + nb]}
         blob_off += nb
     header_json = json.dumps(header_entries, separators=(",", ":")).encode()
-    pad = (8 - len(header_json) % 8) % 8
+    # O_DIRECT readers need both the payload origin and final file length on a
+    # 64 KiB boundary. Spaces are valid safetensors header padding.
+    pad = (65536 - (8 + len(header_json)) % 65536) % 65536
     header_json += b" " * pad
     written = 0
     handles = {}
@@ -144,6 +147,10 @@ def main() -> int:
                 w.write(chunk)
                 remaining -= len(chunk)
             written += nb
+        tail = (-written) % 65536
+        if tail:
+            w.write(bytes(tail))
+            written += tail
     for h in handles.values():
         h.close()
     print(f"packed {written/2**30:.2f} GiB, {len(plan)} tensors -> {out}")

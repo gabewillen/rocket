@@ -41,6 +41,8 @@ struct TensorView {
   std::vector<std::int64_t> shape;
   const std::uint8_t* data = nullptr;
   std::size_t nbytes = 0;
+  std::filesystem::path source_file;
+  std::uint64_t file_offset = 0;
 
   std::int64_t numel() const;
 };

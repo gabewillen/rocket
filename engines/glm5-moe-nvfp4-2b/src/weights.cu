@@ -3,14 +3,24 @@
 #include "nvfp4.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
+#include <future>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
+
+extern "C" unsigned char* SHA256(const unsigned char*, std::size_t, unsigned char*);
 
 namespace rocket::engine {
 namespace {
@@ -29,6 +39,49 @@ std::string layer_prefix(int l) {
 
 std::size_t align_up(std::size_t v, std::size_t a) { return (v + a - 1) / a * a; }
 
+constexpr std::size_t kPageBytes = 65536;
+constexpr std::size_t kDirectChunkBytes = 256u << 20;
+constexpr int kDirectPipelineSlots = 4;
+constexpr std::size_t kSha256Bytes = 32;
+
+#pragma pack(push, 1)
+struct ExpertSlabHeader {
+  char magic[16];
+  std::uint32_t version;
+  std::uint32_t page_bytes;
+  std::uint64_t metadata_bytes;
+  std::uint64_t payload_offset;
+  std::uint64_t payload_bytes;
+  std::uint64_t slot_bytes;
+  std::uint64_t slot_count;
+  std::uint32_t hidden;
+  std::uint32_t intermediate;
+  std::uint32_t layers;
+  std::uint32_t experts;
+  std::uint32_t first_expert;
+  std::uint32_t expert_count;
+  std::uint32_t sparse_layers;
+  std::uint8_t config_sha256[32];
+  std::uint8_t index_sha256[32];
+};
+#pragma pack(pop)
+static_assert(sizeof(ExpertSlabHeader) == 156);
+
+void read_exact_at(int fd, void* dst, std::size_t bytes, std::uint64_t offset,
+                   const std::filesystem::path& path) {
+  auto* out = static_cast<std::uint8_t*>(dst);
+  std::size_t done = 0;
+  while (done < bytes) {
+    const ssize_t got = ::pread(fd, out + done, bytes - done,
+                                static_cast<off_t>(offset + done));
+    if (got < 0 && errno == EINTR) continue;
+    if (got <= 0)
+      fail("pread " + path.string() + ": " +
+           (got == 0 ? std::string("unexpected EOF") : std::strerror(errno)));
+    done += static_cast<std::size_t>(got);
+  }
+}
+
 float optional_input_scale(fuel::Checkpoint& ckpt, const std::string& name) {
   if (!ckpt.has(name)) return 1.0f;
   const fuel::TensorView& scale = ckpt.tensor(name);
@@ -39,6 +92,17 @@ float optional_input_scale(fuel::Checkpoint& ckpt, const std::string& name) {
   if (!std::isfinite(value) || value <= 0.0f)
     fail(name + ": input_scale must be finite and positive");
   return value;
+}
+
+std::array<unsigned char, kSha256Bytes> sha256_file(const std::filesystem::path& path) {
+  const auto bytes = std::filesystem::file_size(path);
+  std::vector<std::uint8_t> data(bytes);
+  std::ifstream in(path, std::ios::binary);
+  if (!in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size())))
+    fail("read " + path.string() + " for SHA-256");
+  std::array<unsigned char, kSha256Bytes> digest{};
+  SHA256(data.data(), data.size(), digest.data());
+  return digest;
 }
 
 std::vector<std::uint8_t> read_file(const std::filesystem::path& path, std::size_t expected) {
@@ -55,14 +119,22 @@ std::vector<std::uint8_t> read_file(const std::filesystem::path& path, std::size
 }  // namespace
 
 void* WeightStore::device_alloc(std::size_t bytes) {
+  const auto started = std::chrono::steady_clock::now();
   void* p = nullptr;
   cuda_check(cudaMalloc(&p, bytes), "cudaMalloc " + std::to_string(bytes) + " B");
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - started).count();
+  allocation_ms_ += elapsed_ms;
+  if (std::getenv("ROCKET_LOAD_PROFILE") && bytes >= (512u << 20))
+    std::fprintf(stderr, "[alloc] %.2f GiB in %.3f s\n",
+                 static_cast<double>(bytes) / (1ull << 30), elapsed_ms / 1000.0);
   owned_.push_back(p);
   resident_bytes_ += bytes;
   return p;
 }
 
 void WeightStore::copy_in(void* dst, const void* src, std::size_t bytes) {
+  const auto started = std::chrono::steady_clock::now();
   static const bool trace = std::getenv("ROCKET_TRACE_COPY") != nullptr;
   static unsigned seq = 0;
   if (trace)
@@ -70,12 +142,54 @@ void WeightStore::copy_in(void* dst, const void* src, std::size_t bytes) {
   std::size_t done = 0;
   while (done < bytes) {
     const std::size_t chunk = std::min(pinned_bytes_, bytes - done);
+    const auto stage_started = std::chrono::steady_clock::now();
     std::memcpy(pinned_, static_cast<const std::uint8_t*>(src) + done, chunk);
+    upload_stage_ms_ += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - stage_started).count();
+    const auto cuda_started = std::chrono::steady_clock::now();
     cuda_check(cudaMemcpy(static_cast<std::uint8_t*>(dst) + done, pinned_, chunk,
                           cudaMemcpyHostToDevice),
                "cudaMemcpy weight");
+    upload_cuda_ms_ += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - cuda_started).count();
     done += chunk;
   }
+  upload_ms_ += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - started).count();
+}
+
+void WeightStore::copy_in_direct(void* dst, const fuel::TensorView& tensor) {
+  const auto started = std::chrono::steady_clock::now();
+  const std::string key = tensor.source_file.string();
+  int fd = -1;
+  if (const auto it = direct_fds_.find(key); it != direct_fds_.end()) {
+    fd = it->second;
+  } else {
+    fd = ::open(tensor.source_file.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECT);
+    if (fd < 0)
+      fail("open O_DIRECT " + tensor.source_file.string() + ": " + std::strerror(errno));
+    direct_fds_.emplace(key, fd);
+  }
+  std::size_t done = 0;
+  while (done < tensor.nbytes) {
+    const std::uint64_t position = tensor.file_offset + done;
+    const std::uint64_t aligned = position / kPageBytes * kPageBytes;
+    const std::size_t leading = static_cast<std::size_t>(position - aligned);
+    const std::size_t logical = std::min(tensor.nbytes - done, pinned_bytes_ - leading);
+    const std::size_t direct_bytes = align_up(leading + logical, kPageBytes);
+    const auto stage_started = std::chrono::steady_clock::now();
+    read_exact_at(fd, pinned_, direct_bytes, aligned, tensor.source_file);
+    upload_stage_ms_ += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - stage_started).count();
+    const auto cuda_started = std::chrono::steady_clock::now();
+    cuda_check(cudaMemcpy(static_cast<std::uint8_t*>(dst) + done, pinned_ + leading, logical,
+                          cudaMemcpyHostToDevice), "cudaMemcpy direct weight");
+    upload_cuda_ms_ += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - cuda_started).count();
+    done += logical;
+  }
+  upload_ms_ += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - started).count();
 }
 
 void WeightStore::record_dtype(std::string_view name, fuel::DType dt) {
@@ -97,7 +211,8 @@ const bf16* WeightStore::upload_bf16(std::string_view name, std::int64_t expect_
     fail(std::string(name) + " has " + std::to_string(t.numel()) + " elements, expected " +
          std::to_string(expect_numel));
   void* d = device_alloc(t.nbytes);
-  copy_in(d, t.data, t.nbytes);
+  if (std::getenv("ROCKET_RESIDENT_DIRECT")) copy_in_direct(d, t);
+  else copy_in(d, t.data, t.nbytes);
   record_dtype(name, fuel::DType::kBF16);
   return static_cast<const bf16*>(d);
 }
@@ -143,7 +258,8 @@ const float* WeightStore::upload_f32(std::string_view name, std::int64_t expect_
   if (t.dtype != fuel::DType::kF32)
     fail(std::string(name) + " is not F32");
   void* d = device_alloc(t.nbytes);
-  copy_in(d, t.data, t.nbytes);
+  if (std::getenv("ROCKET_RESIDENT_DIRECT")) copy_in_direct(d, t);
+  else copy_in(d, t.data, t.nbytes);
   record_dtype(name, fuel::DType::kF32);
   return static_cast<const float*>(d);
 }
@@ -212,7 +328,8 @@ const bf16* WeightStore::upload_concat(const std::vector<std::string>& names,
       off += host.size() * 2;
       continue;
     }
-    copy_in(d + off, t.data, t.nbytes);
+    if (std::getenv("ROCKET_RESIDENT_DIRECT")) copy_in_direct(d + off, t);
+    else copy_in(d + off, t.data, t.nbytes);
     record_dtype(n, t.dtype);
     off += t.nbytes;
   }
@@ -228,14 +345,14 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
   // ~WeightStore only runs after a completed construction.
   struct CtorGuard {
     std::vector<void*>& owned;
-    std::uint8_t*& pinned;
+    std::uint8_t*& pinned_raw;
     bool armed = true;
     ~CtorGuard() {
       if (!armed) return;
       for (void* p : owned) cudaFree(p);
-      if (pinned != nullptr) cudaFreeHost(pinned);
+      if (pinned_raw != nullptr) cudaFreeHost(pinned_raw);
     }
-  } guard{owned_, pinned_};
+  } guard{owned_, pinned_raw_};
 
   // FP8-per-row overlay loader: reads {weight.u8, weight_scale.f32} produced
   // by materialize-nvfp4-overlay --fp8-row. Rows must match the bf16 tensor's
@@ -270,8 +387,10 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
   };
 
   pinned_bytes_ = 64u << 20;
-  cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&pinned_), pinned_bytes_, cudaHostAllocDefault),
-             "cudaHostAlloc staging");
+  cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&pinned_raw_), pinned_bytes_ + kPageBytes,
+                           cudaHostAllocDefault), "cudaHostAlloc staging");
+  pinned_ = reinterpret_cast<std::uint8_t*>(
+      align_up(reinterpret_cast<std::uintptr_t>(pinned_raw_), kPageBytes));
 
   const int H = cfg_.hidden_size;
   const int qkv = cfg_.kda_qkv_dim();
@@ -401,11 +520,13 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
           if (wt.numel() != static_cast<std::int64_t>(n) * k_true / 2)
             fail(p_full + " has unexpected packed element count");
           auto* pd = static_cast<std::uint8_t*>(device_alloc(wt.numel()));
-          copy_in(pd, wt.data, wt.numel());
+          if (std::getenv("ROCKET_RESIDENT_DIRECT")) copy_in_direct(pd, wt);
+          else copy_in(pd, wt.data, wt.nbytes);
           w4.packed = pd;
           const fuel::TensorView& sc = ckpt_.tensor(p_full + ".weight_scale");
           auto* sd = static_cast<std::uint8_t*>(device_alloc(sc.numel()));
-          copy_in(sd, sc.data, sc.numel());
+          if (std::getenv("ROCKET_RESIDENT_DIRECT")) copy_in_direct(sd, sc);
+          else copy_in(sd, sc.data, sc.nbytes);
           w4.scale = sd;
           const fuel::SfLayout layout = fuel::sf_layout(n, k_true, 16);
           if (layout.bytes() != sc.nbytes)
@@ -428,8 +549,13 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
           const fuel::TensorView& uw = ckpt_.tensor(p + "mlp.up_proj.weight");
           const std::size_t per = static_cast<std::size_t>(I) * H / 2;
           auto* w13 = static_cast<std::uint8_t*>(device_alloc(2 * per));
-          copy_in(w13, gw.data, per);
-          copy_in(w13 + per, uw.data, per);
+          if (std::getenv("ROCKET_RESIDENT_DIRECT")) {
+            copy_in_direct(w13, gw);
+            copy_in_direct(w13 + per, uw);
+          } else {
+            copy_in(w13, gw.data, per);
+            copy_in(w13 + per, uw.data, per);
+          }
           w.dense.fp4_gate.packed = w13;
           w.dense.fp4_up.packed = w13 + per;
           const fuel::SfLayout lay = fuel::sf_layout(I, H, 16);
@@ -547,9 +673,9 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
   lru_pos_.resize(n_slots);
   // One cache slab keeps preload destinations contiguous. Besides avoiding
   // thousands of large cudaMalloc calls, this permits multi-expert DMA runs.
-  auto* cache_slab = static_cast<std::uint8_t*>(device_alloc(n_slots * slot_bytes_));
+  expert_cache_slab_ = static_cast<std::uint8_t*>(device_alloc(n_slots * slot_bytes_));
   for (std::size_t i = 0; i < n_slots; ++i) {
-    auto* base = cache_slab + i * slot_bytes_;
+    auto* base = expert_cache_slab_ + i * slot_bytes_;
     slots_[i].base = base;
     ExpertDev& v = slot_view_[i];
     std::size_t off = 0;
@@ -568,13 +694,21 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
     if (ce != cudaSuccess)
       std::fprintf(stderr, "[ctor-end] sticky CUDA error: %s\n", cudaGetErrorString(ce));
     else
-      std::fprintf(stderr, "[ctor-end] clean\n"); }
+      std::fprintf(stderr,
+                   "[ctor-end] clean; allocations %.3f s, resident uploads %.3f s "
+                   "(stage %.3f s, H2D %.3f s)\n",
+                   allocation_ms_ / 1000.0, upload_ms_ / 1000.0,
+                   upload_stage_ms_ / 1000.0, upload_cuda_ms_ / 1000.0); }
   guard.armed = false;
 }
 
 WeightStore::~WeightStore() {
   for (void* p : owned_) cudaFree(p);
-  if (pinned_ != nullptr) cudaFreeHost(pinned_);
+  for (const auto& [path, fd] : direct_fds_) {
+    (void)path;
+    ::close(fd);
+  }
+  if (pinned_raw_ != nullptr) cudaFreeHost(pinned_raw_);
 }
 
 void WeightStore::set_expert_range(int first, int count) {
@@ -597,6 +731,9 @@ void WeightStore::set_expert_set(const std::vector<int>& expert_ids) {
   down_global_.assign(static_cast<std::size_t>(cfg_.text_layers) * cfg_.n_routed_experts, 0.0f);
   down_input_scale_.assign(static_cast<std::size_t>(cfg_.text_layers) * cfg_.n_routed_experts,
                            1.0f);
+  // The slab carries all ranks' down scalars. Avoid faulting one 64 KiB
+  // checkpoint page per expert when the slab fast path will replace them.
+  if (std::getenv("ROCKET_EXPERT_SLAB_DIR") != nullptr) return;
   for (int l = 0; l < cfg_.text_layers; ++l) {
     if (cfg_.layers[l].mlp != fuel::MlpKind::kSparse) continue;
     const std::string p = layer_prefix(l) + "mlp.experts.";
@@ -634,8 +771,167 @@ float WeightStore::expert_down_input_scale(int layer, int expert_id) const {
   return i < down_input_scale_.size() ? down_input_scale_[i] : 1.0f;
 }
 
+std::size_t WeightStore::preload_expert_slab(const std::filesystem::path& path,
+                                              cudaStream_t s) {
+  const int meta_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (meta_fd < 0) fail("open " + path.string() + ": " + std::strerror(errno));
+  ExpertSlabHeader h{};
+  read_exact_at(meta_fd, &h, sizeof(h), 0, path);
+  constexpr char magic[16] = {'R','O','C','K','E','T','E','X','P','E','R','T','1',0,0,0};
+  if (std::memcmp(h.magic, magic, sizeof(magic)) != 0 || h.version != 1)
+    fail(path.string() + " is not a version-1 Rocket expert slab");
+  const auto config_digest = sha256_file(ckpt_.dir() / "config.json");
+  const auto index_digest = sha256_file(ckpt_.dir() / "model.safetensors.index.json");
+  if (std::memcmp(h.config_sha256, config_digest.data(), kSha256Bytes) != 0 ||
+      std::memcmp(h.index_sha256, index_digest.data(), kSha256Bytes) != 0)
+    fail(path.string() + " was materialized from a different checkpoint");
+  if (h.page_bytes != kPageBytes || h.payload_offset % kPageBytes != 0 ||
+      h.payload_bytes % kPageBytes != 0 || h.slot_bytes != slot_bytes_ ||
+      h.hidden != static_cast<std::uint32_t>(cfg_.hidden_size) ||
+      h.intermediate != static_cast<std::uint32_t>(cfg_.moe_intermediate_size) ||
+      h.layers != static_cast<std::uint32_t>(cfg_.text_layers) ||
+      h.experts != static_cast<std::uint32_t>(cfg_.n_routed_experts) ||
+      h.expert_count != static_cast<std::uint32_t>(expert_count_))
+    fail(path.string() + " geometry does not match this engine");
+  int first = 0;
+  while (first < cfg_.n_routed_experts && !owns_expert(first)) ++first;
+  for (int e = 0; e < cfg_.n_routed_experts; ++e)
+    if (owns_expert(e) != (e >= first && e < first + expert_count_))
+      fail("expert slab requires one contiguous ownership range");
+  if (h.first_expert != static_cast<std::uint32_t>(first))
+    fail(path.string() + " belongs to a different expert rank");
+  std::size_t sparse_layers = 0;
+  for (const auto& layer : cfg_.layers)
+    if (layer.mlp == fuel::MlpKind::kSparse) ++sparse_layers;
+  const std::size_t needed = sparse_layers * static_cast<std::size_t>(expert_count_);
+  if (h.sparse_layers != sparse_layers || h.slot_count != needed ||
+      h.payload_bytes != needed * slot_bytes_ || slots_.size() < needed)
+    fail(path.string() + " slot count does not match this engine");
+  struct stat st{};
+  if (::fstat(meta_fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+      static_cast<std::uint64_t>(st.st_size) != h.payload_offset + h.payload_bytes)
+    fail(path.string() + " has the wrong byte count");
+  std::vector<std::uint8_t> metadata(h.metadata_bytes);
+  read_exact_at(meta_fd, metadata.data(), metadata.size(), kPageBytes, path);
+  ::close(meta_fd);
+  const std::size_t down_meta_bytes =
+      static_cast<std::size_t>(cfg_.text_layers) * cfg_.n_routed_experts * 2 * sizeof(float);
+  const std::size_t slot_meta_bytes = needed * 4 * sizeof(float);
+  const std::size_t chunk_count =
+      (static_cast<std::size_t>(h.payload_bytes) + kDirectChunkBytes - 1) /
+      kDirectChunkBytes;
+  const std::size_t digest_offset = down_meta_bytes + slot_meta_bytes;
+  if (h.metadata_bytes < digest_offset + chunk_count * kSha256Bytes)
+    fail(path.string() + " metadata is truncated");
+  for (std::size_t i = 0; i < static_cast<std::size_t>(cfg_.text_layers) * cfg_.n_routed_experts;
+       ++i) {
+    std::memcpy(&down_global_[i], metadata.data() + i * 8, sizeof(float));
+    std::memcpy(&down_input_scale_[i], metadata.data() + i * 8 + 4, sizeof(float));
+  }
+
+  const int direct_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECT);
+  if (direct_fd < 0) fail("open O_DIRECT " + path.string() + ": " + std::strerror(errno));
+  std::array<void*, kDirectPipelineSlots> staging{};
+  std::array<cudaEvent_t, kDirectPipelineSlots> ready{};
+  std::array<bool, kDirectPipelineSlots> used{};
+  std::array<std::future<std::array<unsigned char, kSha256Bytes>>,
+             kDirectPipelineSlots> hashes{};
+  std::array<std::size_t, kDirectPipelineSlots> hash_chunks{};
+  for (int i = 0; i < kDirectPipelineSlots; ++i) {
+    if (::posix_memalign(&staging[i], kPageBytes, kDirectChunkBytes) != 0)
+      fail("allocate aligned expert slab staging");
+    cuda_check(cudaHostRegister(staging[i], kDirectChunkBytes, cudaHostRegisterDefault),
+               "cudaHostRegister expert slab staging");
+    cuda_check(cudaEventCreateWithFlags(&ready[i], cudaEventDisableTiming),
+               "cudaEventCreate expert slab staging");
+  }
+  const auto started = std::chrono::steady_clock::now();
+  double read_ms = 0.0;
+  auto verify_hash = [&](int b) {
+    if (!used[b]) return;
+    cuda_check(cudaEventSynchronize(ready[b]), "expert slab staging reuse");
+    const auto digest = hashes[b].get();
+    const std::uint8_t* expected =
+        metadata.data() + digest_offset + hash_chunks[b] * kSha256Bytes;
+    if (std::memcmp(digest.data(), expected, kSha256Bytes) != 0)
+      fail(path.string() + " chunk " + std::to_string(hash_chunks[b]) +
+           " failed SHA-256 authentication");
+  };
+  std::size_t done = 0, chunk_index = 0;
+  while (done < h.payload_bytes) {
+    const int b = static_cast<int>(chunk_index % kDirectPipelineSlots);
+    verify_hash(b);
+    const std::size_t chunk = std::min(kDirectChunkBytes,
+                                      static_cast<std::size_t>(h.payload_bytes) - done);
+    const auto read_started = std::chrono::steady_clock::now();
+    read_exact_at(direct_fd, staging[b], chunk, h.payload_offset + done, path);
+    read_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - read_started).count();
+    hashes[b] = std::async(std::launch::async, [src = staging[b], chunk] {
+      std::array<unsigned char, kSha256Bytes> digest{};
+      SHA256(static_cast<const unsigned char*>(src), chunk, digest.data());
+      return digest;
+    });
+    hash_chunks[b] = chunk_index;
+    cuda_check(cudaMemcpyAsync(expert_cache_slab_ + done, staging[b], chunk,
+                               cudaMemcpyHostToDevice, s), "expert slab H2D");
+    cuda_check(cudaEventRecord(ready[b], s), "expert slab staging ready");
+    used[b] = true;
+    done += chunk;
+    ++chunk_index;
+  }
+  for (int b = 0; b < kDirectPipelineSlots; ++b) verify_hash(b);
+  cuda_check(cudaStreamSynchronize(s), "expert slab final sync");
+  const double total_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - started).count();
+  for (int i = 0; i < kDirectPipelineSlots; ++i) {
+    cudaEventDestroy(ready[i]);
+    cudaHostUnregister(staging[i]);
+    std::free(staging[i]);
+  }
+  ::close(direct_fd);
+
+  const std::uint8_t* slot_meta = metadata.data() + down_meta_bytes;
+  std::size_t slot = 0;
+  for (int l = 0; l < cfg_.text_layers; ++l) {
+    if (cfg_.layers[l].mlp != fuel::MlpKind::kSparse) continue;
+    for (int e = first; e < first + expert_count_; ++e, ++slot) {
+      const long long key = static_cast<long long>(l) * cfg_.n_routed_experts + e;
+      ExpertDev& v = slot_view_[slot];
+      std::memcpy(&v.gate_global, slot_meta + slot * 16, 4);
+      std::memcpy(&v.gate_input_scale, slot_meta + slot * 16 + 4, 4);
+      std::memcpy(&v.up_global, slot_meta + slot * 16 + 8, 4);
+      std::memcpy(&v.up_input_scale, slot_meta + slot * 16 + 12, 4);
+      v.down_global = down_global_[static_cast<std::size_t>(l) * cfg_.n_routed_experts + e];
+      v.down_input_scale =
+          down_input_scale_[static_cast<std::size_t>(l) * cfg_.n_routed_experts + e];
+      slots_[slot].key = key;
+      resident_expert_[key] = static_cast<int>(slot);
+      lru_.erase(lru_pos_[slot]);
+      lru_.push_front(static_cast<int>(slot));
+      lru_pos_[slot] = lru_.begin();
+    }
+  }
+  expert_slab_loaded_ = true;
+  streamed_bytes_ += h.payload_bytes;
+  std::fprintf(stderr,
+               "expert slab: %.2f GiB in %.3f s (direct reads %.3f s, %.2f GiB/s)\n",
+               static_cast<double>(h.payload_bytes) / (1ull << 30), total_ms / 1000.0,
+               read_ms / 1000.0,
+               static_cast<double>(h.payload_bytes) / (1ull << 30) / (total_ms / 1000.0));
+  return needed;
+}
+
 std::size_t WeightStore::preload_owned_experts(cudaStream_t s) {
   if (expert_count_ <= 0) fail("preload_owned_experts needs an owned expert set");
+  if (const char* dir = std::getenv("ROCKET_EXPERT_SLAB_DIR")) {
+    int first = 0;
+    while (first < cfg_.n_routed_experts && !owns_expert(first)) ++first;
+    const int rank = first == 0 ? 0 : 1;
+    return preload_expert_slab(std::filesystem::path(dir) /
+                                   ("rank" + std::to_string(rank) + "-experts.slab"),
+                               s);
+  }
   std::size_t needed = 0;
   for (int l = 0; l < cfg_.text_layers; ++l)
     if (cfg_.layers[l].mlp == fuel::MlpKind::kSparse)

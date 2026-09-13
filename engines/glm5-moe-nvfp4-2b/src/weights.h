@@ -240,6 +240,7 @@ class WeightStore {
   const bf16* upload_concat(const std::vector<std::string>& names, std::int64_t expect_numel);
   void* device_alloc(std::size_t bytes);
   void copy_in(void* dst, const void* src, std::size_t bytes);
+  void copy_in_direct(void* dst, const fuel::TensorView& tensor);
 
   fuel::ModelConfig cfg_;
   fuel::Checkpoint ckpt_;
@@ -251,6 +252,10 @@ class WeightStore {
 
   std::vector<void*> owned_;
   std::size_t resident_bytes_ = 0;
+  double allocation_ms_ = 0.0;
+  double upload_ms_ = 0.0;
+  double upload_stage_ms_ = 0.0;
+  double upload_cuda_ms_ = 0.0;
 
   // --- streamed experts ---
   struct Slot {
@@ -258,17 +263,22 @@ class WeightStore {
     long long key = -1;  // layer * n_experts + expert
   };
   std::vector<Slot> slots_;
+  std::uint8_t* expert_cache_slab_ = nullptr;
   std::list<int> lru_;                                  // front is most recent
   std::unordered_map<long long, int> resident_expert_;  // key -> slot
   std::vector<std::list<int>::iterator> lru_pos_;
   std::vector<ExpertDev> slot_view_;
   std::size_t slot_bytes_ = 0;
   std::uint8_t* pinned_ = nullptr;
+  std::uint8_t* pinned_raw_ = nullptr;
   std::size_t pinned_bytes_ = 0;
+  std::unordered_map<std::string, int> direct_fds_;
   std::uint64_t hits_ = 0, misses_ = 0;
   std::size_t streamed_bytes_ = 0;
+  bool expert_slab_loaded_ = false;
 
   void build_expert_ownership(const std::vector<int>& expert_ids);
+  std::size_t preload_expert_slab(const std::filesystem::path& path, cudaStream_t s);
   std::vector<char> owned_expert_;  // [n_routed_experts], 1 = this rank fetches it
   int expert_count_ = 0;  // 0 means "every expert", the single-booster case
   std::vector<float> down_global_;  // [text_layers * n_routed_experts]

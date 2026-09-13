@@ -6,11 +6,21 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <fcntl.h>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace rocket::engine {
 namespace {
+constexpr std::size_t kPageBytes = 65536;
+constexpr std::size_t kChunkBytes = 256u << 20;
+std::size_t align_up(std::size_t value, std::size_t alignment) {
+  return (value + alignment - 1) / alignment * alignment;
+}
 void cuda_ok(cudaError_t e, const char* what) {
   if (e != cudaSuccess) throw std::runtime_error(std::string("dflash2: ") + what + ": " +
                                                  cudaGetErrorString(e));
@@ -31,8 +41,50 @@ void DFlash2Weights::load(const std::filesystem::path& ckpt_file) {
   }
   if (!first || !last || last <= first) throw std::runtime_error("dflash2: empty tensor payload");
   const std::size_t slab_bytes = static_cast<std::size_t>(last - first);
+  const std::uint64_t first_file_offset = [&] {
+    for (const auto& [name, tv] : shard.tensors())
+      if (tv.data == first) return tv.file_offset;
+    throw std::runtime_error("dflash2: first tensor file offset missing");
+  }();
   cuda_ok(cudaMalloc(&device_slab_, slab_bytes), "slab allocation");
-  cuda_ok(cudaMemcpy(device_slab_, first, slab_bytes, cudaMemcpyHostToDevice), "slab upload");
+  void* raw = nullptr;
+  cuda_ok(cudaHostAlloc(&raw, kChunkBytes + kPageBytes, cudaHostAllocDefault),
+          "direct staging allocation");
+  auto* staging = reinterpret_cast<std::uint8_t*>(
+      align_up(reinterpret_cast<std::uintptr_t>(raw), kPageBytes));
+  const int fd = ::open(ckpt_file.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECT);
+  if (fd < 0) {
+    cudaFreeHost(raw);
+    throw std::runtime_error("dflash2: O_DIRECT open: " + std::string(std::strerror(errno)));
+  }
+  const auto upload_started = std::chrono::steady_clock::now();
+  std::size_t done = 0;
+  while (done < slab_bytes) {
+    const std::uint64_t position = first_file_offset + done;
+    const std::uint64_t aligned = position / kPageBytes * kPageBytes;
+    const std::size_t leading = static_cast<std::size_t>(position - aligned);
+    const std::size_t logical = std::min(slab_bytes - done, kChunkBytes - leading);
+    const std::size_t request = align_up(leading + logical, kPageBytes);
+    ssize_t got;
+    do {
+      got = ::pread(fd, staging, request, static_cast<off_t>(aligned));
+    } while (got < 0 && errno == EINTR);
+    if (got < 0 || static_cast<std::size_t>(got) < leading + logical) {
+      ::close(fd);
+      cudaFreeHost(raw);
+      throw std::runtime_error("dflash2: short O_DIRECT read");
+    }
+    cuda_ok(cudaMemcpy(static_cast<std::uint8_t*>(device_slab_) + done, staging + leading,
+                       logical, cudaMemcpyHostToDevice), "direct slab upload");
+    done += logical;
+  }
+  ::close(fd);
+  cudaFreeHost(raw);
+  const double upload_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - upload_started).count();
+  std::fprintf(stderr, "dflash2 direct: %.2f GiB in %.3f s (%.2f GiB/s)\n",
+               static_cast<double>(slab_bytes) / (1ull << 30), upload_s,
+               static_cast<double>(slab_bytes) / (1ull << 30) / upload_s);
   for (const auto& [name, tv] : shard.tensors()) {
     if (name == "__metadata__" || tv.nbytes == 0) continue;
     void* dev = static_cast<std::uint8_t*>(device_slab_) + (tv.data - first);

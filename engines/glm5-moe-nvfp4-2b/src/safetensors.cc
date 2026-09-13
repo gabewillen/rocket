@@ -162,6 +162,8 @@ Shard::Shard(const std::filesystem::path& file) : path_(file) {
 
     tv.data = payload + begin;
     tv.nbytes = end - begin;
+    tv.source_file = path_;
+    tv.file_offset = 8 + header_len + begin;
     if (std::getenv("ROCKET_DEBUG_LAYER0") != nullptr && tv.dtype == DType::kF32 &&
         tv.nbytes == 131072 && name.find("layers.0.") != std::string::npos &&
         name.find("conv1d") != std::string::npos) {

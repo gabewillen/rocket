@@ -13,6 +13,7 @@ cmake_minimum_required(VERSION 3.28)
 
 project(rocket_glm5_moe_nvfp4_2b LANGUAGES CXX CUDA)
 find_package(CUDAToolkit REQUIRED)
+find_library(ROCKET_CRYPTO NAMES crypto libcrypto.so.3 REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,7 +56,7 @@ target_compile_definitions(rocket_engine PUBLIC
   ROCKET_CUDA_ARCH=${ROCKET_CUDA_ARCH}
   $<$<BOOL:${ROCKET_DFLASH2_PROFILE}>:ROCKET_DFLASH2_PROFILE>
 )
-target_link_libraries(rocket_engine PUBLIC rocket_fuel CUDA::cublas)
+target_link_libraries(rocket_engine PUBLIC rocket_fuel CUDA::cublas ${ROCKET_CRYPTO})
 target_compile_options(rocket_engine PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>
 )

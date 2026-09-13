@@ -26,6 +26,8 @@ function(rocket_add_bench name)
   )
 endfunction()
 
+rocket_add_bench(alloc-latency alloc_latency.cu)
+
 # Page size for the KV pool: gather locality against sharing granularity, on
 # the two kernels that read the cache through the block table every step.
 # No CUTLASS, no checkpoint.
