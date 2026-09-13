@@ -104,6 +104,9 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   const int big_inter =
       std::max(cfg_.intermediate_size, cfg_.moe_intermediate_size * cfg_.n_shared_experts);
   const int MB = max_batch_;
+  // Verify-width row space: shared activation buffers hold kSpecMax rows per
+  // stream so step_spec can batch B*k positions without reallocating.
+  const int SB = MB * DecodeEngine::kSpecMax;
 
   auto alloc = [&](std::size_t bytes) {
     void* p = nullptr;
@@ -134,6 +137,10 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   k_conv_state_ = A(static_cast<std::size_t>(nk) * MB * qkv * taps);
   v_conv_state_ = A(static_cast<std::size_t>(nk) * MB * qkv * taps);
   kda_state_ = F(static_cast<std::size_t>(nk) * MB * heads_kda * hd * hd);
+  kda_state_draft_ = F(static_cast<std::size_t>(nk) * MB * heads_kda * hd * hd);
+  q_conv_state_draft_ = A(static_cast<std::size_t>(nk) * MB * qkv * taps);
+  k_conv_state_draft_ = A(static_cast<std::size_t>(nk) * MB * qkv * taps);
+  v_conv_state_draft_ = A(static_cast<std::size_t>(nk) * MB * qkv * taps);
 
   // Exact-byte guard against fuels/glm-5.3-flash/attention.yaml's own
   // bytes.kda_state_per_stream accounting: recurrent_per_layer is
@@ -188,55 +195,56 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   n_tokens_dev_ = I(MB);
   n_pools_dev_ = I(MB);
 
-  streams_ = A(static_cast<std::size_t>(MB) * hc * H);
-  residual_ = A(static_cast<std::size_t>(MB) * hc * H);
-  collapsed_ = A(static_cast<std::size_t>(MB) * H);
-  normed_ = A(static_cast<std::size_t>(MB) * H);
-  sublayer_out_ = A(static_cast<std::size_t>(MB) * H);
-  hmean_ = A(static_cast<std::size_t>(MB) * H);
-  mix_ = F(static_cast<std::size_t>(MB) * cfg_.hc_mix());
-  post_ = F(static_cast<std::size_t>(MB) * hc);
-  comb_ = F(static_cast<std::size_t>(MB) * hc * hc);
+  streams_ = A(static_cast<std::size_t>(SB) * hc * H);
+  residual_ = A(static_cast<std::size_t>(SB) * hc * H);
+  collapsed_ = A(static_cast<std::size_t>(SB) * H);
+  normed_ = A(static_cast<std::size_t>(SB) * H);
+  sublayer_out_ = A(static_cast<std::size_t>(SB) * H);
+  hmean_ = A(static_cast<std::size_t>(SB) * H);
+  dflash_aux_hidden_ = A(static_cast<std::size_t>(5) * SB * H);
+  mix_ = F(static_cast<std::size_t>(SB) * cfg_.hc_mix());
+  post_ = F(static_cast<std::size_t>(SB) * hc);
+  comb_ = F(static_cast<std::size_t>(SB) * hc * hc);
 
-  q_raw_ = A(static_cast<std::size_t>(MB) * qkv);
-  k_raw_ = A(static_cast<std::size_t>(MB) * qkv);
-  v_raw_ = A(static_cast<std::size_t>(MB) * qkv);
-  q_conv_ = A(static_cast<std::size_t>(MB) * qkv);
-  k_conv_ = A(static_cast<std::size_t>(MB) * qkv);
-  v_conv_ = A(static_cast<std::size_t>(MB) * qkv);
-  lr_a_ = A(static_cast<std::size_t>(MB) * hd);
-  lr_b_ = A(static_cast<std::size_t>(MB) * qkv);
-  gate_ = A(static_cast<std::size_t>(MB) * qkv);
-  beta_raw_ = A(static_cast<std::size_t>(MB) * heads_kda);
-  beta_ = A(static_cast<std::size_t>(MB) * heads_kda);
-  kda_o_ = A(static_cast<std::size_t>(MB) * qkv);
-  kda_on_ = A(static_cast<std::size_t>(MB) * qkv);
+  q_raw_ = A(static_cast<std::size_t>(SB) * qkv);
+  k_raw_ = A(static_cast<std::size_t>(SB) * qkv);
+  v_raw_ = A(static_cast<std::size_t>(SB) * qkv);
+  q_conv_ = A(static_cast<std::size_t>(SB) * qkv);
+  k_conv_ = A(static_cast<std::size_t>(SB) * qkv);
+  v_conv_ = A(static_cast<std::size_t>(SB) * qkv);
+  lr_a_ = A(static_cast<std::size_t>(SB) * hd);
+  lr_b_ = A(static_cast<std::size_t>(SB) * qkv);
+  gate_ = A(static_cast<std::size_t>(SB) * qkv);
+  beta_raw_ = A(static_cast<std::size_t>(SB) * heads_kda);
+  beta_ = A(static_cast<std::size_t>(SB) * heads_kda);
+  kda_o_ = A(static_cast<std::size_t>(SB) * qkv);
+  kda_on_ = A(static_cast<std::size_t>(SB) * qkv);
 
-  q_resid_raw_ = A(static_cast<std::size_t>(MB) * cfg_.q_lora_rank);
-  q_resid_ = A(static_cast<std::size_t>(MB) * cfg_.q_lora_rank);
-  q_ = A(static_cast<std::size_t>(MB) * heads_mla * cfg_.qk_head_dim());
-  ckv_ = A(static_cast<std::size_t>(MB) * kvl);
-  latent_stage_ = A(static_cast<std::size_t>(MB) * kvl);
-  v_out_ = A(static_cast<std::size_t>(MB) * heads_mla * cfg_.v_head_dim);
-  q_abs_ = F(static_cast<std::size_t>(MB) * heads_mla * kvl);
-  ctx_ = F(static_cast<std::size_t>(MB) * heads_mla * kvl);
-  scores_ = F(static_cast<std::size_t>(MB) * heads_mla * sel_stride_);
+  q_resid_raw_ = A(static_cast<std::size_t>(SB) * cfg_.q_lora_rank);
+  q_resid_ = A(static_cast<std::size_t>(SB) * cfg_.q_lora_rank);
+  q_ = A(static_cast<std::size_t>(SB) * heads_mla * cfg_.qk_head_dim());
+  ckv_ = A(static_cast<std::size_t>(SB) * kvl);
+  latent_stage_ = A(static_cast<std::size_t>(SB) * kvl);
+  v_out_ = A(static_cast<std::size_t>(SB) * heads_mla * cfg_.v_head_dim);
+  q_abs_ = F(static_cast<std::size_t>(SB) * heads_mla * kvl);
+  ctx_ = F(static_cast<std::size_t>(SB) * heads_mla * kvl);
+  scores_ = F(static_cast<std::size_t>(SB) * heads_mla * sel_stride_);
 
-  q_idx_ = A(static_cast<std::size_t>(MB) * ih * ihd);
-  idx_k_raw_ = A(static_cast<std::size_t>(MB) * ihd);
-  idx_k_stage_ = A(static_cast<std::size_t>(MB) * ihd);
-  idx_g_stage_ = A(static_cast<std::size_t>(MB) * ihd);
-  pool_keys_ = A(static_cast<std::size_t>(MB) * pool_stride_ * ihd);
-  pool_scores_ = F(static_cast<std::size_t>(MB) * pool_stride_);
-  head_w_ = F(static_cast<std::size_t>(MB) * ih);
-  sel_pools_ = I(static_cast<std::size_t>(MB) * sel_pool_stride_);
-  sel_tokens_ = I(static_cast<std::size_t>(MB) * sel_stride_);
-  n_sel_ = I(MB);
-  n_tok_ = I(MB);
+  q_idx_ = A(static_cast<std::size_t>(SB) * ih * ihd);
+  idx_k_raw_ = A(static_cast<std::size_t>(SB) * ihd);
+  idx_k_stage_ = A(static_cast<std::size_t>(SB) * ihd);
+  idx_g_stage_ = A(static_cast<std::size_t>(SB) * ihd);
+  pool_keys_ = A(static_cast<std::size_t>(SB) * pool_stride_ * ihd);
+  pool_scores_ = F(static_cast<std::size_t>(SB) * pool_stride_);
+  head_w_ = F(static_cast<std::size_t>(SB) * ih);
+  sel_pools_ = I(static_cast<std::size_t>(SB) * sel_pool_stride_);
+  sel_tokens_ = I(static_cast<std::size_t>(SB) * sel_stride_);
+  n_sel_ = I(SB);
+  n_tok_ = I(SB);
 
-  router_logits_ = F(static_cast<std::size_t>(MB) * cfg_.n_routed_experts);
-  topk_w_ = F(static_cast<std::size_t>(MB) * cfg_.num_experts_per_tok);
-  topk_idx_ = I(static_cast<std::size_t>(MB) * cfg_.num_experts_per_tok);
+  router_logits_ = F(static_cast<std::size_t>(SB) * cfg_.n_routed_experts);
+  topk_w_ = F(static_cast<std::size_t>(SB) * cfg_.num_experts_per_tok);
+  topk_idx_ = I(static_cast<std::size_t>(SB) * cfg_.num_experts_per_tok);
   exp_gate_ = A(cfg_.moe_intermediate_size);
   exp_up_ = A(cfg_.moe_intermediate_size);
   exp_h_ = A(cfg_.moe_intermediate_size);
@@ -245,7 +253,7 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   // --- grouped-GEMM (stage 2) routed-expert scratch, worst case one group
   // per gathered row: max_batch * num_experts_per_tok rows/groups. ---
   const int MI = cfg_.moe_intermediate_size;
-  moe_max_rows_ = MB * cfg_.num_experts_per_tok;
+  moe_max_rows_ = SB * cfg_.num_experts_per_tok;
   const std::size_t MR = static_cast<std::size_t>(moe_max_rows_);
   moe_x_ = A(MR * H);
   moe_a1_packed_ = U8(MR * H / 2);
@@ -258,13 +266,13 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   const int DI = cfg_.intermediate_size;
   // --- dense-MLP fp4 grouped-path scratch: one group per projection, so the
   // row space is the batch itself. ---
-  dense_a1_packed_ = U8(static_cast<std::size_t>(MB) * H / 2);
+  dense_a1_packed_ = U8(static_cast<std::size_t>(SB) * H / 2);
   dense_a1_sf_ = U8(64 * 512);  // one 128-row tile, k_tiles(H)=64
-  dense_gu_ = A(static_cast<std::size_t>(MB) * 2 * DI);
-  dense_a2_packed_ = U8(static_cast<std::size_t>(MB) * DI / 2);
+  dense_gu_ = A(static_cast<std::size_t>(SB) * 2 * DI);
+  dense_a2_packed_ = U8(static_cast<std::size_t>(SB) * DI / 2);
   dense_a2_sf_ = U8(192 * 512);  // k_tiles(I=12288)=192
-  dense_down_raw_ = A(static_cast<std::size_t>(MB) * H);
-  shared_gu_ = A(static_cast<std::size_t>(MB) * 2 * MI * cfg_.n_shared_experts);
+  dense_down_raw_ = A(static_cast<std::size_t>(SB) * H);
+  shared_gu_ = A(static_cast<std::size_t>(SB) * 2 * MI * cfg_.n_shared_experts);
 
   // --- EXL3-fuel routed-expert scratch ---
   if (w_.exl3_fuel()) {
@@ -312,16 +320,19 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
     cuda_check(cudaMalloc(&exl3_a_had_,
                           static_cast<std::size_t>(MB) * H * 2), "exl3 a_had");
   }
-  dense_row_in_group_ = I(MB);
-  dense_group_of_row_ = I(MB);
+  // Spec verify batches kSpecMax rows per stream through the dense/shared MLPs
+  // (run_dense_mlp(l, total)), so these row maps must cover the SB row space,
+  // not the plain batch MB.
+  dense_row_in_group_ = I(SB);
+  dense_group_of_row_ = I(SB);
   dense_sf_base_ = I64(1);
   dense_gate_global_ = F(1);
   dense_up_global_ = F(1);
   dense_down_global_ = F(1);
   {
-    std::vector<int> seq(static_cast<std::size_t>(MB));
-    for (int m = 0; m < MB; ++m) seq[m] = m;
-    cudaMemcpyAsync(dense_row_in_group_, seq.data(), MB * sizeof(int), cudaMemcpyHostToDevice,
+    std::vector<int> seq(static_cast<std::size_t>(SB));
+    for (int m = 0; m < SB; ++m) seq[m] = m;
+    cudaMemcpyAsync(dense_row_in_group_, seq.data(), SB * sizeof(int), cudaMemcpyHostToDevice,
                     stream_);
     cudaStreamSynchronize(stream_);
   }
@@ -341,14 +352,24 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
             "pinned moe idx");
   cuda_check(cudaHostAlloc(&moe_wts_pinned_, MR * sizeof(float), cudaHostAllocDefault),
             "pinned moe wts");
-  mlp_gate_ = A(static_cast<std::size_t>(MB) * big_inter);
-  mlp_up_ = A(static_cast<std::size_t>(MB) * big_inter);
-  mlp_h_ = A(static_cast<std::size_t>(MB) * big_inter);
-  mlp_out_ = A(static_cast<std::size_t>(MB) * H);
-  acc_ = A(static_cast<std::size_t>(MB) * H);
-  logits_ = F(static_cast<std::size_t>(MB) * cfg_.vocab_size);
-  scratch_f_ = F(MB);
-  argmax_i_ = I(MB);
+  mlp_gate_ = A(static_cast<std::size_t>(SB) * big_inter);
+  mlp_up_ = A(static_cast<std::size_t>(SB) * big_inter);
+  mlp_h_ = A(static_cast<std::size_t>(SB) * big_inter);
+  mlp_out_ = A(static_cast<std::size_t>(SB) * H);
+  acc_ = A(static_cast<std::size_t>(SB) * H);
+  logits_ = F(static_cast<std::size_t>(SB) * cfg_.vocab_size);
+  scratch_f_ = F(SB);
+  argmax_i_ = I(SB);
+  tokens_spec_dev_ = I(SB);
+  kda_spec_normed_rail_ = A(static_cast<std::size_t>(nk) * SB * H);
+  kda_spec_qkv_rail_ = A(static_cast<std::size_t>(nk) * 3 * SB * qkv);
+  kda_spec_gate_rail_ = A(static_cast<std::size_t>(nk) * SB * qkv);
+  kda_spec_beta_rail_ = A(static_cast<std::size_t>(nk) * SB * heads_kda);
+  kda_spec_on_rail_ = A(static_cast<std::size_t>(nk) * SB * qkv);
+  kda_spec_cut_dev_ = I(MB);
+  pos_spec_dev_ = I(SB);
+  ntok_spec_dev_ = I(SB);
+  npool_spec_dev_ = I(SB);
   telemetry_scratch_ = F(MB);
 
   pos_.assign(MB, 0);
@@ -383,6 +404,206 @@ void DecodeEngine::destroy_graphs() {
   graph_execs_.clear();
   graphs_.clear();
   graph_batch_ = -1;
+}
+
+// KV-divergence probe (ROCKET_KV_CHECKSUM=1): fp32 sums of the paged MLA
+// latent/key/gate values for logical slots [from, to) of slot-0's sequence,
+// over every MLA layer. Reveals whether verify-written KV equals the plain
+// path's writes.
+void DecodeEngine::mla_dump_ints(const char* tag, int layer, const int* sel, const int* n_tok,
+                                 int stride, int batch) {
+  static bool on = std::getenv("ROCKET_LHC_CHECKSUM") != nullptr;
+  if (!on) return;
+  std::vector<int> hsel(static_cast<std::size_t>(batch) * stride, 0);
+  std::vector<int> hn(std::size_t(batch), 0);
+  cudaMemcpy(hsel.data(), sel, hsel.size() * sizeof(int), cudaMemcpyDeviceToHost);
+  cudaMemcpy(hn.data(), n_tok, hn.size() * sizeof(int), cudaMemcpyDeviceToHost);
+  cudaStreamSynchronize(stream_);
+  for (int m = 0; m < batch; ++m) {
+    const int n = hn[m];
+    long long s = 0;
+    for (int i = 0; i < n && i < stride; ++i) s += hsel[static_cast<std::size_t>(m) * stride + i];
+    std::string heads;
+    for (int i = 0; i < 6 && i < n && i < stride; ++i)
+      heads += (i ? "," : "") +
+               std::to_string(hsel[static_cast<std::size_t>(m) * stride + i]);
+    fprintf(stderr, "[lhc] %-11s lay%d row%d n=%d sum=%lld first=[%s]\n", tag, layer, m, n, s,
+            heads.c_str());
+  }
+}
+
+void DecodeEngine::mla_dump_score(const char* tag, int layer, const float* ctx, int batch,
+                                  int heads) {
+  static bool on = std::getenv("ROCKET_LHC_CHECKSUM") != nullptr;
+  if (!on) return;
+  std::vector<float> h(static_cast<std::size_t>(batch) * heads, 0.f);
+  cudaMemcpy(h.data(), ctx, h.size() * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaStreamSynchronize(stream_);
+  for (int m = 0; m < batch; ++m) {
+    double s = 0.0, amax = 0.0;
+    for (int hd = 0; hd < heads; ++hd) {
+      double v = h[static_cast<std::size_t>(m) * heads + hd];
+      s += v; amax = std::max(amax, std::fabs(v));
+    }
+    fprintf(stderr, "[lhc] %-11s lay%d row%d nsum=%.8g amax=%.8g\n", tag, layer, m, s, amax);
+  }
+}
+
+void DecodeEngine::print_streams_checksum(int layer, const char* tag, int rows, std::size_t n,
+                                          const bf16* buf, int row_stride) {
+  static bool on = std::getenv("ROCKET_LHC_CHECKSUM") != nullptr;
+  if (!on) return;
+  static std::vector<bf16> h;
+  if (!buf) buf = streams_;
+  if (row_stride <= 0) row_stride = static_cast<int>(n / static_cast<std::size_t>(rows));
+  h.resize(n);
+  cudaStreamSynchronize(stream_);
+  cudaMemcpy(h.data(), buf, n * sizeof(bf16), cudaMemcpyDeviceToHost);
+  for (int r = 0; r < rows; ++r) {
+    double s = 0.0, amax = 0.0;
+    for (int i = 0; i < row_stride; ++i) {
+      double v = __bfloat162float(h[static_cast<std::size_t>(r) * row_stride + i]);
+      s += v; amax = std::max(amax, std::fabs(v));
+    }
+    fprintf(stderr, "[lhc] %-11s lay%d row%d buf=%.8g amax=%.8g\n", tag, layer, r, s, amax);
+  }
+}
+
+void DecodeEngine::print_kv_checksum(const char* tag, int from, int to) {
+  static bool kvs = std::getenv("ROCKET_KV_CHECKSUM") != nullptr;
+  if (!kvs || !mla_kv_.latent) return;
+  static const int at = std::getenv("ROCKET_KV_AT") ? std::atoi(std::getenv("ROCKET_KV_AT")) : -1;
+  if (at >= 0 && to != at) return;
+  if (at >= 0 && from < at - 1) from = at - 1;
+  const int pt = mla_kv_.page_tokens;
+  const int kvl = mla_kv_.kv_lora;
+  const int ihd = mla_kv_.index_head_dim;
+  static std::vector<bf16> hlat, hkey, hgate;
+  hlat.resize(static_cast<std::size_t>(pt) * kvl);
+  hkey.resize(static_cast<std::size_t>(pt) * ihd);
+  hgate.resize(hkey.size());
+  for (int lay = 0; lay < mla_kv_.layers; ++lay) {
+    const bf16* dlat = mla_kv_.latent + static_cast<std::size_t>(lay) * pt * kvl;
+    const bf16* dkey = mla_kv_.key + static_cast<std::size_t>(lay) * pt * ihd;
+    const bf16* dgate = mla_kv_.gate + static_cast<std::size_t>(lay) * pt * ihd;
+    cudaMemcpy(hlat.data(), dlat, hlat.size() * sizeof(bf16), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hkey.data(), dkey, hkey.size() * sizeof(bf16), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hgate.data(), dgate, hgate.size() * sizeof(bf16), cudaMemcpyDeviceToHost);
+    double sl = 0.0, sk = 0.0, sg = 0.0;
+    for (int pos = from; pos < to; ++pos) {
+      double s1 = 0.0, k1 = 0.0, g1 = 0.0;
+      for (int c = 0; c < kvl; ++c) s1 += static_cast<double>(__bfloat162float(hlat[pos * kvl + c]));
+      for (int c = 0; c < ihd; ++c) {
+        k1 += static_cast<double>(__bfloat162float(hkey[pos * ihd + c]));
+        g1 += static_cast<double>(__bfloat162float(hgate[pos * ihd + c]));
+      }
+      sl += s1; sk += k1; sg += g1;
+      if (to - from <= 4)
+        fprintf(stderr, "[kvslot] %-10s lay%d pos%d latent=%.8g key=%.8g gate=%.8g\n", tag, lay,
+                pos, s1, k1, g1);
+    }
+    fprintf(stderr, "[kv] %-10s lay%d latent=%.8g key=%.8g gate=%.8g\n", tag, lay, sl, sk, sg);
+  }
+}
+
+// State-divergence probe (ROCKET_SPEC_CHECKSUM=1): layer-0 bf16 conv +
+// fp32 recurrence state sums for slot 0.
+void DecodeEngine::print_kda_checksum(int layer, const char* tag) {
+  static bool kcs = std::getenv("ROCKET_SPEC_CHECKSUM") != nullptr;
+  if (!kcs) return;
+  const int qkv = cfg_.kda_qkv_dim();
+  const int taps = cfg_.conv_state_taps();
+  const int hd2 = cfg_.kda_heads * cfg_.kda_head_dim * cfg_.kda_head_dim;
+  const int slot = 0;
+  {
+    static std::vector<float> hs;
+    hs.resize(hd2);
+    cudaMemcpyAsync(hs.data(), kda_state_ + static_cast<std::size_t>(slot) * max_batch_ * hd2,
+                    hd2 * sizeof(float), cudaMemcpyDeviceToHost, stream_);
+    cudaStreamSynchronize(stream_);
+    double sum = 0.0;
+    float mn = 3.4e38f, mx = -3.4e38f;
+    for (float v : hs) { sum += v; mn = std::min(mn, v); mx = std::max(mx, v); }
+    fprintf(stderr, "[cksum] %-12s L%d rec sum=%.8g min%.4g max%.4g\n", tag, layer, sum, mn, mx);
+  }
+  for (const char* nm : { "q", "k", "v" }) {
+    static std::vector<bf16> hb;
+    hb.resize(qkv * taps);
+    const bf16* base = (nm[0] == 'q' ? q_conv_state_
+                          : nm[0] == 'k' ? k_conv_state_ : v_conv_state_) +
+                       static_cast<std::size_t>(slot) * max_batch_ * qkv * taps;
+    cudaMemcpyAsync(hb.data(), base, hb.size() * sizeof(bf16), cudaMemcpyDeviceToHost, stream_);
+    cudaStreamSynchronize(stream_);
+    double sum = 0.0;
+    for (bf16 b : hb) sum += static_cast<double>(__bfloat162float(b));
+    fprintf(stderr, "[cksum] %-12s L%d %sconv sum=%.8g\n", tag, layer, nm, sum);
+  }
+}
+
+void DecodeEngine::commit_positions(const std::vector<int>& accepted) {
+  const int k = spec_k_;
+  bool any_reject = false;
+  for (int m = 0; m < static_cast<int>(pos_.size()) && m < static_cast<int>(accepted.size()); ++m) {
+    if (accepted[m] < k) any_reject = true;
+    pos_[m] += accepted[m];
+    const int seq = kv_seq_of_slot_[m];
+    if (seq < 0) fail("commit_positions: stream slot holds no KV sequence");
+    kv_cache_->truncate(seq, pos_[m]);
+  }
+  print_kv_checksum("commit-kv", 0, pos_[0]);
+  if (!any_reject) {
+    // Verification wrote every active stream's final state out of place.
+    // Pointer promotion replaces four arena-sized D2D copies.
+    std::swap(q_conv_state_, q_conv_state_draft_);
+    std::swap(k_conv_state_, k_conv_state_draft_);
+    std::swap(v_conv_state_, v_conv_state_draft_);
+    std::swap(kda_state_, kda_state_draft_);
+    return;
+  }
+  // Verification left committed state untouched. Replay only the accepted
+  // prefix in place; rejected positions never enter persistent state.
+  std::vector<int> cut(max_batch_, 0);
+  for (int m = 0; m < static_cast<int>(cut.size()) && m < static_cast<int>(accepted.size()); ++m)
+    cut[m] = accepted[m];
+  cudaMemcpyAsync(kda_spec_cut_dev_, cut.data(), cut.size() * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  for (int l = 0; l < cfg_.text_layers; ++l) {
+    if (cfg_.layers[l].attn != fuel::AttnKind::kKda) continue;
+    const KdaW& kda = w_.layer(l).kda;
+    const int slot = kda_slot_[l];
+    const int batch = spec_batch_;
+    const int rows = spec_k_ * batch;
+    const int qkv = cfg_.kda_qkv_dim();
+    const int heads = cfg_.kda_heads;
+    const int hd = cfg_.kda_head_dim;
+    const int taps = cfg_.conv_state_taps();
+    const std::size_t rail_rows = static_cast<std::size_t>(kSpecMax) * max_batch_;
+    const std::size_t rail_qkv = static_cast<std::size_t>(slot) * 3 * rail_rows * qkv;
+    const std::size_t rail_gate = static_cast<std::size_t>(slot) * rail_rows * qkv;
+    const std::size_t rail_beta = static_cast<std::size_t>(slot) * rail_rows * heads;
+
+    const bf16* q_rail = kda_spec_qkv_rail_ + rail_qkv;
+    const bf16* k_rail = kda_spec_qkv_rail_ + rail_qkv + rail_rows * qkv;
+    const bf16* v_rail = kda_spec_qkv_rail_ + rail_qkv + 2 * rail_rows * qkv;
+    const bf16* gate_rail = kda_spec_gate_rail_ + rail_gate;
+    const bf16* beta_rail = kda_spec_beta_rail_ + rail_beta;
+
+    bf16* qstate = q_conv_state_ + static_cast<std::size_t>(slot) * max_batch_ * qkv * taps;
+    bf16* kstate = k_conv_state_ + static_cast<std::size_t>(slot) * max_batch_ * qkv * taps;
+    bf16* vstate = v_conv_state_ + static_cast<std::size_t>(slot) * max_batch_ * qkv * taps;
+    kda_conv_update_cut(q_conv_, qstate, q_rail, kda.conv, kda_spec_cut_dev_, batch, qkv,
+                        cfg_.kda_conv_kernel, spec_k_, stream_);
+    kda_conv_update_cut(k_conv_, kstate, k_rail,
+                        kda.conv + static_cast<std::size_t>(qkv) * cfg_.kda_conv_kernel,
+                        kda_spec_cut_dev_, batch, qkv, cfg_.kda_conv_kernel, spec_k_, stream_);
+    kda_conv_update_cut(v_conv_, vstate, v_rail,
+                        kda.conv + static_cast<std::size_t>(2) * qkv * cfg_.kda_conv_kernel,
+                        kda_spec_cut_dev_, batch, qkv, cfg_.kda_conv_kernel, spec_k_, stream_);
+    kda_norm_qk(q_conv_, k_conv_, rows, heads, hd, qkv, stream_);
+    float* state = kda_state_ + static_cast<std::size_t>(slot) * max_batch_ * heads * hd * hd;
+    kda_recurrent_cut(state, kda_o_, q_conv_, k_conv_, v_conv_, gate_rail, beta_rail,
+                      kda_spec_cut_dev_, batch, heads, hd, qkv, spec_k_, stream_);
+  }
 }
 
 void DecodeEngine::reset() {
@@ -576,7 +797,14 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
   const int heads = cfg_.kda_heads;
   const int MB = max_batch_;
 
-  if (k.qkv_fp8.packed != nullptr) {
+  const bool tc_proj = std::getenv("ROCKET_KDA_CUBLAS") != nullptr;
+  if (tc_proj) {
+    gemm_bf16_cublas(q_raw_, k.qkv, normed_, batch, qkv, H, stream_);
+    gemm_bf16_cublas(k_raw_, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, batch, qkv, H,
+                     stream_);
+    gemm_bf16_cublas(v_raw_, k.qkv + static_cast<std::size_t>(2) * qkv * H, normed_, batch, qkv, H,
+                     stream_);
+  } else if (k.qkv_fp8.packed != nullptr) {
     // FP8-per-row q/k/v (same row order as the bf16 concat): half the weight
     // bytes of the largest per-token family. Batch-invariant kernel keeps
     // M=1 and M=B bit-identical.
@@ -591,9 +819,11 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
                  normed_ + static_cast<std::size_t>(m) * H, qkv, H, stream_);
   } else {
     gemm_bf16(q_raw_, k.qkv, normed_, batch, qkv, H, stream_);
+    gemm_bf16(k_raw_, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, batch, qkv, H,
+              stream_);
+    gemm_bf16(v_raw_, k.qkv + static_cast<std::size_t>(2) * qkv * H, normed_, batch, qkv, H,
+              stream_);
   }
-  gemm_bf16(k_raw_, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, batch, qkv, H, stream_);
-  gemm_bf16(v_raw_, k.qkv + static_cast<std::size_t>(2) * qkv * H, normed_, batch, qkv, H, stream_);
   k_mark("qkv_gemm");
   if (telemetry_) {
     const std::string p = "layer" + std::to_string(layer) + ".";
@@ -602,9 +832,12 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
     record_absmax(p + "kda_v.output", v_raw_, batch, qkv);
   }
 
-  bf16* qstate = q_conv_state_ + static_cast<std::size_t>(slot) * MB * qkv * taps;
-  bf16* kstate = k_conv_state_ + static_cast<std::size_t>(slot) * MB * qkv * taps;
-  bf16* vstate = v_conv_state_ + static_cast<std::size_t>(slot) * MB * qkv * taps;
+  bf16* qstate = (kda_use_draft_state_ ? q_conv_state_draft_ : q_conv_state_) +
+                 static_cast<std::size_t>(slot) * MB * qkv * taps;
+  bf16* kstate = (kda_use_draft_state_ ? k_conv_state_draft_ : k_conv_state_) +
+                 static_cast<std::size_t>(slot) * MB * qkv * taps;
+  bf16* vstate = (kda_use_draft_state_ ? v_conv_state_draft_ : v_conv_state_) +
+                 static_cast<std::size_t>(slot) * MB * qkv * taps;
   kda_conv_update(q_conv_, qstate, q_raw_, k.conv, batch, qkv, cfg_.kda_conv_kernel, stream_);
   kda_conv_update(k_conv_, kstate, k_raw_, k.conv + static_cast<std::size_t>(qkv) * cfg_.kda_conv_kernel,
                   batch, qkv, cfg_.kda_conv_kernel, stream_);
@@ -613,6 +846,14 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
                   cfg_.kda_conv_kernel, stream_);
   kda_norm_qk(q_conv_, k_conv_, batch, heads, hd, /*row_stride=*/qkv, stream_);
   k_mark("conv3+normqk");
+  static bool lhcxp = std::getenv("ROCKET_LHC_CHECKSUM") != nullptr;
+  const bool dbg3p = lhcxp && layer == 3;
+  if (dbg3p) {
+    print_streams_checksum(layer, "plain-kda1", batch, static_cast<std::size_t>(batch) * qkv,
+                           q_raw_, qkv);
+    print_streams_checksum(layer, "plain-kda1c", batch, static_cast<std::size_t>(batch) * qkv,
+                           q_conv_, qkv);
+  }
   if (std::getenv("ROCKET_DEBUG_LAYER0") != nullptr && layer == 0) {
     auto dump_bf16 = [&](const char* what, const void* p, std::size_t n) {
       std::vector<std::uint16_t> h(n);
@@ -662,16 +903,31 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
                   qkv);
   kda_forget_gate(gate_, lr_b_, k.dt_bias, k.a_log, batch, heads, hd, cfg_.kda_gate_lower_bound,
                   stream_);
+  if (dbg3p)
+    print_streams_checksum(layer, "plain-kda2", batch, static_cast<std::size_t>(batch) * qkv,
+                           gate_, qkv);
   k_mark("gates");
 
   gemm_bf16(beta_raw_, k.b_proj, normed_, batch, heads, H, stream_);
   kda_sigmoid(beta_, beta_raw_, batch * heads, stream_);
   k_mark("beta");
 
-  float* state = kda_state_ + static_cast<std::size_t>(slot) * MB * heads * hd * hd;
+  float* state = (kda_use_draft_state_ ? kda_state_draft_ : kda_state_) +
+                 static_cast<std::size_t>(slot) * MB * heads * hd * hd;
   kda_recurrent_step(state, kda_o_, q_conv_, k_conv_, v_conv_, gate_, beta_, batch, heads, hd,
                      /*row_stride=*/qkv, stream_);
   k_mark("recurrent");
+  if (dbg3p) {
+    print_streams_checksum(layer, "plain-kda3", batch, static_cast<std::size_t>(batch) * qkv,
+                           kda_o_, qkv);
+    static std::vector<float> hs(static_cast<std::size_t>(kSpecMax) * heads * hd * hd);
+    cudaMemcpy(hs.data(), state, static_cast<std::size_t>(heads * hd * hd) * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaStreamSynchronize(stream_);
+    double ssum = 0.0;
+    for (int i = 0; i < heads * hd * hd; ++i) ssum += static_cast<double>(hs[i]);
+    fprintf(stderr, "[lhc] %-11s lay%d row%d state=%.8g\n", "plain-kda3s", layer, 0, ssum);
+  }
   if (std::getenv("ROCKET_DEBUG_LAYER0") != nullptr && layer == 0) {
     auto dump_bf16 = [&](const char* what, const void* p, std::size_t n) {
       std::vector<std::uint16_t> h(n);
@@ -702,7 +958,9 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
                   qkv);
   kda_gated_norm(kda_on_, kda_o_, lr_b_, k.o_norm, batch, heads, hd, cfg_.rms_norm_eps, stream_);
   k_mark("o_norm");
-  if (k.o_proj_fp8.packed != nullptr)
+  if (tc_proj)
+    gemm_bf16_cublas(sublayer_out_, k.o_proj, kda_on_, batch, H, qkv, stream_);
+  else if (k.o_proj_fp8.packed != nullptr)
     gemm_fp8_row(sublayer_out_, k.o_proj_fp8.packed, k.o_proj_fp8.scales, kda_on_, batch, H, qkv,
                  0, stream_);
   else
@@ -715,8 +973,147 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
     record_absmax("layer" + std::to_string(layer) + ".attn.normed", normed_, batch, H);
 }
 
+// Spec KDA site: position-major [K * batch] rows, exactly as the verify
+// batches them. With cut=nullptr the chained states end at the final position
+// and land in the draft buffers; with a cut the kernels dump the committed
+// state at the per-row accept boundary and the replay runs against the real
+// buffers. Only the conv and the recurrence chain state; everything else is
+// a plain [rows, width] batched call.
+void DecodeEngine::run_kda_spec_site(int layer, int positions, int batch, const int* cut, bool collect_stages) {
+  const bool kprof = std::getenv("ROCKET_DEBUG_KDA") != nullptr && layer == 0;
+  const auto k_t0 = Clock::now();
+  auto k_mark = [&](const char* what) {
+    if (!kprof) return;
+    cudaStreamSynchronize(stream_);
+    std::printf("[kda-spec-prof] %-18s %8.3f ms\n", what,
+                std::chrono::duration<double, std::milli>(Clock::now() - k_t0).count());
+  };
+  if (std::getenv("ROCKET_LHC_CHECKSUM") && layer == 3)
+    fprintf(stderr, "[site-hit] L3 pos=%d batch=%d cut=%p\n", positions, batch, (const void*)cut);
+  const KdaW& k = w_.layer(layer).kda;
+  const int H = cfg_.hidden_size;
+  const int qkv = cfg_.kda_qkv_dim();
+  const int hd = cfg_.kda_head_dim;
+  const int taps = cfg_.conv_state_taps();
+  const int heads = cfg_.kda_heads;
+  const int rows = positions * batch;
+  const int MB = max_batch_;
+
+  const bool draft = (cut == nullptr);
+  const int* chain_cut = cut;
+  // Verification is transactional: read committed state and write the
+  // speculative final state to the alternate arena. Cut/replay stays in place.
+  bf16* qstate_in = q_conv_state_ + static_cast<std::size_t>(kda_slot_[layer]) * MB * qkv * taps;
+  bf16* kstate_in = k_conv_state_ + static_cast<std::size_t>(kda_slot_[layer]) * MB * qkv * taps;
+  bf16* vstate_in = v_conv_state_ + static_cast<std::size_t>(kda_slot_[layer]) * MB * qkv * taps;
+  bf16* qstate_out = draft ? q_conv_state_draft_ + static_cast<std::size_t>(kda_slot_[layer]) * MB * qkv * taps : qstate_in;
+  bf16* kstate_out = draft ? k_conv_state_draft_ + static_cast<std::size_t>(kda_slot_[layer]) * MB * qkv * taps : kstate_in;
+  bf16* vstate_out = draft ? v_conv_state_draft_ + static_cast<std::size_t>(kda_slot_[layer]) * MB * qkv * taps : vstate_in;
+  const int slot = kda_slot_[layer];
+
+  const std::size_t rail_rows = static_cast<std::size_t>(kSpecMax) * max_batch_;
+  const std::size_t rail_qkv = static_cast<std::size_t>(slot) * 3 * rail_rows * qkv;
+  bf16* q_work = draft ? kda_spec_qkv_rail_ + rail_qkv : q_raw_;
+  bf16* k_work = draft ? kda_spec_qkv_rail_ + rail_qkv + rail_rows * qkv : k_raw_;
+  bf16* v_work = draft ? kda_spec_qkv_rail_ + rail_qkv + 2 * rail_rows * qkv : v_raw_;
+
+  const bool tc_proj = std::getenv("ROCKET_KDA_CUBLAS") != nullptr;
+  if (tc_proj) {
+    gemm_bf16_cublas(q_work, k.qkv, normed_, rows, qkv, H, stream_);
+    gemm_bf16_cublas(k_work, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, rows, qkv, H,
+                     stream_);
+    gemm_bf16_cublas(v_work, k.qkv + static_cast<std::size_t>(2) * qkv * H, normed_, rows, qkv, H,
+                     stream_);
+  } else if (k.qkv_fp8.packed != nullptr) {
+    gemm_fp8_row(q_work, k.qkv_fp8.packed, k.qkv_fp8.scales, normed_, rows, qkv, H, 0, stream_);
+    gemm_fp8_row(k_work, k.qkv_fp8.packed, k.qkv_fp8.scales, normed_, rows, qkv, H, qkv, stream_);
+    gemm_fp8_row(v_work, k.qkv_fp8.packed, k.qkv_fp8.scales, normed_, rows, qkv, H, 2 * qkv, stream_);
+  } else if (k.q_overlay.packed) {
+    for (int r = 0; r < rows; ++r)
+      gemv_nvfp4(q_work + static_cast<std::size_t>(r) * qkv, k.q_overlay.packed,
+                 k.q_overlay.scale, k.q_overlay.global,
+                 normed_ + static_cast<std::size_t>(r) * H, qkv, H, stream_);
+    gemm_bf16(k_work, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, rows, qkv, H, stream_);
+    gemm_bf16(v_work, k.qkv + static_cast<std::size_t>(2) * qkv * H, normed_, rows, qkv, H, stream_);
+  } else {
+    gemm_bf16(q_work, k.qkv, normed_, rows, qkv, H, stream_);
+    gemm_bf16(k_work, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, rows, qkv, H, stream_);
+    gemm_bf16(v_work, k.qkv + static_cast<std::size_t>(2) * qkv * H, normed_, rows, qkv, H, stream_);
+  }
+  k_mark("qkv projections");
+  kda_conv_update_chunk_oop(q_conv_, qstate_in, qstate_out, q_work, k.conv, batch, qkv,
+                            cfg_.kda_conv_kernel, positions, stream_);
+  kda_conv_update_chunk_oop(k_conv_, kstate_in, kstate_out, k_work,
+                            k.conv + static_cast<std::size_t>(qkv) * cfg_.kda_conv_kernel,
+                            batch, qkv, cfg_.kda_conv_kernel, positions, stream_);
+  kda_conv_update_chunk_oop(v_conv_, vstate_in, vstate_out, v_work,
+                            k.conv + static_cast<std::size_t>(2) * qkv * cfg_.kda_conv_kernel,
+                            batch, qkv, cfg_.kda_conv_kernel, positions, stream_);
+  kda_norm_qk(q_conv_, k_conv_, rows, heads, hd, /*row_stride=*/qkv, stream_);
+  k_mark("conv3 + qk norm");
+  static bool lhcx = std::getenv("ROCKET_LHC_CHECKSUM") != nullptr;
+  const bool dbg3 = lhcx && layer == 3 && draft;
+  if (dbg3) print_streams_checksum(layer, "spec-kda1", rows, static_cast<std::size_t>(rows) * qkv,
+                                   q_work, qkv);
+  const std::size_t rail_gate = static_cast<std::size_t>(slot) * rail_rows * qkv;
+  const std::size_t rail_beta = static_cast<std::size_t>(slot) * rail_rows * heads;
+  bf16* gate_work = draft ? kda_spec_gate_rail_ + rail_gate : gate_;
+  bf16* beta_work = draft ? kda_spec_beta_rail_ + rail_beta : beta_;
+  gemm_bf16(lr_a_, k.f_a, normed_, rows, hd, H, stream_);
+  gemm_bf16(lr_b_, k.f_b, lr_a_, rows, qkv, hd, stream_);
+  kda_forget_gate(gate_work, lr_b_, k.dt_bias, k.a_log, rows, heads, hd,
+                  cfg_.kda_gate_lower_bound, stream_);
+  k_mark("decay gate");
+  if (dbg3) print_streams_checksum(layer, "spec-kda2", rows, static_cast<std::size_t>(rows) * qkv,
+                                   gate_work, qkv);
+  gemm_bf16(beta_raw_, k.b_proj, normed_, rows, heads, H, stream_);
+  kda_sigmoid(beta_work, beta_raw_, rows * heads, stream_);
+  k_mark("beta");
+  float* state_in = kda_state_ + static_cast<std::size_t>(slot) * MB * heads * hd * hd;
+  float* state_out = draft ? kda_state_draft_ + static_cast<std::size_t>(slot) * MB * heads * hd * hd
+                           : state_in;
+  if (draft) {
+    kda_recurrent_chunk_oop(state_in, state_out, kda_o_, q_conv_, k_conv_, v_conv_, gate_work,
+                            beta_work, batch, heads, hd, /*row_stride=*/qkv, positions, stream_);
+  } else {
+    kda_recurrent_cut(state_in, kda_o_, q_conv_, k_conv_, v_conv_, gate_work, beta_work,
+                      chain_cut, batch, heads, hd, /*row_stride=*/qkv, positions, stream_);
+  }
+  k_mark("recurrent");
+  if (dbg3) {
+    print_streams_checksum(layer, "spec-kda3", rows, static_cast<std::size_t>(rows) * qkv,
+                           kda_o_, qkv);
+    if (batch == 1) {
+      static std::vector<float> hs(static_cast<std::size_t>(kSpecMax) * heads * hd * hd);
+      cudaMemcpy(hs.data(), state_out, hs.size() * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaStreamSynchronize(stream_);
+      for (int r = 0; r < rows; ++r) {
+        double s = 0.0;
+        for (int i = 0; i < heads * hd * hd; ++i)
+          s += static_cast<double>(hs[static_cast<std::size_t>(r) * heads * hd * hd + i]);
+        fprintf(stderr, "[lhc] %-11s lay%d row%d state=%.8g\n", "spec-kda3s", layer, r, s);
+      }
+    }
+  }
+  gemm_bf16(lr_a_, k.g_a, normed_, rows, hd, H, stream_);
+  gemm_bf16(lr_b_, k.g_b, lr_a_, rows, qkv, hd, stream_);
+  kda_gated_norm(kda_on_, kda_o_, lr_b_, k.o_norm, rows, heads, hd, cfg_.rms_norm_eps, stream_);
+  k_mark("output gate + norm");
+  if (dbg3) print_streams_checksum(layer, "spec-kda4", rows, static_cast<std::size_t>(rows) * qkv,
+                                   kda_on_, qkv);
+  if (tc_proj)
+    gemm_bf16_cublas(sublayer_out_, k.o_proj, kda_on_, rows, H, qkv, stream_);
+  else if (k.o_proj_fp8.packed != nullptr)
+    gemm_fp8_row(sublayer_out_, k.o_proj_fp8.packed, k.o_proj_fp8.scales, kda_on_, rows, H, qkv,
+                 0, stream_);
+  else
+    gemm_bf16(sublayer_out_, k.o_proj, kda_on_, rows, H, qkv, stream_);
+  k_mark("output projection");
+  if (collect_stages) (void)0;
+}
+
 void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_dev,
-                           int n_pools_max) {
+                           int n_pools_max, int n_streams) {
   const MlaW& m = w_.layer(layer).mla;
   const int H = cfg_.hidden_size;
   const int heads = cfg_.mla_heads;
@@ -724,14 +1121,20 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   const int ihd = cfg_.index_head_dim;
   const int ih = cfg_.index_n_heads;
   const int kpool = cfg_.index_kpool;
+  const bool tc_all = std::getenv("ROCKET_CUBLAS_ALL") != nullptr;
 
-  if (m.q_a_fp8.packed != nullptr)
+  if (tc_all)
+    gemm_bf16_cublas(q_resid_raw_, m.q_a, normed_, batch, cfg_.q_lora_rank, H, stream_);
+  else if (m.q_a_fp8.packed != nullptr)
     gemm_fp8_row(q_resid_raw_, m.q_a_fp8.packed, m.q_a_fp8.scales, normed_, batch,
                  cfg_.q_lora_rank, H, 0, stream_);
   else
     gemm_bf16(q_resid_raw_, m.q_a, normed_, batch, cfg_.q_lora_rank, H, stream_);
   rmsnorm(q_resid_, q_resid_raw_, m.q_a_norm, batch, cfg_.q_lora_rank, cfg_.rms_norm_eps, stream_);
-  if (m.q_b_fp8.packed != nullptr)
+  if (tc_all)
+    gemm_bf16_cublas(q_, m.q_b, q_resid_, batch, heads * cfg_.qk_head_dim(),
+                     cfg_.q_lora_rank, stream_);
+  else if (m.q_b_fp8.packed != nullptr)
     gemm_fp8_row(q_, m.q_b_fp8.packed, m.q_b_fp8.scales, q_resid_, batch,
                  heads * cfg_.qk_head_dim(), cfg_.q_lora_rank, 0, stream_);
   else
@@ -740,7 +1143,9 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
     record_absmax("layer" + std::to_string(layer) + ".mla_q.output", q_, batch,
                   heads * cfg_.qk_head_dim());
 
-  if (m.kv_a_fp8.packed != nullptr)
+  if (tc_all)
+    gemm_bf16_cublas(ckv_, m.kv_a, normed_, batch, kvl, H, stream_);
+  else if (m.kv_a_fp8.packed != nullptr)
     gemm_fp8_row(ckv_, m.kv_a_fp8.packed, m.kv_a_fp8.scales, normed_, batch, kvl, H, 0, stream_);
   else
     gemm_bf16(ckv_, m.kv_a, normed_, batch, kvl, H, stream_);
@@ -748,7 +1153,9 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
     record_absmax("layer" + std::to_string(layer) + ".mla_kv.output", ckv_, batch, kvl);
   rmsnorm(latent_stage_, ckv_, m.kv_a_norm, batch, kvl, cfg_.rms_norm_eps, stream_);
 
-  if (m.idx_wq_b_fp8.packed != nullptr)
+  if (tc_all)
+    gemm_bf16_cublas(q_idx_, m.idx_wq_b, q_resid_, batch, ih * ihd, cfg_.q_lora_rank, stream_);
+  else if (m.idx_wq_b_fp8.packed != nullptr)
     gemm_fp8_row(q_idx_, m.idx_wq_b_fp8.packed, m.idx_wq_b_fp8.scales, q_resid_, batch, ih * ihd,
                  cfg_.q_lora_rank, 0, stream_);
   else
@@ -766,14 +1173,31 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   // move the top-k, and the scores are used for nothing else.
   gemm_bf16_f32(head_w_, m.idx_weights, normed_, batch, ih, H, stream_);
 
-  kv_write_latent(mla_kv_, latent_stage_, pos_dev_, batch, slot, stream_);
-  kv_write_index(mla_kv_, idx_k_stage_, idx_g_stage_, pos_dev_, batch, slot, stream_);
+  kv_write_latent(mla_kv_, latent_stage_, pos_dev_, batch, n_streams, slot, stream_);
+  kv_write_index(mla_kv_, idx_k_stage_, idx_g_stage_, pos_dev_, batch, n_streams, slot, stream_);
+  static bool lhcx = std::getenv("ROCKET_LHC_CHECKSUM") != nullptr;
+  const bool dbg3 = lhcx && layer == 3;
+  if (dbg3) {
+    print_streams_checksum(layer, "mla-w", batch, static_cast<std::size_t>(batch) * kvl,
+                           latent_stage_, kvl);
+  }
 
   if (n_pools_max > 0) {
-    indexer_pool_keys(pool_keys_, mla_kv_, m.idx_ape, n_pools_dev_, n_pools_max, pool_stride_,
-                      batch, slot, kpool, ihd, stream_);
+  indexer_pool_keys(pool_keys_, mla_kv_, m.idx_ape, n_pools_dev_, n_pools_max, pool_stride_,
+                    batch, n_streams, slot, kpool, ihd, stream_);
+    if (dbg3)
+      print_streams_checksum(layer, "mla-pk", batch,
+                             static_cast<std::size_t>(std::max(batch, 1)) * ihd, pool_keys_, ihd);
     indexer_scores(pool_scores_, q_idx_, pool_keys_, head_w_, n_pools_dev_, n_pools_max,
                    pool_stride_, batch, ih, ihd, stream_);
+    if (dbg3) {
+      std::vector<int> hnp(static_cast<std::size_t>(batch), 0);
+      cudaMemcpy(hnp.data(), n_pools_dev_, hnp.size() * sizeof(int), cudaMemcpyDeviceToHost);
+      cudaStreamSynchronize(stream_);
+      for (int m = 0; m < batch; ++m)
+        fprintf(stderr, "[lhc] %-11s lay%d row%d npool=%d npmax=%d\n", "mla-np", layer, m, hnp[m],
+                n_pools_max);
+    }
     indexer_select(sel_pools_, n_sel_, pool_scores_, n_pools_dev_, n_pools_max, pool_stride_,
                    sel_pool_stride_, batch, cfg_.index_select_pools(), stream_);
   } else {
@@ -785,18 +1209,31 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   const float scaling = 1.0f / std::sqrt(static_cast<float>(cfg_.qk_head_dim()));
   mla_absorb_q(q_abs_, m.kv_b, q_, batch, heads, cfg_.qk_nope_head_dim, cfg_.v_head_dim, kvl,
               stream_);
-  mla_scores(scores_, q_abs_, mla_kv_, sel_tokens_, n_tok_, sel_stride_, sel_stride_, batch, slot,
-            heads, kvl, scaling, stream_);
+  mla_scores(scores_, q_abs_, mla_kv_, sel_tokens_, n_tok_, sel_stride_, sel_stride_, batch,
+             n_streams, slot, heads, kvl, scaling, stream_);
   mla_softmax(scores_, n_tok_, sel_stride_, batch, heads, stream_);
-  mla_context(ctx_, scores_, mla_kv_, sel_tokens_, n_tok_, sel_stride_, sel_stride_, batch, slot,
-             heads, kvl, stream_);
+  mla_context(ctx_, scores_, mla_kv_, sel_tokens_, n_tok_, sel_stride_, sel_stride_, batch,
+              n_streams, slot, heads, kvl, stream_);
+  if (dbg3) {
+    mla_dump_ints("mla-sel", layer, sel_tokens_, n_tok_, sel_stride_, batch);
+    mla_dump_score("mla-ctx", layer, ctx_, batch, heads);
+  }
   mla_expand_v(v_out_, m.kv_b, ctx_, batch, heads, cfg_.qk_nope_head_dim, cfg_.v_head_dim, kvl,
               stream_);
-  if (m.o_proj_fp8.packed != nullptr)
+  if (tc_all)
+    gemm_bf16_cublas(sublayer_out_, m.o_proj, v_out_, batch, H, heads * cfg_.v_head_dim, stream_);
+  else if (m.o_proj_fp8.packed != nullptr)
     gemm_fp8_row(sublayer_out_, m.o_proj_fp8.packed, m.o_proj_fp8.scales, v_out_, batch, H,
                  heads * cfg_.v_head_dim, 0, stream_);
   else
     gemm_bf16(sublayer_out_, m.o_proj, v_out_, batch, H, heads * cfg_.v_head_dim, stream_);
+  if (dbg3) {
+    print_streams_checksum(layer, "mla-vout", batch,
+                           static_cast<std::size_t>(batch) * heads * cfg_.v_head_dim, v_out_,
+                           heads * cfg_.v_head_dim);
+    print_streams_checksum(layer, "mla-out", batch, static_cast<std::size_t>(batch) * H,
+                           sublayer_out_, H);
+  }
   if (telemetry_)
     record_absmax("layer" + std::to_string(layer) + ".mla_o.output", sublayer_out_, batch, H);
 
@@ -1075,6 +1512,9 @@ bool DecodeEngine::run_moe_grouped(int layer, int batch, const std::vector<int>&
                         moe_sf1_base_, own_n, H, stream_);
     gemv_fallback =
         force_grouped_fail || !grouped_gemm_nvfp4(groups1, 2 * MI, H, stream_);
+    if (std::getenv("ROCKET_MOE_TRACE") && (gemv_fallback || layer == 3))
+      std::fprintf(stderr, "[moe-gemv] ep=%d layer=%d rows=%d own_n=%d fallback=%d\n",
+                   ep_ != nullptr, layer, rows, own_n, static_cast<int>(gemv_fallback));
     if (gemv_fallback) {
       for (std::size_t g_fb = 0; g_fb < group_expert.size(); ++g_fb) {
         const ExpertDev& e = w_.expert(layer, group_expert[g_fb], stream_);
@@ -1266,9 +1706,90 @@ void DecodeEngine::run_moe(int layer, int batch) {
   const int SI = MI * cfg_.n_shared_experts;
   const int K = cfg_.num_experts_per_tok;
 
+  static bool mtrace = std::getenv("ROCKET_MOE_TRACE") != nullptr;
+  if (mtrace) {
+    // Sentinel fill BEFORE the gemm: rows still holding 0xA5 bytes after the
+    // gemm prove the gemm never wrote them.
+    cudaMemsetAsync(router_logits_, 0xA5,
+                    static_cast<std::size_t>(max_batch_ * kSpecMax) * cfg_.n_routed_experts *
+                        sizeof(float),
+                    stream_);
+    cudaStreamSynchronize(stream_);
+  }
+  // Exactly one router projection per MoE layer. A second identical launch
+  // here used to overwrite this result and cost 42 redundant GEMMs per full
+  // GLM-5.3 forward.
   gemm_bf16_f32(router_logits_, mo.router, normed_, batch, cfg_.n_routed_experts, H, stream_);
+  static bool rowwise_router = std::getenv("ROCKET_ROUTER_ROWWISE") != nullptr;
+  if (rowwise_router) {
+    // Band-aid probe: force the proven M=1 kernel per row for the router.
+    for (int mp = 0; mp < batch; ++mp)
+      gemm_bf16_f32(router_logits_ + static_cast<std::size_t>(mp) * cfg_.n_routed_experts,
+                    mo.router, normed_ + static_cast<std::size_t>(mp) * H, 1,
+                    cfg_.n_routed_experts, H, stream_);
+  }
+
   moe_router(topk_idx_, topk_w_, router_logits_, mo.router_bias, batch, cfg_.n_routed_experts, K,
             cfg_.norm_topk_prob, cfg_.routed_scaling_factor, stream_);
+  if (std::getenv("ROCKET_SPEC_DEBUG")) cuda_check(cudaGetLastError(), "spec moe router");
+  if (mtrace) {
+    static std::vector<float> rl(std::size_t(max_batch_) * cfg_.n_routed_experts, 0.f);
+    static std::vector<bf16> nx(std::size_t(max_batch_ * kSpecMax) * cfg_.hidden_size);
+    static std::vector<bf16> chead_buf(std::size_t(max_batch_ * kSpecMax) * cfg_.hidden_size);
+    std::vector<int> tidx(std::size_t(batch) * K);
+    std::vector<float> twts(std::size_t(batch) * K);
+    cudaMemcpyAsync(rl.data(), router_logits_, rl.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                    stream_);
+    cudaMemcpyAsync(nx.data(), normed_, nx.size() * sizeof(bf16), cudaMemcpyDeviceToHost, stream_);
+    cudaMemcpyAsync(chead_buf.data(), collapsed_, chead_buf.size() * sizeof(bf16),
+                    cudaMemcpyDeviceToHost, stream_);
+    cudaMemcpyAsync(rl.data(), router_logits_, rl.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                    stream_);
+    cudaMemcpyAsync(tidx.data(), topk_idx_, tidx.size() * sizeof(int), cudaMemcpyDeviceToHost,
+                    stream_);
+    cudaMemcpyAsync(twts.data(), topk_w_, twts.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                    stream_);
+    cudaStreamSynchronize(stream_);
+    for (int m = 0; m < batch; ++m) {
+      double s = 0.0, ns = 0.0, amax = 0.0;
+      float lamax = 0.f;
+      for (int e = 0; e < cfg_.n_routed_experts; ++e) {
+        float v = rl[static_cast<std::size_t>(m) * cfg_.n_routed_experts + e];
+        s += static_cast<double>(v);
+        lamax = std::fmaxf(lamax, std::fabs(v));
+      }
+      for (int h = 0; h < H; ++h) {
+        float v = __bfloat162float(nx[static_cast<std::size_t>(m) * H + h]);
+        ns += v; amax = std::max(amax, double(std::fabs(v)));
+      }
+      std::string heads;
+      for (int e = 0; e < 6; ++e) {
+        heads += (e ? "," : "") +
+                 std::to_string(rl[static_cast<std::size_t>(m) * cfg_.n_routed_experts + e])
+                     .substr(0, 7);
+      }
+      std::string nhead, chead;
+      for (int h = 0; h < 6; ++h)
+        nhead += (h ? "," : "") +
+                 std::to_string(__bfloat162float(nx[static_cast<std::size_t>(m) * H + h]))
+                     .substr(0, 7);
+      for (int h = 0; h < 6; ++h)
+        chead += (h ? "," : "") +
+                 std::to_string(__bfloat162float(chead_buf[static_cast<std::size_t>(m) * H + h]))
+                     .substr(0, 7);
+      std::string ids;
+      for (int k = 0; k < K; ++k) {
+        ids += (k ? "," : "") +
+               std::to_string(tidx[static_cast<std::size_t>(m) * K + k]) + ":" +
+               std::to_string(twts[static_cast<std::size_t>(m) * K + k]).substr(0, 6);
+      }
+      fprintf(stderr,
+              "[moe] L%d row%d b=%d normed(s=%.4g amax=%.4g n0..5=[%s] c0..5=[%s]) "
+              "llog(amax=%.4g e0..5=[%s]) lsum=%.8g ew=[%s]\n",
+              layer, m, batch, ns, amax, nhead.c_str(), chead.c_str(), lamax, heads.c_str(), s,
+              ids.c_str());
+    }
+  }
 
   std::vector<int> idx(static_cast<std::size_t>(batch) * K);
   std::vector<float> wts(static_cast<std::size_t>(batch) * K);
@@ -1288,12 +1809,14 @@ void DecodeEngine::run_moe(int layer, int batch) {
   record_expert_fire(idx);
 
   if (w_.exl3_fuel()) {
-    // DEBUG: no-op MoE to isolate the sticky error source
-    cudaMemsetAsync(acc_, 0, static_cast<std::size_t>(batch) * H * sizeof(bf16), stream_);
+    // EXL3-fuel routed experts: gather + per-expert trellis GEMV +
+    // scatter-accumulate (run_moe_exl3, defined above).
+    run_moe_exl3(layer, batch, idx, wts);
     return;
   }
 
   cudaMemsetAsync(acc_, 0, static_cast<std::size_t>(batch) * H * sizeof(bf16), stream_);
+  if (std::getenv("ROCKET_SPEC_DEBUG")) cuda_check(cudaGetLastError(), "spec moe memset");
   const bool want_grouped =
       moe_path_ == MoePath::kForceGrouped ||
       (moe_path_ == MoePath::kAuto && batch >= kGroupedMoeMinBatch);
@@ -1307,6 +1830,7 @@ void DecodeEngine::run_moe(int layer, int batch) {
     run_moe_gemv(layer, batch, idx);
   }
   m_mark("grouped_gemm_total");
+  if (std::getenv("ROCKET_SPEC_DEBUG")) cuda_check(cudaGetLastError(), "spec moe grouped");
 
   // Without overlap the step blocks here, exactly where the serialized
   // exchange always sat. With it, the shared expert's dense GEMMs are enqueued
@@ -1320,6 +1844,8 @@ void DecodeEngine::run_moe(int layer, int batch) {
   add_bf16(acc_, mlp_out_, batch * H, stream_);
   cudaMemcpyAsync(sublayer_out_, acc_, static_cast<std::size_t>(batch) * H * sizeof(bf16),
                   cudaMemcpyDeviceToDevice, stream_);
+  if (std::getenv("ROCKET_SPEC_DEBUG"))
+    cuda_check(cudaGetLastError(), ("spec moe L" + std::to_string(layer)).c_str());
 
   if (telemetry_)
     record_absmax("layer" + std::to_string(layer) + ".ffn.normed", normed_, batch, H);
@@ -1395,7 +1921,7 @@ void DecodeEngine::run_attn_site(int layer, int batch, int n_pools_launch) {
   if (cfg_.layers[layer].attn == fuel::AttnKind::kKda) {
     run_kda(layer, kda_slot_[layer], batch);
   } else {
-    run_mla(layer, mla_slot_[layer], batch, n_tokens_dev_, n_pools_launch);
+    run_mla(layer, mla_slot_[layer], batch, n_tokens_dev_, n_pools_launch, batch);
   }
   if (dbg) {
     auto dump_bf16 = [&](const char* what, const void* p, std::size_t n) {
@@ -1681,16 +2207,19 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
   stages_ = StageMs{};
   router_entropy_ = 0.0;
 
-  std::vector<int> pos_h(batch), ntok_h(batch);
+  std::vector<int> pos_h(batch), ntok_h(batch), npool_h(batch);
   int n_pools_max = 0;
   for (int m = 0; m < batch; ++m) {
     pos_h[m] = pos_[m];
     ntok_h[m] = pos_[m] + 1;
-    n_pools_max = std::max(n_pools_max, ntok_h[m] / cfg_.index_kpool);
+    npool_h[m] = ntok_h[m] / cfg_.index_kpool;
+    n_pools_max = std::max(n_pools_max, npool_h[m]);
   }
   cudaMemcpyAsync(tokens_dev_, tokens.data(), batch * sizeof(int), cudaMemcpyHostToDevice, stream_);
   cudaMemcpyAsync(pos_dev_, pos_h.data(), batch * sizeof(int), cudaMemcpyHostToDevice, stream_);
   cudaMemcpyAsync(n_tokens_dev_, ntok_h.data(), batch * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(n_pools_dev_, npool_h.data(), batch * sizeof(int), cudaMemcpyHostToDevice,
                   stream_);
 
   {
@@ -1734,6 +2263,13 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
       if (le != cudaSuccess)
         std::fprintf(stderr, "[sticky] layer %d entry: %s\n", l, cudaGetErrorString(le));
     }
+    static bool lhcx = std::getenv("ROCKET_LHC_CHECKSUM") != nullptr;
+    if (lhcx && l == 3) {
+      print_streams_checksum(l, "plain-l3a", batch, static_cast<std::size_t>(batch) * hc * H,
+                             streams_, hc * H);
+      print_streams_checksum(l, "plain-l3n", batch, static_cast<std::size_t>(batch) * H, normed_,
+                             H);
+    }
     if (cfg_.layers[l].attn == fuel::AttnKind::kKda) {
       StageTimer t(stream_, &stages_.kda, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       run_kda(l, kda_slot_[l], batch);
@@ -1742,7 +2278,11 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
       // rather than isolated by a sync, since a batched step has no
       // per-layer host readback of the selection count anymore.
       StageTimer t(stream_, &stages_.mla, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
-      run_mla(l, mla_slot_[l], batch, n_tokens_dev_, n_pools_max);
+      run_mla(l, mla_slot_[l], batch, n_tokens_dev_, n_pools_max, batch);
+    }
+    if (lhcx && l == 3) {
+      print_streams_checksum(l, "plain-l3b", batch, static_cast<std::size_t>(batch) * H,
+                             sublayer_out_, H);
     }
     if (dbg_l0) {
       auto dump_bf16 = [&](const char* what, const void* p, std::size_t n) {
@@ -1807,6 +2347,15 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
       StageTimer t(stream_, &stages_.hyper_connection, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
       hc_combine(streams_, post_, sublayer_out_, comb_, residual_, batch, hc, H, stream_);
     }
+    if (std::getenv("ROCKET_DFLASH2_DIR")) {
+      // Draft config ids are one-based, matching vLLM's idx + 1 test.
+      static constexpr int taps[5] = {4, 13, 23, 32, 41};
+      for (int ti = 0; ti < 5; ++ti)
+        if (l == taps[ti])
+          hc_head_mean(dflash_aux_hidden_ + static_cast<std::size_t>(ti) * kSpecMax * max_batch_ * H,
+                       streams_, batch, hc, H, stream_);
+    }
+    print_streams_checksum(l, "plain-lhc", batch, static_cast<std::size_t>(batch) * hc * H);
 
     if (collect_stages) {
       hc_head_mean(hmean_, streams_, batch, hc, H, stream_);
@@ -1835,8 +2384,220 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
     if (s.mlp == fuel::MlpKind::kSparse) ++moe_layers;
   router_entropy_ /= (moe_layers > 0 ? moe_layers : 1);
 
-  for (int m = 0; m < batch; ++m) ++pos_[m];
+  print_kda_checksum(0, "step-end");
+  print_kv_checksum("step-kv", 0, pos_[0] + 1);
+    for (int m = 0; m < batch; ++m) ++pos_[m];
   cuda_check(cudaGetLastError(), "decode step");
+  out_tokens = std::move(next);
+}
+
+// Multi-token verify. tokens holds batch*spec_k entries in position-major
+// order: tokens[j*batch + m] is stream m's token at verify position j
+// (j=0 is the already-committed token, j>=1 are draft tokens). Every layer
+// type sees the weights once; KDA and MLA layers walk positions sequentially
+// because their state chains, while hc/norm/FFN/lm_head batch across all
+// B*spec_k rows. out_tokens gets batch*spec_k argmax values in the same
+// position-major order; out_tokens[j*batch+m] predicts the token at verify
+// position j+1 of stream m.
+void DecodeEngine::step_spec(const std::vector<int>& tokens, int spec_k,
+                             std::vector<int>& out_tokens, bool collect_stages) {
+  const int batch = static_cast<int>(tokens.size()) / spec_k;
+  const int total = batch * spec_k;
+  if (spec_k < 1 || spec_k > kSpecMax) fail("spec_k out of [1, kSpecMax]");
+  if (batch <= 0 || batch > max_batch_) fail("batch out of [1, max_batch] range");
+  for (int m = 0; m < batch; ++m)
+    if (pos_[m] + spec_k > max_tokens_) fail("spec positions exceed max_tokens");
+
+  stages_ = StageMs{};
+  router_entropy_ = 0.0;
+  spec_k_ = spec_k;
+  spec_batch_ = batch;
+
+  // Reserve every verify position's KV site up front; commit_positions
+  // truncates the sequence back to the accepted length once the caller has
+  // decided which drafts to keep.
+  for (int m = 0; m < batch; ++m) {
+    const int seq = kv_seq_of_slot_[m];
+    if (seq < 0) fail("step_spec: stream slot holds no KV sequence");
+    for (int j = 0; j < spec_k; ++j) {
+      const kv::AppendSite site = kv_cache_->append_token(seq, tokens[j * batch + m]);
+      if (site.page < 0) fail("step_spec: KV pool exhausted");
+      if (site.grew_table || site.copied_on_extend)
+        kv_arena_->upload_table(m, kv_cache_->page_table(seq));
+    }
+  }
+
+  const int H = cfg_.hidden_size;
+  const int hc = cfg_.hc_mult;
+  const int taps = cfg_.conv_state_taps();
+  const int qkv = cfg_.kda_qkv_dim();
+  const int hd = cfg_.kda_head_dim;
+  const int heads = cfg_.kda_heads;
+  const int MB = max_batch_;
+
+  // Per-row position/n_tokens arrays cover all spec_k positions: row
+  // j*batch+m sits at pos_[m]+j.
+  std::vector<int> pos_spec(total), ntok_spec(total), npool_spec(total), pos_h(batch);
+  int n_pools_max = 0;
+  for (int j = 0; j < spec_k; ++j) {
+    for (int m = 0; m < batch; ++m) {
+      const int p = pos_[m] + j;
+      pos_spec[j * batch + m] = p;
+      ntok_spec[j * batch + m] = p + 1;
+      npool_spec[j * batch + m] = (p + 1) / cfg_.index_kpool;
+      n_pools_max = std::max(n_pools_max, npool_spec[j * batch + m]);
+    }
+    pos_h.push_back(0);  // keep this vector's size stable per loop
+  }
+  pos_h.assign(batch, 0);
+  cudaMemcpyAsync(pos_spec_dev_, pos_spec.data(), total * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(ntok_spec_dev_, ntok_spec.data(), total * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(npool_spec_dev_, npool_spec.data(), total * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(tokens_spec_dev_, tokens.data(), total * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+
+  {
+    StageTimer t(stream_, &stages_.embed, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+    embed_streams(streams_, w_.embed(), tokens_spec_dev_, total, hc, H, stream_);
+  }
+  cuda_check(cudaGetLastError(), "spec embed");
+  if (std::getenv("ROCKET_SPEC_DEBUG")) {
+    fprintf(stderr, "[ptrs] rig=%p gro=%p sfb=%p\n",
+            static_cast<const void*>(dense_row_in_group_),
+            static_cast<const void*>(dense_group_of_row_),
+            static_cast<const void*>(dense_sf_base_));
+    std::vector<int> rh(max_batch_ * DecodeEngine::kSpecMax),
+        gh(max_batch_ * DecodeEngine::kSpecMax);
+    cudaMemcpy(rh.data(), dense_row_in_group_, rh.size() * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(gh.data(), dense_group_of_row_, gh.size() * sizeof(int), cudaMemcpyDeviceToHost);
+    fprintf(stderr, "[vals] row_in_group:");
+    for (int m = 0; m < max_batch_ * DecodeEngine::kSpecMax; ++m) fprintf(stderr, " %d", rh[m]);
+    fprintf(stderr, "\n[vals] group_of_row:");
+    for (int m = 0; m < max_batch_ * DecodeEngine::kSpecMax; ++m) fprintf(stderr, " %d", gh[m]);
+    fprintf(stderr, "\n");
+  }
+  print_kda_checksum(0, "spec-entry");
+  print_kv_checksum("spec-kv", 0, pos_[0]);
+  for (int l = 0; l < cfg_.text_layers; ++l) {
+    const LayerW& lw = w_.layer(l);
+
+    // ---- attention site (batched hyper-connection + norm) ----
+    {
+      StageTimer t(stream_, &stages_.hyper_connection, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      cudaMemcpyAsync(residual_, streams_, static_cast<std::size_t>(total) * hc * H * sizeof(bf16),
+                      cudaMemcpyDeviceToDevice, stream_);
+      hc_mix_gemv(mix_, lw.attn_hc.fn, streams_, total, cfg_.hc_mix(), hc, H, cfg_.rms_norm_eps, stream_);
+      hc_split(post_, comb_, collapsed_, mix_, lw.attn_hc.base, lw.attn_hc.scale, streams_, total,
+               hc, H, cfg_.hc_eps, cfg_.hc_sinkhorn_iters, stream_);
+    }
+    {
+      StageTimer t(stream_, &stages_.norms, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      rmsnorm(normed_, collapsed_, lw.input_norm, total, H, cfg_.rms_norm_eps, stream_);
+    }
+    cuda_check(cudaGetLastError(), "spec hc+norm attn");
+    static bool lhcx = std::getenv("ROCKET_LHC_CHECKSUM") != nullptr;
+    static bool brdbg = std::getenv("ROCKET_BRANCH_DEBUG") != nullptr;
+    if (lhcx && l == 3) {
+      print_streams_checksum(l, "spec-l3a", total, static_cast<std::size_t>(total) * hc * H,
+                             streams_, hc * H);
+      print_streams_checksum(l, "spec-l3n", total, static_cast<std::size_t>(total) * H, normed_,
+                             H);
+    }
+    if (brdbg && l <= 6)
+      fprintf(stderr, "[branch] spec L%d attn=%d -> %s\n", l, int(cfg_.layers[l].attn),
+              cfg_.layers[l].attn == fuel::AttnKind::kKda ? "KDA" : "MLA");
+    if (cfg_.layers[l].attn == fuel::AttnKind::kKda) {
+      StageTimer t(stream_, &stages_.kda, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      // Whole site at spec_k*batch rows; the chained conv and recurrence run
+      // against the draft state copies so a rejected prefix never touches the
+      // committed state.
+      run_kda_spec_site(l, spec_k, batch, /*cut=*/nullptr, collect_stages);
+      cuda_check(cudaGetLastError(), "spec kda");
+    } else {
+      StageTimer t(stream_, &stages_.mla, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      // Whole site at total rows. kv_locate and the indexer read the
+      // per-row device arrays uploaded above, so no per-position launches.
+      bf16* saved_pos = reinterpret_cast<bf16*>(pos_dev_);
+      bf16* saved_tok = reinterpret_cast<bf16*>(n_tokens_dev_);
+      bf16* saved_pool = reinterpret_cast<bf16*>(n_pools_dev_);
+      pos_dev_ = reinterpret_cast<int*>(pos_spec_dev_);
+      n_tokens_dev_ = reinterpret_cast<int*>(ntok_spec_dev_);
+      n_pools_dev_ = reinterpret_cast<int*>(npool_spec_dev_);
+      run_mla(l, mla_slot_[l], total, n_tokens_dev_, n_pools_max, batch);
+      pos_dev_ = reinterpret_cast<int*>(saved_pos);
+      n_tokens_dev_ = reinterpret_cast<int*>(saved_tok);
+      n_pools_dev_ = reinterpret_cast<int*>(saved_pool);
+      cuda_check(cudaGetLastError(), "spec mla");
+    }
+    if (lhcx && l == 3) {
+      print_streams_checksum(l, "spec-l3b", total, static_cast<std::size_t>(total) * H,
+                             sublayer_out_, H);
+    }
+    {
+      StageTimer t(stream_, &stages_.hyper_connection, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      hc_combine(streams_, post_, sublayer_out_, comb_, residual_, total, hc, H, stream_);
+    }
+
+    // ---- feed-forward site ----
+    {
+      StageTimer t(stream_, &stages_.hyper_connection, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      cudaMemcpyAsync(residual_, streams_, static_cast<std::size_t>(total) * hc * H * sizeof(bf16),
+                      cudaMemcpyDeviceToDevice, stream_);
+      hc_mix_gemv(mix_, lw.ffn_hc.fn, streams_, total, cfg_.hc_mix(), hc, H, cfg_.rms_norm_eps, stream_);
+      hc_split(post_, comb_, collapsed_, mix_, lw.ffn_hc.base, lw.ffn_hc.scale, streams_, total, hc,
+               H, cfg_.hc_eps, cfg_.hc_sinkhorn_iters, stream_);
+    }
+    {
+      StageTimer t(stream_, &stages_.norms, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      rmsnorm(normed_, collapsed_, lw.post_attn_norm, total, H, cfg_.rms_norm_eps, stream_);
+    }
+    cuda_check(cudaGetLastError(), "spec hc+norm ffn");
+    if (cfg_.layers[l].mlp == fuel::MlpKind::kDense) {
+      StageTimer t(stream_, &stages_.dense_mlp, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      run_dense_mlp(l, total);
+    } else {
+      StageTimer t(stream_, &stages_.moe_experts, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      run_moe(l, total);
+    }
+    cuda_check(cudaGetLastError(), "spec ffn");
+    {
+      StageTimer t(stream_, &stages_.hyper_connection, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      hc_combine(streams_, post_, sublayer_out_, comb_, residual_, total, hc, H, stream_);
+      print_streams_checksum(l, "spec-lhc", total, static_cast<std::size_t>(total) * hc * H);
+    }
+    if (std::getenv("ROCKET_DFLASH2_DIR")) {
+      // Draft config ids are one-based, matching vLLM's idx + 1 test.
+      static constexpr int taps[5] = {4, 13, 23, 32, 41};
+      for (int ti = 0; ti < 5; ++ti)
+        if (l == taps[ti])
+          hc_head_mean(dflash_aux_hidden_ + static_cast<std::size_t>(ti) * kSpecMax * max_batch_ * H,
+                       streams_, total, hc, H, stream_);
+    }
+  }
+
+  std::vector<int> next(total, 0);
+  {
+    StageTimer t(stream_, &stages_.lm_head, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+    hc_head_mean(hmean_, streams_, total, hc, H, stream_);
+    rmsnorm(normed_, hmean_, w_.final_norm(), total, H, cfg_.rms_norm_eps, stream_);
+    gemm_bf16_f32(logits_, w_.lm_head(), normed_, total, cfg_.vocab_size, H, stream_);
+    argmax_f32(argmax_i_, scratch_f_, logits_, total, cfg_.vocab_size, stream_);
+    cudaMemcpyAsync(next.data(), argmax_i_, total * sizeof(int), cudaMemcpyDeviceToHost, stream_);
+    cudaStreamSynchronize(stream_);
+  }
+
+  print_kda_checksum(0, "spec-end");
+  finish_stage_events();
+
+  int moe_layers = 0;
+  for (const fuel::LayerSpec& s : cfg_.layers)
+    if (s.mlp == fuel::MlpKind::kSparse) ++moe_layers;
+  router_entropy_ /= (moe_layers > 0 ? moe_layers : 1);
+
+  cuda_check(cudaGetLastError(), "decode step_spec");
   out_tokens = std::move(next);
 }
 

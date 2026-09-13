@@ -55,6 +55,9 @@ void mul_scalar_bf16(bf16* out, const bf16* in, float scalar, long long n, cudaS
 void gemm_fp8_row(bf16* y, const std::uint8_t* w, const float* scales, const bf16* x,
                    int batch, int n_rows, int k, int row_off, cudaStream_t s);
 void gemm_bf16(bf16* y, const bf16* w, const bf16* x, int batch, int n_rows, int k, cudaStream_t s);
+// Tensor-core path for large verification matrices. Same row-major contract.
+void gemm_bf16_cublas(bf16* y, const bf16* w, const bf16* x, int batch, int n_rows, int k,
+                       cudaStream_t s);
 // Same, accumulating into an FP32 destination instead of BF16.
 void gemm_bf16_f32(float* y, const bf16* w, const bf16* x, int batch, int n_rows, int k,
                    cudaStream_t s);
@@ -107,6 +110,36 @@ void kda_sigmoid(bf16* out, const bf16* in, int n, cudaStream_t s);
 // tile in registers (not shared memory) and reduces partial sums through a
 // small shared buffer. Persistent state stays FP32 because the measured BF16
 // storage candidate diverged on 7/8 real prompts within 40 greedy tokens.
+// Multi-position variants for the spec verify: the same math, K positions
+// per launch. Inputs and outputs are K contiguous [batch, width] blocks
+// (position-major rows = j*batch + m). The conv and the recurrence chain
+// per-position state inside one launch; the other elementwise kernels take
+// K*batch rows like any batched call.
+void kda_conv_update_chunk(bf16* out, bf16* state, const bf16* in, const bf16* weight, int batch,
+                           int channels, int kernel, int pos, cudaStream_t s);
+// Transactional verify forms read committed state and write speculative state
+// to a separate buffer. The recurrence arithmetic and reduction order match
+// the in-place forms exactly.
+void kda_conv_update_chunk_oop(bf16* out, const bf16* state_in, bf16* state_out,
+                               const bf16* in, const bf16* weight, int batch, int channels,
+                               int kernel, int pos, cudaStream_t s);
+void kda_recurrent_chunk(float* state, bf16* o, const bf16* q, const bf16* key, const bf16* v,
+                         const bf16* g, const bf16* beta, int batch, int heads, int head_dim,
+                         int row_stride, int pos, cudaStream_t s);
+void kda_recurrent_chunk_oop(const float* state_in, float* state_out, bf16* o,
+                             const bf16* q, const bf16* key, const bf16* v,
+                             const bf16* g, const bf16* beta, int batch, int heads,
+                             int head_dim, int row_stride, int pos, cudaStream_t s);
+// Reject-path replay: roll the chained state forward to the per-row cut and
+// dump only there. Handled inside the same kernels via `cut` (one entry per
+// row, >= pos means the end-of-kernel dump as usual).
+void kda_conv_update_cut(bf16* out, bf16* state, const bf16* in, const bf16* weight,
+                         const int* cut, int batch, int channels, int kernel, int pos,
+                         cudaStream_t s);
+void kda_recurrent_cut(float* state, bf16* o, const bf16* q, const bf16* key, const bf16* v,
+                       const bf16* g, const bf16* beta, const int* cut, int batch, int heads,
+                       int head_dim, int row_stride, int pos, cudaStream_t s);
+
 void kda_recurrent_step(float* state, bf16* o, const bf16* q, const bf16* k, const bf16* v,
                         const bf16* g, const bf16* beta, int batch, int heads, int head_dim,
                         int row_stride, cudaStream_t s);
@@ -117,10 +150,10 @@ void kda_gated_norm(bf16* out, const bf16* x, const bf16* gate, const bf16* weig
 // --- paged KV writes -------------------------------------------------------
 // Append this step's latent / indexer key / indexer gate for every stream at
 // its own position. `pos` is a device array of `batch` positions.
-void kv_write_latent(const KvPages& kv, const bf16* src, const int* pos, int batch, int layer_slot,
-                     cudaStream_t s);
+void kv_write_latent(const KvPages& kv, const bf16* src, const int* pos, int batch, int n_streams,
+                     int layer_slot, cudaStream_t s);
 void kv_write_index(const KvPages& kv, const bf16* key_src, const bf16* gate_src, const int* pos,
-                    int batch, int layer_slot, cudaStream_t s);
+                    int batch, int n_streams, int layer_slot, cudaStream_t s);
 
 // --- MLA, absorbed ---------------------------------------------------------
 // q_absorbed[h][c] = sum_d Wk[h][d][c] * q[h][d], with Wk the k_nope half of
@@ -134,13 +167,13 @@ void mla_absorb_q(float* q_abs, const bf16* kv_b, const bf16* q, int batch, int 
 // launch; no kernel reads past a stream's own n_sel, so the padding in a row
 // never reaches the softmax.
 void mla_scores(float* scores, const float* q_abs, const KvPages& kv, const int* sel,
-                const int* n_sel, int n_sel_max, int sel_stride, int batch, int layer_slot,
-                int heads, int kv_lora, float scaling, cudaStream_t s);
+                const int* n_sel, int n_sel_max, int sel_stride, int batch, int n_streams,
+                int layer_slot, int heads, int kv_lora, float scaling, cudaStream_t s);
 void mla_softmax(float* scores, const int* n_sel, int sel_stride, int batch, int heads,
                  cudaStream_t s);
 void mla_context(float* ctx, const float* scores, const KvPages& kv, const int* sel,
-                 const int* n_sel, int n_sel_max, int sel_stride, int batch, int layer_slot,
-                 int heads, int kv_lora, cudaStream_t s);
+                 const int* n_sel, int n_sel_max, int sel_stride, int batch, int n_streams,
+                 int layer_slot, int heads, int kv_lora, cudaStream_t s);
 // out[h][v] = sum_c Wv[h][v][c] * ctx[h][c]
 void mla_expand_v(bf16* out, const bf16* kv_b, const float* ctx, int batch, int heads, int nope,
                   int v_dim, int kv_lora, cudaStream_t s);
@@ -151,8 +184,8 @@ void mla_expand_v(bf16* out, const bf16* kv_b, const float* ctx, int batch, int 
 // `n_pools_max` is the host's bound on n_pools over the batch; it only sizes
 // the launch, so no kernel reads past a stream's own n_pools.
 void indexer_pool_keys(bf16* pool_keys, const KvPages& kv, const bf16* ape, const int* n_pools,
-                       int n_pools_max, int pool_stride, int batch, int layer_slot, int kpool,
-                       int head_dim, cudaStream_t s);
+                       int n_pools_max, int pool_stride, int batch, int n_streams, int layer_slot,
+                       int kpool, int head_dim, cudaStream_t s);
 // score[p] = sum_h w[h] * relu(q[h] . pool_key[p] * head_dim^-0.5)
 void indexer_scores(float* scores, const bf16* q, const bf16* pool_keys, const float* head_w,
                     const int* n_pools, int n_pools_max, int pool_stride, int batch, int heads,

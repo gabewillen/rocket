@@ -11,6 +11,8 @@
 // cooperatively over num_sms.
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include "util.cuh"
 #include "exl3_kernel_map.cuh"
 #include "exl3_devctx.cuh"
@@ -42,6 +44,28 @@ static int dev_num_sms(int device)
     if (cached[device] == 0)
         cudaDeviceGetAttribute(&cached[device], cudaDevAttrMultiProcessorCount, device);
     return cached[device];
+}
+
+// Exact dynamic shared storage used by exl3_gemm_kernel_inner for each
+// upstream template shape. Reserving the 90 KiB compile-time ceiling makes a
+// 48-block cooperative launch impossible on GB10 even though the selected
+// 4-bit kernels use only 17-50 KiB.
+static int gemm_smem_bytes(int shape_idx, int bits)
+{
+    int tile_k = 0, tile_n = 0, stages = 0;
+    switch (shape_idx)
+    {
+        case 1: tile_k = 16; tile_n = 128; stages = 6; break;
+        case 2: tile_k = 32; tile_n = 128; stages = 4; break;
+        case 3: tile_k = 32; tile_n = 256; stages = 4; break;
+        case 4: tile_k = 16; tile_n = 512; stages = 4; break;
+        default: return SMEM_MAX;
+    }
+    constexpr int tile_m = 16;
+    const int a_bytes = 2 * tile_m * tile_k;
+    const int b_bytes = tile_k * tile_n * bits / 8;
+    const int c_bytes = 4 * tile_m * tile_n;
+    return stages * (a_bytes + b_bytes) + c_bytes;
 }
 
 extern "C" int exl3_gemm_raw
@@ -79,6 +103,19 @@ extern "C" int exl3_gemm_raw
     );
     if (!kernel) return 0;
 
+    static bool traced = false;
+    if (!traced && std::getenv("ROCKET_EXL3_TRACE"))
+    {
+        traced = true;
+        std::fprintf(stderr,
+                     "[exl3-gemm] A=%p B=%p C=%p locks=%p suh=%p A_had=%p svh=%p "
+                     "m=%d k=%d n=%d shape=%d blocks=%d threads=%d smem=%d\n",
+                     A_ptr, B_ptr, C_ptr, locks, suh_ptr, A_had_ptr, svh_ptr,
+                     size_m, size_k, size_n, shape_idx, num_sms, block_dim,
+                     gemm_smem_bytes(shape_idx, bits));
+        std::fflush(stderr);
+    }
+
     void* kernelArgs[] =
     {
         (void*)& A_ptr,
@@ -93,19 +130,15 @@ extern "C" int exl3_gemm_raw
         (void*)& svh_ptr
     };
 
-    static bool attr_set[MAX_DEVICES] = {};
-    if (!attr_set[device])
-    {
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
-        attr_set[device] = true;
-    }
+    const int smem = gemm_smem_bytes(shape_idx, bits);
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaError_t rc = cudaLaunchCooperativeKernel
     (
         (void*) kernel,
         num_sms,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        smem,
         stream
     );
     if (rc != cudaSuccess) return 0;

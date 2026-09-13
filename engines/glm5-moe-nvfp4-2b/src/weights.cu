@@ -753,16 +753,27 @@ std::size_t WeightStore::preload_owned_experts(cudaStream_t s) {
   for (int l = 0; l < cfg_.text_layers; ++l)
     if (cfg_.layers[l].mlp == fuel::MlpKind::kSparse)
       needed += static_cast<std::size_t>(expert_count_);
-  if (slots_.size() < needed)
-    fail("expert cache has " + std::to_string(slots_.size()) + " slots; preload needs " +
-         std::to_string(needed));
-  const std::size_t before = resident_expert_.size();
-  for (int l = 0; l < cfg_.text_layers; ++l) {
-    if (cfg_.layers[l].mlp != fuel::MlpKind::kSparse) continue;
-    for (int e = 0; e < cfg_.n_routed_experts; ++e)
-      if (owns_expert(e)) (void)expert(l, e, s);
+  const std::size_t before = exl3_fuel() ? exl3_resident_.size() : resident_expert_.size();
+  if (exl3_fuel()) {
+    if (exl3_slots_.size() < needed)
+      fail("exl3 expert cache has " + std::to_string(exl3_slots_.size()) + " slots; preload needs " +
+           std::to_string(needed));
+    for (int l = 0; l < cfg_.text_layers; ++l) {
+      if (cfg_.layers[l].mlp != fuel::MlpKind::kSparse) continue;
+      for (int e = 0; e < cfg_.n_routed_experts; ++e)
+        if (owns_expert(e)) (void)exl3_expert(l, e, s);
+    }
+  } else {
+    if (slots_.size() < needed)
+      fail("expert cache has " + std::to_string(slots_.size()) + " slots; preload needs " +
+           std::to_string(needed));
+    for (int l = 0; l < cfg_.text_layers; ++l) {
+      if (cfg_.layers[l].mlp != fuel::MlpKind::kSparse) continue;
+      for (int e = 0; e < cfg_.n_routed_experts; ++e)
+        if (owns_expert(e)) (void)expert(l, e, s);
+    }
   }
-  return resident_expert_.size() - before;
+  return (exl3_fuel() ? exl3_resident_.size() : resident_expert_.size()) - before;
 }
 
 const ExpertDev& WeightStore::expert(int layer, int expert_id, cudaStream_t s) {

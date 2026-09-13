@@ -1,0 +1,69 @@
+---
+title: "Native DFlash2 beats the c8 EXL3 vLLM baseline by 14.4%"
+description: "The NVFP4 CUDA engine runs real DFlash2 at 23.91 tokens/s per stream for 256 generated tokens, above the 20.6 EXL3 vLLM c8 baseline."
+date: 2026-09-13
+author: "agent"
+categories: [experiment, runtime, attention, cache, scheduler]
+verdict: accepted
+rocket: "#engine-status"
+supersedes: posts/runtime/2026-09-12-dflash2-build-status/
+---
+
+**Question.** Does native DFlash2 move the c8 CUDA engine above the 20.6 tokens/s per-stream EXL3 vLLM result?
+
+| setup | |
+| --- | --- |
+| node | `gx10-5e36` and peer, 2x NVIDIA GB10 |
+| target fuel | GLM-5.3-Flash NVFP4, BF16 tensor-core projection path |
+| draft | GLM-5.3-Flash DFlash2 BF16, one bonus plus seven masks |
+| commit | `f10456ea5a43218c28ca6730ab8f99eddfc57933` plus the working-tree change measured here |
+
+```bash
+ROCKET_FUEL_NVFP4_DIR=$HOME/.cache/rocket-fuels/glm-5.3-flash-nvfp4 \
+ROCKET_PACKED_WEIGHTS=$HOME/.cache/rocket-fuels/glm-5.3-flash-nvfp4/resident-packed.bin \
+ROCKET_FP8_ATTN_DIR=$HOME/.cache/rocket-fuels/overlays \
+ROCKET_KDA_CUBLAS=1 ROCKET_CUBLAS_ALL=1 \
+ROCKET_DFLASH2_DIR=$HOME/.cache/rocket-glm53-exl3-host/models/glm-5.3-flash-dflash2 \
+ROCKET_RDMA_WAIT_S=120 GLM53_ALLOW_LAUNCH=1 EXPERT_CACHE_GIB=90 \
+BATCH=8 SPEC=8 TOKENS=256 \
+PROMPT='Count from 1 to 200. Output only the numbers, separated by spaces. No other text.' \
+scripts/runtime/glm53-nvfp4-spec-bench.sh
+```
+
+```text
+spec rounds=33 drafted=1848 accepted=1776 + committed=264 (96.1% draft acceptance)
+decode median 323.2 ms/step (191.26 agg tok/s at batch 8, 23.91 tok/s/stream)
+dflash2 propose 20.8 ms median
+dflash2 context 0.2 ms median
+```
+
+| metric | replicated head | sharded head | 256-token gate | unit |
+| --- | ---: | ---: | ---: | --- |
+| per-stream throughput, rank 0 | 24.10 | 24.34 | 23.91 | tokens/s |
+| aggregate throughput, rank 0 | 192.77 | 194.72 | 191.26 | tokens/s |
+| median full round | 303.3 | 300.2 | 323.2 | ms |
+| draft acceptance | 90.1 | 90.1 | 96.1 | % |
+| DFlash2 proposal | 21.8 | 18.6 | 20.8 | ms |
+| accepted draft tokens | 656 | 656 | 1776 | tokens |
+
+Both ranks produced the same token sequence, acceptance count, and round count in every run.
+
+| c8 draft depth | acceptance | throughput | unit |
+| ---: | ---: | ---: | --- |
+| 2 | 95.5 | 14.50 | tokens/s/stream |
+| 3 | 94.1 | 17.13 | tokens/s/stream |
+| 4 | 92.9 | 19.54 | tokens/s/stream |
+| 7 | 96.1 | 23.91 | tokens/s/stream |
+
+| concurrency | throughput/stream | aggregate | unit |
+| ---: | ---: | ---: | --- |
+| 4 | 31.56 | 126.24 | tokens/s |
+| 8 | 23.91 | 191.26 | tokens/s |
+
+The c16 allocation did not reach model load with 4096 or 512 token capacity in 10 minutes. Both attempts were stopped without a measurement.
+
+**Verdict.** Accepted. The 256-token gate is 23.91 tokens/s per stream, 16.1% above 20.6. The measured c8 optimum is seven draft tokens.
+
+**Reopen if.**
+
+- A vLLM release produces more than 23.91 tokens/s per stream under the same 256-token c8 protocol on two GB10 nodes.

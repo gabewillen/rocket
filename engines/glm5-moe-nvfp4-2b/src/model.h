@@ -104,6 +104,30 @@ class DecodeEngine {
   // position advance by one. out_tokens is resized to tokens.size() and
   // filled with each slot's greedy next token.
   void step(const std::vector<int>& tokens, std::vector<int>& out_tokens, bool collect_stages);
+  // Multi-token verify: processes B×k rows where each stream contributes k
+  // sequential positions. KDA layers process position-by-position (the
+  // recurrence chains); all other layers batch across positions (weights
+  // read once per layer). Returns per-row argmax for acceptance checking.
+  void step_spec(const std::vector<int>& tokens, int spec_k,
+                 std::vector<int>& out_tokens, bool collect_stages);
+  void set_spec_k(int k) { spec_k_ = k; }
+  // Advances each stream's logical position by the number of verified tokens.
+  // The caller derives this from the acceptance check; step_spec leaves pos_
+  // untouched because the advance depends on per-stream acceptance counts.
+  // Advances each stream to pos+accepted[m] and drops the K pages the verify
+  // reserved beyond the accepted prefix, so the indexer can never read a
+  // rejected draft's KV.
+  void commit_positions(const std::vector<int>& accepted);
+  // KDA draft-state diagnostics. Verification itself is transactional:
+  // committed state is read-only until commit_positions swaps or replays.
+  void print_kda_checksum(int layer, const char* tag);
+  void print_kv_checksum(const char* tag, int from, int to);
+  void print_streams_checksum(int layer, const char* tag, int rows, std::size_t n,
+                              const bf16* buf = nullptr, int row_stride = 0);
+  void mla_dump_ints(const char* tag, int layer, const int* sel, const int* n_tok, int stride,
+                     int batch);
+  void mla_dump_score(const char* tag, int layer, const float* ctx, int batch, int heads);
+  int spec_k() const { return spec_k_; }
 
   // Resets every stream slot's KDA state, hyper-connection streams, and
   // position to 0. The paged MLA/indexer KV is not cleared: positions restart
@@ -143,6 +167,10 @@ class DecodeEngine {
   int position(int stream) const { return pos_[stream]; }
   int max_batch() const { return max_batch_; }
   WeightStore& weights() { return w_; }
+  // Five target hidden-state taps consumed by DFlash2, laid out
+  // [5][last_step_rows][hidden] in target_layer_ids order.
+  const bf16* dflash_aux_hidden() const { return dflash_aux_hidden_; }
+  int dflash_aux_stride_rows() const { return kSpecMax * max_batch_; }
 
   // Telemetry: per-projection-site activation absmax, calibration capture
   // stage 1 (fuels/glm-5.3-flash/fuel.yaml, serving_regime.quantization_plan).
@@ -209,7 +237,12 @@ class DecodeEngine {
 
  private:
   void run_kda(int layer, int slot, int batch);
-  void run_mla(int layer, int slot, int batch, const int* n_tokens_dev, int n_pools_max);
+  // Spec-verify KDA site over the position-major [k * batch] row space. It
+  // reads committed state and writes the alternate state arena; commitment
+  // swaps arenas on full acceptance or replays the accepted prefix in place.
+  void run_kda_spec_site(int layer, int positions, int batch, const int* cut, bool collect_stages);
+  void run_mla(int layer, int slot, int batch, const int* n_tokens_dev, int n_pools_max,
+               int n_streams);
   void run_dense_mlp(int layer, int batch);
   void run_moe(int layer, int batch);
   void run_moe_gemv(int layer, int batch, const std::vector<int>& idx);
@@ -263,6 +296,10 @@ class DecodeEngine {
   cudaStream_t stream_ = nullptr;
   int max_tokens_ = 0;
   int max_batch_ = 0;
+  int spec_k_ = 1;  // 1 = no spec, >1 = multi-token verify width
+ public:
+  static constexpr int kSpecMax = 8;  // upper bound on verify width; sizes shared activation buffers
+ private:
   std::vector<int> pos_;  // per stream slot, host
 
   int kda_layers_ = 0, mla_layers_ = 0;
@@ -272,6 +309,12 @@ class DecodeEngine {
   // per-layer call sees a plain [batch, ...] contiguous block. ---
   bf16 *q_conv_state_ = nullptr, *k_conv_state_ = nullptr, *v_conv_state_ = nullptr;  // [kda_layers][max_batch][qkv][taps]
   float* kda_state_ = nullptr;  // [kda_layers][max_batch][heads][hd][hd]
+  // Alternate transactional state arena. step_spec reads the committed arena
+  // and writes this one. Full acceptance swaps pointers; rejection discards
+  // it and advances committed state only through the accepted prefix.
+  float* kda_state_draft_ = nullptr;
+  bf16 *q_conv_state_draft_ = nullptr, *k_conv_state_draft_ = nullptr, *v_conv_state_draft_ = nullptr;
+  bool kda_use_draft_state_ = false;
 
   // --- paged MLA latent + indexer key/gate: the arena's KvPages, always,
   // one radix-tree-backed pool behind every stream slot's block table
@@ -287,6 +330,19 @@ class DecodeEngine {
 
   // per-step device scratch
   int* tokens_dev_ = nullptr;
+  int* tokens_spec_dev_ = nullptr;  // batch*spec_k entries, position-major
+  // Per-KDA-layer rails holding the verify's normed rows for the rejection
+  // replay: [kda_layers][kSpecMax * max_batch][hidden] bf16.
+  bf16* kda_spec_normed_rail_ = nullptr;
+  bf16* kda_spec_qkv_rail_ = nullptr;    // [kda_layers][kSpecMax * max_batch][qkv] q|k|v rows
+  bf16* kda_spec_gate_rail_ = nullptr;   // gate rows for the replay
+  bf16* kda_spec_beta_rail_ = nullptr;   // beta rows for the replay
+  bf16* kda_spec_on_rail_ = nullptr;     // gated-norm output rows for the replay (compute-fresh rows only)
+  int* kda_spec_cut_dev_ = nullptr;
+  int spec_batch_ = 0;      // per-row accepted count for the rejection replay
+  int* pos_spec_dev_ = nullptr;      // total rows: pos[m]+j
+  int* ntok_spec_dev_ = nullptr;     // total rows: pos[m]+j+1
+  int* npool_spec_dev_ = nullptr;    // total rows: (pos[m]+j+1)/kpool
   int* pos_dev_ = nullptr;
   int* n_tokens_dev_ = nullptr;
   int* n_pools_dev_ = nullptr;
@@ -294,6 +350,7 @@ class DecodeEngine {
   // activations, all [max_batch, width] row-major unless noted
   bf16 *streams_ = nullptr, *residual_ = nullptr, *collapsed_ = nullptr, *normed_ = nullptr;
   bf16 *sublayer_out_ = nullptr, *hmean_ = nullptr;
+  bf16* dflash_aux_hidden_ = nullptr;  // [5][kSpecMax*max_batch][hidden]
   float *mix_ = nullptr, *post_ = nullptr, *comb_ = nullptr;
   bf16 *q_raw_ = nullptr, *k_raw_ = nullptr, *v_raw_ = nullptr;
   bf16 *q_conv_ = nullptr, *k_conv_ = nullptr, *v_conv_ = nullptr;

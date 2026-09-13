@@ -211,6 +211,10 @@ class KvCache {
   // Reserves the site for one more token and returns where to write it.
   // `page` is -1 when the pool is exhausted; nothing is mutated in that case.
   AppendSite append_token(int seq, int token_id);
+  // Drops every reserved site beyond `new_len`. Rejected spec drafts leave
+  // stale KV in the pages they were given; truncating releases those pages
+  // and rewinds the sequence so the indexer never reads them.
+  void truncate(int seq, int new_len);
 
   // Frees the stream slot, keeps every page. The caller is responsible for
   // the KDA state (KdaStateStore, kv_arena.h): it is per stream, 72.8 MiB,

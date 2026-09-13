@@ -36,12 +36,16 @@ endif()
 
 # 64 KiB is the universal quantum on this platform (blog/rocket.qmd#alignment).
 set(ROCKET_PAGE_BYTES 65536 CACHE STRING "Host page size the plan is aligned to")
+option(ROCKET_DFLASH2_PROFILE "Compile DFlash2 CUDA event profiling" OFF)
 
 add_library(rocket_engine STATIC
   src/engine.cu
   src/kernels.cu
   src/weights.cu
   src/model.cu
+  src/dflash2_loader.cu
+  src/dflash2_draft.cu
+  src/dflash2_engine.cu
   src/kv/page_pool.cc
   src/kv/kv_arena.cu
 )
@@ -65,6 +69,7 @@ set_target_properties(rocket_exl3 PROPERTIES
 target_compile_definitions(rocket_engine PUBLIC
   ROCKET_PAGE_BYTES=${ROCKET_PAGE_BYTES}
   ROCKET_CUDA_ARCH=${ROCKET_CUDA_ARCH}
+  $<$<BOOL:${ROCKET_DFLASH2_PROFILE}>:ROCKET_DFLASH2_PROFILE>
 )
 target_link_libraries(rocket_engine PUBLIC rocket_fuel CUDA::cublas rocket_exl3)
 target_compile_options(rocket_engine PRIVATE

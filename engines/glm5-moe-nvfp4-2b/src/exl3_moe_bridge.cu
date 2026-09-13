@@ -14,6 +14,7 @@
 #include "exl3_kernel_map.cuh"
 #include "comp_units/exl3_moe_instances.cuh"
 #include "exl3_gemm_inner.cuh"  // EXL3_GEMM_BASE_THREADS, MOE_TILESIZE_K, SMEM_MAX
+#include "exl3_moe_common.cuh"  // MOE_SMS_PER_EXPERT
 #include "exl3_devctx.cuh"
 #include "torch_check_shim.h"
 #include <cuda_fp16.h>
@@ -82,7 +83,7 @@ extern "C" void exl3_moe_raw
     if (!attr_set[device])
     {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             90 * 1024);
+                             SMEM_MAX);
         attr_set[device] = true;
     }
 
@@ -147,7 +148,7 @@ extern "C" void exl3_moe_raw
         grid_dim,
         block_dim,
         kernelArgs,
-        90 * 1024,
+        SMEM_MAX,
         stream
     );
 }

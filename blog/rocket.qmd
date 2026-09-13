@@ -180,6 +180,7 @@ entries land; each row links its evidence.
 | radix KV, fork sharing | done | [93 streams at 262k vs 8 unshared](posts/cache/2026-09-08-shared-prefixes-hold-93-streams-at-262k/) |
 | KDA kernel at roofline | kernel shipped, engine adoption in flight | [47 to 215 GB/s](posts/kernels/2026-09-08-kda-state-tile-out-of-shared-memory/) |
 | FP8 on the BF16 half | telemetry capturing | [plan in fuel.yaml](fuels/glm-5.3-flash.qmd) |
+| DFlash2 speculative decode, c8 | done | [23.91 tok/s per stream, 191.26 aggregate over 256 tokens](posts/runtime/2026-09-13-dflash2-cuda-beats-vllm-c8/) |
 | c8..c64 forked-prefix vs 132.8 tok/s c32 | not yet run | workload: `scripts/scheduler/agent-workload.py` |
 | OpenAI-compatible API | not started | |
 

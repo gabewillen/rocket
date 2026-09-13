@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -475,6 +476,11 @@ void Fabric::exchange(int handle, std::size_t src_off, std::size_t dst_off, std:
 
 void Fabric::barrier() {
   const std::uint64_t seq = next_seq();
+  static const bool trace = std::getenv("ROCKET_FABRIC_TRACE") != nullptr;
+  if (trace) {
+    std::fprintf(stderr, "[fab] barrier seq=%llu\n", static_cast<unsigned long long>(seq));
+    std::fflush(stderr);
+  }
   signal(seq);
   wait_peer(seq);
   flush();

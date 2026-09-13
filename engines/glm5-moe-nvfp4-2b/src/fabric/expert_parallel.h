@@ -93,6 +93,21 @@ class ExpertParallel {
   // is compute and is deliberately not counted here.
   void exchange_end(double* ms_sink);
 
+  // Rank 0 is authoritative for speculative acceptance and bonus tokens.
+  // Both ranks call this once per round; rank 1 receives rank 0's two integer
+  // vectors before either process commits KDA/KV state or starts another
+  // forward, keeping the model/exchange call sequence in lockstep.
+  void sync_round_decision(std::vector<int>& accepted, std::vector<int>& last);
+  // Rank 0's draft chain is authoritative before target verification, so
+  // replicated-draft last-bit differences cannot feed different MoE rows.
+  void sync_draft_tokens(std::vector<int>& tokens);
+  // Exchanges each rank's local top-16 candidate IDs/scores and returns the
+  // peer arrays. Used to split the replicated 1.18 GiB DFlash lm_head read.
+  void exchange_draft_candidates(const std::vector<int>& local_ids,
+                                 const std::vector<float>& local_vals,
+                                 std::vector<int>& peer_ids,
+                                 std::vector<float>& peer_vals);
+
   void barrier() { fab_->barrier(); }
   const Stats& stats() const { return fab_->stats(); }
   void reset_stats() { fab_->reset_stats(); }

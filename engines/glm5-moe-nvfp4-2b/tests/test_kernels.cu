@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 
+#include "dflash2.h"
 #include "kernels.h"
 #include "nvfp4.h"
 
@@ -76,7 +77,7 @@ float sigmoidf_h(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 // ------------------------------------------------------------------ gemv
 void test_gemv() {
-  const int M = 8, N = 257, K = 512;
+  const int M = 56, N = 257, K = 512;
   const std::vector<float> w = randn(N * K), x = randn(M * K);
   std::vector<float> ref(M * N);
   for (int m = 0; m < M; ++m) {
@@ -93,6 +94,18 @@ void test_gemv() {
   rocket::engine::gemm_bf16_f32(dy, dw, dx, M, N, K, nullptr);
   cudaDeviceSynchronize();
   check("batched gemm bf16->f32", rel_err(to_host(dy, M * N), ref), 2e-3);
+  setenv("ROCKET_CUBLAS_ALL", "1", 1);
+  rocket::engine::gemm_bf16_f32(dy, dw, dx, M, N, K, nullptr);
+  cudaDeviceSynchronize();
+  check("cuBLAS gemm bf16->f32", rel_err(to_host(dy, M * N), ref), 2e-3);
+  unsetenv("ROCKET_CUBLAS_ALL");
+
+  bf16* dy_tc = nullptr;
+  cudaMalloc(&dy_tc, M * N * sizeof(bf16));
+  rocket::engine::gemm_bf16_cublas(dy_tc, dw, dx, M, N, K, nullptr);
+  cudaDeviceSynchronize();
+  check("cuBLAS gemm bf16->bf16", rel_err(as_float(to_host(dy_tc, M * N)), ref), 4e-3);
+  cudaFree(dy_tc);
 
   bf16* dy_bf16 = nullptr;
   cudaMalloc(&dy_bf16, M * N * sizeof(bf16));
@@ -318,6 +331,61 @@ void test_kda() {
   cudaDeviceSynchronize();
   check("kda recurrent readout", rel_err(as_float(to_host(dout, qkv)), o), 2e-2);
   check("kda recurrent state", rel_err(to_host(dstate, heads * hd * hd), state_ref), 2e-2);
+
+  // Transactional speculative state must be bit-identical to the in-place
+  // chunk while preserving its input arena. Use two positions to exercise
+  // state chaining rather than reducing this to a copy test.
+  const int pos = 2;
+  std::vector<float> q2(pos * qkv), k2(pos * qkv), v2(pos * qkv), g2(pos * qkv);
+  std::vector<float> beta2(pos * heads);
+  for (int p = 0; p < pos; ++p) {
+    std::copy(q.begin(), q.end(), q2.begin() + p * qkv);
+    std::copy(k.begin(), k.end(), k2.begin() + p * qkv);
+    std::copy(v.begin(), v.end(), v2.begin() + p * qkv);
+    std::copy(g.begin(), g.end(), g2.begin() + p * qkv);
+    std::copy(beta.begin(), beta.end(), beta2.begin() + p * heads);
+  }
+  auto dq2 = to_dev(as_bf16(q2)), dk2 = to_dev(as_bf16(k2)), dv2 = to_dev(as_bf16(v2));
+  auto dg2 = to_dev(as_bf16(g2)), db2 = to_dev(as_bf16(beta2));
+  auto ds_ip = to_dev(state), ds_in = to_dev(state);
+  float* ds_out = nullptr;
+  bf16 *do_ip = nullptr, *do_oop = nullptr;
+  cudaMalloc(&ds_out, state.size() * sizeof(float));
+  cudaMalloc(&do_ip, pos * qkv * sizeof(bf16));
+  cudaMalloc(&do_oop, pos * qkv * sizeof(bf16));
+  rocket::engine::kda_recurrent_chunk(ds_ip, do_ip, dq2, dk2, dv2, dg2, db2, 1, heads, hd,
+                                      qkv, pos, nullptr);
+  rocket::engine::kda_recurrent_chunk_oop(ds_in, ds_out, do_oop, dq2, dk2, dv2, dg2, db2, 1,
+                                          heads, hd, qkv, pos, nullptr);
+  cudaDeviceSynchronize();
+  check("kda chunk oop readout exact",
+        rel_err(as_float(to_host(do_oop, pos * qkv)), as_float(to_host(do_ip, pos * qkv))), 0.0);
+  check("kda chunk oop state exact",
+        rel_err(to_host(ds_out, state.size()), to_host(ds_ip, state.size())), 0.0);
+  check("kda chunk oop input preserved", rel_err(to_host(ds_in, state.size()), state), 0.0);
+}
+
+// ------------------------------------------------------ DFlash2 grouped conv
+void test_dflash2_conv() {
+  const int rows = 8, hidden = 32, group = 16, groups = hidden / group, taps = 2;
+  const auto x = randn(rows * hidden), coeff = randn(rows * 2 * taps * groups, 0.2f);
+  const auto base = randn(2 * taps * hidden, 0.2f);
+  std::vector<float> ref(rows * hidden, 0.0f);
+  for (int r = 0; r < rows; ++r)
+    for (int c = 0; c < hidden; ++c)
+      for (int t = 0; t < taps; ++t)
+        if ((r % rows) >= t)
+          ref[r * hidden + c] +=
+              (base[(taps + t) * hidden + c] +
+               coeff[((r * 2 + 1) * taps + t) * groups + c / group]) *
+              x[(r - t) * hidden + c];
+  auto dx = to_dev(as_bf16(x)), dc = to_dev(as_bf16(coeff)), db = to_dev(as_bf16(base));
+  bf16* dout = nullptr;
+  cudaMalloc(&dout, ref.size() * sizeof(bf16));
+  rocket::engine::dflash2_grouped_conv_finish(dout, dx, dc, db, rows, hidden, rows, group, taps,
+                                               nullptr);
+  cudaDeviceSynchronize();
+  check("dflash2 grouped conv", rel_err(as_float(to_host(dout, ref.size())), ref), 5e-3);
 }
 
 // ------------------------------------------------------------- MoE router
@@ -630,7 +698,8 @@ void test_indexer() {
   bf16* dpk = nullptr;
   cudaMalloc(&dpk, n_pools * hd * sizeof(bf16));
   rocket::engine::indexer_pool_keys(dpk, kv, da, dnpools, n_pools, /*pool_stride=*/n_pools,
-                                    /*batch=*/1, /*layer_slot=*/0, kpool, hd, nullptr);
+                                    /*batch=*/1, /*n_streams=*/1, /*layer_slot=*/0, kpool, hd,
+                                    nullptr);
   cudaDeviceSynchronize();
   check("indexer pool compression", rel_err(as_float(to_host(dpk, n_pools * hd)), ref), 5e-3);
 
@@ -697,6 +766,7 @@ int main() {
   std::printf("gemv\n");            test_gemv();
   std::printf("hyper-connections\n"); test_hyperconnection();
   std::printf("kda\n");             test_kda();
+  std::printf("dflash2\n");         test_dflash2_conv();
   std::printf("moe router\n");      test_router();
   std::printf("swiglu\n");          test_swiglu();
   std::printf("nvfp4 gemv\n");      test_nvfp4_gemv();

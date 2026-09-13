@@ -312,6 +312,25 @@ AppendSite KvCache::append_token(int seq, int token_id) {
   return site;
 }
 
+void KvCache::truncate(int seq, int new_len) {
+  if (seq < 0 || seq >= static_cast<int>(seqs_.size()) || !seqs_[seq].live)
+    fail("truncate: not a live sequence");
+  Seq& s = seqs_[seq];
+  const int P = geom_.page_tokens;
+  if (new_len > s.length || new_len < 0) fail("truncate: new_len out of range");
+  if (new_len == s.length) return;
+  const int keep = (new_len + P - 1) / P;
+  for (int li = static_cast<int>(s.pages.size()) - 1; li >= keep; --li) {
+    if (s.nodes[li] >= 0 && tree_->child_count(s.nodes[li]) == 0)
+      tree_->detach(s.nodes[li]);
+    pool_->decref(s.pages[li]);
+  }
+  s.pages.resize(keep);
+  s.nodes.resize(keep);
+  s.tokens.resize(new_len);
+  s.length = new_len;
+}
+
 // A page that just filled becomes a tree node, keyed by the hash of its token
 // block seeded with its parent node's hash. The node makes the page findable
 // by open_shared() and orders eviction: a page with cached descendants cannot

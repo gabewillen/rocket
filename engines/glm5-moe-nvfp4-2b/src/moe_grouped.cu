@@ -95,6 +95,16 @@ struct Scratch {
   cutlass::DeviceAllocation<const ElementSF*> pSFA, pSFB;
   cutlass::DeviceAllocation<ElementD*> pD;
   cutlass::DeviceAllocation<std::uint8_t> workspace;
+  // Host metadata must outlive the asynchronous H2D copies and kernel launch.
+  std::vector<typename ProblemShape::UnderlyingProblemShape> h_ps;
+  std::vector<StrideA> h_sA;
+  std::vector<StrideB> h_sB;
+  std::vector<StrideD> h_sD;
+  std::vector<LayoutSFA> h_lSFA;
+  std::vector<LayoutSFB> h_lSFB;
+  std::vector<const ElementInput*> h_pA, h_pB;
+  std::vector<const ElementSF*> h_pSFA, h_pSFB;
+  std::vector<ElementD*> h_pD;
 
   void reserve(int groups) {
     if (groups <= capacity) return;
@@ -109,6 +119,17 @@ struct Scratch {
     pSFA.reset(groups);
     pSFB.reset(groups);
     pD.reset(groups);
+    h_ps.resize(groups);
+    h_sA.resize(groups);
+    h_sB.resize(groups);
+    h_sD.resize(groups);
+    h_lSFA.resize(groups);
+    h_lSFB.resize(groups);
+    h_pA.resize(groups);
+    h_pB.resize(groups);
+    h_pSFA.resize(groups);
+    h_pSFB.resize(groups);
+    h_pD.resize(groups);
     capacity = groups;
   }
 };
@@ -171,15 +192,17 @@ bool run_grouped_impl(const std::vector<GroupedGemmGroup>& groups, int n, int k,
   if (G == 0) return true;
   sc.reserve(G);
 
-  std::vector<typename ProblemShape::UnderlyingProblemShape> ps_host(G);
-  std::vector<StrideA> sA_host(G);
-  std::vector<StrideB> sB_host(G);
-  std::vector<StrideD> sD_host(G);
-  std::vector<LayoutSFA> lSFA_host(G);
-  std::vector<LayoutSFB> lSFB_host(G);
-  std::vector<const ElementInput*> pA_host(G), pB_host(G);
-  std::vector<const ElementSF*> pSFA_host(G), pSFB_host(G);
-  std::vector<ElementD*> pD_host(G);
+  auto& ps_host = sc.h_ps;
+  auto& sA_host = sc.h_sA;
+  auto& sB_host = sc.h_sB;
+  auto& sD_host = sc.h_sD;
+  auto& lSFA_host = sc.h_lSFA;
+  auto& lSFB_host = sc.h_lSFB;
+  auto& pA_host = sc.h_pA;
+  auto& pB_host = sc.h_pB;
+  auto& pSFA_host = sc.h_pSFA;
+  auto& pSFB_host = sc.h_pSFB;
+  auto& pD_host = sc.h_pD;
 
   for (int i = 0; i < G; ++i) {
     const GroupedGemmGroup& g = groups[i];
@@ -197,25 +220,24 @@ bool run_grouped_impl(const std::vector<GroupedGemmGroup>& groups, int n, int k,
     pD_host[i] = reinterpret_cast<ElementD*>(g.d_out);
   }
 
-  // Synchronous: this metadata is a few hundred bytes per group and the
-  // decode loop already syncs once per step to read router indices back to
-  // host (model.cu::run_moe), so this is not adding a new sync point class,
-  // only more work at an existing one. Making this async would need the host
-  // vectors above to outlive an in-flight copy, which the current run_moe
-  // call shape (grouped_gemm_nvfp4 returns before the caller reuses them)
-  // does not guarantee.
+  // Stream-ordered metadata uploads. Scratch owns the host vectors, so their
+  // lifetime extends through the launch; no cudaMemcpy synchronization is
+  // needed between descriptor construction and the grouped kernel.
   if (upload) {
-    sc.ps.copy_from_host(ps_host.data());
-    sc.sA.copy_from_host(sA_host.data());
-    sc.sB.copy_from_host(sB_host.data());
-    sc.sD.copy_from_host(sD_host.data());
-    sc.lSFA.copy_from_host(lSFA_host.data());
-    sc.lSFB.copy_from_host(lSFB_host.data());
-    sc.pA.copy_from_host(pA_host.data());
-    sc.pB.copy_from_host(pB_host.data());
-    sc.pSFA.copy_from_host(pSFA_host.data());
-    sc.pSFB.copy_from_host(pSFB_host.data());
-    sc.pD.copy_from_host(pD_host.data());
+#define ROCKET_META_COPY(dst, src) \
+    cudaMemcpyAsync((dst).get(), (src).data(), G * sizeof((src)[0]), cudaMemcpyHostToDevice, s)
+    ROCKET_META_COPY(sc.ps, ps_host);
+    ROCKET_META_COPY(sc.sA, sA_host);
+    ROCKET_META_COPY(sc.sB, sB_host);
+    ROCKET_META_COPY(sc.sD, sD_host);
+    ROCKET_META_COPY(sc.lSFA, lSFA_host);
+    ROCKET_META_COPY(sc.lSFB, lSFB_host);
+    ROCKET_META_COPY(sc.pA, pA_host);
+    ROCKET_META_COPY(sc.pB, pB_host);
+    ROCKET_META_COPY(sc.pSFA, pSFA_host);
+    ROCKET_META_COPY(sc.pSFB, pSFB_host);
+    ROCKET_META_COPY(sc.pD, pD_host);
+#undef ROCKET_META_COPY
   }
 
   cutlass::KernelHardwareInfo hw;

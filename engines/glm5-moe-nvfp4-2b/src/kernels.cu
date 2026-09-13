@@ -1,8 +1,10 @@
 #include "kernels.h"
+#include <stdexcept>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_fp8.h>
+#include <cublas_v2.h>
 #include <math_constants.h>
 
 // Register-split KDA recurrent step, adopted from the kernels lane's bench
@@ -322,6 +324,40 @@ __global__ void kda_conv_kernel(bf16* __restrict__ out, bf16* __restrict__ state
   outr[c] = b(siluf(acc));
 }
 
+// K positions of the depthwise causal conv in one launch. Each (row,
+// channel-group) block owns the taps window and rolls it across positions;
+// out[j][m][c] follows the same silu(conv) as the single-position kernel.
+// Position-major rows: in[j*batch + m] / out[j*batch + m].
+__global__ void kda_conv_chunk_kernel(bf16* __restrict__ out,
+                                      const bf16* __restrict__ state_in,
+                                      bf16* __restrict__ state_out, const bf16* __restrict__ in,
+                                      const bf16* __restrict__ weight, const int* __restrict__ cut,
+                                      int batch, int channels, int kernel, int pos) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= channels) return;
+  const int m = blockIdx.y;
+  const int taps = kernel - 1;
+  const int stop = cut ? min(cut[m], pos) : pos;
+  const bf16* w = weight + static_cast<long long>(c) * kernel;
+  const bf16* st_in = state_in + (static_cast<long long>(m) * channels + c) * taps;
+  bf16* st_out = state_out + (static_cast<long long>(m) * channels + c) * taps;
+
+  float window[16];
+  for (int t = 0; t < taps && t <= 15; ++t) window[t] = f(st_in[t]);
+  // Cut launches are commit-only. Positions beyond stop are rejected and no
+  // output consumes them, so do not roll or convolve that tail.
+  for (int j = 0; j < stop; ++j) {
+    float acc = 0.0f;
+    for (int t = 0; t < taps; ++t) acc += f(w[t]) * window[t];
+    const float xv = f(in[(static_cast<long long>(j) * batch + m) * channels + c]);
+    acc += f(w[taps]) * xv;
+    for (int t = 0; t < taps - 1 && t < 15; ++t) window[t] = window[t + 1];
+    if (taps - 1 <= 15) window[taps - 1] = xv;
+    out[(static_cast<long long>(j) * batch + m) * channels + c] = b(siluf(acc));
+  }
+  for (int t = 0; t < taps && t <= 15; ++t) st_out[t] = b(window[t]);
+}
+
 __global__ void kda_forget_kernel(bf16* __restrict__ g, const bf16* __restrict__ fb,
                                   const float* __restrict__ dt_bias,
                                   const float* __restrict__ a_log, int heads, int head_dim,
@@ -406,6 +442,62 @@ __global__ void kda_step_kernel(float* __restrict__ state, bf16* __restrict__ o,
   o[vbase + j] = b(acc);
 }
 
+// K positions of the delta-rule recurrence in one launch. Same math and
+// register/smem layout as kda_step_kernel, wrapped in a position loop that
+// chains the fp32 state tile across j. Position-major rows fold into the
+// base offsets: (j*batch + m) replaces m everywhere the original indexed
+// the row.
+__global__ void kda_recurrent_chunk_kernel(const float* __restrict__ state_in,
+                                           float* __restrict__ state_out,
+                                           bf16* __restrict__ o, const bf16* __restrict__ q,
+                                           const bf16* __restrict__ key,
+                                           const bf16* __restrict__ v, const bf16* __restrict__ g,
+                                           const bf16* __restrict__ beta, const int* __restrict__ cut,
+                                           int batch, int heads, int head_dim, int row_stride,
+                                           int pos) {
+  extern __shared__ float tile[];
+  float* sq = tile + head_dim * head_dim;
+  float* sk = sq + head_dim;
+  float* sg = sk + head_dim;
+
+  const int h = blockIdx.x;
+  const int m = blockIdx.y;
+  const int j = threadIdx.x;
+  const long long sbase =
+      (static_cast<long long>(m) * heads + h) * head_dim * head_dim;
+  for (int t = j; t < head_dim * head_dim; t += blockDim.x) tile[t] = state_in[sbase + t];
+  __syncthreads();
+
+  const int stop = cut ? min(cut[m], pos) : pos;
+  // Replay has no consumer for rejected-position outputs. Advance only the
+  // accepted prefix and store that state once.
+  for (int p = 0; p < stop; ++p) {
+    const long long vbase = (static_cast<long long>(p) * batch + m) * row_stride +
+                            static_cast<long long>(h) * head_dim;
+    sq[j] = f(q[vbase + j]);
+    sk[j] = f(key[vbase + j]);
+    sg[j] = __expf(f(g[vbase + j]));
+    __syncthreads();
+
+    const long long bb = (static_cast<long long>(p) * batch + m) * heads + h;
+    const float beta_h = f(beta[bb]);
+    float u = 0.0f;
+    for (int i = 0; i < head_dim; ++i) u += sg[i] * tile[i * head_dim + j] * sk[i];
+    const float d = beta_h * (f(v[vbase + j]) - u);
+
+    float acc = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+      const float sc = sg[i] * tile[i * head_dim + j] + sk[i] * d;
+      tile[i * head_dim + j] = sc;
+      acc += sc * sq[i];
+    }
+    __syncthreads();
+    o[vbase + j] = b(acc);
+  }
+
+  for (int t = j; t < head_dim * head_dim; t += blockDim.x) state_out[sbase + t] = tile[t];
+}
+
 __global__ void kda_gated_norm_kernel(bf16* __restrict__ out, const bf16* __restrict__ x,
                                       const bf16* __restrict__ gate, const bf16* __restrict__ w,
                                       int head_dim, float eps) {
@@ -426,10 +518,12 @@ __global__ void kda_gated_norm_kernel(bf16* __restrict__ out, const bf16* __rest
 // -------------------------------------------------------------- paged KV writes
 
 __global__ void kv_write_latent_kernel(KvPages kv, const bf16* __restrict__ src,
-                                       const int* __restrict__ pos, int layer_slot) {
+                                       const int* __restrict__ pos, int layer_slot,
+                                       int n_streams) {
   const int m = blockIdx.x;
+  const int st = n_streams > 0 ? m % n_streams : m;
   int page = 0, slot = 0;
-  kv_locate(kv, m, pos[m], &page, &slot);
+  kv_locate(kv, st, pos[m], &page, &slot);
   const long long dst_base =
       ((static_cast<long long>(page) * kv.layers + layer_slot) * kv.page_tokens + slot) * kv.kv_lora;
   const bf16* s = src + static_cast<long long>(m) * kv.kv_lora;
@@ -438,10 +532,11 @@ __global__ void kv_write_latent_kernel(KvPages kv, const bf16* __restrict__ src,
 
 __global__ void kv_write_index_kernel(KvPages kv, const bf16* __restrict__ key_src,
                                       const bf16* __restrict__ gate_src, const int* __restrict__ pos,
-                                      int layer_slot) {
+                                      int layer_slot, int n_streams) {
   const int m = blockIdx.x;
+  const int st = n_streams > 0 ? m % n_streams : m;
   int page = 0, slot = 0;
-  kv_locate(kv, m, pos[m], &page, &slot);
+  kv_locate(kv, st, pos[m], &page, &slot);
   const long long dst_base = ((static_cast<long long>(page) * kv.layers + layer_slot) *
                               kv.page_tokens + slot) * kv.index_head_dim;
   const bf16* ks = key_src + static_cast<long long>(m) * kv.index_head_dim;
@@ -469,14 +564,14 @@ __global__ void mla_absorb_q_kernel(float* __restrict__ q_abs, const bf16* __res
 __global__ void mla_scores_kernel(float* __restrict__ scores, const float* __restrict__ q_abs,
                                   KvPages kv, const int* __restrict__ sel,
                                   const int* __restrict__ n_sel, int sel_stride, int layer_slot,
-                                  int heads, int kv_lora, float scaling) {
+                                  int heads, int kv_lora, float scaling, int n_streams) {
   extern __shared__ float lat[];
   const int i = blockIdx.x;
   const int m = blockIdx.y;
   if (i >= n_sel[m]) return;
   const int tok = sel[static_cast<long long>(m) * sel_stride + i];
   int page = 0, slot = 0;
-  kv_locate(kv, m, tok, &page, &slot);
+  kv_locate(kv, n_streams > 0 ? m % n_streams : m, tok, &page, &slot);
   const long long src =
       ((static_cast<long long>(page) * kv.layers + layer_slot) * kv.page_tokens + slot) * kv_lora;
   for (int c = threadIdx.x; c < kv_lora; c += blockDim.x) lat[c] = f(kv.latent[src + c]);
@@ -526,7 +621,7 @@ __global__ void mla_softmax_kernel(float* __restrict__ scores, const int* __rest
 __global__ void mla_context_kernel(float* __restrict__ ctx, const float* __restrict__ scores,
                                    KvPages kv, const int* __restrict__ sel,
                                    const int* __restrict__ n_sel, int sel_stride, int layer_slot,
-                                   int kv_lora) {
+                                   int kv_lora, int n_streams) {
   const int h = blockIdx.x;
   const int m = blockIdx.y;
   const int c = threadIdx.x;
@@ -536,7 +631,7 @@ __global__ void mla_context_kernel(float* __restrict__ ctx, const float* __restr
   const int* sel_row = sel + static_cast<long long>(m) * sel_stride;
   for (int i = 0; i < n; ++i) {
     int page = 0, slot = 0;
-    kv_locate(kv, m, sel_row[i], &page, &slot);
+    kv_locate(kv, n_streams > 0 ? m % n_streams : m, sel_row[i], &page, &slot);
     const long long src =
         ((static_cast<long long>(page) * kv.layers + layer_slot) * kv.page_tokens + slot) * kv_lora;
     acc += row[i] * f(kv.latent[src + c]);
@@ -564,9 +659,11 @@ __global__ void mla_expand_v_kernel(bf16* __restrict__ out, const bf16* __restri
 
 __global__ void indexer_pool_kernel(bf16* __restrict__ pool_keys, KvPages kv,
                                     const bf16* __restrict__ ape, const int* __restrict__ n_pools,
-                                    int pool_stride, int layer_slot, int kpool, int head_dim) {
+                                    int pool_stride, int layer_slot, int kpool, int head_dim,
+                                    int n_streams) {
   const int p = blockIdx.x;
   const int m = blockIdx.y;
+  const int st = n_streams > 0 ? m % n_streams : m;
   if (p >= n_pools[m]) return;
   const int c = threadIdx.x;
   if (c >= head_dim) return;
@@ -575,7 +672,7 @@ __global__ void indexer_pool_kernel(bf16* __restrict__ pool_keys, KvPages kv,
   for (int i = 0; i < kpool; ++i) {
     const int tok = p * kpool + i;
     int page = 0, slot = 0;
-    kv_locate(kv, m, tok, &page, &slot);
+    kv_locate(kv, st, tok, &page, &slot);
     const long long src =
         ((static_cast<long long>(page) * kv.layers + layer_slot) * kv.page_tokens + slot) * head_dim;
     logit[i] = f(kv.gate[src + c]) + f(ape[i * head_dim + c]);
@@ -590,7 +687,7 @@ __global__ void indexer_pool_kernel(bf16* __restrict__ pool_keys, KvPages kv,
   for (int i = 0; i < kpool; ++i) {
     const int tok = p * kpool + i;
     int page = 0, slot = 0;
-    kv_locate(kv, m, tok, &page, &slot);
+    kv_locate(kv, st, tok, &page, &slot);
     const long long src =
         ((static_cast<long long>(page) * kv.layers + layer_slot) * kv.page_tokens + slot) * head_dim;
     acc += (logit[i] / sum) * f(kv.key[src + c]);
@@ -1161,10 +1258,42 @@ void gemm_fp8_row(bf16* y, const std::uint8_t* w, const float* scales, const bf1
 }
 
 void gemm_bf16(bf16* y, const bf16* w, const bf16* x, int batch, int n_rows, int k, cudaStream_t s) {
+  if (batch >= 16 && std::getenv("ROCKET_CUBLAS_ALL")) {
+    gemm_bf16_cublas(y, w, x, batch, n_rows, k, s);
+    return;
+  }
   gemm_dispatch<bf16>(y, w, x, batch, n_rows, k, s);
+}
+void gemm_bf16_cublas(bf16* y, const bf16* w, const bf16* x, int batch, int n_rows, int k,
+                       cudaStream_t s) {
+  static cublasHandle_t handle = nullptr;
+  if (!handle && cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS)
+    throw std::runtime_error("cublasCreate failed");
+  if (cublasSetStream(handle, s) != CUBLAS_STATUS_SUCCESS)
+    throw std::runtime_error("cublasSetStream failed");
+  const float alpha = 1.0f, beta = 0.0f;
+  const cublasStatus_t st = cublasGemmEx(
+      handle, CUBLAS_OP_T, CUBLAS_OP_N, n_rows, batch, k, &alpha, w, CUDA_R_16BF, k, x,
+      CUDA_R_16BF, k, &beta, y, CUDA_R_16BF, n_rows, CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  if (st != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublas BF16 GEMM failed");
 }
 void gemm_bf16_f32(float* y, const bf16* w, const bf16* x, int batch, int n_rows, int k,
                    cudaStream_t s) {
+  if (batch >= 16 && std::getenv("ROCKET_CUBLAS_ALL")) {
+    static cublasHandle_t handle = nullptr;
+    if (!handle && cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("cublasCreate failed");
+    if (cublasSetStream(handle, s) != CUBLAS_STATUS_SUCCESS)
+      throw std::runtime_error("cublasSetStream failed");
+    const float alpha = 1.0f, beta = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N, n_rows, batch, k, &alpha, w, CUDA_R_16BF, k, x,
+        CUDA_R_16BF, k, &beta, y, CUDA_R_32F, n_rows, CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublas BF16->F32 GEMM failed");
+    return;
+  }
   gemm_dispatch<float>(y, w, x, batch, n_rows, k, s);
 }
 void rmsnorm(bf16* out, const bf16* x, const bf16* weight, int batch, int n, float eps,
@@ -1238,49 +1367,119 @@ void kda_recurrent_step(float* state, bf16* o, const bf16* q, const bf16* k, con
   kda_step_kernel<<<dim3(heads, batch), head_dim, shmem, s>>>(state, o, q, k, v, g, beta, heads,
                                                               head_dim, row_stride);
 }
+void kda_conv_update_chunk(bf16* out, bf16* state, const bf16* in, const bf16* weight, int batch,
+                           int channels, int kernel, int pos, cudaStream_t s) {
+  if (kernel - 1 > 15) throw std::runtime_error("kda conv chunk: taps window exceeds the 16-lane register path");
+  kda_conv_chunk_kernel<<<dim3((channels + 255) / 256, batch), 256, 0, s>>>(
+      out, state, state, in, weight, nullptr, batch, channels, kernel, pos);
+}
+
+void kda_conv_update_chunk_oop(bf16* out, const bf16* state_in, bf16* state_out,
+                               const bf16* in, const bf16* weight, int batch, int channels,
+                               int kernel, int pos, cudaStream_t s) {
+  if (kernel - 1 > 15)
+    throw std::runtime_error("kda conv chunk: taps window exceeds the 16-lane register path");
+  kda_conv_chunk_kernel<<<dim3((channels + 255) / 256, batch), 256, 0, s>>>(
+      out, state_in, state_out, in, weight, nullptr, batch, channels, kernel, pos);
+}
+
+void kda_conv_update_cut(bf16* out, bf16* state, const bf16* in, const bf16* weight,
+                         const int* cut, int batch, int channels, int kernel, int pos,
+                         cudaStream_t s) {
+  if (kernel - 1 > 15) throw std::runtime_error("kda conv chunk: taps window exceeds the 16-lane register path");
+  kda_conv_chunk_kernel<<<dim3((channels + 255) / 256, batch), 256, 0, s>>>(
+      out, state, state, in, weight, cut, batch, channels, kernel, pos);
+}
+
+void kda_recurrent_chunk(float* state, bf16* o, const bf16* q, const bf16* key, const bf16* v,
+                         const bf16* g, const bf16* beta, int batch, int heads, int head_dim,
+                         int row_stride, int pos, cudaStream_t s) {
+  const std::size_t shmem =
+      sizeof(float) * (static_cast<std::size_t>(head_dim) * head_dim + 3 * head_dim);
+  static bool configured = false;
+  if (!configured) {
+    cudaFuncSetAttribute(kda_recurrent_chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shmem));
+    configured = true;
+  }
+  kda_recurrent_chunk_kernel<<<dim3(heads, batch), head_dim, shmem, s>>>(
+      state, state, o, q, key, v, g, beta, nullptr, batch, heads, head_dim, row_stride, pos);
+}
+
+void kda_recurrent_chunk_oop(const float* state_in, float* state_out, bf16* o,
+                             const bf16* q, const bf16* key, const bf16* v,
+                             const bf16* g, const bf16* beta, int batch, int heads,
+                             int head_dim, int row_stride, int pos, cudaStream_t s) {
+  const std::size_t shmem =
+      sizeof(float) * (static_cast<std::size_t>(head_dim) * head_dim + 3 * head_dim);
+  static bool configured = false;
+  if (!configured) {
+    cudaFuncSetAttribute(kda_recurrent_chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shmem));
+    configured = true;
+  }
+  kda_recurrent_chunk_kernel<<<dim3(heads, batch), head_dim, shmem, s>>>(
+      state_in, state_out, o, q, key, v, g, beta, nullptr, batch, heads, head_dim, row_stride, pos);
+}
+
+void kda_recurrent_cut(float* state, bf16* o, const bf16* q, const bf16* key, const bf16* v,
+                       const bf16* g, const bf16* beta, const int* cut, int batch, int heads,
+                       int head_dim, int row_stride, int pos, cudaStream_t s) {
+  const std::size_t shmem =
+      sizeof(float) * (static_cast<std::size_t>(head_dim) * head_dim + 3 * head_dim);
+  static bool configured = false;
+  if (!configured) {
+    cudaFuncSetAttribute(kda_recurrent_chunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shmem));
+    configured = true;
+  }
+  kda_recurrent_chunk_kernel<<<dim3(heads, batch), head_dim, shmem, s>>>(
+      state, state, o, q, key, v, g, beta, cut, batch, heads, head_dim, row_stride, pos);
+}
+
 void kda_gated_norm(bf16* out, const bf16* x, const bf16* gate, const bf16* weight, int batch,
                     int heads, int head_dim, float eps, cudaStream_t s) {
   kda_gated_norm_kernel<<<dim3(heads, batch), 128, 0, s>>>(out, x, gate, weight, head_dim, eps);
 }
-void kv_write_latent(const KvPages& kv, const bf16* src, const int* pos, int batch, int layer_slot,
-                     cudaStream_t s) {
-  kv_write_latent_kernel<<<batch, 128, 0, s>>>(kv, src, pos, layer_slot);
+void kv_write_latent(const KvPages& kv, const bf16* src, const int* pos, int batch, int n_streams,
+                     int layer_slot, cudaStream_t s) {
+  kv_write_latent_kernel<<<batch, 128, 0, s>>>(kv, src, pos, layer_slot, n_streams);
 }
 void kv_write_index(const KvPages& kv, const bf16* key_src, const bf16* gate_src, const int* pos,
-                    int batch, int layer_slot, cudaStream_t s) {
-  kv_write_index_kernel<<<batch, 128, 0, s>>>(kv, key_src, gate_src, pos, layer_slot);
+                    int batch, int n_streams, int layer_slot, cudaStream_t s) {
+  kv_write_index_kernel<<<batch, 128, 0, s>>>(kv, key_src, gate_src, pos, layer_slot, n_streams);
 }
 void mla_absorb_q(float* q_abs, const bf16* kv_b, const bf16* q, int batch, int heads, int nope,
                   int v_dim, int kv_lora, cudaStream_t s) {
   mla_absorb_q_kernel<<<dim3(heads, batch), kv_lora, 0, s>>>(q_abs, kv_b, q, nope, v_dim, kv_lora);
 }
 void mla_scores(float* scores, const float* q_abs, const KvPages& kv, const int* sel,
-                const int* n_sel, int n_sel_max, int sel_stride, int batch, int layer_slot,
-                int heads, int kv_lora, float scaling, cudaStream_t s) {
+                const int* n_sel, int n_sel_max, int sel_stride, int batch, int n_streams,
+                int layer_slot, int heads, int kv_lora, float scaling, cudaStream_t s) {
   mla_scores_kernel<<<dim3(n_sel_max, batch), 256, sizeof(float) * kv_lora, s>>>(
-      scores, q_abs, kv, sel, n_sel, sel_stride, layer_slot, heads, kv_lora, scaling);
+      scores, q_abs, kv, sel, n_sel, sel_stride, layer_slot, heads, kv_lora, scaling, n_streams);
 }
 void mla_softmax(float* scores, const int* n_sel, int sel_stride, int batch, int heads,
                  cudaStream_t s) {
   mla_softmax_kernel<<<dim3(heads, batch), 256, 0, s>>>(scores, n_sel, sel_stride, heads);
 }
 void mla_context(float* ctx, const float* scores, const KvPages& kv, const int* sel,
-                 const int* n_sel, int n_sel_max, int sel_stride, int batch, int layer_slot,
-                 int heads, int kv_lora, cudaStream_t s) {
+                 const int* n_sel, int n_sel_max, int sel_stride, int batch, int n_streams,
+                 int layer_slot, int heads, int kv_lora, cudaStream_t s) {
   (void)n_sel_max;
   mla_context_kernel<<<dim3(heads, batch), kv_lora, 0, s>>>(ctx, scores, kv, sel, n_sel, sel_stride,
-                                                            layer_slot, kv_lora);
+                                                            layer_slot, kv_lora, n_streams);
 }
 void mla_expand_v(bf16* out, const bf16* kv_b, const float* ctx, int batch, int heads, int nope,
                   int v_dim, int kv_lora, cudaStream_t s) {
   mla_expand_v_kernel<<<dim3(heads, v_dim, batch), 128, 0, s>>>(out, kv_b, ctx, nope, v_dim, kv_lora);
 }
 void indexer_pool_keys(bf16* pool_keys, const KvPages& kv, const bf16* ape, const int* n_pools,
-                       int n_pools_max, int pool_stride, int batch, int layer_slot, int kpool,
-                       int head_dim, cudaStream_t s) {
+                       int n_pools_max, int pool_stride, int batch, int n_streams, int layer_slot,
+                       int kpool, int head_dim, cudaStream_t s) {
   indexer_pool_kernel<<<dim3(n_pools_max, batch), head_dim, 0, s>>>(pool_keys, kv, ape, n_pools,
                                                                     pool_stride, layer_slot, kpool,
-                                                                    head_dim);
+                                                                    head_dim, n_streams);
 }
 void indexer_scores(float* scores, const bf16* q, const bf16* pool_keys, const float* head_w,
                     const int* n_pools, int n_pools_max, int pool_stride, int batch, int heads,
