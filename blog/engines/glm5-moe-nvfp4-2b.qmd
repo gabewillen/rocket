@@ -1,0 +1,20 @@
+---
+title: "glm5-moe-nvfp4-2b"
+description: "Two-GB10 CUDA engine for GLM-5.3-Flash NVFP4 with DFlash2 speculative decode."
+status: built
+chemistry: "glm5-moe-288e-top8-kda-dsa"
+date-modified: 2026-09-13
+---
+
+Burns [GLM-5.3-Flash](../fuels/glm-5.3-flash.qmd) NVFP4 across two NVIDIA GB10 boosters.
+
+| property | value |
+| --- | --- |
+| source | `engines/glm5-moe-nvfp4-2b/` |
+| boosters | 2x NVIDIA GB10 |
+| serving weights | NVFP4 experts with BF16 or FP8 attention-family overlays |
+| speculation | DFlash2, seven draft tokens at the measured c8 optimum |
+| c8 throughput | [25.00 tokens/s per stream, 200.01 aggregate](../posts/runtime/2026-09-13-glm53-cold-load-reaches-nvme-ceiling/) |
+| cold weight load | [25.8 seconds](../posts/runtime/2026-09-13-glm53-cold-load-reaches-nvme-ceiling/) |
+
+The first accepted DFlash2 gate measured [23.91 tokens/s per stream](../posts/runtime/2026-09-13-dflash2-cuda-beats-vllm-c8/), above the 20.6 tokens/s EXL3 vLLM c8 baseline. The later final-layout run measured 25.00 tokens/s per stream and a 25.8-second cold weight load.

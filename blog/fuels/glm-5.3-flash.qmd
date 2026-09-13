@@ -1,9 +1,9 @@
 ---
 title: "GLM-5.3-Flash"
-description: "321B total, 18B active, hybrid KDA and sparse MLA, 288 experts top-8. No engine burns it yet."
+description: "321B total, 18B active, hybrid KDA and sparse MLA, 288 experts top-8. Burns in the two-GB10 CUDA engine."
 chemistry: "glm5-moe-288e-top8-kda-dsa"
-status: unburned
-date-modified: 2026-09-05
+status: burning
+date-modified: 2026-09-13
 toc-depth: 2
 ---
 
@@ -46,4 +46,4 @@ comes from.
 
 ## Engines {#engines}
 
-None yet.
+[`glm5-moe-nvfp4-2b`](../engines/glm5-moe-nvfp4-2b.qmd) burns the NVFP4 fuel across two NVIDIA GB10 boosters. Its accepted c8 DFlash2 run reached [25.00 tokens/s per stream and 200.01 aggregate tokens/s](../posts/runtime/2026-09-13-glm53-cold-load-reaches-nvme-ceiling/) with a 25.8-second cold weight load.
