@@ -1275,7 +1275,7 @@ void gemm_bf16_cublas(bf16* y, const bf16* w, const bf16* x, int batch, int n_ro
   const cublasStatus_t st = cublasGemmEx(
       handle, CUBLAS_OP_T, CUBLAS_OP_N, n_rows, batch, k, &alpha, w, CUDA_R_16BF, k, x,
       CUDA_R_16BF, k, &beta, y, CUDA_R_16BF, n_rows, CUBLAS_COMPUTE_32F,
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      CUBLAS_GEMM_ALGO0_TENSOR_OP);
   if (st != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublas BF16 GEMM failed");
 }
 void gemm_bf16_f32(float* y, const bf16* w, const bf16* x, int batch, int n_rows, int k,
@@ -1290,7 +1290,7 @@ void gemm_bf16_f32(float* y, const bf16* w, const bf16* x, int batch, int n_rows
     const cublasStatus_t st = cublasGemmEx(
         handle, CUBLAS_OP_T, CUBLAS_OP_N, n_rows, batch, k, &alpha, w, CUDA_R_16BF, k, x,
         CUDA_R_16BF, k, &beta, y, CUDA_R_32F, n_rows, CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        CUBLAS_GEMM_ALGO0_TENSOR_OP);
     if (st != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("cublas BF16->F32 GEMM failed");
     return;
   }

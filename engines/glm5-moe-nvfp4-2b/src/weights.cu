@@ -521,59 +521,7 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
   }
 
   // --- streamed expert cache ----------------------------------------------
-  // EXL3 fuel: routed experts are trellis blobs (per projection:
-  // trellis [k/16, n/16, bits*16] int16 + suh [k] f16 + svh [n] f16), 12.6
-  // MiB per expert at K4; attention and dense stay BF16 in the checkpoint.
-  // The slot holds the nine blobs back to back in gate, up, down order.
-  { // Probe: can we still cudaMalloc after mmapping 120 shards?
-    void* probe = nullptr;
-    cudaError_t prc = cudaMalloc(&probe, 12619776);
-    std::fprintf(stderr, "[probe] cudaMalloc(12MB) after mmap: %s (%p)\n",
-                 cudaGetErrorString(prc), probe);
-    if (prc == cudaSuccess) cudaFree(probe);
-  }
-  exl3_fuel_ = cfg_.quant_method == "exl3";
-  if (std::getenv("ROCKET_TRACE_COPY"))
-    std::fprintf(stderr, "[fuel] quant_method=%s exl3_fuel=%d\n",
-                 cfg_.quant_method.c_str(), exl3_fuel_);
-  if (exl3_fuel_) {
-    const std::size_t gt = static_cast<std::size_t>(cfg_.moe_intermediate_size) * H / 2;
-    const std::size_t dt = static_cast<std::size_t>(H) * cfg_.moe_intermediate_size / 2;
-    const std::size_t suh_g = H * 2, svh_g = cfg_.moe_intermediate_size * 2;
-    const std::size_t suh_d = cfg_.moe_intermediate_size * 2, svh_d = H * 2;
-    exl3_slot_bytes_ = align_up(2 * (gt + suh_g + svh_g) + dt + suh_d + svh_d, 512);
-    std::size_t n_slots = expert_cache_bytes / exl3_slot_bytes_;
-    if (n_slots < static_cast<std::size_t>(cfg_.num_experts_per_tok))
-      fail("expert cache is smaller than one token's top-k working set");
-    // One contiguous slab for all slots: avoids many small cudaMallocs
-    // that can behave badly on this unified-memory platform.
-    auto* slab = static_cast<std::uint8_t*>(device_alloc(n_slots * exl3_slot_bytes_));
-    exl3_owned_.push_back(slab);
-    resident_bytes_ += n_slots * exl3_slot_bytes_;
-    exl3_slots_.resize(n_slots);
-    exl3_lru_pos_.resize(n_slots);
-    for (std::size_t i = 0; i < n_slots; ++i) {
-      std::size_t off = 0;
-      auto seg = [&](std::size_t bytes) {
-        void* p = slab + i * exl3_slot_bytes_ + off;
-        off += bytes;
-        return p;
-      };
-      auto& v = exl3_slots_[i];
-      v.gate_trellis = seg(gt);  v.gate_suh = seg(suh_g);  v.gate_svh = seg(svh_g);
-      v.up_trellis = seg(gt);    v.up_suh = seg(suh_g);    v.up_svh = seg(svh_g);
-      v.down_trellis = seg(dt);  v.down_suh = seg(suh_d);  v.down_svh = seg(svh_d);
-    }
-    for (std::size_t i = 0; i < n_slots; ++i) {
-      exl3_lru_.push_front(static_cast<int>(i));
-      exl3_lru_pos_[i] = exl3_lru_.begin();
-    }
-    // NVFP4 slot pool skipped entirely on this fuel.
-    slot_bytes_ = 0;
-    slots_.clear();
-    slot_view_.clear();
-  }
-  if (!exl3_fuel_) {
+  // --- streamed NVFP4 expert cache -----------------------------------------
   // Layout, in order: gate_packed and up_packed sit back to back so the pair
   // doubles as the fused w13 grouped-GEMM B operand (weights.h::ExpertDev);
   // gate_scale/up_scale are the checkpoint's own linear layout for the GEMV
@@ -597,8 +545,11 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
   slots_.resize(n_slots);
   slot_view_.resize(n_slots);
   lru_pos_.resize(n_slots);
+  // One cache slab keeps preload destinations contiguous. Besides avoiding
+  // thousands of large cudaMalloc calls, this permits multi-expert DMA runs.
+  auto* cache_slab = static_cast<std::uint8_t*>(device_alloc(n_slots * slot_bytes_));
   for (std::size_t i = 0; i < n_slots; ++i) {
-    auto* base = static_cast<std::uint8_t*>(device_alloc(slot_bytes_));
+    auto* base = cache_slab + i * slot_bytes_;
     slots_[i].base = base;
     ExpertDev& v = slot_view_[i];
     std::size_t off = 0;
@@ -613,7 +564,6 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
     lru_.push_front(static_cast<int>(i));
     lru_pos_[i] = lru_.begin();
   }
-  }
   { const cudaError_t ce = cudaGetLastError();
     if (ce != cudaSuccess)
       std::fprintf(stderr, "[ctor-end] sticky CUDA error: %s\n", cudaGetErrorString(ce));
@@ -625,69 +575,6 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
 WeightStore::~WeightStore() {
   for (void* p : owned_) cudaFree(p);
   if (pinned_ != nullptr) cudaFreeHost(pinned_);
-}
-
-// EXL3 slot streaming: same LRU discipline as the NVFP4 fetch, nine blobs
-// per expert (trellis + suh + svh per projection) staged through the pinned
-// buffer.
-const Exl3ExpertView& WeightStore::exl3_expert(int layer, int expert_id, cudaStream_t s) {
-  const std::uint64_t key =
-      static_cast<std::uint64_t>(layer) * cfg_.n_routed_experts + expert_id;
-  auto rit = exl3_resident_.find(key);
-  if (rit != exl3_resident_.end()) {
-    ++hits_;
-    const int slot = rit->second;
-    exl3_lru_.erase(exl3_lru_pos_[slot]);
-    exl3_lru_.push_front(slot);
-    exl3_lru_pos_[slot] = exl3_lru_.begin();
-    return exl3_slots_[slot];
-  }
-  ++misses_;
-  int slot;
-  if (!exl3_lru_.empty() && exl3_resident_.size() >= exl3_slots_.size()) {
-    slot = exl3_lru_.back();
-    exl3_lru_.pop_back();
-    for (auto it = exl3_resident_.begin(); it != exl3_resident_.end(); ++it)
-      if (it->second == slot) { exl3_resident_.erase(it); break; }
-  } else {
-    slot = static_cast<int>(exl3_resident_.size());
-  }
-  const std::string p = layer_prefix(layer) + "mlp.experts." + std::to_string(expert_id) + ".";
-  const std::size_t H = cfg_.hidden_size;
-  const std::size_t SI = cfg_.moe_intermediate_size;
-  const std::size_t gt = SI * H / 2;
-  const std::size_t dt = H * SI / 2;
-  Exl3ExpertView& v = exl3_slots_[slot];
-  struct Blob { const char* suffix; std::size_t bytes; const void** dst; };
-  const Blob blobs[9] = {
-      {"gate_proj.trellis", gt, &v.gate_trellis},
-      {"gate_proj.suh", H * 2, &v.gate_suh},
-      {"gate_proj.svh", SI * 2, &v.gate_svh},
-      {"up_proj.trellis", gt, &v.up_trellis},
-      {"up_proj.suh", H * 2, &v.up_suh},
-      {"up_proj.svh", SI * 2, &v.up_svh},
-      {"down_proj.trellis", dt, &v.down_trellis},
-      {"down_proj.suh", SI * 2, &v.down_suh},
-      {"down_proj.svh", H * 2, &v.down_svh},
-  };
-  for (const auto& b : blobs) {
-    const fuel::TensorView& t = ckpt_.tensor(p + b.suffix);
-    if (std::getenv("ROCKET_TRACE_COPY"))
-      std::fprintf(stderr, "[exl3-blob] L%d.E%d %s dst=%p bytes=%zu\n",
-                   layer, expert_id, b.suffix, *b.dst, t.nbytes);
-    std::memcpy(pinned_, t.data, t.nbytes);
-    cuda_check(cudaMemcpy(const_cast<void*>(*b.dst), pinned_, t.nbytes,
-                          cudaMemcpyHostToDevice), "exl3 blob H2D");
-    streamed_bytes_ += t.nbytes;
-  }
-  if (std::getenv("ROCKET_TRACE_COPY"))
-    std::fprintf(stderr, "[exl3-expert] L%d.E%d slot=%d/%zu base=%p gt=%p up_t=%p dn_t=%p\n",
-                 layer, expert_id, slot, exl3_slots_.size(),
-                 exl3_owned_[slot], v.gate_trellis, v.up_trellis, v.down_trellis);
-  exl3_resident_[key] = slot;
-  exl3_lru_.push_front(slot);
-  exl3_lru_pos_[slot] = exl3_lru_.begin();
-  return v;
 }
 
 void WeightStore::set_expert_range(int first, int count) {
@@ -753,27 +640,16 @@ std::size_t WeightStore::preload_owned_experts(cudaStream_t s) {
   for (int l = 0; l < cfg_.text_layers; ++l)
     if (cfg_.layers[l].mlp == fuel::MlpKind::kSparse)
       needed += static_cast<std::size_t>(expert_count_);
-  const std::size_t before = exl3_fuel() ? exl3_resident_.size() : resident_expert_.size();
-  if (exl3_fuel()) {
-    if (exl3_slots_.size() < needed)
-      fail("exl3 expert cache has " + std::to_string(exl3_slots_.size()) + " slots; preload needs " +
-           std::to_string(needed));
-    for (int l = 0; l < cfg_.text_layers; ++l) {
-      if (cfg_.layers[l].mlp != fuel::MlpKind::kSparse) continue;
-      for (int e = 0; e < cfg_.n_routed_experts; ++e)
-        if (owns_expert(e)) (void)exl3_expert(l, e, s);
-    }
-  } else {
-    if (slots_.size() < needed)
-      fail("expert cache has " + std::to_string(slots_.size()) + " slots; preload needs " +
-           std::to_string(needed));
-    for (int l = 0; l < cfg_.text_layers; ++l) {
-      if (cfg_.layers[l].mlp != fuel::MlpKind::kSparse) continue;
-      for (int e = 0; e < cfg_.n_routed_experts; ++e)
-        if (owns_expert(e)) (void)expert(l, e, s);
-    }
+  const std::size_t before = resident_expert_.size();
+  if (slots_.size() < needed)
+    fail("expert cache has " + std::to_string(slots_.size()) + " slots; preload needs " +
+         std::to_string(needed));
+  for (int l = 0; l < cfg_.text_layers; ++l) {
+    if (cfg_.layers[l].mlp != fuel::MlpKind::kSparse) continue;
+    for (int e = 0; e < cfg_.n_routed_experts; ++e)
+      if (owns_expert(e)) (void)expert(l, e, s);
   }
-  return (exl3_fuel() ? exl3_resident_.size() : resident_expert_.size()) - before;
+  return resident_expert_.size() - before;
 }
 
 const ExpertDev& WeightStore::expert(int layer, int expert_id, cudaStream_t s) {
@@ -814,6 +690,8 @@ const ExpertDev& WeightStore::expert(int layer, int expert_id, cudaStream_t s) {
       {"down_proj", v.down_packed, v.down_scale, v.down_scale_swizzled, &v.down_global,
        &v.down_input_scale, H, MI},
   };
+  const auto* slot_base = slots_[slot].base;
+  if (slot_bytes_ > pinned_bytes_) fail("expert slot exceeds pinned staging buffer");
   for (int pi = 0; pi < 3; ++pi) {
     const Piece& pc = pieces[pi];
     const fuel::TensorView& packed = ckpt_.tensor(p + pc.proj + ".weight");
@@ -822,36 +700,23 @@ const ExpertDev& WeightStore::expert(int layer, int expert_id, cudaStream_t s) {
     const fuel::SfLayout layout = fuel::sf_layout(pc.n, pc.k, 16);
     if (layout.bytes() != scale.nbytes)
       fail(p + pc.proj + ": swizzled scale size does not match the linear checkpoint size");
-    // Staged through pinned memory: the source is a page in the mmap'd
-    // checkpoint, so this is the disk-or-page-cache read plus one DMA. The
-    // swizzle is a host-side byte permutation (nvfp4.cc::swizzle_block_scales)
-    // between the linear and swizzled copies, both staged in the same pinned
-    // buffer; test-loader-swizzle measures it at ~1 GB/s of scale bytes,
-    // which hides under the NVMe read of the packed weight it swizzles for.
-    std::memcpy(pinned_, packed.data, packed.nbytes);
-    std::memcpy(pinned_ + packed.nbytes, scale.data, scale.nbytes);
-    std::vector<std::uint8_t> swizzled(layout.bytes());
-    fuel::swizzle_block_scales(pinned_ + packed.nbytes, layout, swizzled.data());
-    std::memcpy(pinned_ + packed.nbytes + scale.nbytes, swizzled.data(), swizzled.size());
-
-    cuda_check(cudaMemcpyAsync(const_cast<std::uint8_t*>(pc.dst_packed), pinned_, packed.nbytes,
-                               cudaMemcpyHostToDevice, s),
-               "expert packed H2D");
-    cuda_check(cudaMemcpyAsync(const_cast<std::uint8_t*>(pc.dst_scale), pinned_ + packed.nbytes,
-                               scale.nbytes, cudaMemcpyHostToDevice, s),
-               "expert scale H2D");
-    // up_proj's swizzled half lands after gate's in the fused w13_scale slab
-    // (weights.h::ExpertDev), which is exactly one gate-sized swizzle.
-    const std::uint8_t* dst_sw = (pi == 1) ? v.w13_scale + swizzled.size() : pc.dst_scale_sw;
-    cuda_check(cudaMemcpyAsync(const_cast<std::uint8_t*>(dst_sw),
-                               pinned_ + packed.nbytes + scale.nbytes, swizzled.size(),
-                               cudaMemcpyHostToDevice, s),
-               "expert scale (swizzled) H2D");
-    cuda_check(cudaStreamSynchronize(s), "expert stage sync");
+    const std::uint8_t* dst_sw =
+        (pi == 1) ? v.w13_scale + layout.bytes() : pc.dst_scale_sw;
+    const auto packed_off = static_cast<std::size_t>(pc.dst_packed - slot_base);
+    const auto scale_off = static_cast<std::size_t>(pc.dst_scale - slot_base);
+    const auto sw_off = static_cast<std::size_t>(dst_sw - slot_base);
+    std::memcpy(pinned_ + packed_off, packed.data, packed.nbytes);
+    std::memcpy(pinned_ + scale_off, scale.data, scale.nbytes);
+    fuel::swizzle_block_scales(pinned_ + scale_off, layout, pinned_ + sw_off);
     std::memcpy(pc.global, g2.data, sizeof(float));
     *pc.input_scale = optional_input_scale(ckpt_, p + pc.proj + ".input_scale");
-    streamed_bytes_ += packed.nbytes + scale.nbytes + swizzled.size();
+    streamed_bytes_ += packed.nbytes + scale.nbytes + layout.bytes();
   }
+  // The slot is already in its final device layout. One transfer and one
+  // synchronization replace nine copies and three synchronizations.
+  cuda_check(cudaMemcpyAsync(slots_[slot].base, pinned_, slot_bytes_, cudaMemcpyHostToDevice, s),
+             "expert slot H2D");
+  cuda_check(cudaStreamSynchronize(s), "expert slot sync");
 
   slots_[slot].key = key;
   resident_expert_[key] = slot;

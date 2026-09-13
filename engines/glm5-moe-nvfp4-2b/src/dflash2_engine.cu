@@ -65,45 +65,42 @@ __global__ void add_rms_kernel(bf16* normed, bf16* residual, const bf16* hidden,
   }
 }
 
-__global__ void swiglu_kernel(bf16* out, const bf16* gate, const bf16* up, int n) {
+__global__ void swiglu_kernel(bf16* out, const bf16* gate, const bf16* up,
+                              int rows, int width, int input_stride) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) {
-    const float x = f(gate[i]);
-    out[i] = b((x / (1.0f + __expf(-x))) * f(up[i]));
+  if (i < rows * width) {
+    const int row = i / width, col = i % width;
+    const float x = f(gate[static_cast<long long>(row) * input_stride + col]);
+    out[i] = b((x / (1.0f + __expf(-x))) *
+               f(up[static_cast<long long>(row) * input_stride + col]));
   }
 }
 
-__global__ void per_head_rms_kernel(bf16* x, const bf16* weight, int rows, int heads, int hd,
-                                    float eps) {
+__global__ void rms_rope_kernel(bf16* x, const bf16* weight, const int* positions,
+                                int rows, int heads, int hd, int row_stride,
+                                float eps, float theta) {
   __shared__ float sm[128];
   const int h = blockIdx.x;
   const int r = blockIdx.y;
   const int d = threadIdx.x;
-  const long long base = (static_cast<long long>(r) * heads + h) * hd;
-  float v = d < hd ? f(x[base + d]) : 0.0f;
-  sm[d] = v * v;
+  if (r >= rows || h >= heads) return;
+  const long long base = static_cast<long long>(r) * row_stride + h * hd;
+  const float raw = d < hd ? f(x[base + d]) : 0.0f;
+  sm[d] = raw * raw;
   __syncthreads();
-  for (int s = 64; s; s >>= 1) {
-    if (d < s) sm[d] += sm[d + s];
+  for (int off = 64; off; off >>= 1) {
+    if (d < off) sm[d] += sm[d + off];
     __syncthreads();
   }
-  if (d < hd) x[base + d] = b(v * rsqrtf(sm[0] / hd + eps) * f(weight[d]));
-}
-
-__global__ void rope_kernel(bf16* x, const int* positions, int rows, int heads, int hd,
-                            float theta) {
-  const int pair = blockIdx.x * blockDim.x + threadIdx.x;
-  const int r = blockIdx.y;
-  if (pair >= hd / 2 || r >= rows) return;
-  const float inv = __powf(theta, -2.0f * pair / hd);
-  float sn, cs;
-  __sincosf(positions[r] * inv, &sn, &cs);
-  for (int h = 0; h < heads; ++h) {
-    const long long base = (static_cast<long long>(r) * heads + h) * hd;
-    const float x0 = f(x[base + pair]);
-    const float x1 = f(x[base + pair + hd / 2]);
-    x[base + pair] = b(x0 * cs - x1 * sn);
-    x[base + pair + hd / 2] = b(x1 * cs + x0 * sn);
+  if (d < hd / 2) {
+    const float inv = rsqrtf(sm[0] / hd + eps);
+    const float x0 = f(b(raw * inv * f(weight[d])));
+    const float x1 = f(b(f(x[base + d + hd / 2]) * inv * f(weight[d + hd / 2])));
+    const float freq = __powf(theta, -2.0f * d / hd);
+    float sn, cs;
+    __sincosf(positions[r] * freq, &sn, &cs);
+    x[base + d] = b(x0 * cs - x1 * sn);
+    x[base + d + hd / 2] = b(x1 * cs + x0 * sn);
   }
 }
 
@@ -119,41 +116,39 @@ __global__ void scatter_context_kv_kernel(bf16* cache, const bf16* src, const in
 __global__ void attention_scores_kernel(float* scores, const bf16* q, const bf16* ctx_k,
                                         const bf16* query_k, const int* base_pos, int rows,
                                         int qcount, int max_tokens, int heads, int kv_heads,
-                                        int hd, int attend_stride, int window) {
-  const int h = blockIdx.x;
+                                        int hd, int q_stride, int attend_stride, int window) {
+  constexpr int kKeysPerBlock = 4;
+  const int h = blockIdx.x % heads;
+  const int key_tile = blockIdx.x / heads;
   const int row = blockIdx.y;
+  if (row >= rows) return;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int key_i = key_tile * kKeysPerBlock + warp;
   const int req = row / qcount;
   const int qoff = row % qcount;
   const int ctx_end = base_pos[req];
   const int ctx_start = max(0, ctx_end + qoff + 1 - window);
   const int ctx_n = ctx_end - ctx_start;
   const int total = ctx_n + qcount;
-  if (row >= rows || h >= heads) return;
+  if (key_i >= total) return;
   const int kvh = h / (heads / kv_heads);
-  const bf16* qp = q + (static_cast<long long>(row) * heads + h) * hd;
-  __shared__ float sm[128];
-  for (int key_i = 0; key_i < total; ++key_i) {
-    const bf16* kp = key_i < ctx_n
-        ? ctx_k + ((static_cast<long long>(req) * max_tokens + ctx_start + key_i) * kv_heads + kvh) * hd
-        : query_k + ((static_cast<long long>(req) * qcount + key_i - ctx_n) * kv_heads + kvh) * hd;
-    float part = 0.0f;
-    for (int d = threadIdx.x; d < hd; d += blockDim.x) part += f(qp[d]) * f(kp[d]);
-    sm[threadIdx.x] = part;
-    __syncthreads();
-    for (int s = 64; s; s >>= 1) {
-      if (threadIdx.x < s) sm[threadIdx.x] += sm[threadIdx.x + s];
-      __syncthreads();
-    }
-    if (threadIdx.x == 0)
-      scores[(static_cast<long long>(row) * heads + h) * attend_stride + key_i] = sm[0] * rsqrtf(float(hd));
-    __syncthreads();
-  }
+  const bf16* qp = q + static_cast<long long>(row) * q_stride + h * hd;
+  const bf16* kp = key_i < ctx_n
+      ? ctx_k + ((static_cast<long long>(req) * max_tokens + ctx_start + key_i) * kv_heads + kvh) * hd
+      : query_k + ((static_cast<long long>(req) * qcount + key_i - ctx_n) * kv_heads + kvh) * hd;
+  float sum = 0.0f;
+  for (int d = lane; d < hd; d += 32) sum += f(qp[d]) * f(kp[d]);
+  for (int off = 16; off; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
+  if (lane == 0)
+    scores[(static_cast<long long>(row) * heads + h) * attend_stride + key_i] =
+        sum * rsqrtf(float(hd));
 }
 
-__global__ void attention_context_kernel(bf16* out, const float* scores, const bf16* ctx_v,
+__global__ void attention_context_kernel(bf16* out, float* scores, const bf16* ctx_v,
                                          const bf16* query_v, const int* base_pos, int rows,
                                          int qcount, int max_tokens, int heads, int kv_heads,
-                                         int hd, int attend_stride, int window) {
+                                         int hd, int query_v_stride, int attend_stride, int window) {
   const int h = blockIdx.x;
   const int row = blockIdx.y;
   const int d = threadIdx.x;
@@ -163,25 +158,38 @@ __global__ void attention_context_kernel(bf16* out, const float* scores, const b
   const int ctx_start = max(0, ctx_end + qoff + 1 - window);
   const int ctx_n = ctx_end - ctx_start;
   const int total = ctx_n + qcount;
-  const float* sc = scores + (static_cast<long long>(row) * heads + h) * attend_stride;
-  __shared__ float sm_max, sm_sum;
-  if (d == 0) {
-    float mx = -INFINITY;
-    for (int i = 0; i < total; ++i) mx = fmaxf(mx, sc[i]);
-    float sum = 0.0f;
-    for (int i = 0; i < total; ++i) sum += __expf(sc[i] - mx);
-    sm_max = mx;
-    sm_sum = sum;
-  }
+  float* sc = scores + (static_cast<long long>(row) * heads + h) * attend_stride;
+  __shared__ float red[128];
+  float local_max = -INFINITY;
+  for (int i = d; i < total; i += blockDim.x) local_max = fmaxf(local_max, sc[i]);
+  red[d] = local_max;
   __syncthreads();
+  for (int off = 64; off; off >>= 1) {
+    if (d < off) red[d] = fmaxf(red[d], red[d + off]);
+    __syncthreads();
+  }
+  const float mx = red[0];
+  float local_sum = 0.0f;
+  for (int i = d; i < total; i += blockDim.x) {
+    const float e = __expf(sc[i] - mx);
+    sc[i] = e;
+    local_sum += e;
+  }
+  red[d] = local_sum;
+  __syncthreads();
+  for (int off = 64; off; off >>= 1) {
+    if (d < off) red[d] += red[d + off];
+    __syncthreads();
+  }
+  const float inv_sum = 1.0f / red[0];
   if (d < hd) {
     const int kvh = h / (heads / kv_heads);
     float acc = 0.0f;
     for (int i = 0; i < total; ++i) {
       const bf16* vp = i < ctx_n
           ? ctx_v + ((static_cast<long long>(req) * max_tokens + ctx_start + i) * kv_heads + kvh) * hd
-          : query_v + ((static_cast<long long>(req) * qcount + i - ctx_n) * kv_heads + kvh) * hd;
-      acc += __expf(sc[i] - sm_max) / sm_sum * f(vp[d]);
+          : query_v + static_cast<long long>(req * qcount + i - ctx_n) * query_v_stride + kvh * hd;
+      acc += sc[i] * inv_sum * f(vp[d]);
     }
     out[(static_cast<long long>(row) * heads + h) * hd + d] = b(acc);
   }
@@ -206,26 +214,42 @@ __global__ void top16_kernel(int* ids, float* vals, const float* logits, int row
   for (int j = 0; j < 16; ++j) { lv[j] = -INFINITY; li[j] = -1; }
   for (int v = threadIdx.x; v < vocab; v += blockDim.x) {
     const float x = logits[static_cast<long long>(r) * vocab + v];
-    if (x > lv[15]) {
+    if (x > lv[15] || (x == lv[15] && (li[15] < 0 || v < li[15]))) {
       int j = 15;
-      while (j > 0 && x > lv[j - 1]) { lv[j] = lv[j - 1]; li[j] = li[j - 1]; --j; }
+      while (j > 0 && (x > lv[j - 1] || (x == lv[j - 1] && v < li[j - 1]))) {
+        lv[j] = lv[j - 1]; li[j] = li[j - 1]; --j;
+      }
       lv[j] = x; li[j] = v;
     }
   }
   for (int j = 0; j < 16; ++j) { sv[threadIdx.x * 16 + j] = lv[j]; si[threadIdx.x * 16 + j] = li[j]; }
   __syncthreads();
-  if (threadIdx.x == 0) {
-    float bestv[16]; int besti[16];
-    for (int j = 0; j < 16; ++j) { bestv[j] = -INFINITY; besti[j] = -1; }
-    for (int z = 0; z < 256 * 16; ++z) {
-      const float x = sv[z];
-      if (x > bestv[15]) {
-        int j = 15;
-        while (j > 0 && x > bestv[j - 1]) { bestv[j] = bestv[j - 1]; besti[j] = besti[j - 1]; --j; }
-        bestv[j] = x; besti[j] = si[z];
+  // Merge sorted per-thread lists as a tree. The old thread-0 walk performed
+  // 4096 serial insertions per row; each level here merges two 16-entry lists.
+  for (int stride = 128; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      float mv[16]; int mi[16];
+      int a = 0, b = 0;
+      const int lhs = threadIdx.x * 16;
+      const int rhs = (threadIdx.x + stride) * 16;
+      for (int j = 0; j < 16; ++j) {
+        const float av = a < 16 ? sv[lhs + a] : -INFINITY;
+        const float bv = b < 16 ? sv[rhs + b] : -INFINITY;
+        const int ai = a < 16 ? si[lhs + a] : -1;
+        const int bi = b < 16 ? si[rhs + b] : -1;
+        const bool take_a = av > bv || (av == bv && ai <= bi);
+        mv[j] = take_a ? av : bv;
+        mi[j] = take_a ? ai : bi;
+        a += take_a;
+        b += !take_a;
       }
+      for (int j = 0; j < 16; ++j) { sv[lhs + j] = mv[j]; si[lhs + j] = mi[j]; }
     }
-    for (int j = 0; j < 16; ++j) { vals[r * 16 + j] = bestv[j]; ids[r * 16 + j] = besti[j]; }
+    __syncthreads();
+  }
+  if (threadIdx.x < 16) {
+    vals[r * 16 + threadIdx.x] = sv[threadIdx.x];
+    ids[r * 16 + threadIdx.x] = si[threadIdx.x];
   }
 }
 
@@ -266,6 +290,8 @@ struct DFlash2DraftEngine::Impl {
   const bf16* lm_head;
   rocket::fabric::ExpertParallel* ep;
   int max_batch, max_tokens, max_draft, max_rows, attend_stride;
+  cudaStream_t selector_stream = nullptr;
+  cudaEvent_t selector_ready = nullptr;
   std::vector<void*> owned;
   bf16 *aux_cat, *ctx_hidden, *ctx_norm, *ctx_k, *ctx_v;
   bf16 *kv_k, *kv_v;
@@ -283,23 +309,41 @@ struct DFlash2DraftEngine::Impl {
        rocket::fabric::ExpertParallel* parallel)
       : embed(e), lm_head(lm), ep(parallel), max_batch(mb), max_tokens(mt), max_draft(md) {
     w.load(dir / "model.safetensors");
+    ck(cudaStreamCreateWithFlags(&selector_stream,cudaStreamNonBlocking),"selector stream");
+    ck(cudaEventCreateWithFlags(&selector_ready,cudaEventDisableTiming),"selector event");
+    const int H=w.cfg.hidden_size, KV=w.cfg.num_kv_heads*w.cfg.head_dim;
+    const int FF=w.cfg.intermediate_size, R=w.cfg.selector_rank;
     max_rows = mb * (md + 1);
     attend_stride = std::min(mt, w.cfg.sliding_window) + md + 1;
     aux_cat=A((std::size_t)max_rows*5*w.cfg.hidden_size); ctx_hidden=A((std::size_t)max_rows*w.cfg.hidden_size);
-    ctx_norm=A((std::size_t)max_rows*w.cfg.hidden_size); ctx_k=A((std::size_t)max_rows*1024); ctx_v=A((std::size_t)max_rows*1024);
-    kv_k=A((std::size_t)5*mb*mt*1024); kv_v=A((std::size_t)5*mb*mt*1024);
-    hidden=A((std::size_t)max_rows*4096); residual=A((std::size_t)max_rows*4096); normed=A((std::size_t)max_rows*4096);
-    tmp=A((std::size_t)max_rows*4096); coeff=A((std::size_t)max_rows*1024); q=A((std::size_t)max_rows*4096);
-    k=A((std::size_t)max_rows*1024); v=A((std::size_t)max_rows*1024); attn=A((std::size_t)max_rows*4096);
-    gate=A((std::size_t)max_rows*12288); up=A((std::size_t)max_rows*12288); mlp=A((std::size_t)max_rows*12288);
-    sample_hidden=A((std::size_t)mb*md*4096); selector_hidden=A((std::size_t)mb*md*256);
-    scores=F((std::size_t)max_rows*32*attend_stride); logits=F((std::size_t)mb*md*w.cfg.vocab_size); top_vals=F((std::size_t)mb*md*16);
+    ctx_norm=A((std::size_t)max_rows*H); ctx_k=A((std::size_t)max_rows*KV); ctx_v=A((std::size_t)max_rows*KV);
+    kv_k=A((std::size_t)w.cfg.num_layers*mb*mt*KV); kv_v=A((std::size_t)w.cfg.num_layers*mb*mt*KV);
+    hidden=A((std::size_t)max_rows*H); residual=A((std::size_t)max_rows*H); normed=A((std::size_t)max_rows*H);
+    tmp=A((std::size_t)max_rows*H); coeff=A((std::size_t)max_rows*4*(H/w.cfg.conv_group_size));
+    q=A((std::size_t)max_rows*(H+KV)); v=q+H;
+    k=A((std::size_t)max_rows*KV); attn=A((std::size_t)max_rows*H);
+    gate=A((std::size_t)max_rows*2*FF); up=gate+FF;
+    mlp=A((std::size_t)max_rows*FF);
+    sample_hidden=A((std::size_t)mb*md*H); selector_hidden=A((std::size_t)mb*md*R);
+    scores=F((std::size_t)max_rows*w.cfg.num_heads*attend_stride); logits=F((std::size_t)mb*md*w.cfg.vocab_size); top_vals=F((std::size_t)mb*md*16);
     ids=I(max_rows); positions=I(max_rows); src_rows=I(max_rows); stream_ids=I(max_rows); ctx_positions=I(max_rows);
     top_ids=I((std::size_t)mb*md*16); draft_ids=I((std::size_t)mb*md);
-    ck(cudaMemset(kv_k,0,(std::size_t)5*mb*mt*1024*2),"zero K cache");
-    ck(cudaMemset(kv_v,0,(std::size_t)5*mb*mt*1024*2),"zero V cache");
+    for (int l=0;l<5;++l) {
+      const auto* qw=W(l,"self_attn.q_proj.weight");
+      const auto* vw=W(l,"self_attn.v_proj.weight");
+      const auto* gw=W(l,"mlp.gate_proj.weight");
+      const auto* uw=W(l,"mlp.up_proj.weight");
+      if (vw != qw + (std::size_t)H*H || uw != gw + (std::size_t)FF*H)
+        throw std::runtime_error("dflash2 fused projection weights are not contiguous");
+    }
+    ck(cudaMemset(kv_k,0,(std::size_t)w.cfg.num_layers*mb*mt*KV*2),"zero K cache");
+    ck(cudaMemset(kv_v,0,(std::size_t)w.cfg.num_layers*mb*mt*KV*2),"zero V cache");
   }
-  ~Impl(){ for(void* p:owned) cudaFree(p); }
+  ~Impl(){
+    if(selector_ready) cudaEventDestroy(selector_ready);
+    if(selector_stream) cudaStreamDestroy(selector_stream);
+    for(void* p:owned) cudaFree(p);
+  }
   const bf16* W(int l, const char* suffix) const {
     const std::string n="layers."+std::to_string(l)+"."+suffix;
     const void* p=w.tensor_data(n.c_str()); if(!p) throw std::runtime_error("dflash2 missing "+n); return static_cast<const bf16*>(p);
@@ -316,7 +360,9 @@ void DFlash2DraftEngine::append_context(const bf16* aux, int aux_stride, int pos
                                         const std::vector<int>& base_pos,
                                         const std::vector<int>& accepted, cudaStream_t s) {
   auto& z=*p_;
-  if (batch < 1 || batch > z.max_batch || positions_n < 1 || positions_n > 8 ||
+  const auto& c=z.w.cfg; const int H=c.hidden_size, KV=c.num_kv_heads*c.head_dim;
+  if (batch < 1 || batch > z.max_batch || positions_n < 1 ||
+      static_cast<long long>(positions_n) * batch > z.max_rows ||
       static_cast<int>(base_pos.size()) != batch || static_cast<int>(accepted.size()) != batch)
     throw std::runtime_error("dflash2 context shape");
   std::vector<int> sr, st, ps;
@@ -329,22 +375,24 @@ void DFlash2DraftEngine::append_context(const bf16* aux, int aux_stride, int pos
   ck(cudaMemcpyAsync(z.src_rows,sr.data(),n*4,cudaMemcpyHostToDevice,s),"context row map");
   ck(cudaMemcpyAsync(z.stream_ids,st.data(),n*4,cudaMemcpyHostToDevice,s),"context stream map");
   ck(cudaMemcpyAsync(z.ctx_positions,ps.data(),n*4,cudaMemcpyHostToDevice,s),"context positions");
-  gather_aux_kernel<<<dim3(16,n),256,0,s>>>(z.aux_cat,aux,z.src_rows,n,aux_stride,4096);
-  gemm_bf16_cublas(z.ctx_hidden,static_cast<const bf16*>(z.w.tensor_data("fc.weight")),z.aux_cat,n,4096,20480,s);
-  rmsnorm(z.ctx_norm,z.ctx_hidden,static_cast<const bf16*>(z.w.tensor_data("hidden_norm.weight")),n,4096,z.w.cfg.rms_norm_eps,s);
-  for(int l=0;l<5;++l){
-    gemm_bf16_cublas(z.ctx_k,z.W(l,"self_attn.k_proj.weight"),z.ctx_norm,n,1024,4096,s);
-    gemm_bf16_cublas(z.ctx_v,z.W(l,"self_attn.v_proj.weight"),z.ctx_norm,n,1024,4096,s);
-    per_head_rms_kernel<<<dim3(8,n),128,0,s>>>(z.ctx_k,z.W(l,"self_attn.k_norm.weight"),n,8,128,z.w.cfg.rms_norm_eps);
-    rope_kernel<<<dim3(1,n),64,0,s>>>(z.ctx_k,z.ctx_positions,n,8,128,10000.0f);
-    scatter_context_kv_kernel<<<dim3(4,n),256,0,s>>>(z.kv_k+(std::size_t)l*z.max_batch*z.max_tokens*1024,z.ctx_k,z.stream_ids,z.ctx_positions,n,z.max_tokens,1024);
-    scatter_context_kv_kernel<<<dim3(4,n),256,0,s>>>(z.kv_v+(std::size_t)l*z.max_batch*z.max_tokens*1024,z.ctx_v,z.stream_ids,z.ctx_positions,n,z.max_tokens,1024);
+  gather_aux_kernel<<<dim3(16,n),256,0,s>>>(z.aux_cat,aux,z.src_rows,n,aux_stride,H);
+  gemm_bf16_cublas(z.ctx_hidden,static_cast<const bf16*>(z.w.tensor_data("fc.weight")),z.aux_cat,n,H,5*H,s);
+  rmsnorm(z.ctx_norm,z.ctx_hidden,static_cast<const bf16*>(z.w.tensor_data("hidden_norm.weight")),n,H,z.w.cfg.rms_norm_eps,s);
+  for(int l=0;l<c.num_layers;++l){
+    gemm_bf16_cublas(z.ctx_k,z.W(l,"self_attn.k_proj.weight"),z.ctx_norm,n,KV,H,s);
+    gemm_bf16_cublas(z.ctx_v,z.W(l,"self_attn.v_proj.weight"),z.ctx_norm,n,KV,H,s);
+    rms_rope_kernel<<<dim3(c.num_kv_heads,n),c.head_dim,0,s>>>(z.ctx_k,z.W(l,"self_attn.k_norm.weight"),
+                                            z.ctx_positions,n,c.num_kv_heads,c.head_dim,KV,c.rms_norm_eps,10000.0f);
+    scatter_context_kv_kernel<<<dim3(4,n),256,0,s>>>(z.kv_k+(std::size_t)l*z.max_batch*z.max_tokens*KV,z.ctx_k,z.stream_ids,z.ctx_positions,n,z.max_tokens,KV);
+    scatter_context_kv_kernel<<<dim3(4,n),256,0,s>>>(z.kv_v+(std::size_t)l*z.max_batch*z.max_tokens*KV,z.ctx_v,z.stream_ids,z.ctx_positions,n,z.max_tokens,KV);
   }
 }
 
 void DFlash2DraftEngine::propose(const std::vector<int>& anchor, const std::vector<int>& position,
                                  int batch, int draft, std::vector<int>& out, cudaStream_t s) {
   auto& z=*p_;
+  const auto& c=z.w.cfg; const int H=c.hidden_size, KV=c.num_kv_heads*c.head_dim;
+  const int NH=c.num_heads, NK=c.num_kv_heads, HD=c.head_dim, FF=c.intermediate_size;
   if(batch < 1 || batch > z.max_batch || static_cast<int>(anchor.size()) != batch ||
      static_cast<int>(position.size()) != batch)
     throw std::runtime_error("dflash2 proposal shape");
@@ -354,6 +402,13 @@ void DFlash2DraftEngine::propose(const std::vector<int>& anchor, const std::vect
     if (pos < 0 || pos + draft >= z.max_tokens)
       throw std::runtime_error("dflash2 proposal position");
   const int qcount=draft+1, rows=batch*qcount;
+  int max_attend = 0;
+  for (int base : position) {
+    for (int qoff = 0; qoff < qcount; ++qoff) {
+      const int ctx_start = std::max(0, base + qoff + 1 - z.w.cfg.sliding_window);
+      max_attend = std::max(max_attend, base - ctx_start + qcount);
+    }
+  }
   std::vector<int> hi(rows), hp(rows);
   for(int m=0;m<batch;++m) for(int j=0;j<qcount;++j){ hi[m*qcount+j]=j?z.w.cfg.mask_token_id:anchor[m]; hp[m*qcount+j]=position[m]+j; }
   ck(cudaMemcpyAsync(z.ids,hi.data(),rows*4,cudaMemcpyHostToDevice,s),"query ids");
@@ -364,36 +419,35 @@ void DFlash2DraftEngine::propose(const std::vector<int>& anchor, const std::vect
   cudaEventCreate(&ev0); cudaEventCreate(&ev1); cudaEventCreate(&ev2); cudaEventCreate(&ev3);
   cudaEventRecord(ev0,s);
 #endif
-  gather_embed_kernel<<<dim3(16,rows),256,0,s>>>(z.hidden,z.embed,z.ids,rows,4096);
-  for(int l=0;l<5;++l){
-    add_rms_kernel<<<rows,256,0,s>>>(z.normed,z.residual,z.hidden,z.W(l,"input_layernorm.weight"),rows,4096,z.w.cfg.rms_norm_eps,l==0);
-    dflash2_grouped_conv_prepare(z.tmp,z.coeff,z.normed,z.W(l,"attention_conv.kernel_projection.weight"),z.W(l,"attention_conv.base_kernel"),rows,4096,qcount,16,2,s);
-    gemm_bf16_cublas(z.q,z.W(l,"self_attn.q_proj.weight"),z.tmp,rows,4096,4096,s);
-    gemm_bf16_cublas(z.k,z.W(l,"self_attn.k_proj.weight"),z.tmp,rows,1024,4096,s);
-    gemm_bf16_cublas(z.v,z.W(l,"self_attn.v_proj.weight"),z.tmp,rows,1024,4096,s);
-    per_head_rms_kernel<<<dim3(32,rows),128,0,s>>>(z.q,z.W(l,"self_attn.q_norm.weight"),rows,32,128,z.w.cfg.rms_norm_eps);
-    per_head_rms_kernel<<<dim3(8,rows),128,0,s>>>(z.k,z.W(l,"self_attn.k_norm.weight"),rows,8,128,z.w.cfg.rms_norm_eps);
-    rope_kernel<<<dim3(1,rows),64,0,s>>>(z.q,z.positions,rows,32,128,10000.0f);
-    rope_kernel<<<dim3(1,rows),64,0,s>>>(z.k,z.positions,rows,8,128,10000.0f);
-    const bf16* lk=z.kv_k+(std::size_t)l*z.max_batch*z.max_tokens*1024;
-    const bf16* lv=z.kv_v+(std::size_t)l*z.max_batch*z.max_tokens*1024;
-    attention_scores_kernel<<<dim3(32,rows),128,0,s>>>(z.scores,z.q,lk,z.k,z.ctx_positions,rows,qcount,z.max_tokens,32,8,128,z.attend_stride,2048);
-    attention_context_kernel<<<dim3(32,rows),128,0,s>>>(z.attn,z.scores,lv,z.v,z.ctx_positions,rows,qcount,z.max_tokens,32,8,128,z.attend_stride,2048);
-    gemm_bf16_cublas(z.tmp,z.W(l,"self_attn.o_proj.weight"),z.attn,rows,4096,4096,s);
-    dflash2_grouped_conv_finish(z.hidden,z.tmp,z.coeff,z.W(l,"attention_conv.base_kernel"),rows,4096,qcount,16,2,s);
-    add_rms_kernel<<<rows,256,0,s>>>(z.normed,z.residual,z.hidden,z.W(l,"post_attention_layernorm.weight"),rows,4096,z.w.cfg.rms_norm_eps,false);
-    dflash2_grouped_conv_prepare(z.tmp,z.coeff,z.normed,z.W(l,"mlp_conv.kernel_projection.weight"),z.W(l,"mlp_conv.base_kernel"),rows,4096,qcount,16,2,s);
-    gemm_bf16_cublas(z.gate,z.W(l,"mlp.gate_proj.weight"),z.tmp,rows,12288,4096,s);
-    gemm_bf16_cublas(z.up,z.W(l,"mlp.up_proj.weight"),z.tmp,rows,12288,4096,s);
-    swiglu_kernel<<<(rows*12288+255)/256,256,0,s>>>(z.mlp,z.gate,z.up,rows*12288);
-    gemm_bf16_cublas(z.tmp,z.W(l,"mlp.down_proj.weight"),z.mlp,rows,4096,12288,s);
-    dflash2_grouped_conv_finish(z.hidden,z.tmp,z.coeff,z.W(l,"mlp_conv.base_kernel"),rows,4096,qcount,16,2,s);
+  gather_embed_kernel<<<dim3(16,rows),256,0,s>>>(z.hidden,z.embed,z.ids,rows,H);
+  for(int l=0;l<c.num_layers;++l){
+    add_rms_kernel<<<rows,256,0,s>>>(z.normed,z.residual,z.hidden,z.W(l,"input_layernorm.weight"),rows,H,c.rms_norm_eps,l==0);
+    dflash2_grouped_conv_prepare(z.tmp,z.coeff,z.normed,z.W(l,"attention_conv.kernel_projection.weight"),z.W(l,"attention_conv.base_kernel"),rows,H,qcount,c.conv_group_size,c.conv_kernel_size,s);
+    gemm_bf16_cublas(z.q,z.W(l,"self_attn.q_proj.weight"),z.tmp,rows,H+KV,H,s);
+    gemm_bf16_cublas(z.k,z.W(l,"self_attn.k_proj.weight"),z.tmp,rows,KV,H,s);
+    rms_rope_kernel<<<dim3(NH,rows),HD,0,s>>>(z.q,z.W(l,"self_attn.q_norm.weight"),
+                                               z.positions,rows,NH,HD,H+KV,c.rms_norm_eps,10000.0f);
+    rms_rope_kernel<<<dim3(NK,rows),HD,0,s>>>(z.k,z.W(l,"self_attn.k_norm.weight"),
+                                              z.positions,rows,NK,HD,KV,c.rms_norm_eps,10000.0f);
+    const bf16* lk=z.kv_k+(std::size_t)l*z.max_batch*z.max_tokens*KV;
+    const bf16* lv=z.kv_v+(std::size_t)l*z.max_batch*z.max_tokens*KV;
+    const int score_tiles = (max_attend + 3) / 4;
+    attention_scores_kernel<<<dim3(NH*score_tiles,rows),128,0,s>>>(z.scores,z.q,lk,z.k,z.ctx_positions,rows,qcount,z.max_tokens,NH,NK,HD,H+KV,z.attend_stride,c.sliding_window);
+    attention_context_kernel<<<dim3(NH,rows),HD,0,s>>>(z.attn,z.scores,lv,z.v,z.ctx_positions,rows,qcount,z.max_tokens,NH,NK,HD,H+KV,z.attend_stride,c.sliding_window);
+    gemm_bf16_cublas(z.tmp,z.W(l,"self_attn.o_proj.weight"),z.attn,rows,H,H,s);
+    dflash2_grouped_conv_finish(z.hidden,z.tmp,z.coeff,z.W(l,"attention_conv.base_kernel"),rows,H,qcount,c.conv_group_size,c.conv_kernel_size,s);
+    add_rms_kernel<<<rows,256,0,s>>>(z.normed,z.residual,z.hidden,z.W(l,"post_attention_layernorm.weight"),rows,H,c.rms_norm_eps,false);
+    dflash2_grouped_conv_prepare(z.tmp,z.coeff,z.normed,z.W(l,"mlp_conv.kernel_projection.weight"),z.W(l,"mlp_conv.base_kernel"),rows,H,qcount,c.conv_group_size,c.conv_kernel_size,s);
+    gemm_bf16_cublas(z.gate,z.W(l,"mlp.gate_proj.weight"),z.tmp,rows,2*FF,H,s);
+    swiglu_kernel<<<(rows*FF+255)/256,256,0,s>>>(z.mlp,z.gate,z.up,rows,FF,2*FF);
+    gemm_bf16_cublas(z.tmp,z.W(l,"mlp.down_proj.weight"),z.mlp,rows,H,FF,s);
+    dflash2_grouped_conv_finish(z.hidden,z.tmp,z.coeff,z.W(l,"mlp_conv.base_kernel"),rows,H,qcount,c.conv_group_size,c.conv_kernel_size,s);
   }
-  add_rms_kernel<<<rows,256,0,s>>>(z.normed,z.residual,z.hidden,static_cast<const bf16*>(z.w.tensor_data("norm.weight")),rows,4096,z.w.cfg.rms_norm_eps,false);
+  add_rms_kernel<<<rows,256,0,s>>>(z.normed,z.residual,z.hidden,static_cast<const bf16*>(z.w.tensor_data("norm.weight")),rows,H,c.rms_norm_eps,false);
 #ifdef ROCKET_DFLASH2_PROFILE
   cudaEventRecord(ev1,s);
 #endif
-  select_sample_rows_kernel<<<dim3(16,batch*draft),256,0,s>>>(z.sample_hidden,z.normed,batch,qcount,draft,4096);
+  select_sample_rows_kernel<<<dim3(16,batch*draft),256,0,s>>>(z.sample_hidden,z.normed,batch,qcount,draft,H);
   // Candidate logits use the target lm_head exactly as upstream.
   const int sample_rows=batch*draft;
   // Split the bandwidth-bound target head across the two expert-parallel
@@ -403,9 +457,15 @@ void DFlash2DraftEngine::propose(const std::vector<int>& anchor, const std::vect
   const int local_vocab = z.ep ? (z.ep->rank() == 0 ? z.w.cfg.vocab_size / 2
                                                    : z.w.cfg.vocab_size - vocab_begin)
                                : z.w.cfg.vocab_size;
-  gemm_bf16_f32(z.logits,z.lm_head + static_cast<std::size_t>(vocab_begin) * 4096,
-                 z.sample_hidden,sample_rows,local_vocab,4096,s);
+  gemm_bf16_f32(z.logits,z.lm_head + static_cast<std::size_t>(vocab_begin) * H,
+                 z.sample_hidden,sample_rows,local_vocab,H,s);
   top16_kernel<<<sample_rows,256,0,s>>>(z.top_ids,z.top_vals,z.logits,sample_rows,local_vocab);
+  ck(cudaEventRecord(z.selector_ready,s),"selector input ready");
+  ck(cudaStreamWaitEvent(z.selector_stream,z.selector_ready,0),"selector stream wait");
+  gemm_bf16_cublas(z.selector_hidden,
+                    static_cast<const bf16*>(z.w.tensor_data("candidate_selector.hidden_projection.weight")),
+                    z.sample_hidden,sample_rows,c.selector_rank,H,z.selector_stream);
+  ck(cudaEventRecord(z.selector_ready,z.selector_stream),"selector projection ready");
   if (z.ep) {
     const std::size_t count = static_cast<std::size_t>(sample_rows) * 16;
     std::vector<int> local_ids(count), peer_ids;
@@ -442,11 +502,11 @@ void DFlash2DraftEngine::propose(const std::vector<int>& anchor, const std::vect
 #ifdef ROCKET_DFLASH2_PROFILE
   cudaEventRecord(ev2,s);
 #endif
-  gemm_bf16_cublas(z.selector_hidden,static_cast<const bf16*>(z.w.tensor_data("candidate_selector.hidden_projection.weight")),z.sample_hidden,sample_rows,256,4096,s);
+  ck(cudaStreamWaitEvent(s,z.selector_ready,0),"selector projection join");
   ck(cudaMemcpyAsync(z.ids,anchor.data(),batch*4,cudaMemcpyHostToDevice,s),"anchor ids");
   selector_walk_kernel<<<batch,16,0,s>>>(z.draft_ids,z.top_ids,z.top_vals,z.selector_hidden,
       static_cast<const bf16*>(z.w.tensor_data("candidate_selector.predecessor_codebook")),
-      static_cast<const bf16*>(z.w.tensor_data("candidate_selector.successor_codebook")),z.ids,batch,draft,256);
+      static_cast<const bf16*>(z.w.tensor_data("candidate_selector.successor_codebook")),z.ids,batch,draft,c.selector_rank);
   out.resize(batch*draft);
   ck(cudaMemcpyAsync(out.data(),z.draft_ids,out.size()*4,cudaMemcpyDeviceToHost,s),"draft ids out");
 #ifdef ROCKET_DFLASH2_PROFILE

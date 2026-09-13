@@ -49,29 +49,13 @@ add_library(rocket_engine STATIC
   src/kv/page_pool.cc
   src/kv/kv_arena.cu
 )
-target_include_directories(rocket_engine PUBLIC src src/exl3)
-# Ported exllamav3 EXL3 kernels (torch-free subset) + raw-pointer bridges, as
-# their own library: the trellis kernels are self-contained per TU (the
-# bridges launch them through device function pointers), so they compile
-# whole-program (-rdc=false); the engine target's separable compilation would
-# turn the launch-bounds register contract across the inlined inner calls
-# into a hard ptxas ABI error.
-file(GLOB EXL3_BRIDGE_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/exl3_bridge.cu
-                             ${CMAKE_CURRENT_SOURCE_DIR}/src/exl3_moe_bridge.cu)
-file(GLOB_RECURSE EXL3_UNIT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/exl3/*.cu)
-add_library(rocket_exl3 STATIC ${EXL3_BRIDGE_SOURCES} ${EXL3_UNIT_SOURCES})
-target_include_directories(rocket_exl3 PUBLIC src src/exl3)
-target_compile_options(rocket_exl3 PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math -rdc=false>)
-set_target_properties(rocket_exl3 PROPERTIES
-  CUDA_SEPARABLE_COMPILATION OFF
-  POSITION_INDEPENDENT_CODE ON)
+target_include_directories(rocket_engine PUBLIC src)
 target_compile_definitions(rocket_engine PUBLIC
   ROCKET_PAGE_BYTES=${ROCKET_PAGE_BYTES}
   ROCKET_CUDA_ARCH=${ROCKET_CUDA_ARCH}
   $<$<BOOL:${ROCKET_DFLASH2_PROFILE}>:ROCKET_DFLASH2_PROFILE>
 )
-target_link_libraries(rocket_engine PUBLIC rocket_fuel CUDA::cublas rocket_exl3)
+target_link_libraries(rocket_engine PUBLIC rocket_fuel CUDA::cublas)
 target_compile_options(rocket_engine PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-lineinfo>
 )

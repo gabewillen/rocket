@@ -246,10 +246,10 @@ ModelConfig load_model_config(const std::filesystem::path& attention_yaml,
   const json::JsonValue& t = member(root, "text_config");
   const json::JsonValue* qc = root.member("quant_config");
   if (qc == nullptr) qc = root.member("quantization_config");
-  c.quant_method = "nvfp4";
   if (qc != nullptr && qc->kind == json::JsonValue::Kind::kObject) {
-    const json::JsonValue* qm = qc->member("quant_method");
-    if (qm != nullptr && qm->kind == json::JsonValue::Kind::kString) c.quant_method = qm->str;
+    const json::JsonValue* qa = qc->member("quant_algo");
+    if (qa != nullptr && qa->kind == json::JsonValue::Kind::kString)
+      expect(qa->str == "NVFP4", "quant_algo=NVFP4");
   }
 
   expect(json_int(t, "hidden_size") == c.hidden_size, "hidden_size");

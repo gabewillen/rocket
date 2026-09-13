@@ -240,7 +240,7 @@ class DecodeEngine {
   // Spec-verify KDA site over the position-major [k * batch] row space. It
   // reads committed state and writes the alternate state arena; commitment
   // swaps arenas on full acceptance or replays the accepted prefix in place.
-  void run_kda_spec_site(int layer, int positions, int batch, const int* cut, bool collect_stages);
+  void run_kda_spec_site(int layer, int positions, int batch, const int* cut);
   void run_mla(int layer, int slot, int batch, const int* n_tokens_dev, int n_pools_max,
                int n_streams);
   void run_dense_mlp(int layer, int batch);
@@ -285,8 +285,6 @@ class DecodeEngine {
   void run_moe_dispatch_stage(int layer, int batch);
   void run_moe_post_stage(int layer, int batch);
   void run_shared_mlp(int layer, int batch);
-  void run_moe_exl3(int layer, int batch, const std::vector<int>& idx,
-                    const std::vector<float>& wts);
   void run_step_layers_graph(int batch);
   void ensure_graphs_built(int batch);
   void destroy_graphs();
@@ -407,23 +405,6 @@ class DecodeEngine {
   std::uint8_t *dense_a1_packed_ = nullptr, *dense_a1_sf_ = nullptr;
   std::uint8_t *dense_a2_packed_ = nullptr, *dense_a2_sf_ = nullptr;
   bf16 *dense_gu_ = nullptr, *dense_down_raw_ = nullptr, *shared_gu_ = nullptr;
-  // EXL3-fuel MoE scratch (routed experts via the ported trellis kernels)
-  void* exl3_hidden_fp16_ = nullptr;      // [MB, H] fp16
-  float* exl3_out_fp32_ = nullptr;        // [MB, H] fp32, zero + accumulate
-  std::int64_t* exl3_tok_sorted_ = nullptr;   // [MB*K]
-  std::uint16_t* exl3_w_sorted_ = nullptr;    // [MB*K] fp16 bits
-  std::int64_t* exl3_expert_count_ = nullptr; // [n_routed_experts]
-  void* exl3_ptrs_dev_ = nullptr;         // [n_routed_experts * 9] device ptrs
-  void* exl3_ptrs_stage_ = nullptr;       // pinned staging for ptr arrays
-  void* exl3_temp_g_ = nullptr;           // [conc, max_tpe, H] fp16
-  void* exl3_temp_u_ = nullptr;
-  void* exl3_temp_ig_ = nullptr;          // [conc, max_tpe, MI] fp16
-  void* exl3_temp_iu_ = nullptr;
-  int exl3_conc_ = 0, exl3_max_tpe_ = 0;
-  void* exl3_a_had_ = nullptr;
-  void* exl3_a_had_mi_ = nullptr;            // [MB, H] fp16 hadamard scratch
-  std::int64_t* exl3_counts_stage_ = nullptr;  // pinned staging
-  void* exl3_tok_stage_ = nullptr;        // pinned staging (tok + w)
   int *dense_row_in_group_ = nullptr, *dense_group_of_row_ = nullptr;
   long long* dense_sf_base_ = nullptr;
   float *dense_gate_global_ = nullptr, *dense_up_global_ = nullptr, *dense_down_global_ = nullptr;

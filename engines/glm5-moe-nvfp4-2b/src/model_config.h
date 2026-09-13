@@ -27,10 +27,6 @@ struct LayerSpec {
 
 // Everything the decode step needs to know about the fuel's shape.
 struct ModelConfig {
-  // Checkpoint quant kind: "nvfp4" (default) or "exl3" (routed experts only;
-  // non-routed weights stay native BF16 in that fuel).
-  std::string quant_method = "nvfp4";
-
   // --- from attention.yaml -------------------------------------------------
   int hidden_size = 0;          // 4096
   int text_layers = 0;          // 45

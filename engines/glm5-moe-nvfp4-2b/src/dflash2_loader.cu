@@ -40,9 +40,41 @@ void DFlash2Weights::load(const std::filesystem::path& ckpt_file) {
     bytes_.emplace(name, tv.nbytes);
     shapes_.emplace(name, tv.shape);
   }
-  if (tensors_dev_.size() != 81)
-    throw std::runtime_error("dflash2: expected 81 tensors, loaded " +
-                             std::to_string(tensors_dev_.size()));
+  auto require_shape = [&](const std::string& name,
+                           std::initializer_list<std::int64_t> expected) {
+    const auto it = shapes_.find(name);
+    if (it == shapes_.end() || it->second != std::vector<std::int64_t>(expected))
+      throw std::runtime_error("dflash2: incompatible or missing tensor " + name);
+  };
+  require_shape("fc.weight", {cfg.hidden_size, 5ll * cfg.hidden_size});
+  require_shape("hidden_norm.weight", {cfg.hidden_size});
+  require_shape("norm.weight", {cfg.hidden_size});
+  require_shape("candidate_selector.hidden_projection.weight",
+                {cfg.selector_rank, cfg.hidden_size});
+  require_shape("candidate_selector.predecessor_codebook", {cfg.vocab_size, cfg.selector_rank});
+  require_shape("candidate_selector.successor_codebook", {cfg.vocab_size, cfg.selector_rank});
+  for (int l = 0; l < cfg.num_layers; ++l) {
+    const std::string p = "layers." + std::to_string(l) + ".";
+    for (const char* n : {"input_layernorm.weight", "post_attention_layernorm.weight"})
+      require_shape(p + n, {cfg.hidden_size});
+    for (const char* site : {"attention_conv.", "mlp_conv."}) {
+      require_shape(p + site + "base_kernel",
+                    {cfg.conv_kernel_size, cfg.conv_kernel_size, cfg.hidden_size});
+      require_shape(p + site + "kernel_projection.weight",
+                    {cfg.hidden_size / cfg.conv_group_size * 4, cfg.hidden_size});
+    }
+    require_shape(p + "self_attn.q_proj.weight", {cfg.hidden_size, cfg.hidden_size});
+    require_shape(p + "self_attn.k_proj.weight",
+                  {cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size});
+    require_shape(p + "self_attn.v_proj.weight",
+                  {cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size});
+    require_shape(p + "self_attn.o_proj.weight", {cfg.hidden_size, cfg.hidden_size});
+    require_shape(p + "self_attn.q_norm.weight", {cfg.head_dim});
+    require_shape(p + "self_attn.k_norm.weight", {cfg.head_dim});
+    require_shape(p + "mlp.gate_proj.weight", {cfg.intermediate_size, cfg.hidden_size});
+    require_shape(p + "mlp.up_proj.weight", {cfg.intermediate_size, cfg.hidden_size});
+    require_shape(p + "mlp.down_proj.weight", {cfg.hidden_size, cfg.intermediate_size});
+  }
 }
 
 const void* DFlash2Weights::tensor_data(const char* name) const {
