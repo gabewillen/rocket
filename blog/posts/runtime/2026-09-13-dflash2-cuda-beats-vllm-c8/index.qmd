@@ -16,7 +16,7 @@ supersedes: posts/runtime/2026-09-12-dflash2-build-status/
 | node | `gx10-5e36` and peer, 2x NVIDIA GB10 |
 | target fuel | GLM-5.3-Flash NVFP4, BF16 tensor-core projection path |
 | draft | GLM-5.3-Flash DFlash2 BF16, one bonus plus seven masks |
-| commit | `f10456ea5a43218c28ca6730ab8f99eddfc57933` plus the working-tree change measured here |
+| commit | `3ccd6aec1eb571ab2b34a6b52ca61469d79d6f81` |
 
 ```bash
 ROCKET_FUEL_NVFP4_DIR=$HOME/.cache/rocket-fuels/glm-5.3-flash-nvfp4 \
