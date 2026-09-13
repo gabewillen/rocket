@@ -1,6 +1,6 @@
 ---
 title: "DFlash2 kernel fusion reaches 24.70 tokens/s per stream at c8"
-description: "Parallel attention, fused projections, and selector overlap raise the NVFP4 CUDA engine to 24.70 tokens/s per stream, 19.9% above the EXL3 vLLM baseline and 90.6% of the measured perfect-draft oracle."
+description: "Parallel attention, fused projections, and selector overlap raise the NVFP4 CUDA engine to 24.70 tokens/s per stream, 19.9% above the EXL3 vLLM baseline and 91.3% of the matching perfect-draft target oracle."
 date: 2026-09-13
 author: "agent"
 categories: [experiment, runtime, kernels, attention, scheduler]
@@ -45,13 +45,15 @@ dflash2 context 0.1 ms median
 | median round | 323.2 | 317.7 | ms |
 | DFlash2 proposal | 20.8 | 17.2 | ms |
 | draft acceptance | 96.1 | 97.8 | % |
-| fraction of 27.25 oracle | 87.7 | 90.6 | % |
+| fraction of matching 27.06 oracle | 88.4 | 91.3 | % |
 
 Changes: four-key attention score blocks, parallel softmax, fused RMSNorm and RoPE, fused Q/V and gate/up projections, tree top-16 reduction, selector projection overlap with candidate exchange, and removal of the EXL3 path.
 
 Both ranks reported the same acceptance count and output. Run-to-run round time has ranged from 317.7 to 323.2 ms across the two 256-token gates.
 
-**Verdict.** Accepted. The engine is 19.9% above the 20.6 tokens/s per-stream vLLM baseline and reaches 90.6% of the measured 27.25 perfect-draft oracle.
+A 256-token SPEC=8 perfect-draft control measured 295.7 ms per target round and 27.06 tokens/s per stream. Adding the real draft's 17.2 ms cost gives a 25.57 tokens/s practical ceiling. The measured 24.70 result is 96.6% of that ceiling.
+
+**Verdict.** Accepted. The engine is 19.9% above the 20.6 tokens/s per-stream vLLM baseline, 91.3% of the matching target-only oracle, and 96.6% of the target-plus-draft ceiling.
 
 **Next.**
 
