@@ -1,0 +1,86 @@
+---
+title: "GLM-5.3 cold weight load falls from 111.4 to 25.8 seconds"
+description: "Rank-local expert slabs and direct resident and DFlash2 reads cut cold weight loading 4.3x while sustaining 4.4 to 5.2 GiB/s from local NVMe."
+date: 2026-09-13
+author: "agent"
+categories: [experiment, runtime, memory]
+verdict: accepted
+rocket: "#engine-status"
+---
+
+**Question.** Can final-layout slabs remove the 64 KiB page-fault and tensor-dispatch cost from GLM-5.3 cold loading?
+
+| setup | value |
+| --- | --- |
+| nodes | `gx10-5e36` and peer, 2x NVIDIA GB10 |
+| kernel | 6.17.13-rocket64k, 64 KiB pages |
+| target fuel | GLM-5.3-Flash NVFP4 |
+| commit | `476c0cfdc9771f7e2496395a68c74806240c8956` |
+| expert artifact per rank | 6,048 slots, 15 MiB/slot, 88.59375 GiB |
+| resident artifact | 1,273 tensors, 16.02 GiB |
+| draft artifact | 81 tensors, 2.18 GiB |
+
+```bash
+sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+ssh 192.168.100.11 "sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'"
+
+ROCKET_FUEL_NVFP4_DIR=$HOME/.cache/rocket-fuels/glm-5.3-flash-nvfp4 \
+ROCKET_PACKED_WEIGHTS=$HOME/.cache/rocket-fuels/glm-5.3-flash-nvfp4/resident-direct.bin \
+ROCKET_EXPERT_SLAB_DIR=$HOME/.cache/rocket-fuels/glm-5.3-flash-nvfp4/expert-slabs-v1 \
+ROCKET_RESIDENT_DIRECT=1 \
+ROCKET_FP8_ATTN_DIR=$HOME/.cache/rocket-fuels/overlays/fp8-all \
+ROCKET_DFLASH2_DIR=$HOME/.cache/rocket-glm53-exl3-host/models/glm-5.3-flash-dflash2 \
+ROCKET_KDA_CUBLAS=1 ROCKET_CUBLAS_ALL=1 GLM53_ALLOW_LAUNCH=1 \
+BATCH=8 SPEC=8 TOKENS=256 EXPERT_CACHE_GIB=90 MAX_TOKENS=512 \
+scripts/runtime/glm53-nvfp4-spec-bench.sh
+```
+
+```text
+[ctor-end] clean; allocations 3.461 s, resident uploads 3.632 s
+  (stage 3.316 s, H2D 0.316 s)
+dflash2 direct: 2.18 GiB in 0.495 s (4.41 GiB/s)
+expert slab: 88.59 GiB in 17.053 s (direct reads 16.936 s, 5.20 GiB/s)
+load 25.8 s weights, 0.2 s tokenizer
+spec rounds=33 drafted=1848 accepted=1808 + committed=264 (97.8%)
+decode median 313.9 ms/step (200.01 aggregate, 25.00 tokens/s/stream)
+```
+
+| cold weight load | head | peer | unit |
+| --- | ---: | ---: | --- |
+| baseline mmap expert preload | 111.4 | 111.1 | s |
+| rank-local expert slab | 42.9 | 42.6 | s |
+| upload-order resident pack | 38.5 | 38.2 | s |
+| direct resident reads | 27.6 | 27.4 | s |
+| direct DFlash2 reads, run 1 | 25.7 | 25.4 | s |
+| direct DFlash2 reads, run 2 | 26.0 | 25.8 | s |
+| final 256-token gate | 25.8 | 25.6 | s |
+
+| final head stage | value | unit |
+| --- | ---: | --- |
+| CUDA allocations | 3.461 | s |
+| resident direct read | 3.316 | s |
+| resident H2D | 0.316 | s |
+| DFlash2 direct read and H2D | 0.495 | s |
+| expert direct read and H2D | 17.053 | s |
+| file payload total | 106.79 | GiB |
+
+The two cache-dropped final replicates measured 25.7 and 26.0 s on the head. Mean was 25.85 s, sample SD 0.21 s, and CV 0.82%.
+
+Expert slabs use 256 MiB O_DIRECT chunks, four 64 KiB-aligned pinned slots, per-chunk SHA-256, checkpoint fingerprints, and final CUDA slot order. Resident tensors are written in WeightStore upload order and read through aligned O_DIRECT windows. The DFlash2 payload uses the same bounded direct-read boundary.
+
+```bash
+engines/glm5-moe-nvfp4-2b/build/bench/bench-alloc-latency 90
+```
+
+```text
+bytes=96636764160 cudaMalloc=3.162415_s cudaMallocAsync_call=3.011558_s
+cudaMallocAsync_sync=3.011572_s cudaHostAllocMapped=4.537376_s status=no error
+```
+
+Allocation alternatives save less than 0.2 s or regress. The file stages sustain 4.4 to 5.2 GiB/s, matching the local storage range. Removing another second requires fewer serving bytes or different storage hardware.
+
+**Verdict.** Accepted. Cold weight load is 4.3x faster, output and 97.8% acceptance are unchanged, and the file path is at the measured NVMe ceiling.
+
+**Reopen if.**
+
+- NVMe hardware, filesystem, CUDA allocation behavior, or the serving weight representation changes.
