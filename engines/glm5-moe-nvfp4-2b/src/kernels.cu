@@ -1368,7 +1368,9 @@ void dequant_fp8_row(bf16* out, const std::uint8_t* w, const float* scales,
 
 void gemm_fp8_row(bf16* y, const std::uint8_t* w, const float* scales, const bf16* x, int batch,
                   int n_rows, int k, int row_off, cudaStream_t s) {
-  if (batch >= 8 && std::getenv("ROCKET_FP8_CUBLAS")) {
+  // Decode uses the native FP8-row reader at C8. Chunked prefill has enough
+  // rows to amortize one dequantization into the cuBLAS tensor-core path.
+  if (batch >= 16 && std::getenv("ROCKET_FP8_CUBLAS")) {
     static bf16* scratch = nullptr;
     static std::size_t scratch_elements = 0;
     const std::size_t need = static_cast<std::size_t>(n_rows) * k;
