@@ -95,7 +95,8 @@ common_args="$common_args --preload-owned $PRELOAD"
 # fuel/overlay paths must agree on both ranks.
 env_prefix=""
 for v in ROCKET_FUEL_NVFP4_DIR ROCKET_ATTENTION_YAML ROCKET_PACKED_WEIGHTS \
-         ROCKET_FP8_ATTN_DIR ROCKET_KDA_QKV_FP8_DIR ROCKET_RDMA_WAIT_S; do
+         ROCKET_FP8_ATTN_DIR ROCKET_KDA_QKV_FP8_DIR ROCKET_KDA_CUBLAS ROCKET_CUBLAS_ALL \
+         ROCKET_RDMA_WAIT_S GLM53_ALLOW_LAUNCH; do
   if [[ -n ${!v:-} ]]; then env_prefix+="$v=${!v} "; fi
 done
 
