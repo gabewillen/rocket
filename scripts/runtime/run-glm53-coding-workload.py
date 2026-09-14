@@ -14,7 +14,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--workload", type=pathlib.Path, required=True)
     p.add_argument("--batch", type=int, choices=(4, 8, 16), default=8)
-    p.add_argument("--spec", type=int, default=1)
+    p.add_argument("--spec", type=int, default=8)
     p.add_argument("--spec-map", help="comma-separated K for 2K,8K,32K,64K phases")
     p.add_argument("--phase", type=int, choices=range(4), action="append")
     p.add_argument("--out", type=pathlib.Path, required=True)
