@@ -1540,7 +1540,7 @@ void mla_context(float* ctx, const float* scores, const KvPages& kv, const int* 
                  const int* n_sel, int n_sel_max, int sel_stride, int batch, int n_streams,
                  int layer_slot, int heads, int kv_lora, cudaStream_t s) {
   (void)n_sel_max;
-  if (std::getenv("ROCKET_MLA_WARP_CONTEXT") && kv_lora == 512)
+  if (kv_lora == 512 && !std::getenv("ROCKET_MLA_LEGACY_CONTEXT"))
     mla_context_warp_kernel<<<dim3(heads, batch), 32, 0, s>>>(
         ctx, scores, kv, sel, n_sel, sel_stride, layer_slot, kv_lora, n_streams);
   else
