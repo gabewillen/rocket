@@ -200,6 +200,34 @@ __global__ void embed_streams_kernel(bf16* __restrict__ streams, const bf16* __r
   for (int d = threadIdx.x; d < hidden; d += blockDim.x) dst[d] = src[d];
 }
 
+__global__ void rosa_embed_spans_kernel(bf16* __restrict__ out, const bf16* __restrict__ embed,
+                                        const int* __restrict__ ids,
+                                        const int* __restrict__ lengths,
+                                        int max_span, int hidden) {
+  const int m = blockIdx.y;
+  const int d = blockIdx.x * blockDim.x + threadIdx.x;
+  if (d >= hidden) return;
+  const int n = lengths[m];
+  float acc = 0.0f;
+  for (int i = 0; i < n; ++i)
+    acc += f(embed[static_cast<long long>(ids[m * max_span + i]) * hidden + d]);
+  out[static_cast<long long>(m) * hidden + d] = b(n > 0 ? acc / n : 0.0f);
+}
+
+__global__ void hc_memory_residual_kernel(bf16* __restrict__ streams,
+                                          const bf16* __restrict__ memory,
+                                          const float* __restrict__ confidence,
+                                          int source_batch, int hc, int hidden,
+                                          int stream_index, float gate) {
+  const int row = blockIdx.y;
+  const int d = blockIdx.x * blockDim.x + threadIdx.x;
+  if (d >= hidden) return;
+  const int source = row % source_batch;
+  const float scale = gate * confidence[source];
+  bf16* dst = streams + (static_cast<long long>(row) * hc + stream_index) * hidden;
+  dst[d] = b(f(dst[d]) + scale * f(memory[static_cast<long long>(source) * hidden + d]));
+}
+
 // ------------------------------------------------------ hyper-connections
 
 __global__ void hc_mix_kernel(float* __restrict__ mix, const bf16* __restrict__ fn,
@@ -1437,6 +1465,17 @@ void layernorm(bf16* out, const bf16* x, const bf16* w, const bf16* bias, int ba
 void embed_streams(bf16* streams, const bf16* embed, const int* tokens, int batch, int hc,
                    int hidden, cudaStream_t s) {
   embed_streams_kernel<<<dim3(hc, batch), 256, 0, s>>>(streams, embed, tokens, hc, hidden);
+}
+void rosa_embed_spans(bf16* out, const bf16* embed, const int* ids, const int* lengths,
+                      int batch, int max_span, int hidden, cudaStream_t s) {
+  rosa_embed_spans_kernel<<<dim3((hidden + 255) / 256, batch), 256, 0, s>>>(
+      out, embed, ids, lengths, max_span, hidden);
+}
+void hc_memory_residual(bf16* streams, const bf16* memory, const float* confidence,
+                        int rows, int source_batch, int hc, int hidden, int stream_index,
+                        float gate, cudaStream_t s) {
+  hc_memory_residual_kernel<<<dim3((hidden + 255) / 256, rows), 256, 0, s>>>(
+      streams, memory, confidence, source_batch, hc, hidden, stream_index, gate);
 }
 void hc_mix_gemv(float* mix, const bf16* fn, const bf16* streams, int batch, int hc_mix, int hc,
                  int hidden, float eps, cudaStream_t s) {

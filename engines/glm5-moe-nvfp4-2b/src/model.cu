@@ -190,6 +190,11 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   }
 
   tokens_dev_ = I(MB);
+  rosa_token_ids_ = I(static_cast<std::size_t>(MB) * kRosaSpanMax);
+  rosa_lengths_ = I(MB);
+  rosa_hidden_ = A(static_cast<std::size_t>(MB) * cfg_.hidden_size);
+  rosa_confidence_ = F(MB);
+  rosa_layer_gates_.assign(cfg_.text_layers, 0.0f);
   prefix_token_dev_ = I(1);
   pos_dev_ = I(MB);
   n_tokens_dev_ = I(MB);
@@ -498,6 +503,46 @@ void DecodeEngine::print_kda_checksum(int layer, const char* tag) {
     for (bf16 b : hb) sum += static_cast<double>(__bfloat162float(b));
     fprintf(stderr, "[cksum] %-12s L%d %sconv sum=%.8g\n", tag, layer, nm, sum);
   }
+}
+
+void DecodeEngine::set_rosa_memory(const std::vector<std::vector<int>>& span_tokens,
+                                   const std::vector<float>& confidence,
+                                   const std::vector<float>& layer_gates) {
+  if (span_tokens.empty() || span_tokens.size() > static_cast<std::size_t>(max_batch_) ||
+      confidence.size() != span_tokens.size() ||
+      layer_gates.size() != static_cast<std::size_t>(cfg_.text_layers))
+    fail("set_rosa_memory: shape mismatch");
+  std::vector<int> ids(static_cast<std::size_t>(max_batch_) * kRosaSpanMax, 0);
+  std::vector<int> lengths(max_batch_, 0);
+  std::vector<float> conf(max_batch_, 0.0f);
+  bool any_gate = false;
+  for (float gate : layer_gates) {
+    if (!std::isfinite(gate)) fail("set_rosa_memory: nonfinite layer gate");
+    any_gate = any_gate || gate != 0.0f;
+  }
+  for (std::size_t m = 0; m < span_tokens.size(); ++m) {
+    if (!std::isfinite(confidence[m]) || confidence[m] < 0.0f || confidence[m] > 1.0f)
+      fail("set_rosa_memory: confidence outside [0,1]");
+    lengths[m] = std::min<int>(span_tokens[m].size(), kRosaSpanMax);
+    std::copy_n(span_tokens[m].begin(), lengths[m], ids.begin() + m * kRosaSpanMax);
+    conf[m] = confidence[m];
+  }
+  rosa_layer_gates_ = layer_gates;
+  rosa_memory_active_ = any_gate;
+  if (!rosa_memory_active_) return;
+  cudaMemcpyAsync(rosa_token_ids_, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice,
+                  stream_);
+  cudaMemcpyAsync(rosa_lengths_, lengths.data(), lengths.size() * sizeof(int),
+                  cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(rosa_confidence_, conf.data(), conf.size() * sizeof(float),
+                  cudaMemcpyHostToDevice, stream_);
+  rosa_embed_spans(rosa_hidden_, w_.embed(), rosa_token_ids_, rosa_lengths_,
+                   static_cast<int>(span_tokens.size()), kRosaSpanMax, cfg_.hidden_size, stream_);
+}
+
+void DecodeEngine::clear_rosa_memory() {
+  rosa_memory_active_ = false;
+  std::fill(rosa_layer_gates_.begin(), rosa_layer_gates_.end(), 0.0f);
 }
 
 void DecodeEngine::commit_positions(const std::vector<int>& accepted) {
@@ -2366,7 +2411,7 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
   // and telemetry off (record_absmax syncs too); step() falls back to the
   // direct per-layer loop below for either, exactly as if use_cuda_graph_
   // were never set.
-  const bool use_graph = use_cuda_graph_ && !collect_stages && !telemetry_;
+  const bool use_graph = use_cuda_graph_ && !collect_stages && !telemetry_ && !rosa_memory_active_;
   if (use_graph) {
     static bool said = false;
     if (!said) { std::printf("[graph] capturing/replaying graph path\n"); said = true; }
@@ -2381,6 +2426,9 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
     // ---- attention site ----
     {
       StageTimer t(stream_, &stages_.hyper_connection, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      if (rosa_memory_active_ && rosa_layer_gates_[l] != 0.0f)
+        hc_memory_residual(streams_, rosa_hidden_, rosa_confidence_, batch, batch, hc, H, 3,
+                           rosa_layer_gates_[l], stream_);
       cudaMemcpyAsync(residual_, streams_, static_cast<std::size_t>(batch) * hc * H * sizeof(bf16),
                       cudaMemcpyDeviceToDevice, stream_);
       hc_mix_gemv(mix_, lw.attn_hc.fn, streams_, batch, cfg_.hc_mix(), hc, H, cfg_.rms_norm_eps,
@@ -2616,6 +2664,9 @@ void DecodeEngine::step_spec(const std::vector<int>& tokens, int spec_k,
     // ---- attention site (batched hyper-connection + norm) ----
     {
       StageTimer t(stream_, &stages_.hyper_connection, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
+      if (rosa_memory_active_ && rosa_layer_gates_[l] != 0.0f)
+        hc_memory_residual(streams_, rosa_hidden_, rosa_confidence_, total, batch, hc, H, 3,
+                           rosa_layer_gates_[l], stream_);
       cudaMemcpyAsync(residual_, streams_, static_cast<std::size_t>(total) * hc * H * sizeof(bf16),
                       cudaMemcpyDeviceToDevice, stream_);
       hc_mix_gemv(mix_, lw.attn_hc.fn, streams_, total, cfg_.hc_mix(), hc, H, cfg_.rms_norm_eps, stream_);

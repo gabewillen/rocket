@@ -576,7 +576,8 @@ int main(int argc, char** argv) {
       spec_tokens.assign(batch * K, 0);
       std::vector<int> dflash_tokens;
       std::vector<int> draft_slots;
-      std::vector<std::vector<int>> lookup(batch);
+      std::vector<std::vector<int>> lookup(batch), rosa_span(batch);
+      std::vector<float> rosa_confidence(batch, 0.0f);
       if (std::getenv("ROCKET_PROMPT_LOOKUP") && !draft_ids) {
         for (int m = 0; m < batch; ++m) if (active[m]) {
           std::vector<int> history = prompt_ids[m];
@@ -592,11 +593,30 @@ int main(int argc, char** argv) {
                              history.begin() + suffix)) {
                 lookup[m].assign(history.begin() + at + ngram,
                                  history.begin() + at + ngram + K - 1);
+                const std::size_t span_begin = at > 32 ? at - 32 : 0;
+                const std::size_t span_end = std::min(history.size(), at + ngram + K - 1 + 32);
+                rosa_span[m].assign(history.begin() + span_begin, history.begin() + span_end);
+                const float recency = static_cast<float>(suffix - at);
+                rosa_confidence[m] = (static_cast<float>(ngram) / 8.0f) /
+                                     (1.0f + recency / 2048.0f);
                 break;
               }
             }
           }
         }
+      }
+      static const float rosa_gate = std::getenv("ROCKET_ROSA_MEMORY_GATE")
+          ? std::strtof(std::getenv("ROCKET_ROSA_MEMORY_GATE"), nullptr) : 0.0f;
+      if (rosa_gate != 0.0f) {
+        std::vector<float> layer_gates(cfg.text_layers, rosa_gate);
+        if (const char* only = std::getenv("ROCKET_ROSA_MEMORY_LAYER")) {
+          std::fill(layer_gates.begin(), layer_gates.end(), 0.0f);
+          const int layer = std::atoi(only);
+          if (layer >= 0 && layer < cfg.text_layers) layer_gates[layer] = rosa_gate;
+        }
+        engine.set_rosa_memory(rosa_span, rosa_confidence, layer_gates);
+      } else {
+        engine.clear_rosa_memory();
       }
       if (dflash && !draft_ids) {
         const auto draft_t0 = Clock::now();
