@@ -15,6 +15,7 @@ PRELOAD_OWNED=${PRELOAD_OWNED:-1}
 PROMPT_LIST=${PROMPT_LIST:?set PROMPT_LIST to a file containing one prompt path per stream}
 RESULT_JSON=${RESULT_JSON:-/tmp/glm53-coding-result.json}
 PROMPT_TOKEN_LIMIT=${PROMPT_TOKEN_LIMIT:-0}
+DECODE_MARKER=${DECODE_MARKER:-}
 PREFIX_CACHE_DIR=${PREFIX_CACHE_DIR-$HOME/.cache/rocket-prefix-cache/glm53-coding}
 PREFIX_CACHE_BYTES=${PREFIX_CACHE_BYTES:-auto}
 PREFIX_CACHE_STAGING_BYTES=${PREFIX_CACHE_STAGING_BYTES:-128MiB}
@@ -51,13 +52,15 @@ common=(--prompt-list "$PROMPT_LIST" --tokens "$TOKENS" --batch "$BATCH" --spec 
   --expert-cache-gib "$EXPERT_CACHE_GIB" --max-tokens "$MAX_TOKENS"
   --prefill-chunk "$PREFILL_CHUNK" --prefill-tail "$PREFILL_TAIL" --preload-owned "$PRELOAD_OWNED")
 (( PROMPT_TOKEN_LIMIT > 0 )) && common+=(--prompt-token-limit "$PROMPT_TOKEN_LIMIT")
+local_extra=()
+[[ -n $DECODE_MARKER ]] && local_extra+=(--decode-marker "$DECODE_MARKER")
 if [[ -n $PREFIX_CACHE_DIR ]]; then
   mkdir -p "$PREFIX_CACHE_DIR"
   quoted=$(printf %q "$PREFIX_CACHE_DIR")
   ssh -o BatchMode=yes "$PEER" "mkdir -p $quoted"
   if [[ $PREFIX_CACHE_BYTES == auto ]]; then
     lf=$(cache_free_bytes "$PREFIX_CACHE_DIR")
-    rf=$(ssh -o BatchMode=yes "$PEER" "df -B1 --output=avail $quoted | awk 'NR==2 {print \\$1}'")
+    rf=$(ssh -o BatchMode=yes "$PEER" "df -B1 --output=avail $quoted | awk 'NR==2 {print \$1}'")
     (( rf < lf )) && lf=$rf
     PREFIX_CACHE_BYTES=$((lf / 2))
     cap=$((lf - 64 * 1024 * 1024 * 1024))
@@ -78,5 +81,5 @@ printf -v remote_cmd '%q ' "${remote[@]}"
 ssh -o BatchMode=yes -n "$PEER" "$remote_cmd" >/tmp/glm53-coding-rank1.log 2>&1 &
 peer_pid=$!
 trap 'kill $peer_pid 2>/dev/null || true' EXIT
-"$BIN" --rank 0 --host "$HEAD" --port "$PORT" --result-json "$RESULT_JSON" "${common[@]}"
+"$BIN" --rank 0 --host "$HEAD" --port "$PORT" --result-json "$RESULT_JSON" "${local_extra[@]}" "${common[@]}"
 wait "$peer_pid"

@@ -124,6 +124,7 @@ int main(int argc, char** argv) {
   }
   const char* prompt_list = arg_value(argc, argv, "--prompt-list", nullptr);
   const char* result_json = arg_value(argc, argv, "--result-json", nullptr);
+  const char* decode_marker = arg_value(argc, argv, "--decode-marker", nullptr);
   const int prompt_token_limit = std::atoi(arg_value(argc, argv, "--prompt-token-limit", "0"));
   const int n_new = std::atoi(arg_value(argc, argv, "--tokens", "20"));
   const double cache_gib = std::atof(arg_value(argc, argv, "--expert-cache-gib", "56"));
@@ -426,6 +427,10 @@ int main(int argc, char** argv) {
   const double prefill_ms = ms_since(t_prefill);
   if (profile_prefill) cudaProfilerStop();
 
+  if (decode_marker) {
+    std::ofstream marker(decode_marker);
+    marker << "start\n";
+  }
   const auto t_decode_total = Clock::now();
   std::vector<std::vector<int>> generated(batch);
   std::vector<double> token_ms;
@@ -600,6 +605,10 @@ int main(int argc, char** argv) {
   }
 
   const double decode_total_ms = ms_since(t_decode_total);
+  if (decode_marker) {
+    std::ofstream marker(decode_marker);
+    marker << "end\n";
+  }
   std::printf("\n--- output ------------------------------------------------------\n");
   if (batch == 1)
     std::printf("%s%s\n", prompt_print.c_str(), tok.decode(generated[0]).c_str());
@@ -713,6 +722,11 @@ int main(int argc, char** argv) {
     out << "  \"prompt_tokens_per_stream\":" << prompt_ids[0].size() << ",\n";
     out << "  \"useful_output_tokens\":" << useful_tokens << ",\n";
     out << "  \"prefill_ms\":" << prefill_ms << ",\n  \"decode_ms\":" << decode_total_ms << ",\n";
+    out << "  \"ttft_ms_p50\":" << prefill_ms << ",\n  \"ttft_ms_p95\":" << prefill_ms << ",\n";
+    out << "  \"completion_ms_p50\":" << (prefill_ms + decode_total_ms) << ",\n";
+    out << "  \"completion_ms_p95\":" << (prefill_ms + decode_total_ms) << ",\n";
+    out << "  \"inter_token_ms_p50\":" << (useful_tokens > 0 ? decode_total_ms * batch / useful_tokens : 0.0) << ",\n";
+    out << "  \"inter_token_ms_p95\":" << (useful_tokens > 0 ? decode_total_ms * batch / useful_tokens : 0.0) << ",\n";
     out << "  \"aggregate_useful_tok_s\":" << (decode_total_ms > 0 ? useful_tokens * 1000.0 / decode_total_ms : 0.0) << ",\n";
     out << "  \"router_entropy_nats\":" << entropy << ",\n";
     out << "  \"expert_cache_hits\":" << engine.weights().expert_hits() << ",\n";
