@@ -4,6 +4,7 @@
 import hashlib
 import json
 import pathlib
+import re
 
 
 def load_workload(path):
@@ -22,6 +23,9 @@ def validate(sessions):
     for s in sessions:
         if len(s["turns"]) < 3 or not any(t["role"] == "tool" for t in s["turns"]):
             raise ValueError(f"{s['id']} lacks deterministic multi-turn tool history")
+        files = re.findall(r"^FILE ([^ ]+) SHA256 ", s["turns"][0]["content"], re.MULTILINE)
+        if len(files) != len(set(files)):
+            raise ValueError(f"{s['id']} repeats a source block")
     return {"sessions": len(sessions), "distinct_prompts": len(set(hashes))}
 
 

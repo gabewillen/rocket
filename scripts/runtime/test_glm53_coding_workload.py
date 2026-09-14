@@ -23,6 +23,13 @@ class CodingWorkloadTest(unittest.TestCase):
         self.assertGreaterEqual(sum(s["response_tokens"] for p in range(4)
                                     for s in self.sessions[p * 16:p * 16 + 8]), 4096)
 
+    def test_repeated_source_block_fails(self):
+        bad = copy.deepcopy(self.sessions)
+        marker = "\nFILE duplicate.py SHA256 deadbeef\n"
+        bad[0]["turns"][0]["content"] += marker + marker
+        with self.assertRaisesRegex(ValueError, "repeats a source block"):
+            validate(bad)
+
     def test_replicated_prompt_fails(self):
         bad = copy.deepcopy(self.sessions)
         bad[1]["turns"][0]["content"] = bad[0]["turns"][0]["content"]

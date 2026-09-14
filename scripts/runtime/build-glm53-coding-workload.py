@@ -44,14 +44,30 @@ def source_excerpt(root: pathlib.Path, index: int) -> str:
     return f"FILE {path.relative_to(root)}\n{text[start:start + 12000]}"
 
 
-def expand_context(seed: str, target_tokens: int) -> str:
+def source_context(root: pathlib.Path, target_tokens: int, phase: int) -> str:
+    """Concatenate unique tracked source files; never repeat a context block."""
     target_chars = target_tokens * 3
+    tracked = git("-C", str(root), "ls-files").splitlines()
+    allowed = (".py", ".cu", ".cuh", ".cc", ".cpp", ".h", ".sh", ".rs", ".js", ".qmd")
+    paths = [root / path for path in tracked if path.endswith(allowed)]
+    if not paths:
+        raise RuntimeError("no tracked source files for workload")
+    rotate = (phase * 37) % len(paths)
+    paths = paths[rotate:] + paths[:rotate]
     blocks = []
-    counter = 0
-    while sum(map(len, blocks)) < target_chars:
-        digest = hashlib.sha256(f"{target_tokens}:{counter}:{seed}".encode()).hexdigest()
-        blocks.append(f"\nCONTEXT BLOCK {counter} CHECKSUM {digest}\n{seed}\n")
-        counter += 1
+    chars = 0
+    for path in paths:
+        try:
+            text = path.read_text(errors="strict")
+        except (OSError, UnicodeError):
+            continue
+        block = f"\nFILE {path.relative_to(root)} SHA256 {hashlib.sha256(text.encode()).hexdigest()}\n{text}\n"
+        blocks.append(block)
+        chars += len(block)
+        if chars >= target_chars:
+            break
+    if chars < target_chars:
+        raise RuntimeError(f"unique source corpus has only {chars} chars, needs {target_chars}")
     return "".join(blocks)[:target_chars]
 
 
@@ -62,6 +78,7 @@ def main():
     args = parser.parse_args()
     root = pathlib.Path(__file__).resolve().parents[2]
     commit = git("-C", str(root), "rev-parse", "HEAD")
+    contexts = {phase: source_context(root, CONTEXT_TOKENS[phase], phase) for phase in range(4)}
     sessions = []
     for i in range(64):
         phase = i // 16
@@ -75,7 +92,7 @@ def main():
             "Do not invent test results. Preserve numerical and memory-safety contracts.\n"
         )
         unique = f"SESSION {i:02d} LANGUAGE {language} TASK {task}. {TEMPLATES[i % len(TEMPLATES)]}\n"
-        context = expand_context(excerpt, context_tokens)
+        context = contexts[phase]
         turns = [
             {"role": "user", "content": shared + context + "\n" + unique},
             {"role": "tool", "content": f"tool_result session={i} phase=inspect checksum={hashlib.sha256(excerpt.encode()).hexdigest()}"},

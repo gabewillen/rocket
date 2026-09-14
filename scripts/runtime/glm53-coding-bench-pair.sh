@@ -84,9 +84,18 @@ for v in ROCKET_FUEL_NVFP4_DIR ROCKET_PACKED_WEIGHTS ROCKET_EXPERT_SLAB_DIR ROCK
   [[ -n ${!v:-} ]] && remote+=("$v=${!v}")
 done
 remote+=("$BIN" --rank 1 --host "$HEAD" --port "$PORT" --result-json /tmp/glm53-coding-rank1.json "${common[@]}")
-printf -v remote_cmd '%q ' "${remote[@]}"
+printf -v remote_exec '%q ' "${remote[@]}"
+remote_pidfile="/tmp/glm53-coding-rank1-${PORT}.pid"
+printf -v remote_cmd 'echo $$ > %q; exec %s' "$remote_pidfile" "$remote_exec"
+cleanup() {
+  kill "${peer_pid:-}" 2>/dev/null || true
+  quoted_pidfile=$(printf %q "$remote_pidfile")
+  ssh -o BatchMode=yes -n "$PEER" "test ! -f $quoted_pidfile || { kill -9 \$(cat $quoted_pidfile) 2>/dev/null || true; rm -f $quoted_pidfile; }" >/dev/null 2>&1 || true
+}
 ssh -o BatchMode=yes -n "$PEER" "$remote_cmd" >/tmp/glm53-coding-rank1.log 2>&1 &
 peer_pid=$!
-trap 'kill $peer_pid 2>/dev/null || true' EXIT
+trap cleanup EXIT
 "$BIN" --rank 0 --host "$HEAD" --port "$PORT" --result-json "$RESULT_JSON" "${local_extra[@]}" "${common[@]}"
 wait "$peer_pid"
+ssh -o BatchMode=yes -n "$PEER" "rm -f $(printf %q "$remote_pidfile")" >/dev/null 2>&1 || true
+trap - EXIT
