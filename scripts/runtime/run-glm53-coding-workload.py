@@ -15,6 +15,7 @@ def main():
     p.add_argument("--workload", type=pathlib.Path, required=True)
     p.add_argument("--batch", type=int, choices=(4, 8, 16), default=8)
     p.add_argument("--spec", type=int, default=7)
+    p.add_argument("--spec-map", help="comma-separated K for 2K,8K,32K,64K phases")
     p.add_argument("--phase", type=int, choices=range(4), action="append")
     p.add_argument("--out", type=pathlib.Path, required=True)
     p.add_argument("--dry-run", action="store_true")
@@ -22,6 +23,11 @@ def main():
     sessions = load_workload(a.workload)
     summary = validate(sessions)
     phases = a.phase or list(range(4))
+    spec_map = [a.spec] * 4
+    if a.spec_map:
+        spec_map = [int(x) for x in a.spec_map.split(",")]
+        if len(spec_map) != 4 or any(x < 1 or x > 8 for x in spec_map):
+            p.error("--spec-map requires four integers in [1,8]")
     a.out.mkdir(parents=True, exist_ok=True)
     runs = []
     for phase in phases:
@@ -35,9 +41,10 @@ def main():
         token_limit = selected[0]["context_tokens_target"]
         tokens = selected[0]["response_tokens"]
         result = a.out / f"phase-{phase}.json"
+        phase_spec = spec_map[phase]
         cmd = [str(pathlib.Path(__file__).with_name("glm53-coding-bench-pair.sh"))]
         env = os.environ.copy()
-        env.update(BATCH=str(a.batch), SPEC=str(a.spec), TOKENS=str(tokens),
+        env.update(BATCH=str(a.batch), SPEC=str(phase_spec), TOKENS=str(tokens),
                    PROMPT_TOKEN_LIMIT=str(token_limit), MAX_TOKENS=str(token_limit + tokens + 128),
                    PROMPT_LIST=str(prompt_list.resolve()), RESULT_JSON=str(result.resolve()),
                    PORT=str(18782 + phase))
@@ -68,11 +75,11 @@ def main():
             result.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
             runs.append(data)
         else:
-            runs.append({"phase": phase, "batch": a.batch, "spec_k": a.spec,
+            runs.append({"phase": phase, "batch": a.batch, "spec_k": phase_spec,
                          "prompt_count": len(selected), "prompt_token_limit": token_limit,
                          "useful_output_tokens": a.batch * tokens})
     total = sum(x["useful_output_tokens"] for x in runs)
-    final = {**summary, "batch": a.batch, "spec_k": a.spec, "runs": runs,
+    final = {**summary, "batch": a.batch, "spec_map": spec_map, "runs": runs,
              "useful_output_tokens": total}
     (a.out / "summary.json").write_text(json.dumps(final, indent=2, sort_keys=True) + "\n")
     print(json.dumps(final, indent=2, sort_keys=True))

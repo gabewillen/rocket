@@ -269,13 +269,16 @@ int main(int argc, char** argv) {
   }
   std::unique_ptr<rocket::engine::DFlash2DraftEngine> dflash;
   if (const char* draft_dir = std::getenv("ROCKET_DFLASH2_DIR")) {
-    if (spec_k < 2 || spec_k > 8)
-      throw std::runtime_error("DFlash2 requires --spec in [2,8]");
-    const auto td = Clock::now();
-    dflash = std::make_unique<rocket::engine::DFlash2DraftEngine>(
-        draft_dir, engine.weights().embed(), engine.weights().lm_head(), batch, max_tokens, 7,
-        ep.get());
-    std::printf("dflash2   loaded in %.2f s\n", ms_since(td) / 1000.0);
+    if (spec_k > 8) throw std::runtime_error("DFlash2 requires --spec <= 8");
+    if (spec_k >= 2) {
+      const auto td = Clock::now();
+      dflash = std::make_unique<rocket::engine::DFlash2DraftEngine>(
+          draft_dir, engine.weights().embed(), engine.weights().lm_head(), batch, max_tokens, 7,
+          ep.get());
+      std::printf("dflash2   loaded in %.2f s\n", ms_since(td) / 1000.0);
+    } else {
+      std::printf("dflash2   disabled for no-speculation control\n");
+    }
   }
   if (ep && preload_owned) {
     const auto t_pre = Clock::now();
