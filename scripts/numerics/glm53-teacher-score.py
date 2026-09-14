@@ -61,8 +61,9 @@ def trace_summary(rows, run_summary=None):
         "target_top5_rate": sum(any(x["id"] == row["target_id"] for x in row["top5"]) for row in rows) / len(rows),
     }
     if run_summary:
-        for key in ("model_ms", "model_tokens_per_second", "median_token_ms",
-                    "wall_ms", "wall_tokens_per_second"):
+        for key in ("batch", "score_chunk", "model_ms", "model_tokens_per_second",
+                    "model_tokens_per_second_per_stream", "median_step_ms",
+                    "median_token_ms", "wall_ms", "wall_tokens_per_second"):
             if key in run_summary:
                 result[key] = run_summary[key]
     return result
@@ -146,12 +147,14 @@ def main():
         if bool(blogits) != bool(clogits):
             parser.error("both baseline logit files are required for KL/RMS comparison")
         result = compare(base, cand, blogits, clogits)
-        result["baseline"].update({k: base_summary[k] for k in
-            ("model_ms", "model_tokens_per_second", "median_token_ms", "wall_ms", "wall_tokens_per_second")
-            if k in base_summary})
-        result["candidate"].update({k: cand_summary[k] for k in
-            ("model_ms", "model_tokens_per_second", "median_token_ms", "wall_ms", "wall_tokens_per_second")
-            if k in cand_summary})
+        throughput_keys = (
+            "batch", "score_chunk", "model_ms", "model_tokens_per_second",
+            "model_tokens_per_second_per_stream", "median_step_ms", "median_token_ms",
+            "wall_ms", "wall_tokens_per_second")
+        result["baseline"].update({k: base_summary[k] for k in throughput_keys
+                                   if k in base_summary})
+        result["candidate"].update({k: cand_summary[k] for k in throughput_keys
+                                    if k in cand_summary})
     else:
         parser.error("use --trace or --baseline and --candidate")
     text = json.dumps(result, indent=2, sort_keys=True) + "\n"

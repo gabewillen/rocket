@@ -20,11 +20,6 @@ PRELOAD_OWNED=${PRELOAD_OWNED:-1}
 PROMPT=${PROMPT:-"Count from 1 to 50: 1, 2, 3,"}
 PROMPT_FILE=${PROMPT_FILE:-}
 PROMPT_TOKEN_LIMIT=${PROMPT_TOKEN_LIMIT:-0}
-SCORE_TOKEN_FILE=${SCORE_TOKEN_FILE:-}
-SCORE_TEXT_FILE=${SCORE_TEXT_FILE:-}
-SCORE_OUTPUT=${SCORE_OUTPUT:-}
-SCORE_LOGITS=${SCORE_LOGITS:-}
-SCORE_MAX_TOKENS=${SCORE_MAX_TOKENS:-0}
 PREFIX_CACHE_DIR=${PREFIX_CACHE_DIR-$HOME/.cache/rocket-prefix-cache/glm53}
 PREFIX_CACHE_BYTES=${PREFIX_CACHE_BYTES:-auto}
 PREFIX_CACHE_STAGING_BYTES=${PREFIX_CACHE_STAGING_BYTES:-128MiB}
@@ -53,20 +48,6 @@ common=(
   --prompt "$PROMPT" --tokens "$TOKENS" --batch "$BATCH" --spec "$SPEC"
   --expert-cache-gib "$EXPERT_CACHE_GIB" --max-tokens "$MAX_TOKENS" --prefill-chunk "$PREFILL_CHUNK" --prefill-tail "$PREFILL_TAIL" --preload-owned "$PRELOAD_OWNED"
 )
-if [[ -n $SCORE_TOKEN_FILE && -n $SCORE_TEXT_FILE ]]; then
-  echo 'choose one of SCORE_TOKEN_FILE and SCORE_TEXT_FILE' >&2
-  exit 2
-fi
-if [[ -n $SCORE_TOKEN_FILE || -n $SCORE_TEXT_FILE ]]; then
-  [[ -n $SCORE_OUTPUT ]] || { echo 'score mode requires SCORE_OUTPUT' >&2; exit 2; }
-  score_input=${SCORE_TOKEN_FILE:-$SCORE_TEXT_FILE}
-  rsync -a "$score_input" "$PEER:$score_input"
-  if [[ -n $SCORE_TOKEN_FILE ]]; then common+=(--score-token-file "$SCORE_TOKEN_FILE");
-  else common+=(--score-text-file "$SCORE_TEXT_FILE"); fi
-  common+=(--score-output "$SCORE_OUTPUT" --score-max-tokens "$SCORE_MAX_TOKENS")
-  [[ -n $SCORE_LOGITS ]] && common+=(--score-logits "$SCORE_LOGITS")
-  PREFIX_CACHE_DIR=
-fi
 if [[ -n $PROMPT_FILE ]]; then
   rsync -a "$PROMPT_FILE" "$PEER:$PROMPT_FILE"
   common+=(--prompt-file "$PROMPT_FILE")

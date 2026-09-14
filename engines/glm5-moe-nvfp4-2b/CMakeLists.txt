@@ -124,6 +124,9 @@ target_link_libraries(rocket-test-stand PRIVATE rocket_engine)
 add_executable(rocket-decode src/decode_main.cu)
 target_link_libraries(rocket-decode PRIVATE rocket_engine rocket_fuel)
 
+add_executable(rocket-teacher-score src/teacher_score_main.cu)
+target_link_libraries(rocket-teacher-score PRIVATE rocket_engine rocket_fuel)
+
 # Fabric: the RoCE transport between the two boosters (src/fabric/fabric.h).
 # Plain C++ against libibverbs, no CUDA, because nothing in it touches the
 # device: the staging buffers are cudaHostAlloc'd by the caller and register

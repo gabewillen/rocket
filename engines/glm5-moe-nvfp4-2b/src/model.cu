@@ -336,8 +336,13 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
 }
 
 std::vector<float> DecodeEngine::last_logits(int stream) const {
+  return last_logits_row(stream);
+}
+
+std::vector<float> DecodeEngine::last_logits_row(int row) const {
+  if (row < 0 || row >= max_batch_ * kSpecMax) fail("logit row is outside the work buffer");
   std::vector<float> out(static_cast<std::size_t>(cfg_.vocab_size));
-  cudaMemcpyAsync(out.data(), logits_ + static_cast<std::size_t>(stream) * cfg_.vocab_size,
+  cudaMemcpyAsync(out.data(), logits_ + static_cast<std::size_t>(row) * cfg_.vocab_size,
                   out.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_);
   cudaStreamSynchronize(stream_);
   return out;

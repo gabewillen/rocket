@@ -256,6 +256,10 @@ class DecodeEngine {
   // paths directly (tests/test_moe_grouped.cu) rather than only through the
   // greedy token they produce.
   std::vector<float> last_logits(int stream) const;
+  // Accuracy tooling reads any row from the most recent step_spec output.
+  // Rows use the same position-major [position * batch + stream] layout as
+  // step_spec input and output tokens.
+  std::vector<float> last_logits_row(int row) const;
   const std::unordered_map<std::string, float>& telemetry_absmax() const {
     return telemetry_absmax_;
   }
