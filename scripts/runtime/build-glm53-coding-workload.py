@@ -7,7 +7,7 @@ import json
 import pathlib
 import subprocess
 
-LANGUAGES = ["python", "c++", "cuda", "shell"]
+LANGUAGES = ["python", "c++", "cuda", "rust", "javascript", "shell"]
 TASKS = ["comprehension", "bug-diagnosis", "patch-generation", "test-repair", "code-review", "refactoring"]
 CONTEXT_TOKENS = [2048, 8192, 32768, 65536]
 RESPONSE_TOKENS = [128, 256, 512, 1024]
@@ -35,6 +35,8 @@ def source_excerpt(root: pathlib.Path, index: int) -> str:
         root / "engines/glm5-moe-nvfp4-2b/src/kv/nvme_prefix_store.cc",
         root / "scripts/runtime/glm53-nvfp4-spec-bench.sh",
         root / "scripts/numerics/glm53-teacher-score.py",
+        root / "scripts/runtime/fixtures/coding/rust.rs",
+        root / "scripts/runtime/fixtures/coding/javascript.js",
     ]
     path = candidates[index % len(candidates)]
     text = path.read_text(errors="replace")
