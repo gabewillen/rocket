@@ -1473,7 +1473,7 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   const float scaling = 1.0f / std::sqrt(static_cast<float>(cfg_.qk_head_dim()));
   mla_absorb_q(q_abs_, m.kv_b, q_, batch, heads, cfg_.qk_nope_head_dim, cfg_.v_head_dim, kvl,
               stream_);
-  if (std::getenv("ROCKET_MLA_FUSED")) {
+  if (!std::getenv("ROCKET_MLA_LEGACY_SPLIT")) {
     mla_fused_context(ctx_, q_abs_, mla_kv_, sel_tokens_, n_tok_, sel_stride_, batch,
                       n_streams, slot, heads, kvl, scaling, stream_);
   } else {
