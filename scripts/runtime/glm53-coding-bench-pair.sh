@@ -5,7 +5,8 @@ PEER=${PEER:-${ROCKET_PEER:-192.168.100.11}}
 HEAD=${HEAD:-${ROCKET_HEAD:-192.168.100.10}}
 PORT=${PORT:-${ROCKET_PORT:-18782}}
 BATCH=${BATCH:-8}
-SPEC=${SPEC:-7}
+SPEC=${SPEC:-3}
+LAZY_DROP_BATCH=${LAZY_DROP_BATCH:-8}
 TOKENS=${TOKENS:-512}
 EXPERT_CACHE_GIB=${EXPERT_CACHE_GIB:-90}
 MAX_TOKENS=${MAX_TOKENS:-65536}
@@ -55,7 +56,7 @@ if [[ -n $REPLACEMENT_PROMPT ]]; then
 fi
 
 cache_free_bytes() { df -B1 --output=avail "$1" | awk 'NR==2 {print $1}'; }
-common=(--prompt-list "$PROMPT_LIST" --tokens "$TOKENS" --batch "$BATCH" --spec "$SPEC"
+common=(--prompt-list "$PROMPT_LIST" --tokens "$TOKENS" --batch "$BATCH" --spec "$SPEC" --lazy-drop-batch "$LAZY_DROP_BATCH"
   --expert-cache-gib "$EXPERT_CACHE_GIB" --max-tokens "$MAX_TOKENS"
   --prefill-chunk "$PREFILL_CHUNK" --prefill-tail "$PREFILL_TAIL" --preload-owned "$PRELOAD_OWNED")
 (( PROMPT_TOKEN_LIMIT > 0 )) && common+=(--prompt-token-limit "$PROMPT_TOKEN_LIMIT" --prompt-tail-tokens "$PROMPT_TAIL_TOKENS")

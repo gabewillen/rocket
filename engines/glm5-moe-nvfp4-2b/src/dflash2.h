@@ -85,6 +85,12 @@ class DFlash2DraftEngine {
   // Produces `draft_tokens` tokens per stream in position-major order.
   void propose(const std::vector<int>& anchor, const std::vector<int>& position, int batch,
                int draft_tokens, std::vector<int>& out, cudaStream_t stream);
+  // Compact lazy-draft path. `slots` maps compact request rows to persistent
+  // cache slots, so finished or speculation-disabled requests pay no drafter
+  // forward pass.
+  void propose_slots(const std::vector<int>& anchor, const std::vector<int>& position,
+                     const std::vector<int>& slots, int draft_tokens,
+                     std::vector<int>& out, cudaStream_t stream);
   // The proposal model only attends to its configured trailing window. These
   // methods persist and restore exactly that rank-local K/V state.
   std::size_t prefix_state_bytes(int position) const;

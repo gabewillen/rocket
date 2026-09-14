@@ -162,7 +162,9 @@ int main(int argc, char** argv) {
     return 2;
   }
   const int batch = std::atoi(arg_value(argc, argv, "--batch", "1"));
-  const int spec_k = std::atoi(arg_value(argc, argv, "--spec", "1"));
+  const int requested_spec_k = std::atoi(arg_value(argc, argv, "--spec", "1"));
+  const int lazy_drop_batch = std::atoi(arg_value(argc, argv, "--lazy-drop-batch", "8"));
+  const int spec_k = batch > lazy_drop_batch ? 1 : requested_spec_k;
   const int rank = std::atoi(arg_value(argc, argv, "--rank", "-1"));
   const bool preload_owned = arg_value(argc, argv, "--preload-owned", "0")[0] == '1';
   const char* draft_file = arg_value(argc, argv, "--draft-file", nullptr);
@@ -200,6 +202,9 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  if (spec_k != requested_spec_k)
+    std::printf("lazy-spec batch taper: batch %d > %d, target-only decode; DFlash2 forward disabled\n",
+                batch, lazy_drop_batch);
   try {
 
   const rocket::fuel::ModelConfig cfg = rocket::fuel::load_model_config(attn, snapshot);
@@ -479,6 +484,8 @@ int main(int argc, char** argv) {
   std::vector<double> token_ms;
   std::vector<double> draft_ms;
   std::vector<double> draft_context_ms;
+  long long dflash_forward_rows = 0;
+  long long dflash_skipped_rows = 0;
   const int instrument_at = n_new > 12 ? n_new - 6 : std::max(0, n_new - 2);
   rocket::engine::StageMs stages;
   std::vector<float> rms;
@@ -559,11 +566,20 @@ int main(int argc, char** argv) {
       const auto round_t0 = Clock::now();
       spec_tokens.assign(batch * K, 0);
       std::vector<int> dflash_tokens;
+      std::vector<int> draft_slots;
       if (dflash && !draft_ids) {
         const auto draft_t0 = Clock::now();
-        std::vector<int> draft_pos(batch);
-        for (int m = 0; m < batch; ++m) draft_pos[m] = engine.position(m);
-        dflash->propose(last, draft_pos, batch, K - 1, dflash_tokens, nullptr);
+        std::vector<int> draft_anchor, draft_pos;
+        for (int m = 0; m < batch; ++m) if (active[m]) {
+          draft_slots.push_back(m);
+          draft_anchor.push_back(last[m]);
+          draft_pos.push_back(engine.position(m));
+        }
+        if (!draft_slots.empty())
+          dflash->propose_slots(draft_anchor, draft_pos, draft_slots, K - 1,
+                                dflash_tokens, nullptr);
+        dflash_forward_rows += static_cast<long long>(draft_slots.size()) * (K - 1);
+        dflash_skipped_rows += static_cast<long long>(batch - draft_slots.size()) * (K - 1);
         draft_ms.push_back(ms_since(draft_t0));
       }
       for (int m = 0; m < batch; ++m) {
@@ -581,8 +597,11 @@ int main(int argc, char** argv) {
           for (int j = 1; j < K && g.size() + j - 1 < draft_ids->size(); ++j)
             d.push_back((*draft_ids)[g.size() + j - 1]);
         } else if (dflash) {
+          const auto it = std::find(draft_slots.begin(), draft_slots.end(), m);
+          const int compact = static_cast<int>(it - draft_slots.begin());
+          const int draft_batch = static_cast<int>(draft_slots.size());
           for (int j = 0; j < K - 1; ++j)
-            d.push_back(dflash_tokens[static_cast<std::size_t>(j) * batch + m]);
+            d.push_back(dflash_tokens[static_cast<std::size_t>(j) * draft_batch + compact]);
         } else if (g.size() >= 2) {
           const int a = g[g.size() - 2], b = g[g.size() - 1];
           for (int i = static_cast<int>(g.size()) - 3; i >= 0 && static_cast<int>(d.size()) < K - 1; --i) {
@@ -819,7 +838,13 @@ int main(int argc, char** argv) {
     if (!out) throw std::runtime_error(std::string("cannot write --result-json ") + result_json);
     const long long useful_tokens = static_cast<long long>(batch) * n_new;
     out << "{\n  \"schema\":\"rocket.glm53.coding-bench.v1\",\n";
-    out << "  \"batch\":" << batch << ",\n  \"spec_k\":" << spec_k << ",\n";
+    out << "  \"batch\":" << batch << ",\n  \"requested_spec_k\":" << requested_spec_k
+        << ",\n  \"spec_k\":" << spec_k << ",\n";
+    out << "  \"lazy_drop_batch\":" << lazy_drop_batch << ",\n";
+    out << "  \"dflash2_enabled\":" << (dflash ? "true" : "false") << ",\n";
+    out << "  \"dflash2_proposal_calls\":" << draft_ms.size() << ",\n";
+    out << "  \"dflash2_forward_rows\":" << dflash_forward_rows << ",\n";
+    out << "  \"dflash2_skipped_rows\":" << dflash_skipped_rows << ",\n";
     out << "  \"prompt_tokens_per_stream\":" << prompt_ids[0].size() << ",\n";
     out << "  \"useful_output_tokens\":" << useful_tokens << ",\n";
     out << "  \"prefill_ms\":" << prefill_ms << ",\n  \"prompt_restore_and_prefill_ms\":" << request_prompt_ms << ",\n  \"decode_ms\":" << decode_total_ms << ",\n";
