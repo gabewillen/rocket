@@ -653,6 +653,44 @@ __global__ void mla_context_kernel(float* __restrict__ ctx, const float* __restr
   ctx[(static_cast<long long>(m) * gridDim.x + h) * kv_lora + c] = acc;
 }
 
+// Decode specialization: one warp owns one head. Each lane accumulates 16
+// latent dimensions in the same token order as mla_context_kernel, while a
+// single lane resolves each radix-selected page-table entry for the warp.
+__global__ void mla_context_warp_kernel(float* __restrict__ ctx,
+                                        const float* __restrict__ scores, KvPages kv,
+                                        const int* __restrict__ sel,
+                                        const int* __restrict__ n_sel, int sel_stride,
+                                        int layer_slot, int kv_lora, int n_streams) {
+  const int h = blockIdx.x, m = blockIdx.y, lane = threadIdx.x;
+  const int st = n_streams > 0 ? m % n_streams : m;
+  const int n = n_sel[m];
+  const float* row = scores + (static_cast<long long>(m) * gridDim.x + h) * sel_stride;
+  const int* sel_row = sel + static_cast<long long>(m) * sel_stride;
+  float2 acc[8]{};
+  for (int i = 0; i < n; ++i) {
+    int page = 0, slot = 0;
+    if (lane == 0) kv_locate(kv, st, sel_row[i], &page, &slot);
+    page = __shfl_sync(0xffffffffu, page, 0);
+    slot = __shfl_sync(0xffffffffu, slot, 0);
+    const long long src =
+        ((static_cast<long long>(page) * kv.layers + layer_slot) * kv.page_tokens + slot) * kv_lora;
+    const float a = row[i];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const float2 v = __bfloat1622float2(
+          reinterpret_cast<const __nv_bfloat162*>(kv.latent + src)[lane + j * 32]);
+      acc[j].x += a * v.x;
+      acc[j].y += a * v.y;
+    }
+  }
+  float* out = ctx + (static_cast<long long>(m) * gridDim.x + h) * kv_lora;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    out[2 * lane + j * 64] = acc[j].x;
+    out[2 * lane + j * 64 + 1] = acc[j].y;
+  }
+}
+
 __global__ void mla_expand_v_kernel(bf16* __restrict__ out, const bf16* __restrict__ kv_b,
                                     const float* __restrict__ ctx, int nope, int v_dim,
                                     int kv_lora) {
@@ -1502,8 +1540,12 @@ void mla_context(float* ctx, const float* scores, const KvPages& kv, const int* 
                  const int* n_sel, int n_sel_max, int sel_stride, int batch, int n_streams,
                  int layer_slot, int heads, int kv_lora, cudaStream_t s) {
   (void)n_sel_max;
-  mla_context_kernel<<<dim3(heads, batch), kv_lora, 0, s>>>(ctx, scores, kv, sel, n_sel, sel_stride,
-                                                            layer_slot, kv_lora, n_streams);
+  if (std::getenv("ROCKET_MLA_WARP_CONTEXT") && kv_lora == 512)
+    mla_context_warp_kernel<<<dim3(heads, batch), 32, 0, s>>>(
+        ctx, scores, kv, sel, n_sel, sel_stride, layer_slot, kv_lora, n_streams);
+  else
+    mla_context_kernel<<<dim3(heads, batch), kv_lora, 0, s>>>(
+        ctx, scores, kv, sel, n_sel, sel_stride, layer_slot, kv_lora, n_streams);
 }
 void mla_expand_v(bf16* out, const bf16* kv_b, const float* ctx, int batch, int heads, int nope,
                   int v_dim, int kv_lora, cudaStream_t s) {
