@@ -26,6 +26,11 @@ description: Recursively profiles and optimizes the GLM-5.3 CUDA engine for sust
 * require every production run to use the production fuel, DFlash2, expert split, and NVMe prefix cache defaults
 * require one GPU workload at a time across both nodes
 * require every optimization proposal to name a measured bottleneck before code changes
+* whenever this workflow is read or resumed, report the current active workload
+* whenever this workflow is read or resumed, report the latest authoritative c8 and c16 useful throughput
+* whenever this workflow is read or resumed, report the current measured bottleneck
+* whenever this workflow is read or resumed, report candidates accepted or rejected since the preceding update
+* whenever this workflow is read or resumed, report the next measurement or proof gate
 * require every accepted result to use committed scripts and an exact commit SHA
 * require rejected fuel additives to be removed from the loader and both nodes
 * [Inspect Current Evidence](#inspect-current-evidence)
