@@ -1,6 +1,7 @@
 import copy
 import json
 import pathlib
+import subprocess
 import tempfile
 import unittest
 
@@ -32,6 +33,16 @@ class CodingWorkloadTest(unittest.TestCase):
         result = {"generated_token_ids": [[1, 2], [3, 4]], "useful_output_tokens": 5}
         with self.assertRaisesRegex(ValueError, "padding or rejected drafts"):
             useful_tokens(result)
+
+    def test_adaptive_spec_map_dry_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            subprocess.run([
+                str(ROOT / "scripts/runtime/run-glm53-coding-workload.py"),
+                "--workload", str(WORKLOAD), "--batch", "8", "--spec-map", "7,4,3,2",
+                "--out", td, "--dry-run"], check=True, stdout=subprocess.DEVNULL)
+            summary = json.loads((pathlib.Path(td) / "summary.json").read_text())
+            self.assertEqual([7, 4, 3, 2], summary["spec_map"])
+            self.assertEqual([7, 4, 3, 2], [x["spec_k"] for x in summary["runs"]])
 
     def test_phase_materialization_is_distinct(self):
         with tempfile.TemporaryDirectory() as td:
