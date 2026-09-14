@@ -400,8 +400,11 @@ int main(int argc, char** argv) {
   if (profile_prefill) cudaProfilerStart();
   auto t_prefill = Clock::now();
   std::vector<int> next_batch;
+  // Keep at least one prompt token after the checkpoint. A terminal full page
+  // can still have an unsealed radix parent after transactional chunk replay;
+  // the preceding boundary is always a live, reusable prefix.
   const int checkpoint_target =
-      static_cast<int>(prompt_ids[0].size()) / prefix_page_tokens * prefix_page_tokens;
+      static_cast<int>(prompt_ids[0].size() - 1) / prefix_page_tokens * prefix_page_tokens;
   for (std::size_t begin = static_cast<std::size_t>(restored_prefix); begin < prompt_ids[0].size();) {
     const int remaining = static_cast<int>(prompt_ids[0].size() - begin);
     int count = remaining <= prefill_tail ? 1 : std::min(prefill_chunk, remaining - prefill_tail);
