@@ -1,0 +1,73 @@
+{
+  "format_version": 1,
+  "base_model": "GLM-5.3-Flash",
+  "base_weights": "frozen",
+  "adapter": {
+    "injection": "streams[:,3,:] += gate * project(retrieval)",
+    "layers": 45,
+    "rank": 64,
+    "trainable": [
+      "shared_rosa_down",
+      "shared_rosa_up",
+      "layer_gate[45]",
+      "token_gate",
+      "optional_mhc_lora"
+    ],
+    "initialization": "up=0, layer_gate=0, token_gate=0",
+    "zero_gate_contract": "bit-exact stream tensor before the existing mHC mix"
+  },
+  "retrieval_features": [
+    "confidence",
+    "log1p(recency_tokens)/log1p(context_limit)",
+    "ambiguity=1-1/match_count"
+  ],
+  "curriculum": {
+    "useful_exact_retrieval": 0.25,
+    "plausible_incorrect_retrieval": 0.20,
+    "irrelevant_retrieval": 0.15,
+    "no_retrieval": 0.15,
+    "ordinary_coding_without_memory": 0.25
+  },
+  "stages": [
+    {
+      "name": "inference_only",
+      "train": false,
+      "projection": "identity",
+      "gate_sweep": [0.0, 0.03125, 0.0625, 0.125, 0.25],
+      "decision": "No nonzero gate may ship. This stage only tests immediate signal value."
+    },
+    {
+      "name": "adapter_trained",
+      "train": true,
+      "base_model_gradients": false,
+      "primary": true,
+      "decision": "Accept only if exact and long-context recall improve while ordinary coding and false-retrieval controls do not regress."
+    },
+    {
+      "name": "context_reduction",
+      "blocked_on": "adapter_trained accepted",
+      "recent_context_tokens": [65536, 32768, 16384, 8192],
+      "decision": "ROSA must supply omitted exact source/tool spans without coding-quality loss."
+    }
+  ],
+  "required_metrics": [
+    "exact_recall_accuracy",
+    "ordinary_coding_pass_rate",
+    "long_context_coding_pass_rate",
+    "false_retrieval_suppression",
+    "future_token_logit_delta",
+    "teacher_forced_kl_nat_per_token",
+    "centered_logit_rms",
+    "top1_and_top5_overlap",
+    "aggregate_useful_tokens_per_second",
+    "p50_and_p95_latency",
+    "gate_mean_p10_p50_p90_by_layer_and_token_class"
+  ],
+  "failure_attribution": {
+    "retrieval_signal": "Exact span is absent or wrong before projection.",
+    "projection_mixing": "Retrieval is correct but hidden-state delta does not improve recall.",
+    "lack_of_training": "Inference-only fails and the trained adapter succeeds.",
+    "false_retrieval": "Useful controls pass while plausible-wrong or irrelevant controls regress.",
+    "base_divergence": "Zero-gate logits or tokens differ from the baseline."
+  }
+}
