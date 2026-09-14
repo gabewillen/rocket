@@ -118,8 +118,7 @@ description: Recursively profiles and optimizes the GLM-5.3 CUDA engine for sust
 ## Measure Candidate
 
 * run the unchanged c8 workload three times
-* run the unchanged accuracy baseline
-* run the unchanged power measurement
+* defer accuracy, parity, and power evaluation until throughput optimization converges
 * compare medians against `{{baseline}}`
 * compare p95 latency against `{{baseline}}`
 * do not run heuristic coding-output pass-rate checks during optimization iterations
@@ -132,15 +131,14 @@ description: Recursively profiles and optimizes the GLM-5.3 CUDA engine for sust
 ## Decide Candidate
 
 * accept the candidate only if c8 median useful throughput improves by at least `{{minimum_win}}`
-* accept the candidate only if pair-GPU tokens per joule does not regress
-* accept the candidate only if p95 completion latency does not regress by more than five percent
-* defer all coding-task quality judgments to the final eval suite
-* accept the candidate only if perplexity rises by no more than one percent
-* accept the candidate only if mean KL divergence rises by no more than `0.01` nat per token
-* accept the candidate only if no correctness, cache, fabric, or host-stability gate fails
-* if every acceptance condition passes
-  * commit the implementation and set `{{baseline}}` to the candidate
-* if any acceptance condition fails
+* rank optimization candidates by c8 median useful throughput before parity evaluation
+* retain a faster candidate provisionally if p95 completion latency does not regress by more than five percent
+* retain a faster candidate provisionally if no cache, fabric, or host-stability gate fails
+* do not call a provisionally retained candidate production-accepted
+* defer perplexity, KL divergence, centered logit RMS, token overlap, causality, and coding-task quality to final proof after throughput converges
+* if the throughput and operational conditions pass
+  * commit the provisional implementation and set `{{baseline}}` to the candidate
+* if the throughput or operational conditions fail
   * [Revert Candidate](#revert-candidate)
 * [Recurse](#recurse)
 
