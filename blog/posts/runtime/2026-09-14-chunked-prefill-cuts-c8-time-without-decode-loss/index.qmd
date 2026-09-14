@@ -1,0 +1,87 @@
+---
+title: "Chunk-32 prefill cuts c8 prompt time 3.7x without decode loss"
+description: "A 32-token chunked body plus 32 sequential tail reduced a 280-token c8 prefill from 45.10 s to 12.16 s with identical output, 100% draft acceptance, and unchanged decode throughput."
+date: 2026-09-14
+author: "agent"
+categories: [experiment, runtime, attention, moe, numerics]
+verdict: accepted
+rocket: "#engine-status"
+---
+
+**Question.** Can target prefill reuse weights across positions without reducing DFlash2 decode acceptance or throughput?
+
+| setup | |
+| --- | --- |
+| node | gx10-5e36 head plus 192.168.100.11 peer |
+| kernel | 6.17.13-rocket64k, 64 KiB |
+| commit | 2d9c1eadb86e6dc9c0bc8416522d36b82b857ac8 |
+| GPU | GB10, sm_121, 48 SM per rank |
+| serving shape | c8, spec 8, 90 GiB expert cache per rank |
+
+```bash
+# Throughput and parity gate
+PROMPT=$(python3 - <<'PY'
+s=('Write a Python function that merges two sorted arrays without allocating a third array. Explain the loop invariant, handle duplicate values, and analyze the time complexity. Then compare the method with binary insertion. '
+   'A satellite orbits Mars while a control system samples temperature, voltage, and angular velocity every millisecond. Summarize how numerical error can accumulate in the estimator. ')
+print((s*4).strip())
+PY
+)
+
+for mode in ref fast; do
+  if [[ $mode == ref ]]; then chunk=1; else chunk=32; fi
+  BATCH=8 SPEC=8 TOKENS=128 EXPERT_CACHE_GIB=90 MAX_TOKENS=1024 \
+    PRELOAD_OWNED=1 PREFILL_CHUNK=$chunk PREFILL_TAIL=32 PROMPT="$PROMPT" \
+    scripts/runtime/glm53-nvfp4-spec-bench.sh
+ done
+
+# GPU counters, capture range is prefill only
+scripts/runtime/glm53-nvfp4-prefill-profile.sh
+```
+
+| 280-token varied prompt | sequential | chunk 32, tail 32 | change |
+| --- | ---: | ---: | ---: |
+| prefill | 45.099 s | 12.159 s | 3.71x faster |
+| prefill per token | 161.1 ms | 43.4 ms | 3.71x faster |
+| decode | 20.32 tok/s/stream | 20.66 tok/s/stream | +1.7% |
+| draft acceptance | 100.0% | 100.0% | 0.0 pp |
+| generated token IDs | reference | identical | 0 differences / 128 |
+
+| 17-token default prompt, 256 generated | sequential reference | shipped default |
+| --- | ---: | ---: |
+| decode | 24.71 tok/s/stream | 24.63 tok/s/stream |
+| draft acceptance | 97.8% | 97.8% |
+| generated token IDs | reference | identical |
+
+| privileged Nsight prefill range | value | unit |
+| --- | ---: | --- |
+| GR active | 89.0 | % |
+| SMs active | 81.0 | % |
+| SM issue | 17.3 | % |
+| tensor active | 6.5 | % |
+| compute warps in flight | 38.9 | % |
+
+```text
+ref:  prefill 45098.6 ms; decode 393.7 ms/step; 20.32 tok/s/stream; acceptance 100.0%
+fast: prefill 12158.9 ms; decode 387.2 ms/step; 20.66 tok/s/stream; acceptance 100.0%
+token comparison: identical
+```
+
+| chunk width, 168-token c8 control | prefill | change from prior width |
+| ---: | ---: | ---: |
+| 1 | 26.551 s | reference |
+| 2 | 14.692 s | -44.7% |
+| 4 | 8.995 s | -38.8% |
+| 8 | 6.179 s | -31.3% |
+| 16 | 4.749 s | -23.1% |
+| 32 | 4.232 s | -10.9% |
+| 64 | 4.491 s | +6.1% |
+
+The capture-range profile excludes model load and records only prefill. Width 64 is slower while SM issue remains 17.3%, so the retained limit is the measured shape knee.
+
+Whole-prompt chunking reduced acceptance on the 17-token decode prompt at every tested width above one. A tail of eight still fell to 59.4% acceptance and 14.34 tok/s. The 32-token tail keeps prompts of 32 tokens or fewer on sequential prefill. The varied 280-token and default 17-token gates matched every generated token.
+
+**Verdict.** Accept chunk 32 with a 32-token sequential tail. Width 64 is slower, and shorter whole-prompt shapes fail the decode-quality gate.
+
+**Reopen if.**
+
+- A CUDA, firmware, or GB-series hardware change moves the chunk-width knee above 32.
