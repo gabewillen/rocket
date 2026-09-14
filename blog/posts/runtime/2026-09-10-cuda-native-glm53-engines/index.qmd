@@ -1,0 +1,54 @@
+---
+title: "CUDA-native GLM-5.3 engines exist, but none loads NVIDIA's NVFP4 directly"
+description: "ExLlamaV3, llama.cpp, and SparkPipe implement the GLM-5.3-Flash architecture, while the official NVIDIA NVFP4 checkpoint still needs a direct loader."
+date: 2026-09-10
+author: "agent"
+categories: [research, runtime, baseline]
+verdict: accepted
+rocket: "#engine-status"
+---
+
+**Question.** Is there a CUDA-native engine for `nvidia/GLM-5.3-Flash-NVFP4`?
+
+| setup | |
+| --- | --- |
+| node | `gx10-5e36` |
+| commit | `0edaf75970e1cc923829786444be4737c0c3b50e` |
+
+```bash
+for q in \
+  'repo:NVIDIA/TensorRT-LLM glm5_next' \
+  'repo:NVIDIA/TensorRT-LLM Glm5NextForConditionalGeneration' \
+  'repo:NVIDIA/TensorRT-LLM GLM-5.3-Flash-NVFP4'; do
+  curl -fsSL --get --data-urlencode "q=$q" \
+    https://api.github.com/search/commits \
+    -H 'Accept: application/vnd.github+json' | jq -r '.total_count'
+done
+```
+
+```
+0
+0
+0
+```
+
+| engine | CUDA path | GLM-5.3 evidence | exact NVIDIA NVFP4 loader |
+| --- | --- | --- | --- |
+| [ExLlamaV3](https://github.com/turboderp-org/exllamav3) | CUDA extension | `Glm5NextForConditionalGeneration`; public [EXL3 packs](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3); single-GPU decode reported coherent | no |
+| [llama.cpp PR 27754](https://github.com/ggml-org/llama.cpp/pull/27754) | CUDA backend | GLM-5-Next support; GGUF conversion; B200 benchmark in the PR | no |
+| [SparkPipe](https://github.com/sparkpipe/sparkpipe) | custom CUDA C | public `glm5_next` deployment and NVFP4 kernel work | custom pack format |
+| [NVIDIA NeMo AutoModel](https://docs.nvidia.com/nemo/automodel/v0.4/nemo-automodel/nemo_automodel/components/models/glm5_next/model) | CUDA/PyTorch model path | native `Glm5NextForConditionalGeneration` implementation | serving engine: no |
+| [TensorRT-LLM support matrix](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/models/supported-models.md) | CUDA/TensorRT | lists `GlmMoeDsaForCausalLM` for GLM-5.3 | `glm5_next`: no |
+
+The [ExLlamaV3 GLM-5.3 issue](https://github.com/turboderp-org/exllamav3/issues/333) reports coherent one-GPU runs and no implemented tensor parallel path for `Glm5NextForConditionalGeneration`. The [llama.cpp PR](https://github.com/ggml-org/llama.cpp/pull/27754) uses GGUF weights. Neither path consumes ModelOpt NVFP4 safetensors.
+
+**Verdict.** CUDA-native implementations exist for the architecture. No public engine found here directly loads NVIDIA's official `nvidia/GLM-5.3-Flash-NVFP4` checkpoint. Rocket remains the direct path for that weight format.
+
+**Next.**
+
+- Run the completed official checkpoint through Rocket on the two GB10s.
+
+**Reopen if.**
+
+- An upstream engine adds a loader for `glm5_next` ModelOpt NVFP4 safetensors.
+- NVIDIA publishes a CUDA-native runtime path for this exact checkpoint.

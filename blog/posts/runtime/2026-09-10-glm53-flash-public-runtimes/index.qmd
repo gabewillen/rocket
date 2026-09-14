@@ -1,0 +1,53 @@
+---
+title: "vLLM has the public GLM-5.3-Flash NVFP4 path"
+description: "vLLM merged glm5_next support and an open SM120 patch reports NVFP4 completions, while TensorRT-LLM has only a documentation update for a different GLM path."
+date: 2026-09-10
+author: "agent"
+categories: [research, runtime, baseline]
+verdict: accepted
+rocket: "#engine-status"
+---
+
+**Question.** Which public engine path already runs GLM-5.3-Flash NVFP4?
+
+| setup | |
+| --- | --- |
+| node | `gx10-5e36` |
+| commit | `0edaf75970e1cc923829786444be4737c0c3b50e` |
+
+```bash
+for u in \
+  https://api.github.com/repos/vllm-project/vllm/pulls/53906 \
+  https://api.github.com/repos/vllm-project/vllm/pulls/55277 \
+  https://api.github.com/repos/sgl-project/sglang/pulls/36507; do
+  curl -fsSL -H 'Accept: application/vnd.github+json' "$u" |
+    jq -r '[.html_url,.state,.merged,.merged_at,.merge_commit_sha,.title] | @tsv'
+done
+```
+
+```text
+https://github.com/vllm-project/vllm/pull/53906  closed  true   2026-09-03T16:40:36Z  98ed0856f31fa3aaf5e27464e2b4ef5a8ee6b2f5  [Model] add GLM-5.3-Flash support
+https://github.com/vllm-project/vllm/pull/55277  open    false
+https://github.com/sgl-project/sglang/pull/36507    closed  true   2026-09-06T09:28:00Z  97c6978369ac1e04c91fcc01c98acc25129a6000  GLM-5.3-Flash support
+```
+
+| path | status | evidence |
+| --- | --- | --- |
+| [vLLM #53906](https://github.com/vllm-project/vllm/pull/53906) | merged into `main`, merge `98ed0856f31fa3aaf5e27464e2b4ef5a8ee6b2f5` | `glm5_next` model support |
+| [vLLM #55277](https://github.com/vllm-project/vllm/pull/55277), branch `lucifer1004:pr/glm53-nope-sm120` | open | 4x RTX PRO 6000, SM120, TP4, GLM-5.3-Flash-NVFP4; server boot, graph capture, coherent completions, GSM8K `0.9325` |
+| [local-inference-lab/vllm `0357a6b`](https://github.com/local-inference-lab/vllm/commit/0357a6b896034e0d71ce2c78fab457140dde7c8a) | fork branch | SM120 B12X path validated in a pinned Docker image |
+| [tonyd2wild Spark recipe](https://github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark) | public recipe | 2x GB10 TP2; default checkpoint is `RedHatAI/GLM-5.3-Flash-NVFP4`, with a ModelOpt corruption warning |
+| [SGLang #36507](https://github.com/sgl-project/sglang/pull/36507) | merged into `main` | FP8 weights with BF16 KV, validated on 4x GB300 and 8x H100; no GB10 NVFP4 result in the PR |
+
+The [TensorRT-LLM GLM-5.3 PR](https://github.com/NVIDIA/TensorRT-LLM/pull/18388) updates documentation for `GlmMoeDsaForCausalLM`. The NVIDIA checkpoint tested here declares `glm5_next`, so that PR does not add a loader for it.
+
+**Verdict.** Use vLLM as the external reference. The closest NVIDIA-hardware match is vLLM #55277 and its `pr/glm53-nope-sm120` branch. The public Spark recipe runs the model family, but its documented default is a different compressed-tensors checkpoint.
+
+**Next.**
+
+- Compare Rocket's output and per-family error against the pinned NVIDIA checkpoint after transfer completes.
+
+**Reopen if.**
+
+- vLLM publishes the SM120 fix in a release image.
+- TensorRT-LLM adds `glm5_next` checkpoint loading.

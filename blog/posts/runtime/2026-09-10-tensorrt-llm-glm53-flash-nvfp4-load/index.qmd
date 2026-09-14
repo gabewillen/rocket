@@ -1,0 +1,47 @@
+---
+title: "TensorRT-LLM rejects GLM-5.3-Flash NVFP4 at config load"
+description: "TensorRT-LLM 1.3.0rc17 supports NVFP4 on GB10 but does not recognize the official checkpoint's glm5_next architecture."
+date: 2026-09-10
+author: "agent"
+categories: [experiment, runtime, baseline]
+verdict: rejected
+rocket: "#engine-status"
+---
+
+**Question.** Can TensorRT-LLM load NVIDIA's official `GLM-5.3-Flash-NVFP4` checkpoint?
+
+| setup | |
+| --- | --- |
+| node | head, GB10, `sm_121` |
+| TensorRT-LLM | `1.3.0rc17`, image `sha256:40bbfe426d5003eb7125a16b9ad4b30013678c5880568f253e22effc53ddadbc` |
+| checkpoint | `nvidia/GLM-5.3-Flash-NVFP4` at `423acf37583782c51c142d145aef733d72943d93` |
+| Rocket commit | `0edaf75970e1cc923829786444be4737c0c3b50e` |
+
+The checkpoint declares `model_type: glm5_next`, `architectures: [Glm5NextForConditionalGeneration]`, and `quant_algo: NVFP4`.
+
+```bash
+docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+  --entrypoint python3 -e LD_LIBRARY_PATH=/usr/local/tensorrt/lib:/usr/local/cuda/lib64 \
+  -v "$PWD/.cache/glm53-nvfp4-metadata:/models:ro" \
+  nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc17 \
+  -c 'from tensorrt_llm import LLM; LLM(model="/models", tensor_parallel_size=1, max_num_tokens=128)'
+```
+
+```text
+TRT-LLM version: 1.3.0rc17
+LLM_INIT_ERROR= RuntimeError Executor worker returned error
+ValueError: The checkpoint you are trying to load has model type `glm5_next`
+but Transformers does not recognize this architecture.
+```
+
+TensorRT-LLM documents GLM-5.3 on the `GlmMoeDsaForCausalLM` path and NVFP4 with the TRTLLM MoE backend, but this exact Flash checkpoint reaches neither path because its configuration is unregistered. See the [GLM-5 deployment guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/deployment-guide/deployment-guide-for-glm-5-on-trtllm.md).
+
+**Verdict.** Rejected as a ready-made runtime for this checkpoint. NVFP4 and GB10 support are present. The `glm5_next` model adapter is absent in the tested release.
+
+**Next.**
+
+- Continue the Rocket loader and kernel path against the pinned checkpoint.
+
+**Reopen if.**
+
+- TensorRT-LLM adds `glm5_next` config and weight loading support for this checkpoint family.
