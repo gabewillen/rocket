@@ -102,6 +102,27 @@ std::string printable(const std::string& s) {
   return out;
 }
 
+std::string json_escape(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (const unsigned char c : text) {
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char buf[7];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else out.push_back(static_cast<char>(c));
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -445,6 +466,8 @@ int main(int argc, char** argv) {
   std::vector<int> accepted_cnt(batch);
   long long sl_accepted = 0, sl_rounds = 0;  // spec tallies hoisted for the timing print
   std::vector<long long> accepted_drafts_by_stream(batch, 0);
+  std::vector<long long> drafted_by_stream(batch, 0);
+  std::vector<long long> active_rounds_by_stream(batch, 0);
   std::vector<long long> accepted_by_position(std::max(spec_k - 1, 0), 0);
   double entropy = 0.0;
 
@@ -554,6 +577,8 @@ int main(int argc, char** argv) {
           spec_tokens[j * batch + m] = t;
         }
         drafted += K - 1;
+        drafted_by_stream[m] += K - 1;
+        ++active_rounds_by_stream[m];
       }
       if (ep && dflash) ep->sync_draft_tokens(spec_tokens);
 
@@ -797,6 +822,10 @@ int main(int argc, char** argv) {
         << (replacement_preserved_active_slots ? "true" : "false") << ",\n";
     out << "  \"accepted_drafts_by_stream\":[";
     for (int m = 0; m < batch; ++m) out << (m ? "," : "") << accepted_drafts_by_stream[m];
+    out << "],\n  \"drafted_by_stream\":[";
+    for (int m = 0; m < batch; ++m) out << (m ? "," : "") << drafted_by_stream[m];
+    out << "],\n  \"active_rounds_by_stream\":[";
+    for (int m = 0; m < batch; ++m) out << (m ? "," : "") << active_rounds_by_stream[m];
     out << "],\n  \"accepted_by_position\":[";
     for (std::size_t j = 0; j < accepted_by_position.size(); ++j) out << (j ? "," : "") << accepted_by_position[j];
     out << "],\n  \"generated_token_ids\":[";
@@ -805,6 +834,9 @@ int main(int argc, char** argv) {
       for (std::size_t i = 0; i < generated[m].size(); ++i) out << (i ? "," : "") << generated[m][i];
       out << "]";
     }
+    out << "],\n  \"generated_text\":[";
+    for (int m = 0; m < batch; ++m)
+      out << (m ? "," : "") << "\"" << json_escape(tok.decode(generated[m])) << "\"";
     out << "]";
     if (const auto* ps = engine.kv_nvme_stats()) {
       out << ",\n  \"prefix_record_hits\":" << ps->hit_records;

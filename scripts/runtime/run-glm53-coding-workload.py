@@ -51,6 +51,19 @@ def main():
             data["phase"] = phase
             data["task_classes"] = [x["task_class"] for x in selected]
             data["languages"] = [x["language"] for x in selected]
+            data["arrival_ms"] = [x["arrival_ms"] for x in selected]
+            if data.get("drafted_by_stream"):
+                data["acceptance_by_stream"] = [
+                    accepted / drafted if drafted else 0.0
+                    for accepted, drafted in zip(data["accepted_drafts_by_stream"], data["drafted_by_stream"])
+                ]
+                grouped = {}
+                for cls, acceptance in zip(data["task_classes"], data["acceptance_by_stream"]):
+                    grouped.setdefault(cls, []).append(acceptance)
+                data["acceptance_by_task_class"] = {
+                    cls: {"mean": sum(values) / len(values), "p10": sorted(values)[max(0, int(len(values) * 0.1) - 1)]}
+                    for cls, values in sorted(grouped.items())
+                }
             data["wall_ms"] = (time.monotonic() - start) * 1000
             result.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
             runs.append(data)
