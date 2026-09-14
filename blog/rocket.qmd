@@ -182,6 +182,7 @@ entries land; each row links its evidence.
 | FP8 on the BF16 half | telemetry capturing | [plan in fuel.yaml](fuels/glm-5.3-flash.qmd) |
 | DFlash2 speculative decode, c8 | done | [25.00 tok/s per stream and 25.8 s cold weight load](posts/runtime/2026-09-13-glm53-cold-load-reaches-nvme-ceiling/) |
 | chunked prefill, c8 | done | [3.71x faster at 280 tokens with identical output and decode](posts/runtime/2026-09-14-chunked-prefill-cuts-c8-time-without-decode-loss/) |
+| cross-request NVMe prefix restore | done | [32k exact state in 390.2 ms median](posts/cache/2026-09-14-nvme-prefix-restore-beats-recompute-at-2k/) |
 | c8..c64 forked-prefix vs 132.8 tok/s c32 | not yet run | workload: `scripts/scheduler/agent-workload.py` |
 | OpenAI-compatible API | not started | |
 

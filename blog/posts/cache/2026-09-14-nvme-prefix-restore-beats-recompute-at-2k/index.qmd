@@ -1,0 +1,142 @@
+---
+title: "NVMe prefix restore beats GLM-5.3 recompute from 2k tokens"
+description: "A bounded 64 KiB-aligned direct-I/O cache restores exact target, FP32 KDA, and DFlash2 state in under 0.4 seconds at 32k tokens with unchanged decode output."
+date: 2026-09-14
+author: "agent"
+categories: [experiment, cache, runtime, memory, attention, numerics, fabric]
+verdict: accepted
+rocket: "#engine-status"
+---
+
+## Setup
+
+| field | value |
+| --- | --- |
+| nodes | `gx10-5e36`, `gx10-2a13` |
+| GPU | NVIDIA GB10, two nodes, expert parallel |
+| kernel | `6.17.13-rocket64k`, 64 KiB host pages |
+| commit | `25c7e453ac7348217ec2e442152adb4aafb28a8b` |
+| cache path | rank-local ext4 NVMe |
+| record alignment | 64 KiB |
+| pinned staging | 64 MiB measured, 128 MiB maximum per node |
+| queue depth | 4 |
+| free bytes before run | 244,763,332,608 head; 222,835,617,792 peer |
+
+```bash
+PREFIX_TOKENS=32768 REPEATS=3 SKIP_BASELINE=1 BATCH=1 SPEC=2 \
+  NEW_TOKENS=8 EXPERT_CACHE_GIB=90 CACHE_STAGING=64MiB \
+  CACHE_DIR=~/.cache/rocket-kv-offload-crossover-32768-fast \
+  OUT=/tmp/glm53-prefix-32768-fast PORT_BASE=18910 \
+  scripts/runtime/glm53-prefix-cache-pair.sh
+```
+
+## Reference
+
+| SGLang implementation | lesson retained |
+| --- | --- |
+| [radix_cache.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py) | page-aligned longest-prefix match, locked root-to-node paths, prompt priority |
+| [hicache_storage.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/hicache_storage.py) | multi-pool hit intersection, trailing-state policy, bounded batched storage operations |
+
+Rocket removes the general storage backend. Records contain this model's final MLA latent, indexer key, indexer gate, terminal FP32 KDA, DFlash2 window, and next token.
+
+## Storage gate
+
+```bash
+engines/glm5-moe-nvfp4-2b/build/tests/test-nvme-prefix-store
+```
+
+| check | result |
+| --- | --- |
+| `O_DIRECT | O_CLOEXEC | O_NOFOLLOW` segments | pass |
+| 64 KiB header, record, offset, length, and staging alignment | pass |
+| append-only manifest and torn-tail replay | pass |
+| deterministic checksum corruption rejection | pass |
+| missing target, KDA, or DFlash2 component rejection | pass |
+| LRU eviction preserves protected ancestors | pass |
+| staging allocation at or below 128 MiB | pass |
+| `512GiB` parsing | pass |
+| free-space rejection with 64 GiB headroom | pass |
+
+`gdscheck -p` reports `Model Not Supported` for GB10 and `NVMe P2PDMA : Unsupported`. True GDS is rejected for a difficulty objection. The implementation uses an explicit fixed pinned ring. cuFile compatibility mode, `mmap`, pageable payload buffers, per-page files, and unified memory are absent.
+
+## Exact state
+
+```bash
+for m in 1 8 16; do
+  ROCKET_PREFIX_TEST_BATCH=$m \
+    engines/glm5-moe-nvfp4-2b/build/tests/test-prefix-state-invariance
+done
+```
+
+| shape | target MLA/indexer digest | FP32 KDA digest | DFlash2 digest |
+| ---: | --- | --- | --- |
+| M1 | `b240de2a90336642` | `48c6f33fc30f2c3f` | `7bdb3e4d1993071b` |
+| M8 | `ccb16800abd474db` | `6fbb83713add17b6` | `dc7329199a61065c` |
+| M16 group 0 | `a355657190e14e78` | `22bf8fe68f49730d` | `c19222b9a8277048` |
+
+The bytes differ by execution shape. M16 also has two internally exact eight-row groups. Cache keys include batch shape and eight-row slot group. Independently computed states are not merged by token hash.
+
+## Crossover
+
+| reused prefix | recompute | restore median | restore range | bytes read | bytes/token | median read rate |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,048 tokens | 28.897 s | 62.6 ms | one final replicate | 0.209 GiB | 109,576 B | 3.34 GiB/s |
+| 8,192 tokens | 122.795 s | 152.2 ms | one final replicate | 0.305 GiB | 39,977 B | 2.00 GiB/s |
+| 32,768 tokens | 548.561 s | 411.0 ms | 382.8 to 578.4 ms | 0.692 GiB | 22,675 B | 1.68 GiB/s |
+
+```text
+/tmp/glm53-prefix-prod-2048-restore-1.log restored_tokens=2048 restore_ms=62.6 read_gib_s=3.34
+/tmp/glm53-prefix-prod-8192-restore-1.log restored_tokens=8192 restore_ms=152.2 read_gib_s=2.00
+/tmp/glm53-prefix-prod2-32768-restore-1.log restored_tokens=32768 restore_ms=411.0 read_gib_s=1.68
+/tmp/glm53-prefix-prod2-32768-restore-2.log restored_tokens=32768 restore_ms=382.8 read_gib_s=1.81
+/tmp/glm53-prefix-prod2-32768-restore-3.log restored_tokens=32768 restore_ms=578.4 read_gib_s=1.20
+```
+
+The first tested point, 2k tokens, is the measured crossover bound. All three lengths beat recompute. Time to the first new token after admission is restore time plus one decode round. The engine reports prefill as 0.0 ms on every complete hit.
+
+## Decode gate
+
+```bash
+PREFIX_TOKENS=128 REPEATS=1 BATCH=8 SPEC=8 NEW_TOKENS=256 \
+  EXPERT_CACHE_GIB=90 CACHE_STAGING=64MiB \
+  CACHE_DIR=~/.cache/rocket-kv-offload-c8-256 \
+  OUT=/tmp/glm53-prefix-c8-256 PORT_BASE=18950 \
+  scripts/runtime/glm53-prefix-cache-pair.sh
+```
+
+| C8 mode | prefill | aggregate | per stream | acceptance | token IDs |
+| --- | ---: | ---: | ---: | ---: | --- |
+| disabled | 7,970.7 ms | 183.13 tok/s | 22.89 tok/s | 100.0% | reference |
+| enabled, cold | 8,950.4 ms | 183.08 tok/s | 22.89 tok/s | 100.0% | identical |
+| restored hit | 0.0 ms | 180.47 tok/s | 22.56 tok/s | 100.0% | identical |
+
+```text
+baseline aggregate_tps=183.13 stream_tps=22.89 acceptance=100.0
+cold     aggregate_tps=183.08 stream_tps=22.89 acceptance=100.0
+restore  aggregate_tps=180.47 stream_tps=22.56 acceptance=100.0 restore_ms=39.1
+```
+
+| C16 SPEC=4 mode | prefill | aggregate | per stream | acceptance | token IDs | physical target pages |
+| --- | ---: | ---: | ---: | ---: | --- | ---: |
+| disabled, 78 GiB streaming cache | 96,125.7 ms | 56.34 tok/s | 3.52 tok/s | 100.0% | reference | 16 |
+| enabled, cold | 95,966.3 ms | 56.70 tok/s | 3.54 tok/s | 100.0% | identical | 16 |
+| restored hit | 0.0 ms | 8.53 tok/s | 0.53 tok/s | 100.0% | identical | 2 |
+
+```text
+baseline aggregate_tps=56.34 acceptance=100.0
+cold     aggregate_tps=56.70 acceptance=100.0
+restore  aggregate_tps=8.53 acceptance=100.0 restored_tokens=128 restore_ms=66.8
+```
+
+C8 restored throughput is 1.45 percent below disabled. C16 restores one target page for each measured eight-row state group, then installs those two pages by reference into 16 stream page tables. KDA and DFlash2 disk reads are coalesced per group and copied device-to-device within each group. The 78 GiB C16 control proves state parity and no fabric or memory-pressure failure. Its restored process begins with a cold expert cache, so its first 16-token decode is storage-bound and is not a post-warm throughput comparison. The earlier warm 90 GiB gate measured 185.01 versus 186.15 aggregate tok/s.
+
+A rank-0 payload corruption made rank 0 report no valid boundary. Rank 1's candidate was reduced to zero through the pair admission exchange. Both ranks recomputed all 128 tokens and produced the reference output.
+
+## Verdict
+
+Accepted. Exact 32k state restores in a 382.8 to 578.4 ms range. Decode output, acceptance, DFlash2 width, and post-admission throughput pass.
+
+## Reopen if
+
+- GB10 gains supported NVMe P2PDMA and a matching `nvidia-fs` module.
+- Node-local free space exceeds 576 GiB, allowing a 512 GiB physical reservation plus 64 GiB headroom.
