@@ -11,6 +11,8 @@
 #include <numeric>
 #include <optional>
 #include <map>
+#include <queue>
+#include <sstream>
 #include <memory>
 #include <fstream>
 #include <iterator>
@@ -102,6 +104,129 @@ std::string printable(const std::string& s) {
   return out;
 }
 
+std::vector<int> parse_token_line(const std::string& line, int line_no) {
+  std::vector<int> ids;
+  std::istringstream in(line);
+  long long id = 0;
+  while (in >> id) {
+    if (id < 0 || id > 0x7fffffffll)
+      throw std::runtime_error("token id out of range on score line " + std::to_string(line_no));
+    ids.push_back(static_cast<int>(id));
+  }
+  if (!in.eof())
+    throw std::runtime_error("non-integer field on score line " + std::to_string(line_no));
+  return ids;
+}
+
+int run_teacher_forced_score(rocket::engine::DecodeEngine& engine,
+                             const rocket::fuel::ModelConfig& cfg,
+                             const rocket::fuel::Tokenizer& tokenizer,
+                             const char* token_file, const char* text_file,
+                             const char* output_file, const char* logits_file,
+                             int max_score_tokens, int rank) {
+  const char* input_path = token_file ? token_file : text_file;
+  std::ifstream input(input_path);
+  if (!input) throw std::runtime_error(std::string("cannot read score input ") + input_path);
+  const bool emit = rank <= 0;
+  std::ofstream json;
+  std::ofstream binary;
+  if (emit) {
+    json.open(output_file);
+    if (!json) throw std::runtime_error(std::string("cannot write --score-output ") + output_file);
+    json << "{\"type\":\"metadata\",\"schema\":\"rocket.glm53.teacher-score.v1\","
+         << "\"vocab_size\":" << cfg.vocab_size << "}\n";
+    if (logits_file) {
+      binary.open(logits_file, std::ios::binary | std::ios::trunc);
+      if (!binary) throw std::runtime_error(std::string("cannot write --score-logits ") + logits_file);
+      const char magic[8] = {'R','K','T','L','O','G','1','\0'};
+      const std::uint32_t vocab = static_cast<std::uint32_t>(cfg.vocab_size);
+      const std::uint64_t rows = 0;
+      binary.write(magic, sizeof(magic));
+      binary.write(reinterpret_cast<const char*>(&vocab), sizeof(vocab));
+      binary.write(reinterpret_cast<const char*>(&rows), sizeof(rows));
+    }
+  }
+  std::string line;
+  std::uint64_t row = 0;
+  int line_no = 0, sequence = 0;
+  std::vector<int> next;
+  std::vector<double> inference_ms;
+  const auto score_start = Clock::now();
+  while (std::getline(input, line)) {
+    ++line_no;
+    if (line.empty() || line[0] == '#') continue;
+    std::vector<int> ids = token_file ? parse_token_line(line, line_no)
+                                      : tokenizer.encode(line);
+    if (max_score_tokens > 0 && ids.size() > static_cast<std::size_t>(max_score_tokens))
+      ids.resize(static_cast<std::size_t>(max_score_tokens));
+    if (ids.size() < 2) continue;
+    ++sequence;
+    engine.reset();
+    for (std::size_t pos = 0; pos + 1 < ids.size(); ++pos) {
+      const auto token_start = Clock::now();
+      engine.step({ids[pos]}, next, false);
+      inference_ms.push_back(ms_since(token_start));
+      const std::vector<float> logits = engine.last_logits(0);
+      if (!emit) continue;
+      const float max_logit = *std::max_element(logits.begin(), logits.end());
+      double exp_sum = 0.0;
+      for (float x : logits) exp_sum += std::exp(static_cast<double>(x - max_logit));
+      const double logsumexp = static_cast<double>(max_logit) + std::log(exp_sum);
+      const int target = ids[pos + 1];
+      if (target < 0 || target >= cfg.vocab_size)
+        throw std::runtime_error("target token outside vocabulary");
+      std::priority_queue<std::pair<float, int>, std::vector<std::pair<float, int>>,
+                          std::greater<std::pair<float, int>>> top;
+      for (int v = 0; v < cfg.vocab_size; ++v) {
+        const std::pair<float, int> item{logits[v], v};
+        if (top.size() < 5) top.push(item);
+        else if (item > top.top()) { top.pop(); top.push(item); }
+      }
+      std::vector<std::pair<float, int>> top5;
+      while (!top.empty()) { top5.push_back(top.top()); top.pop(); }
+      std::reverse(top5.begin(), top5.end());
+      json << "{\"type\":\"token\",\"sequence\":" << sequence
+           << ",\"position\":" << pos << ",\"input_id\":" << ids[pos]
+           << ",\"target_id\":" << target << ",\"target_logprob\":"
+           << (static_cast<double>(logits[target]) - logsumexp)
+           << ",\"logsumexp\":" << logsumexp << ",\"top5\":[";
+      for (std::size_t i = 0; i < top5.size(); ++i) {
+        if (i) json << ',';
+        json << "{\"id\":" << top5[i].second << ",\"logprob\":"
+             << (static_cast<double>(top5[i].first) - logsumexp) << '}';
+      }
+      json << ']';
+      if (binary) {
+        json << ",\"logit_row\":" << row;
+        binary.write(reinterpret_cast<const char*>(logits.data()),
+                     static_cast<std::streamsize>(logits.size() * sizeof(float)));
+      }
+      json << "}\n";
+      ++row;
+    }
+  }
+  if (emit) {
+    const double wall_ms = ms_since(score_start);
+    const double model_ms = std::accumulate(inference_ms.begin(), inference_ms.end(), 0.0);
+    std::sort(inference_ms.begin(), inference_ms.end());
+    const double median_ms = inference_ms.empty() ? 0.0 : inference_ms[inference_ms.size() / 2];
+    json << "{\"type\":\"summary\",\"sequences\":" << sequence
+         << ",\"tokens\":" << row << ",\"model_ms\":" << model_ms
+         << ",\"model_tokens_per_second\":" << (model_ms > 0 ? row * 1000.0 / model_ms : 0.0)
+         << ",\"median_token_ms\":" << median_ms << ",\"wall_ms\":" << wall_ms
+         << ",\"wall_tokens_per_second\":" << (wall_ms > 0 ? row * 1000.0 / wall_ms : 0.0)
+         << "}\n";
+    std::printf("score     %llu tokens, %.2f model tok/s, %.2f end-to-end tok/s, %.2f ms median\n",
+                static_cast<unsigned long long>(row), model_ms > 0 ? row * 1000.0 / model_ms : 0.0,
+                wall_ms > 0 ? row * 1000.0 / wall_ms : 0.0, median_ms);
+    if (binary) {
+      binary.seekp(8 + sizeof(std::uint32_t));
+      binary.write(reinterpret_cast<const char*>(&row), sizeof(row));
+    }
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -141,6 +266,23 @@ int main(int argc, char** argv) {
   const bool preload_owned = arg_value(argc, argv, "--preload-owned", "0")[0] == '1';
   const char* draft_file = arg_value(argc, argv, "--draft-file", nullptr);
   const bool telemetry = arg_value(argc, argv, "--telemetry", "0")[0] == '1';
+  const char* score_token_file = arg_value(argc, argv, "--score-token-file", nullptr);
+  const char* score_text_file = arg_value(argc, argv, "--score-text-file", nullptr);
+  const char* score_output = arg_value(argc, argv, "--score-output", nullptr);
+  const char* score_logits = arg_value(argc, argv, "--score-logits", nullptr);
+  const int score_max_tokens = std::atoi(arg_value(argc, argv, "--score-max-tokens", "0"));
+  if (score_max_tokens < 0) {
+    std::fprintf(stderr, "--score-max-tokens must be >= 0\n");
+    return 2;
+  }
+  if (score_token_file && score_text_file) {
+    std::fprintf(stderr, "choose one of --score-token-file and --score-text-file\n");
+    return 2;
+  }
+  if ((score_token_file || score_text_file) && !score_output) {
+    std::fprintf(stderr, "score input requires --score-output\n");
+    return 2;
+  }
   const char* prefix_cache_dir = arg_value(argc, argv, "--prefix-cache-dir", nullptr);
   const char* prefix_cache_bytes = arg_value(argc, argv, "--prefix-cache-bytes", "0");
   const char* prefix_staging_bytes = arg_value(argc, argv, "--prefix-cache-staging-bytes", "128MiB");
@@ -243,7 +385,7 @@ int main(int argc, char** argv) {
     engine.set_expert_parallel(ep.get());
   }
   std::unique_ptr<rocket::engine::DFlash2DraftEngine> dflash;
-  if (const char* draft_dir = std::getenv("ROCKET_DFLASH2_DIR")) {
+  if (!score_token_file && !score_text_file) if (const char* draft_dir = std::getenv("ROCKET_DFLASH2_DIR")) {
     if (spec_k < 2 || spec_k > 8)
       throw std::runtime_error("DFlash2 requires --spec in [2,8]");
     const auto td = Clock::now();
@@ -266,6 +408,9 @@ int main(int argc, char** argv) {
     // doorbell kills the pair before a step runs. Hold both ranks here.
     ep->barrier();
   }
+  if (score_token_file || score_text_file)
+    return run_teacher_forced_score(engine, cfg, tok, score_token_file, score_text_file,
+                                    score_output, score_logits, score_max_tokens, rank);
   if (arg_value(argc, argv, "--cuda-graph", "0")[0] == '1') engine.set_use_cuda_graph(true);
   const double load_ms = ms_since(t_load);
   std::printf("resident  %.2f GiB   expert cache %zu slots x %.2f MiB = %.2f GiB\n",
