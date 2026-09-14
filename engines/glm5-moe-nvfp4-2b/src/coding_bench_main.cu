@@ -336,6 +336,7 @@ int main(int argc, char** argv) {
               max_prompt_tokens, batch);
 
   engine.reset();
+  const auto t_request_prompt = Clock::now();
   std::vector<int> last(batch, 0);
   int restored_prefix = 0;
   const int prefix_page_tokens = 128;
@@ -453,6 +454,7 @@ int main(int argc, char** argv) {
     }
   }
   const double prefill_ms = ms_since(t_prefill);
+  const double request_prompt_ms = ms_since(t_request_prompt);
   if (profile_prefill) cudaProfilerStop();
 
   if (decode_marker) {
@@ -807,10 +809,10 @@ int main(int argc, char** argv) {
     out << "  \"batch\":" << batch << ",\n  \"spec_k\":" << spec_k << ",\n";
     out << "  \"prompt_tokens_per_stream\":" << prompt_ids[0].size() << ",\n";
     out << "  \"useful_output_tokens\":" << useful_tokens << ",\n";
-    out << "  \"prefill_ms\":" << prefill_ms << ",\n  \"decode_ms\":" << decode_total_ms << ",\n";
-    out << "  \"ttft_ms_p50\":" << prefill_ms << ",\n  \"ttft_ms_p95\":" << prefill_ms << ",\n";
-    out << "  \"completion_ms_p50\":" << (prefill_ms + decode_total_ms) << ",\n";
-    out << "  \"completion_ms_p95\":" << (prefill_ms + decode_total_ms) << ",\n";
+    out << "  \"prefill_ms\":" << prefill_ms << ",\n  \"prompt_restore_and_prefill_ms\":" << request_prompt_ms << ",\n  \"decode_ms\":" << decode_total_ms << ",\n";
+    out << "  \"ttft_ms_p50\":" << request_prompt_ms << ",\n  \"ttft_ms_p95\":" << request_prompt_ms << ",\n";
+    out << "  \"completion_ms_p50\":" << (request_prompt_ms + decode_total_ms) << ",\n";
+    out << "  \"completion_ms_p95\":" << (request_prompt_ms + decode_total_ms) << ",\n";
     out << "  \"inter_token_ms_p50\":" << (useful_tokens > 0 ? decode_total_ms * batch / useful_tokens : 0.0) << ",\n";
     out << "  \"inter_token_ms_p95\":" << (useful_tokens > 0 ? decode_total_ms * batch / useful_tokens : 0.0) << ",\n";
     out << "  \"aggregate_useful_tok_s\":" << (decode_total_ms > 0 ? useful_tokens * 1000.0 / decode_total_ms : 0.0) << ",\n";
