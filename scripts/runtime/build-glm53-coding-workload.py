@@ -44,12 +44,12 @@ def source_excerpt(root: pathlib.Path, index: int) -> str:
     return f"FILE {path.relative_to(root)}\n{text[start:start + 12000]}"
 
 
-def expand_context(seed: str, target_tokens: int, session_id: int) -> str:
+def expand_context(seed: str, target_tokens: int) -> str:
     target_chars = target_tokens * 3
     blocks = []
     counter = 0
     while sum(map(len, blocks)) < target_chars:
-        digest = hashlib.sha256(f"{session_id}:{counter}:{seed}".encode()).hexdigest()
+        digest = hashlib.sha256(f"{target_tokens}:{counter}:{seed}".encode()).hexdigest()
         blocks.append(f"\nCONTEXT BLOCK {counter} CHECKSUM {digest}\n{seed}\n")
         counter += 1
     return "".join(blocks)[:target_chars]
@@ -69,15 +69,15 @@ def main():
         task = TASKS[i % len(TASKS)]
         context_tokens = CONTEXT_TOKENS[phase]
         response_tokens = RESPONSE_TOKENS[phase]
-        excerpt = source_excerpt(root, i)
+        excerpt = source_excerpt(root, phase)
         shared = (
             "You are working in the public Rocket repository. Return only a concise engineering response. "
             "Do not invent test results. Preserve numerical and memory-safety contracts.\n"
         )
         unique = f"SESSION {i:02d} LANGUAGE {language} TASK {task}. {TEMPLATES[i % len(TEMPLATES)]}\n"
-        context = expand_context(excerpt, context_tokens, i)
+        context = expand_context(excerpt, context_tokens)
         turns = [
-            {"role": "user", "content": shared + unique + context},
+            {"role": "user", "content": shared + context + "\n" + unique},
             {"role": "tool", "content": f"tool_result session={i} phase=inspect checksum={hashlib.sha256(excerpt.encode()).hexdigest()}"},
             {"role": "user", "content": f"Continue session {i:02d}. State the measured bottleneck and the next concrete edit."},
         ]
