@@ -433,6 +433,39 @@ void test_forked_read_equals_materialised() {
 
 // ------------------------------------------------------- persistent radix IO
 
+void test_duplicate_prefix_checkpoint() {
+  std::printf("independently computed duplicate prefixes remain checkpointable\n");
+  const kv::KvGeometry g = geometry();
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("rocket-kv-duplicate-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  cudaStream_t s = nullptr;
+  ck(cudaStreamCreate(&s), "stream");
+  kv::KvArena arena(g, 8, 2, 8, s);
+  kv::PagePool pool(8, kPageTokens);
+  kv::PrefixTree tree;
+  kv::NvmePrefixOptions options;
+  options.directory = dir;
+  options.capacity_bytes = 64ull << 20;
+  options.staging_bytes = 4ull << 20;
+  options.segment_bytes = 32ull << 20;
+  options.free_space_headroom_bytes = 0;
+  options.rank = 0;
+  kv::NvmeArenaPageBacking backing(&arena, g, options, 0x87654321, s);
+  kv::KvCache cache(g, &pool, &tree, &arena, &backing);
+  const int a = cache.open(0), b = cache.open(1);
+  // Same owner value makes the independently allocated pages byte-identical,
+  // matching a batch-invariant common prompt prefix.
+  grow(cache, arena, a, 51, 2 * kPageTokens);
+  grow(cache, arena, b, 51, 2 * kPageTokens);
+  check("duplicate full-prefix hashes agree",
+        cache.hash_at(a, 2 * kPageTokens) == cache.hash_at(b, 2 * kPageTokens));
+  check("duplicate prefix persists despite duplicate radix edges", cache.persist(b));
+  cudaStreamDestroy(s);
+  std::filesystem::remove_all(dir);
+}
+
 void test_nvme_radix_restart() {
   std::printf("radix pages survive GPU eviction and process-style restart\n");
   const kv::KvGeometry g = geometry();
@@ -685,6 +718,7 @@ int main() {
   test_execution_namespaces();
   test_detach_resume();
   test_forked_read_equals_materialised();
+  test_duplicate_prefix_checkpoint();
   test_nvme_radix_restart();
   test_capacity_math();
   test_decode_loop_table_discipline();

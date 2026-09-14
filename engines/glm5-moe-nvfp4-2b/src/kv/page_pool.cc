@@ -301,24 +301,31 @@ std::uint64_t KvCache::hash_at(int seq, int token_count) const {
     fail("hash_at: boundary is not a live full-page prefix");
   if (token_count == 0) return 0;
   const int node = s.nodes.at(token_count / geom_.page_tokens - 1);
-  if (node < 0) fail("hash_at: prefix page is not sealed");
-  return tree_->hash_of(node);
+  if (node >= 0) return tree_->hash_of(node);
+  // Identical blocks computed independently keep separate physical pages:
+  // PrefixTree::seal cannot add a duplicate edge, so this sequence's node is
+  // intentionally -1. The content hash is still authoritative and is needed
+  // to persist its exact page and recurrent state.
+  std::uint64_t seed = s.hash_seed;
+  for (int at = 0; at < token_count; at += geom_.page_tokens)
+    seed = PrefixTree::block_hash(seed, s.tokens.data() + at, geom_.page_tokens);
+  return seed;
 }
 
 bool KvCache::persist(int seq) {
   if (!backing_) return false;
   const Seq& s = seqs_.at(seq);
   if (!s.live) fail("persist: sequence is not live");
-  for (std::size_t i = 0; i < s.nodes.size(); ++i) {
-    const int node = s.nodes[i];
-    if (node < 0) continue;
-    const int page = tree_->page_of(node);
-    if (page < 0) continue;
-    const int parent = tree_->parent_of(node);
-    const std::uint64_t parent_hash = parent == tree_->root() ? 0 : tree_->hash_of(parent);
-    if (!backing_->persist_page(parent_hash, tree_->hash_of(node),
-                                static_cast<int>((i + 1) * geom_.page_tokens), page))
-      return false;
+  std::uint64_t parent_hash = 0;
+  std::uint64_t seed = s.hash_seed;
+  for (std::size_t i = 0; i < s.pages.size(); ++i) {
+    const int end = static_cast<int>((i + 1) * geom_.page_tokens);
+    if (end > s.length) break;
+    const std::uint64_t chain_hash = PrefixTree::block_hash(
+        seed, s.tokens.data() + i * geom_.page_tokens, geom_.page_tokens);
+    if (!backing_->persist_page(parent_hash, chain_hash, end, s.pages[i])) return false;
+    parent_hash = chain_hash;
+    seed = chain_hash;
   }
   return true;
 }
