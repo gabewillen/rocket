@@ -46,7 +46,10 @@ def source_excerpt(root: pathlib.Path, index: int) -> str:
 
 def source_context(root: pathlib.Path, target_tokens: int, phase: int) -> str:
     """Concatenate unique tracked source files; never repeat a context block."""
-    target_chars = target_tokens * 3
+    # GLM tokenizer averages 3.3-3.8 source bytes/token on these fixtures.
+    # Four bytes/token ensures the benchmark's explicit token limit, rather
+    # than corpus exhaustion, defines each 2K/8K/32K/64K phase.
+    target_chars = target_tokens * 4
     tracked = git("-C", str(root), "ls-files").splitlines()
     allowed = (".py", ".cu", ".cuh", ".cc", ".cpp", ".h", ".sh", ".rs", ".js", ".qmd")
     paths = [root / path for path in tracked if path.endswith(allowed)]
