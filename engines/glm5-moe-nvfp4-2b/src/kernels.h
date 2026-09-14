@@ -176,6 +176,9 @@ void mla_softmax(float* scores, const int* n_sel, int sel_stride, int batch, int
 void mla_context(float* ctx, const float* scores, const KvPages& kv, const int* sel,
                  const int* n_sel, int n_sel_max, int sel_stride, int batch, int n_streams,
                  int layer_slot, int heads, int kv_lora, cudaStream_t s);
+void mla_fused_context(float* ctx, const float* q_abs, const KvPages& kv, const int* sel,
+                       const int* n_sel, int sel_stride, int batch, int n_streams,
+                       int layer_slot, int heads, int kv_lora, float scaling, cudaStream_t s);
 // out[h][v] = sum_c Wv[h][v][c] * ctx[h][c]
 void mla_expand_v(bf16* out, const bf16* kv_b, const float* ctx, int batch, int heads, int nope,
                   int v_dim, int kv_lora, cudaStream_t s);

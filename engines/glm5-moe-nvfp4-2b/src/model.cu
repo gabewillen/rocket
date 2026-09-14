@@ -1473,11 +1473,16 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   const float scaling = 1.0f / std::sqrt(static_cast<float>(cfg_.qk_head_dim()));
   mla_absorb_q(q_abs_, m.kv_b, q_, batch, heads, cfg_.qk_nope_head_dim, cfg_.v_head_dim, kvl,
               stream_);
-  mla_scores(scores_, q_abs_, mla_kv_, sel_tokens_, n_tok_, sel_stride_, sel_stride_, batch,
-             n_streams, slot, heads, kvl, scaling, stream_);
-  mla_softmax(scores_, n_tok_, sel_stride_, batch, heads, stream_);
-  mla_context(ctx_, scores_, mla_kv_, sel_tokens_, n_tok_, sel_stride_, sel_stride_, batch,
-              n_streams, slot, heads, kvl, stream_);
+  if (std::getenv("ROCKET_MLA_FUSED")) {
+    mla_fused_context(ctx_, q_abs_, mla_kv_, sel_tokens_, n_tok_, sel_stride_, batch,
+                      n_streams, slot, heads, kvl, scaling, stream_);
+  } else {
+    mla_scores(scores_, q_abs_, mla_kv_, sel_tokens_, n_tok_, sel_stride_, sel_stride_, batch,
+               n_streams, slot, heads, kvl, scaling, stream_);
+    mla_softmax(scores_, n_tok_, sel_stride_, batch, heads, stream_);
+    mla_context(ctx_, scores_, mla_kv_, sel_tokens_, n_tok_, sel_stride_, sel_stride_, batch,
+                n_streams, slot, heads, kvl, stream_);
+  }
   if (dbg3) {
     mla_dump_ints("mla-sel", layer, sel_tokens_, n_tok_, sel_stride_, batch);
     mla_dump_score("mla-ctx", layer, ctx_, batch, heads);

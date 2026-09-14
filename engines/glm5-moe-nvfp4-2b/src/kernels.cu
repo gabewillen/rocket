@@ -656,6 +656,61 @@ __global__ void mla_context_kernel(float* __restrict__ ctx, const float* __restr
 // Decode specialization: one warp owns one head. Each lane accumulates 16
 // latent dimensions in the same token order as mla_context_kernel, while a
 // single lane resolves each radix-selected page-table entry for the warp.
+__global__ void mla_fused_context_kernel(float* __restrict__ ctx,
+                                         const float* __restrict__ q_abs, KvPages kv,
+                                         const int* __restrict__ sel,
+                                         const int* __restrict__ n_sel, int sel_stride,
+                                         int layer_slot, int kv_lora, float scaling,
+                                         int n_streams) {
+  const int h = blockIdx.x, m = blockIdx.y, lane = threadIdx.x;
+  const int st = n_streams > 0 ? m % n_streams : m;
+  const int* sel_row = sel + static_cast<long long>(m) * sel_stride;
+  const float* q = q_abs + (static_cast<long long>(m) * gridDim.x + h) * kv_lora;
+  float2 qv[8], acc[8]{};
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    qv[j].x = q[2 * lane + j * 64];
+    qv[j].y = q[2 * lane + j * 64 + 1];
+  }
+  float mx = -CUDART_INF_F, sum = 0.f;
+  for (int i = 0; i < n_sel[m]; ++i) {
+    int page = 0, slot = 0;
+    if (lane == 0) kv_locate(kv, st, sel_row[i], &page, &slot);
+    page = __shfl_sync(0xffffffffu, page, 0);
+    slot = __shfl_sync(0xffffffffu, slot, 0);
+    const long long src =
+        ((static_cast<long long>(page) * kv.layers + layer_slot) * kv.page_tokens + slot) * kv_lora;
+    float2 lv[8];
+    float dot = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      lv[j] = __bfloat1622float2(
+          reinterpret_cast<const __nv_bfloat162*>(kv.latent + src)[lane + j * 32]);
+      dot = fmaf(qv[j].x, lv[j].x, dot);
+      dot = fmaf(qv[j].y, lv[j].y, dot);
+    }
+    for (int off = 16; off > 0; off >>= 1)
+      dot += __shfl_down_sync(0xffffffffu, dot, off);
+    dot = __shfl_sync(0xffffffffu, dot, 0) * scaling;
+    const float next_mx = fmaxf(mx, dot);
+    const float old_scale = mx == -CUDART_INF_F ? 0.f : __expf(mx - next_mx);
+    const float new_scale = __expf(dot - next_mx);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      acc[j].x = acc[j].x * old_scale + lv[j].x * new_scale;
+      acc[j].y = acc[j].y * old_scale + lv[j].y * new_scale;
+    }
+    sum = sum * old_scale + new_scale;
+    mx = next_mx;
+  }
+  float* out = ctx + (static_cast<long long>(m) * gridDim.x + h) * kv_lora;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    out[2 * lane + j * 64] = acc[j].x / sum;
+    out[2 * lane + j * 64 + 1] = acc[j].y / sum;
+  }
+}
+
 __global__ void mla_context_warp_kernel(float* __restrict__ ctx,
                                         const float* __restrict__ scores, KvPages kv,
                                         const int* __restrict__ sel,
@@ -1535,6 +1590,13 @@ void mla_scores(float* scores, const float* q_abs, const KvPages& kv, const int*
 void mla_softmax(float* scores, const int* n_sel, int sel_stride, int batch, int heads,
                  cudaStream_t s) {
   mla_softmax_kernel<<<dim3(heads, batch), 256, 0, s>>>(scores, n_sel, sel_stride, heads);
+}
+void mla_fused_context(float* ctx, const float* q_abs, const KvPages& kv, const int* sel,
+                       const int* n_sel, int sel_stride, int batch, int n_streams,
+                       int layer_slot, int heads, int kv_lora, float scaling, cudaStream_t s) {
+  if (kv_lora != 512) throw std::runtime_error("mla_fused_context requires kv_lora=512");
+  mla_fused_context_kernel<<<dim3(heads, batch), 32, 0, s>>>(
+      ctx, q_abs, kv, sel, n_sel, sel_stride, layer_slot, kv_lora, scaling, n_streams);
 }
 void mla_context(float* ctx, const float* scores, const KvPages& kv, const int* sel,
                  const int* n_sel, int n_sel_max, int sel_stride, int batch, int n_streams,
