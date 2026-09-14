@@ -576,10 +576,32 @@ int main(int argc, char** argv) {
       spec_tokens.assign(batch * K, 0);
       std::vector<int> dflash_tokens;
       std::vector<int> draft_slots;
+      std::vector<std::vector<int>> lookup(batch);
+      if (std::getenv("ROCKET_PROMPT_LOOKUP") && !draft_ids) {
+        for (int m = 0; m < batch; ++m) if (active[m]) {
+          std::vector<int> history = prompt_ids[m];
+          history.insert(history.end(), generated[m].begin(), generated[m].end());
+          // Prefer the longest exact suffix. Require enough following tokens
+          // for the whole verify window so lookup never falls back to repeated
+          // padding after an ambiguous short code fragment.
+          for (int ngram = 8; ngram >= 3 && lookup[m].empty(); --ngram) {
+            if (history.size() < static_cast<std::size_t>(ngram + K - 1)) continue;
+            const std::size_t suffix = history.size() - ngram;
+            for (std::size_t at = 0; at + ngram + K - 1 <= suffix; ++at) {
+              if (std::equal(history.begin() + at, history.begin() + at + ngram,
+                             history.begin() + suffix)) {
+                lookup[m].assign(history.begin() + at + ngram,
+                                 history.begin() + at + ngram + K - 1);
+                break;
+              }
+            }
+          }
+        }
+      }
       if (dflash && !draft_ids) {
         const auto draft_t0 = Clock::now();
         std::vector<int> draft_anchor, draft_pos;
-        for (int m = 0; m < batch; ++m) if (active[m]) {
+        for (int m = 0; m < batch; ++m) if (active[m] && lookup[m].empty()) {
           draft_slots.push_back(m);
           draft_anchor.push_back(last[m]);
           draft_pos.push_back(engine.position(m));
@@ -605,6 +627,8 @@ int main(int argc, char** argv) {
         if (draft_ids) {
           for (int j = 1; j < K && g.size() + j - 1 < draft_ids->size(); ++j)
             d.push_back((*draft_ids)[g.size() + j - 1]);
+        } else if (!lookup[m].empty()) {
+          d = lookup[m];
         } else if (dflash) {
           const auto it = std::find(draft_slots.begin(), draft_slots.end(), m);
           const int compact = static_cast<int>(it - draft_slots.begin());
