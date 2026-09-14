@@ -1386,7 +1386,7 @@ void gemm_fp8_row(bf16* y, const std::uint8_t* w, const float* scales, const bf1
 }
 
 void gemm_bf16(bf16* y, const bf16* w, const bf16* x, int batch, int n_rows, int k, cudaStream_t s) {
-  if (batch >= 16 && std::getenv("ROCKET_CUBLAS_ALL")) {
+  if (batch >= 8 && std::getenv("ROCKET_CUBLAS_ALL")) {
     gemm_bf16_cublas(y, w, x, batch, n_rows, k, s);
     return;
   }
@@ -1408,7 +1408,7 @@ void gemm_bf16_cublas(bf16* y, const bf16* w, const bf16* x, int batch, int n_ro
 }
 void gemm_bf16_f32(float* y, const bf16* w, const bf16* x, int batch, int n_rows, int k,
                    cudaStream_t s) {
-  if (batch >= 16 && std::getenv("ROCKET_CUBLAS_ALL")) {
+  if (batch >= 8 && std::getenv("ROCKET_CUBLAS_ALL")) {
     static cublasHandle_t handle = nullptr;
     if (!handle && cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS)
       throw std::runtime_error("cublasCreate failed");
