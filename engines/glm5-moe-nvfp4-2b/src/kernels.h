@@ -54,6 +54,8 @@ void fp32_to_bf16_rows(void* dst, const void* src, long long n, cudaStream_t s);
 void mul_scalar_bf16(bf16* out, const bf16* in, float scalar, long long n, cudaStream_t s);
 void gemm_fp8_row(bf16* y, const std::uint8_t* w, const float* scales, const bf16* x,
                    int batch, int n_rows, int k, int row_off, cudaStream_t s);
+void dequant_fp8_row(bf16* out, const std::uint8_t* w, const float* scales,
+                     int n_rows, int k, int row_off, cudaStream_t s);
 void gemm_bf16(bf16* y, const bf16* w, const bf16* x, int batch, int n_rows, int k, cudaStream_t s);
 // Tensor-core path for large verification matrices. Same row-major contract.
 void gemm_bf16_cublas(bf16* y, const bf16* w, const bf16* x, int batch, int n_rows, int k,

@@ -355,27 +355,38 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
   } guard{owned_, pinned_raw_};
 
   // FP8-per-row overlay loader: reads {weight.u8, weight_scale.f32} produced
-  // by materialize-nvfp4-overlay --fp8-row. Rows must match the bf16 tensor's
-  // row count exactly; the bf16 upload still happens (provenance + fallback).
+  // by materialize-nvfp4-overlay --fp8-row. A successful load is the serving
+  // representation, so callers must not also upload the BF16 source tensor.
   auto try_fp8_row = [&](const std::string& tensor_name, std::int64_t rows,
-                         std::int64_t k_true, Fp8RowW& out) {
+                         std::int64_t k_true, Fp8RowW& out) -> bool {
     const char* root = std::getenv("ROCKET_FP8_ATTN_DIR");
-    if (root == nullptr) return;
+    if (root == nullptr) return false;
     // tensor_name -> overlay subdir: layers.N.self_attn.o_proj.weight -> l-N/o_proj
     const std::size_t layers = tensor_name.find("layers.");
-    if (layers == std::string::npos) return;
+    if (layers == std::string::npos) return false;
     const std::string rest = tensor_name.substr(layers + 7);
     const std::size_t dot = rest.find('.');
-    if (dot == std::string::npos) return;
+    if (dot == std::string::npos) return false;
     const std::string layer_id = rest.substr(0, dot);
     std::string leaf = rest.substr(dot + 1);
-    for (const std::string suffix : {".weight"}) {
-      const std::size_t at = leaf.rfind(suffix);
-      if (at != std::string::npos && at + suffix.size() == leaf.size()) leaf = leaf.substr(0, at);
+    if (leaf.starts_with("self_attn.")) leaf.erase(0, std::string("self_attn.").size());
+    const std::string suffix = ".weight";
+    const std::size_t at = leaf.rfind(suffix);
+    if (at != std::string::npos && at + suffix.size() == leaf.size()) leaf.resize(at);
+    const std::filesystem::path root_path(root);
+    const std::filesystem::path layer = "l-" + layer_id;
+    std::filesystem::path dir;
+    for (const std::filesystem::path candidate : {
+             root_path / layer / leaf,
+             root_path / "kda-o-fp8" / layer / leaf,
+             root_path / "kda-o-fp8" / layer,
+             root_path / "mla-fp8" / layer / leaf}) {
+      if (std::filesystem::exists(candidate / "weight.u8")) {
+        dir = candidate;
+        break;
+      }
     }
-    const std::filesystem::path dir =
-        std::filesystem::path(root) / ("l-" + layer_id) / leaf;
-    if (!std::filesystem::exists(dir / "weight.u8")) return;
+    if (dir.empty()) return false;
     const auto packed = read_file(dir / "weight.u8", static_cast<std::size_t>(rows) * k_true);
     const auto scales = read_file(dir / "weight_scale.f32", static_cast<std::size_t>(rows) * 4);
     auto* pd = static_cast<std::uint8_t*>(device_alloc(packed.size()));
@@ -384,6 +395,7 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
     copy_in(sd, scales.data(), scales.size());
     out.packed = pd;
     out.scales = sd;
+    return true;
   };
 
   pinned_bytes_ = 64u << 20;
@@ -419,28 +431,63 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
 
     if (cfg_.layers[l].attn == fuel::AttnKind::kKda) {
       const std::string a = p + "self_attn.";
-      w.kda.qkv = upload_concat({a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"},
-                                static_cast<std::int64_t>(3) * qkv * H);
-      if (const char* fp8_dir = std::getenv("ROCKET_KDA_QKV_FP8_DIR")) {
-        const std::filesystem::path layer_dir =
-            std::filesystem::path(fp8_dir) / ("l-" + std::to_string(l));
-        if (std::filesystem::exists(layer_dir / "weight.u8")) {
-          const auto packed =
-              read_file(layer_dir / "weight.u8", static_cast<std::size_t>(3) * qkv * H);
-          const auto scales =
-              read_file(layer_dir / "weight_scale.f32", static_cast<std::size_t>(3) * qkv * 4);
-          auto* pd = static_cast<std::uint8_t*>(device_alloc(packed.size()));
-          copy_in(pd, packed.data(), packed.size());
-          auto* sd = static_cast<float*>(device_alloc(scales.size()));
-          copy_in(sd, scales.data(), scales.size());
-          w.kda.qkv_fp8.packed = pd;
-          w.kda.qkv_fp8.scales = sd;
+      bool qkv_overlay_loaded = false;
+      {
+        if (const char* fp4_dir = std::getenv("ROCKET_KDA_QKV_NVFP4_DIR")) {
+          const std::filesystem::path layer_dir =
+              std::filesystem::path(fp4_dir) / ("l-" + std::to_string(l));
+          if (std::filesystem::exists(layer_dir / "weight.u8")) {
+            const auto packed = read_file(layer_dir / "weight.u8",
+                static_cast<std::size_t>(3) * qkv * H / 2);
+            const auto scale = read_file(layer_dir / "weight_scale.f8_e4m3",
+                static_cast<std::size_t>(3) * qkv * H / 16);
+            const auto global = read_file(layer_dir / "weight_scale_2.f32", sizeof(float));
+            auto* pd = static_cast<std::uint8_t*>(device_alloc(packed.size()));
+            auto* sd = static_cast<std::uint8_t*>(device_alloc(scale.size()));
+            copy_in(pd, packed.data(), packed.size());
+            copy_in(sd, scale.data(), scale.size());
+            w.kda.qkv_fp4.packed = pd;
+            w.kda.qkv_fp4.scale = sd;
+            std::memcpy(&w.kda.qkv_fp4.global, global.data(), sizeof(float));
+            qkv_overlay_loaded = true;
+          }
+        }
+        if (!qkv_overlay_loaded) {
+          if (const char* fp8_dir = std::getenv("ROCKET_KDA_QKV_FP8_DIR")) {
+            const std::filesystem::path layer_dir =
+                std::filesystem::path(fp8_dir) / ("l-" + std::to_string(l));
+            if (std::filesystem::exists(layer_dir / "weight.u8")) {
+              const auto packed =
+                  read_file(layer_dir / "weight.u8", static_cast<std::size_t>(3) * qkv * H);
+              const auto scales =
+                  read_file(layer_dir / "weight_scale.f32", static_cast<std::size_t>(3) * qkv * 4);
+              auto* pd = static_cast<std::uint8_t*>(device_alloc(packed.size()));
+              auto* sd = static_cast<float*>(device_alloc(scales.size()));
+              copy_in(pd, packed.data(), packed.size());
+              copy_in(sd, scales.data(), scales.size());
+              w.kda.qkv_fp8.packed = pd;
+              w.kda.qkv_fp8.scales = sd;
+              qkv_overlay_loaded = true;
+            }
+          }
         }
       }
-      if (const char* overlay = std::getenv("ROCKET_KDA_Q_NVFP4_OBJECT")) {
-        const int overlay_layer = std::atoi(std::getenv("ROCKET_KDA_Q_NVFP4_LAYER")
-                                                ? std::getenv("ROCKET_KDA_Q_NVFP4_LAYER") : "-1");
-        if (l == overlay_layer) {
+      const char* q_only_overlay = std::getenv("ROCKET_KDA_Q_NVFP4_OBJECT");
+      const int q_only_layer = std::atoi(std::getenv("ROCKET_KDA_Q_NVFP4_LAYER")
+                                             ? std::getenv("ROCKET_KDA_Q_NVFP4_LAYER") : "-1");
+      const bool use_q_only_overlay = !qkv_overlay_loaded && q_only_overlay != nullptr &&
+                                      l == q_only_layer;
+      if (!qkv_overlay_loaded) {
+        if (use_q_only_overlay)
+          w.kda.kv = upload_concat({a + "k_proj.weight", a + "v_proj.weight"},
+                                   static_cast<std::int64_t>(2) * qkv * H);
+        else
+          w.kda.qkv = upload_concat({a + "q_proj.weight", a + "k_proj.weight", a + "v_proj.weight"},
+                                    static_cast<std::int64_t>(3) * qkv * H);
+      }
+      if (use_q_only_overlay) {
+        const char* overlay = q_only_overlay;
+        {
           const std::filesystem::path object(overlay);
           const auto packed = read_file(object / "weight.u8", static_cast<std::size_t>(qkv) * H / 2);
           const auto scale = read_file(object / "weight_scale.f8_e4m3",
@@ -468,34 +515,37 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
       w.kda.a_log = upload_f32(a + "A_log", cfg_.kda_heads);
       w.kda.dt_bias = upload_f32(a + "dt_bias", qkv);
       w.kda.o_norm = upload_bf16(a + "o_norm.weight", hd);
-      w.kda.o_proj = upload_bf16(a + "o_proj.weight", static_cast<std::int64_t>(H) * qkv);
-      try_fp8_row(a + "o_proj.weight", H, qkv, w.kda.o_proj_fp8);
+      if (!try_fp8_row(a + "o_proj.weight", H, qkv, w.kda.o_proj_fp8))
+        w.kda.o_proj = upload_bf16(a + "o_proj.weight", static_cast<std::int64_t>(H) * qkv);
     } else {
       const std::string a = p + "self_attn.";
-      w.mla.q_a = upload_bf16(a + "q_a_proj.weight", static_cast<std::int64_t>(cfg_.q_lora_rank) * H);
+      if (!try_fp8_row(a + "q_a_proj.weight", cfg_.q_lora_rank, H, w.mla.q_a_fp8))
+        w.mla.q_a = upload_bf16(a + "q_a_proj.weight", static_cast<std::int64_t>(cfg_.q_lora_rank) * H);
       w.mla.q_a_norm = upload_bf16(a + "q_a_layernorm.weight", cfg_.q_lora_rank);
-      w.mla.q_b = upload_bf16(a + "q_b_proj.weight",
-                              static_cast<std::int64_t>(cfg_.mla_heads) * qk * cfg_.q_lora_rank);
-      w.mla.kv_a = upload_bf16(a + "kv_a_proj_with_mqa.weight",
-                               static_cast<std::int64_t>(cfg_.kv_lora_rank + cfg_.qk_rope_head_dim) * H);
+      if (!try_fp8_row(a + "q_b_proj.weight", cfg_.mla_heads * qk,
+                       cfg_.q_lora_rank, w.mla.q_b_fp8))
+        w.mla.q_b = upload_bf16(a + "q_b_proj.weight",
+                                static_cast<std::int64_t>(cfg_.mla_heads) * qk * cfg_.q_lora_rank);
+      if (!try_fp8_row(a + "kv_a_proj_with_mqa.weight",
+                       cfg_.kv_lora_rank + cfg_.qk_rope_head_dim, H, w.mla.kv_a_fp8))
+        w.mla.kv_a = upload_bf16(a + "kv_a_proj_with_mqa.weight",
+                                 static_cast<std::int64_t>(cfg_.kv_lora_rank + cfg_.qk_rope_head_dim) * H);
       w.mla.kv_a_norm = upload_bf16(a + "kv_a_layernorm.weight", cfg_.kv_lora_rank);
+      // kv_b is consumed directly by the absorb/expand kernels. Keep BF16
+      // until those kernels have an FP8 operand path; do not load an unused overlay.
       w.mla.kv_b = upload_bf16(a + "kv_b_proj.weight",
                                static_cast<std::int64_t>(cfg_.mla_kv_b_out()) * cfg_.kv_lora_rank);
-      w.mla.o_proj = upload_bf16(a + "o_proj.weight",
-                                 static_cast<std::int64_t>(H) * cfg_.mla_heads * cfg_.v_head_dim);
-      try_fp8_row(a + "o_proj.weight", H, cfg_.mla_heads * cfg_.v_head_dim, w.mla.o_proj_fp8);
-      try_fp8_row(a + "q_b_proj.weight", cfg_.mla_heads * qk, cfg_.q_lora_rank, w.mla.q_b_fp8);
-      try_fp8_row(a + "kv_b_proj.weight", cfg_.mla_kv_b_out(), cfg_.kv_lora_rank, w.mla.kv_b_fp8);
-      try_fp8_row(a + "q_a_proj.weight", cfg_.q_lora_rank, H, w.mla.q_a_fp8);
-      try_fp8_row(a + "kv_a_proj_with_mqa.weight", cfg_.kv_lora_rank + cfg_.qk_rope_head_dim, H,
-                  w.mla.kv_a_fp8);
+      if (!try_fp8_row(a + "o_proj.weight", H,
+                       cfg_.mla_heads * cfg_.v_head_dim, w.mla.o_proj_fp8))
+        w.mla.o_proj = upload_bf16(a + "o_proj.weight",
+                                   static_cast<std::int64_t>(H) * cfg_.mla_heads * cfg_.v_head_dim);
       const std::string ix = a + "indexer.";
-      try_fp8_row(ix + "wq_b.weight", cfg_.index_n_heads * cfg_.index_head_dim, cfg_.q_lora_rank,
-                  w.mla.idx_wq_b_fp8);
       w.mla.idx_wk = upload_bf16(ix + "wk.weight", static_cast<std::int64_t>(cfg_.index_head_dim) * H);
-      w.mla.idx_wq_b = upload_bf16(
-          ix + "wq_b.weight",
-          static_cast<std::int64_t>(cfg_.index_n_heads) * cfg_.index_head_dim * cfg_.q_lora_rank);
+      if (!try_fp8_row(ix + "wq_b.weight", cfg_.index_n_heads * cfg_.index_head_dim,
+                       cfg_.q_lora_rank, w.mla.idx_wq_b_fp8))
+        w.mla.idx_wq_b = upload_bf16(
+            ix + "wq_b.weight",
+            static_cast<std::int64_t>(cfg_.index_n_heads) * cfg_.index_head_dim * cfg_.q_lora_rank);
       w.mla.idx_k_norm_w = upload_bf16(ix + "k_norm.weight", cfg_.index_head_dim);
       w.mla.idx_k_norm_b = upload_bf16(ix + "k_norm.bias", cfg_.index_head_dim);
       w.mla.idx_weights = upload_bf16(ix + "weights_proj.weight",
@@ -590,19 +640,25 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
       w.moe.router = upload_bf16(p + "mlp.gate.weight",
                                  static_cast<std::int64_t>(cfg_.n_routed_experts) * H);
       w.moe.router_bias = upload_f32(p + "mlp.gate.e_score_correction_bias", cfg_.n_routed_experts);
-      w.moe.shared.gate =
-          upload_bf16(p + "mlp.shared_experts.gate_proj.weight", static_cast<std::int64_t>(SI) * H);
-      w.moe.shared.up =
-          upload_bf16(p + "mlp.shared_experts.up_proj.weight", static_cast<std::int64_t>(SI) * H);
-      w.moe.shared.down =
-          upload_bf16(p + "mlp.shared_experts.down_proj.weight", static_cast<std::int64_t>(H) * SI);
+      const char* shared_fp4_root = std::getenv("ROCKET_FP4_SHARED_DIR");
+      const std::filesystem::path shared_fp4_dir = shared_fp4_root == nullptr
+          ? std::filesystem::path{}
+          : std::filesystem::path(shared_fp4_root) / ("l-" + std::to_string(l));
+      const bool shared_fp4_available = shared_fp4_root != nullptr &&
+          std::filesystem::exists(shared_fp4_dir / "gate_proj" / "weight.u8");
+      if (!shared_fp4_available) {
+        w.moe.shared.gate = upload_bf16(p + "mlp.shared_experts.gate_proj.weight",
+                                        static_cast<std::int64_t>(SI) * H);
+        w.moe.shared.up = upload_bf16(p + "mlp.shared_experts.up_proj.weight",
+                                      static_cast<std::int64_t>(SI) * H);
+        w.moe.shared.down = upload_bf16(p + "mlp.shared_experts.down_proj.weight",
+                                        static_cast<std::int64_t>(H) * SI);
+      }
       // Shared experts to NVFP4 (same operand convention as the routed
       // experts): a fused gate|up packed slab with pre-swizzled SFBs, down
       // separate, all under ROCKET_FP4_SHARED_DIR/l-<layer>/<proj>/.
-      if (const char* fp4dir = std::getenv("ROCKET_FP4_SHARED_DIR")) {
-        const std::filesystem::path ld =
-            std::filesystem::path(fp4dir) / ("l-" + std::to_string(l));
-        if (std::filesystem::exists(ld / "gate_proj" / "weight.u8")) {
+      if (shared_fp4_available) {
+        const std::filesystem::path& ld = shared_fp4_dir;
           const fuel::SfLayout lay = fuel::sf_layout(SI, H, 16);
           const auto gp = read_file(ld / "gate_proj" / "weight.u8",
                                     static_cast<std::size_t>(SI) * H / 2);
@@ -641,7 +697,6 @@ WeightStore::WeightStore(const fuel::ModelConfig& cfg, const std::filesystem::pa
           std::memcpy(&w.moe.shared.fp4_gate.global, gg.data(), sizeof(float));
           std::memcpy(&w.moe.shared.fp4_up.global, ug.data(), sizeof(float));
           std::memcpy(&w.moe.shared.fp4_down.global, dg.data(), sizeof(float));
-        }
       }
     }
   }

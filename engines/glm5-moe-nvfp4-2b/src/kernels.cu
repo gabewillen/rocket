@@ -1,4 +1,5 @@
 #include "kernels.h"
+#include <algorithm>
 #include <stdexcept>
 
 #include <cstdio>
@@ -131,6 +132,19 @@ __global__ void gemm_fp8_row_batched_kernel(Out* __restrict__ y, const std::uint
         yr[blockIdx.x] = b(total);
       }
     }
+  }
+}
+
+__global__ void dequant_fp8_row_kernel(bf16* __restrict__ out,
+                                       const std::uint8_t* __restrict__ w,
+                                       const float* __restrict__ scales,
+                                       long long elements, int k, int row_off) {
+  for (long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < elements; i += static_cast<long long>(blockDim.x) * gridDim.x) {
+    const int row = static_cast<int>(i / k);
+    const long long src = static_cast<long long>(row + row_off) * k + (i - static_cast<long long>(row) * k);
+    const float v = static_cast<float>(reinterpret_cast<const __nv_fp8_e4m3*>(w)[src]);
+    out[i] = b(v * scales[row + row_off]);
   }
 }
 
@@ -1252,8 +1266,29 @@ void gemm_fp8_row_dispatch(Out* y, const std::uint8_t* w, const float* scales, c
   }
 }
 
+void dequant_fp8_row(bf16* out, const std::uint8_t* w, const float* scales,
+                     int n_rows, int k, int row_off, cudaStream_t s) {
+  const long long elements = static_cast<long long>(n_rows) * k;
+  const int blocks = static_cast<int>(std::min<long long>((elements + 255) / 256, 65535));
+  dequant_fp8_row_kernel<<<blocks, 256, 0, s>>>(out, w, scales, elements, k, row_off);
+}
+
 void gemm_fp8_row(bf16* y, const std::uint8_t* w, const float* scales, const bf16* x, int batch,
                   int n_rows, int k, int row_off, cudaStream_t s) {
+  if (batch >= 8 && std::getenv("ROCKET_FP8_CUBLAS")) {
+    static bf16* scratch = nullptr;
+    static std::size_t scratch_elements = 0;
+    const std::size_t need = static_cast<std::size_t>(n_rows) * k;
+    if (need > scratch_elements) {
+      if (scratch != nullptr) cudaFree(scratch);
+      if (cudaMalloc(&scratch, need * sizeof(bf16)) != cudaSuccess)
+        throw std::runtime_error("FP8 dequant scratch allocation failed");
+      scratch_elements = need;
+    }
+    dequant_fp8_row(scratch, w, scales, n_rows, k, row_off, s);
+    gemm_bf16_cublas(y, scratch, x, batch, n_rows, k, s);
+    return;
+  }
   gemm_fp8_row_dispatch<bf16>(y, w, scales, x, batch, n_rows, k, row_off, s);
 }
 

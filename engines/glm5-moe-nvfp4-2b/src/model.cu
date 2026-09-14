@@ -989,12 +989,27 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
   const int tc_batch = max_batch_ * kSpecMax;
 
   static const bool tc_proj = std::getenv("ROCKET_KDA_CUBLAS") != nullptr;
-  if (tc_proj) {
+  if (tc_proj && k.qkv_fp4.packed == nullptr && k.qkv_fp8.packed == nullptr &&
+      k.q_overlay.packed == nullptr) {
     gemm_bf16_cublas(q_raw_, k.qkv, normed_, tc_batch, qkv, H, stream_);
     gemm_bf16_cublas(k_raw_, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, tc_batch, qkv, H,
                      stream_);
     gemm_bf16_cublas(v_raw_, k.qkv + static_cast<std::size_t>(2) * qkv * H, normed_, tc_batch, qkv, H,
                      stream_);
+  } else if (k.qkv_fp4.packed != nullptr) {
+    const std::size_t packed_stride = static_cast<std::size_t>(qkv) * H / 2;
+    const std::size_t scale_stride = static_cast<std::size_t>(qkv) * H / 16;
+    for (int m = 0; m < batch; ++m) {
+      const bf16* x = normed_ + static_cast<std::size_t>(m) * H;
+      gemv_nvfp4(q_raw_ + static_cast<std::size_t>(m) * qkv,
+                 k.qkv_fp4.packed, k.qkv_fp4.scale, k.qkv_fp4.global, x, qkv, H, stream_);
+      gemv_nvfp4(k_raw_ + static_cast<std::size_t>(m) * qkv,
+                 k.qkv_fp4.packed + packed_stride, k.qkv_fp4.scale + scale_stride,
+                 k.qkv_fp4.global, x, qkv, H, stream_);
+      gemv_nvfp4(v_raw_ + static_cast<std::size_t>(m) * qkv,
+                 k.qkv_fp4.packed + 2 * packed_stride, k.qkv_fp4.scale + 2 * scale_stride,
+                 k.qkv_fp4.global, x, qkv, H, stream_);
+    }
   } else if (k.qkv_fp8.packed != nullptr) {
     // FP8-per-row q/k/v (same row order as the bf16 concat): half the weight
     // bytes of the largest per-token family. Batch-invariant kernel keeps
@@ -1008,6 +1023,8 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
       gemv_nvfp4(q_raw_ + static_cast<std::size_t>(m) * qkv, k.q_overlay.packed,
                  k.q_overlay.scale, k.q_overlay.global,
                  normed_ + static_cast<std::size_t>(m) * H, qkv, H, stream_);
+    gemm_bf16(k_raw_, k.kv, normed_, batch, qkv, H, stream_);
+    gemm_bf16(v_raw_, k.kv + static_cast<std::size_t>(qkv) * H, normed_, batch, qkv, H, stream_);
   } else {
     gemm_bf16(q_raw_, k.qkv, normed_, batch, qkv, H, stream_);
     gemm_bf16(k_raw_, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, batch, qkv, H,
@@ -1149,7 +1166,7 @@ void DecodeEngine::run_kda(int layer, int slot, int batch) {
                   qkv);
   kda_gated_norm(kda_on_, kda_o_, lr_b_, k.o_norm, batch, heads, hd, cfg_.rms_norm_eps, stream_);
   k_mark("o_norm");
-  if (tc_proj)
+  if (tc_proj && k.o_proj_fp8.packed == nullptr)
     gemm_bf16_cublas(sublayer_out_, k.o_proj, kda_on_, tc_batch, H, qkv, stream_);
   else if (k.o_proj_fp8.packed != nullptr)
     gemm_fp8_row(sublayer_out_, k.o_proj_fp8.packed, k.o_proj_fp8.scales, kda_on_, batch, H, qkv,
@@ -1215,12 +1232,27 @@ void DecodeEngine::run_kda_spec_site(int layer, int positions, int batch, const 
                      : (draft ? kda_spec_qkv_rail_ + rail_qkv + 2 * rail_rows * qkv : v_raw_);
 
   static const bool tc_proj = std::getenv("ROCKET_KDA_CUBLAS") != nullptr;
-  if (tc_proj) {
+  if (tc_proj && k.qkv_fp4.packed == nullptr && k.qkv_fp8.packed == nullptr &&
+      k.q_overlay.packed == nullptr) {
     gemm_bf16_cublas(q_work, k.qkv, normed_, tc_rows, qkv, H, stream_);
     gemm_bf16_cublas(k_work, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, tc_rows, qkv, H,
                      stream_);
     gemm_bf16_cublas(v_work, k.qkv + static_cast<std::size_t>(2) * qkv * H, normed_, tc_rows, qkv, H,
                      stream_);
+  } else if (k.qkv_fp4.packed != nullptr) {
+    const std::size_t packed_stride = static_cast<std::size_t>(qkv) * H / 2;
+    const std::size_t scale_stride = static_cast<std::size_t>(qkv) * H / 16;
+    for (int r = 0; r < rows; ++r) {
+      const bf16* x = normed_ + static_cast<std::size_t>(r) * H;
+      gemv_nvfp4(q_work + static_cast<std::size_t>(r) * qkv,
+                 k.qkv_fp4.packed, k.qkv_fp4.scale, k.qkv_fp4.global, x, qkv, H, stream_);
+      gemv_nvfp4(k_work + static_cast<std::size_t>(r) * qkv,
+                 k.qkv_fp4.packed + packed_stride, k.qkv_fp4.scale + scale_stride,
+                 k.qkv_fp4.global, x, qkv, H, stream_);
+      gemv_nvfp4(v_work + static_cast<std::size_t>(r) * qkv,
+                 k.qkv_fp4.packed + 2 * packed_stride, k.qkv_fp4.scale + 2 * scale_stride,
+                 k.qkv_fp4.global, x, qkv, H, stream_);
+    }
   } else if (k.qkv_fp8.packed != nullptr) {
     gemm_fp8_row(q_work, k.qkv_fp8.packed, k.qkv_fp8.scales, normed_, rows, qkv, H, 0, stream_);
     gemm_fp8_row(k_work, k.qkv_fp8.packed, k.qkv_fp8.scales, normed_, rows, qkv, H, qkv, stream_);
@@ -1230,8 +1262,8 @@ void DecodeEngine::run_kda_spec_site(int layer, int positions, int batch, const 
       gemv_nvfp4(q_work + static_cast<std::size_t>(r) * qkv, k.q_overlay.packed,
                  k.q_overlay.scale, k.q_overlay.global,
                  normed_ + static_cast<std::size_t>(r) * H, qkv, H, stream_);
-    gemm_bf16(k_work, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, rows, qkv, H, stream_);
-    gemm_bf16(v_work, k.qkv + static_cast<std::size_t>(2) * qkv * H, normed_, rows, qkv, H, stream_);
+    gemm_bf16(k_work, k.kv, normed_, rows, qkv, H, stream_);
+    gemm_bf16(v_work, k.kv + static_cast<std::size_t>(qkv) * H, normed_, rows, qkv, H, stream_);
   } else {
     gemm_bf16(q_work, k.qkv, normed_, rows, qkv, H, stream_);
     gemm_bf16(k_work, k.qkv + static_cast<std::size_t>(qkv) * H, normed_, rows, qkv, H, stream_);
@@ -1298,7 +1330,7 @@ void DecodeEngine::run_kda_spec_site(int layer, int positions, int batch, const 
   k_mark("output gate + norm");
   if (dbg3) print_streams_checksum(layer, "spec-kda4", rows, static_cast<std::size_t>(rows) * qkv,
                                    kda_on_, qkv);
-  if (tc_proj)
+  if (tc_proj && k.o_proj_fp8.packed == nullptr)
     gemm_bf16_cublas(sublayer_out_, k.o_proj, kda_on_, tc_rows, H, qkv, stream_);
   else if (k.o_proj_fp8.packed != nullptr)
     gemm_fp8_row(sublayer_out_, k.o_proj_fp8.packed, k.o_proj_fp8.scales, kda_on_, rows, H, qkv,
@@ -1320,7 +1352,7 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   static const bool tc_all = std::getenv("ROCKET_CUBLAS_ALL") != nullptr;
   const int tc_batch = max_batch_ * (spec_k_ > kSpecMax ? max_work_k_ : kSpecMax);
 
-  if (tc_all)
+  if (tc_all && m.q_a_fp8.packed == nullptr)
     gemm_bf16_cublas(q_resid_raw_, m.q_a, normed_, tc_batch, cfg_.q_lora_rank, H, stream_);
   else if (m.q_a_fp8.packed != nullptr)
     gemm_fp8_row(q_resid_raw_, m.q_a_fp8.packed, m.q_a_fp8.scales, normed_, batch,
@@ -1328,7 +1360,7 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   else
     gemm_bf16(q_resid_raw_, m.q_a, normed_, batch, cfg_.q_lora_rank, H, stream_);
   rmsnorm(q_resid_, q_resid_raw_, m.q_a_norm, batch, cfg_.q_lora_rank, cfg_.rms_norm_eps, stream_);
-  if (tc_all)
+  if (tc_all && m.q_b_fp8.packed == nullptr)
     gemm_bf16_cublas(q_, m.q_b, q_resid_, tc_batch, heads * cfg_.qk_head_dim(),
                      cfg_.q_lora_rank, stream_);
   else if (m.q_b_fp8.packed != nullptr)
@@ -1340,7 +1372,7 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
     record_absmax("layer" + std::to_string(layer) + ".mla_q.output", q_, batch,
                   heads * cfg_.qk_head_dim());
 
-  if (tc_all)
+  if (tc_all && m.kv_a_fp8.packed == nullptr)
     gemm_bf16_cublas(ckv_, m.kv_a, normed_, tc_batch, kvl, H, stream_);
   else if (m.kv_a_fp8.packed != nullptr)
     gemm_fp8_row(ckv_, m.kv_a_fp8.packed, m.kv_a_fp8.scales, normed_, batch, kvl, H, 0, stream_);
@@ -1350,7 +1382,7 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
     record_absmax("layer" + std::to_string(layer) + ".mla_kv.output", ckv_, batch, kvl);
   rmsnorm(latent_stage_, ckv_, m.kv_a_norm, batch, kvl, cfg_.rms_norm_eps, stream_);
 
-  if (tc_all)
+  if (tc_all && m.idx_wq_b_fp8.packed == nullptr)
     gemm_bf16_cublas(q_idx_, m.idx_wq_b, q_resid_, tc_batch, ih * ihd, cfg_.q_lora_rank, stream_);
   else if (m.idx_wq_b_fp8.packed != nullptr)
     gemm_fp8_row(q_idx_, m.idx_wq_b_fp8.packed, m.idx_wq_b_fp8.scales, q_resid_, batch, ih * ihd,
@@ -1417,7 +1449,7 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   }
   mla_expand_v(v_out_, m.kv_b, ctx_, batch, heads, cfg_.qk_nope_head_dim, cfg_.v_head_dim, kvl,
               stream_);
-  if (tc_all)
+  if (tc_all && m.o_proj_fp8.packed == nullptr)
     gemm_bf16_cublas(sublayer_out_, m.o_proj, v_out_, tc_batch, H, heads * cfg_.v_head_dim, stream_);
   else if (m.o_proj_fp8.packed != nullptr)
     gemm_fp8_row(sublayer_out_, m.o_proj_fp8.packed, m.o_proj_fp8.scales, v_out_, batch, H,

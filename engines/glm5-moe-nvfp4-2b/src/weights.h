@@ -54,7 +54,9 @@ struct Fp8RowW {
 
 struct KdaW {
   const bf16* qkv = nullptr;      // [3*qkv_dim, hidden], q then k then v
+  const bf16* kv = nullptr;       // [2*qkv_dim, hidden], used when isolated q overlay replaces BF16 q
   Fp8RowW qkv_fp8;                // optional fp8-per-row replacement (same row order)
+  Nvfp4W qkv_fp4;                 // optional NVFP4 q/k/v concat, dequantized by the compute kernel
   Fp8RowW o_proj_fp8;             // optional fp8-per-row o_proj [hidden, qkv_dim]
   Nvfp4W q_overlay;               // optional isolated W4A16 quality experiment
   const bf16* conv = nullptr;     // [3*qkv_dim, kernel]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Materialize FP8-per-row overlay objects for every KDA layer's q/k/v triple.
+"""Materialize FP8-per-row or NVFP4 objects for every KDA layer's q/k/v triple.
 
 Reads per-tensor SHA-256 provenance from the inventory JSON that sits next to
 the snapshot (scripts/numerics/nvfp4-overlay-inventory.py output), then calls
@@ -28,11 +28,14 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--snapshot", default=os.environ.get("ROCKET_FUEL_NVFP4_DIR")
                     or os.path.expanduser("~/.cache/rocket-fuels/glm-5.3-flash-nvfp4"))
-    ap.add_argument("--out", default=os.path.expanduser("~/.cache/rocket-fuels/overlays/kda-qkv-fp8"))
+    ap.add_argument("--out", default=None)
     ap.add_argument("--inventory", default=None)
     ap.add_argument("--ids", default=KDA_IDS)
+    ap.add_argument("--format", choices=("fp8-row", "nvfp4"), default="fp8-row")
     args = ap.parse_args()
 
+    args.out = args.out or os.path.expanduser(
+        f"~/.cache/rocket-fuels/overlays/kda-qkv-{'fp8' if args.format == 'fp8-row' else 'nvfp4'}")
     inv = args.inventory or os.path.join(os.path.dirname(args.snapshot.rstrip("/")), "inventory.json")
     if not os.path.exists(inv):
         print(f"inventory missing: {inv}; run nvfp4-overlay-inventory.py first", file=sys.stderr)
@@ -62,10 +65,11 @@ def main() -> int:
         spec = ",".join(n + "=" + by_name[n]["source_sha256"] for n in names)
         out = os.path.join(args.out, f"l-{layer}")
         os.makedirs(out, exist_ok=True)
-        r = subprocess.run(
-            [os.path.join(BUILD, "materialize-nvfp4-overlay"), args.snapshot, out,
-             snapshot_key, spec, "--fp8-row"],
-            capture_output=True, text=True)
+        command = [os.path.join(BUILD, "materialize-nvfp4-overlay"), args.snapshot, out,
+                   snapshot_key, spec]
+        if args.format == "fp8-row":
+            command.append("--fp8-row")
+        r = subprocess.run(command, capture_output=True, text=True)
         if r.returncode != 0:
             print(f"layer {layer} failed: {r.stderr}", file=sys.stderr)
             return 1
