@@ -524,6 +524,13 @@ int main(int argc, char** argv) {
       const bool instrument = (i == instrument_at);
       const auto t0 = Clock::now();
       engine.step(last, next_batch, instrument);
+      // Rank 0 owns greedy token selection at K1 too. Without this handshake,
+      // last-bit replicated-logit differences can send the two EP ranks down
+      // different token trajectories and invalidate target-only A/B runs.
+      if (ep) {
+        std::vector<int> committed(batch, 1);
+        ep->sync_round_decision(committed, next_batch);
+      }
       for (int m = 0; m < batch; ++m) last[m] = next_batch[m];
       const double dt = ms_since(t0);
       if (instrument) {
