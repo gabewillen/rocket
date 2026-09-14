@@ -16,6 +16,7 @@ PROMPT_LIST=${PROMPT_LIST:?set PROMPT_LIST to a file containing one prompt path 
 RESULT_JSON=${RESULT_JSON:-/tmp/glm53-coding-result.json}
 PROMPT_TOKEN_LIMIT=${PROMPT_TOKEN_LIMIT:-0}
 DECODE_MARKER=${DECODE_MARKER:-}
+REPLACEMENT_PROMPT=${REPLACEMENT_PROMPT:-}
 PREFIX_CACHE_DIR=${PREFIX_CACHE_DIR-$HOME/.cache/rocket-prefix-cache/glm53-coding}
 PREFIX_CACHE_BYTES=${PREFIX_CACHE_BYTES:-auto}
 PREFIX_CACHE_STAGING_BYTES=${PREFIX_CACHE_STAGING_BYTES:-128MiB}
@@ -46,6 +47,11 @@ rsync -a "$BIN" "$PEER:$BIN"
 done
 rsync -a "$PROMPT_LIST" "$PEER:$PROMPT_LIST"
 for p in "${prompts[@]}"; do rsync -a "$p" "$PEER:$p"; done
+if [[ -n $REPLACEMENT_PROMPT ]]; then
+  quoted_dir=$(printf %q "$(dirname "$REPLACEMENT_PROMPT")")
+  ssh -o BatchMode=yes "$PEER" "mkdir -p $quoted_dir"
+  rsync -a "$REPLACEMENT_PROMPT" "$PEER:$REPLACEMENT_PROMPT"
+fi
 
 cache_free_bytes() { df -B1 --output=avail "$1" | awk 'NR==2 {print $1}'; }
 common=(--prompt-list "$PROMPT_LIST" --tokens "$TOKENS" --batch "$BATCH" --spec "$SPEC"
@@ -54,6 +60,7 @@ common=(--prompt-list "$PROMPT_LIST" --tokens "$TOKENS" --batch "$BATCH" --spec 
 (( PROMPT_TOKEN_LIMIT > 0 )) && common+=(--prompt-token-limit "$PROMPT_TOKEN_LIMIT")
 local_extra=()
 [[ -n $DECODE_MARKER ]] && local_extra+=(--decode-marker "$DECODE_MARKER")
+[[ -n $REPLACEMENT_PROMPT ]] && common+=(--replacement-prompt "$REPLACEMENT_PROMPT")
 if [[ -n $PREFIX_CACHE_DIR ]]; then
   mkdir -p "$PREFIX_CACHE_DIR"
   quoted=$(printf %q "$PREFIX_CACHE_DIR")

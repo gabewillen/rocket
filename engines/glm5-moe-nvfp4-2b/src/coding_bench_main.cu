@@ -124,6 +124,7 @@ int main(int argc, char** argv) {
   }
   const char* prompt_list = arg_value(argc, argv, "--prompt-list", nullptr);
   const char* result_json = arg_value(argc, argv, "--result-json", nullptr);
+  const char* replacement_prompt = arg_value(argc, argv, "--replacement-prompt", nullptr);
   const char* decode_marker = arg_value(argc, argv, "--decode-marker", nullptr);
   const int prompt_token_limit = std::atoi(arg_value(argc, argv, "--prompt-token-limit", "0"));
   const int n_new = std::atoi(arg_value(argc, argv, "--tokens", "20"));
@@ -493,12 +494,22 @@ int main(int argc, char** argv) {
     long long& accepted_total = sl_accepted;
     long long& rounds = sl_rounds;
     bool spec_instrumented = false;
-  while (static_cast<int>(generated[0].size()) < n_new) {
-      // Commit the token about to be verified, then build the draft.
-      for (int m = 0; m < batch; ++m) generated[m].push_back(last[m]);
+  while (true) {
+      std::vector<unsigned char> active(batch, 0);
+      bool any_active = false;
+      // Commit one pending greedy token only for unfinished sessions. Finished
+      // slots remain transactionally paused while shorter-acceptance peers run.
+      for (int m = 0; m < batch; ++m) {
+        active[m] = static_cast<int>(generated[m].size()) < n_new;
+        any_active = any_active || active[m];
+        if (active[m]) generated[m].push_back(last[m]);
+      }
+      if (!any_active) break;
       bool any_left = false;
-      for (int m = 0; m < batch; ++m)
-        if (static_cast<int>(generated[m].size()) < n_new) any_left = true;
+      for (int m = 0; m < batch; ++m) {
+        active[m] = static_cast<int>(generated[m].size()) < n_new;
+        any_left = any_left || active[m];
+      }
       if (!any_left) break;
 
       const auto round_t0 = Clock::now();
@@ -513,6 +524,10 @@ int main(int argc, char** argv) {
       }
       for (int m = 0; m < batch; ++m) {
         spec_tokens[m] = last[m];
+        if (!active[m]) {
+          for (int j = 1; j < K; ++j) spec_tokens[j * batch + m] = last[m];
+          continue;
+        }
         // Draft sources: --draft-file draws the verify chain from a reference
         // generation (perfect-draft correctness probe); otherwise an n-gram
         // lookup proposes the continuation, padded with the committed token.
@@ -559,6 +574,10 @@ int main(int argc, char** argv) {
       // authoritative: tiny last-bit differences between otherwise equal
       // replicated logits must never let one rank enter an extra model round.
       for (int m = 0; m < batch; ++m) {
+        if (!active[m]) {
+          accepted_cnt[m] = 0;
+          continue;
+        }
         int acc = 1;  // position 0 is the committed argmax, always correct
         for (int j = 0; j + 1 < K; ++j) {
           if (verify_out[j * batch + m] == spec_tokens[(j + 1) * batch + m]) ++acc;
@@ -596,7 +615,6 @@ int main(int argc, char** argv) {
       } else {
         token_ms.push_back(dt);
       }
-      if (static_cast<int>(generated[0].size()) >= n_new) break;
     }
     const long long accepted_drafts = accepted_total - rounds * batch;
     std::printf("spec       rounds=%lld drafted=%lld accepted=%lld + committed=%lld (%.1f%% draft acceptance)\n",
@@ -608,6 +626,43 @@ int main(int argc, char** argv) {
   if (decode_marker) {
     std::ofstream marker(decode_marker);
     marker << "end\n";
+  }
+  bool replacement_preserved_active_slots = true;
+  if (replacement_prompt && batch > 1) {
+    std::ifstream in(replacement_prompt, std::ios::binary);
+    if (!in) throw std::runtime_error(std::string("cannot read --replacement-prompt ") + replacement_prompt);
+    const std::string replacement_text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    std::vector<int> replacement_ids = tok.encode(replacement_text);
+    if (replacement_ids.size() > 128) replacement_ids.resize(128);
+    std::vector<int> held_positions(batch);
+    for (int m = 0; m < batch; ++m) held_positions[m] = engine.position(m);
+    engine.reset_slot(0);
+    if (dflash) dflash->reset_slot(0, nullptr);
+    int replacement_next = 0;
+    for (std::size_t begin = 0; begin < replacement_ids.size();) {
+      const int count = std::min<int>(rocket::engine::DecodeEngine::kSpecMax,
+                                      replacement_ids.size() - begin);
+      std::vector<int> chunk(static_cast<std::size_t>(count) * batch, last[1]);
+      for (int j = 0; j < count; ++j)
+        chunk[static_cast<std::size_t>(j) * batch] = replacement_ids[begin + j];
+      std::vector<int> base(batch);
+      for (int m = 0; m < batch; ++m) base[m] = engine.position(m);
+      engine.step_spec(chunk, count, verify_out, false);
+      replacement_next = verify_out[static_cast<std::size_t>(count - 1) * batch];
+      std::vector<int> accepted(batch, 0);
+      accepted[0] = count;
+      if (dflash)
+        dflash->append_context(engine.dflash_aux_hidden(), engine.dflash_aux_stride_rows(), count,
+                               batch, base, accepted, nullptr);
+      engine.commit_positions(accepted);
+      begin += count;
+    }
+    last[0] = replacement_next;
+    for (int m = 1; m < batch; ++m)
+      replacement_preserved_active_slots = replacement_preserved_active_slots &&
+                                           engine.position(m) == held_positions[m];
+    std::printf("continuous replacement preserved %d active slots: %s\n", batch - 1,
+                replacement_preserved_active_slots ? "yes" : "NO");
   }
   std::printf("\n--- output ------------------------------------------------------\n");
   if (batch == 1)
@@ -729,9 +784,17 @@ int main(int argc, char** argv) {
     out << "  \"inter_token_ms_p95\":" << (useful_tokens > 0 ? decode_total_ms * batch / useful_tokens : 0.0) << ",\n";
     out << "  \"aggregate_useful_tok_s\":" << (decode_total_ms > 0 ? useful_tokens * 1000.0 / decode_total_ms : 0.0) << ",\n";
     out << "  \"router_entropy_nats\":" << entropy << ",\n";
+    out << "  \"stage_ms\":{\"embed\":" << stages.embed
+        << ",\"hyper_connection\":" << stages.hyper_connection
+        << ",\"norms\":" << stages.norms << ",\"kda\":" << stages.kda
+        << ",\"mla_indexer\":" << stages.mla << ",\"dense_mlp\":" << stages.dense_mlp
+        << ",\"moe\":" << stages.moe_experts << ",\"expert_stream\":" << stages.expert_stream
+        << ",\"lm_head\":" << stages.lm_head << "},\n";
     out << "  \"expert_cache_hits\":" << engine.weights().expert_hits() << ",\n";
     out << "  \"expert_cache_misses\":" << engine.weights().expert_misses() << ",\n";
     out << "  \"rounds\":" << sl_rounds << ",\n";
+    out << "  \"replacement_preserved_active_slots\":"
+        << (replacement_preserved_active_slots ? "true" : "false") << ",\n";
     out << "  \"accepted_drafts_by_stream\":[";
     for (int m = 0; m < batch; ++m) out << (m ? "," : "") << accepted_drafts_by_stream[m];
     out << "],\n  \"accepted_by_position\":[";

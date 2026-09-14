@@ -119,6 +119,54 @@ int main() {
 
   std::printf("\n%s: %d/%d streams mismatched\n", failures == 0 ? "PASS" : "FAIL", failures, M);
 
+  // --- continuous replacement: reset slot 0, prefill it transactionally,
+  // and require slot 1 to resume from the exact state it had before the new
+  // arrival. This is the scheduler primitive used for staggered sessions.
+  engine.reset();
+  const std::vector<int> replacement = tok.encode("fn replacement_slot(x: i32) -> i32 { x + 1 }");
+  for (std::size_t t = 0; t < prompt_ids[0].size(); ++t) {
+    std::vector<int> pair = {prompt_ids[0][t], prompt_ids[0][t]};
+    engine.step(pair, next_batch, false);
+  }
+  const int held_position = engine.position(1);
+  const int held_token = next_batch[1];
+  engine.reset_slot(0);
+  int replacement_next = 0;
+  for (std::size_t begin = 0; begin < replacement.size();) {
+    const int count = std::min<int>(rocket::engine::DecodeEngine::kSpecMax, replacement.size() - begin);
+    std::vector<int> chunk(static_cast<std::size_t>(count) * 2, held_token);
+    for (int j = 0; j < count; ++j) chunk[static_cast<std::size_t>(j) * 2] = replacement[begin + j];
+    engine.step_spec(chunk, count, next_batch, false);
+    replacement_next = next_batch[static_cast<std::size_t>(count - 1) * 2];
+    engine.commit_positions({count, 0});
+    begin += count;
+  }
+  bool replacement_ok = engine.position(1) == held_position;
+  engine.step({replacement_next, held_token}, next_batch, false);
+  const int resumed_token = next_batch[1];
+  engine.reset();
+  for (const int id : prompt_ids[0]) engine.step({id}, next_batch, false);
+  engine.step({held_token}, next_batch, false);
+  replacement_ok = replacement_ok && resumed_token == next_batch[0];
+  std::printf("continuous replacement preserves active slot: %s\n", replacement_ok ? "PASS" : "FAIL");
+  if (!replacement_ok) ++failures;
+
+  // --- multi-token causality: changing future verify inputs must not change
+  // the earlier position's logits/argmax.
+  auto causal_probe = [&](int future) {
+    engine.reset();
+    for (const int id : prompt_ids[0]) engine.step({id}, next_batch, false);
+    const int anchor = next_batch[0];
+    std::vector<int> chain = {anchor, future, future + 1, future + 2};
+    engine.step_spec(chain, 4, next_batch, false);
+    return next_batch[0];
+  };
+  const int causal_a = causal_probe(17);
+  const int causal_b = causal_probe(997);
+  const bool causal_ok = causal_a == causal_b;
+  std::printf("future-token causality: %s (%d vs %d)\n", causal_ok ? "PASS" : "FAIL", causal_a, causal_b);
+  if (!causal_ok) ++failures;
+
   // --- kWideBatch=32 concurrent: each of the 8 prompts run on 4 independent
   // stream slots, every slot compared against its own prompt's M=1 reference
   // above (ref[i % M], not a new M=1 run) -------------------------------

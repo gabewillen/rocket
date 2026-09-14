@@ -142,6 +142,10 @@ class DecodeEngine {
   // position, exactly as the single-stream engine already relied on before
   // batching (its KV was never cleared here either).
   void reset();
+  // Resets one scheduler slot while preserving every other active session.
+  // This is the lifecycle primitive used when a completed request is replaced
+  // under continuous batching.
+  void reset_slot(int slot);
 
   // ---- paged KV: fork/detach/resume against the pool above ----
   // Binds `child_slot` to a new sequence sharing every full page of

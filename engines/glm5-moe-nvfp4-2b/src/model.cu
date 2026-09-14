@@ -596,6 +596,36 @@ void DecodeEngine::commit_positions(const std::vector<int>& accepted) {
   }
 }
 
+void DecodeEngine::reset_slot(int slot) {
+  if (slot < 0 || slot >= max_batch_) fail("reset_slot: slot out of range");
+  pos_[slot] = 0;
+  restored_kda_chain_[slot] = 0;
+  restored_next_token_[slot] = 0;
+  const int H = cfg_.hidden_size;
+  const int qkv = cfg_.kda_qkv_dim();
+  const int taps = cfg_.conv_state_taps();
+  const int MB = max_batch_;
+  for (int li = 0; li < kda_layers_; ++li) {
+    const std::size_t conv_off = (static_cast<std::size_t>(li) * MB + slot) * qkv * taps;
+    const std::size_t conv_bytes = static_cast<std::size_t>(qkv) * taps * sizeof(bf16);
+    cuda_check(cudaMemsetAsync(q_conv_state_ + conv_off, 0, conv_bytes, stream_), "reset slot q conv");
+    cuda_check(cudaMemsetAsync(k_conv_state_ + conv_off, 0, conv_bytes, stream_), "reset slot k conv");
+    cuda_check(cudaMemsetAsync(v_conv_state_ + conv_off, 0, conv_bytes, stream_), "reset slot v conv");
+    const std::size_t state_off = (static_cast<std::size_t>(li) * MB + slot) *
+                                  cfg_.kda_heads * cfg_.kda_head_dim * cfg_.kda_head_dim;
+    const std::size_t state_bytes = static_cast<std::size_t>(cfg_.kda_heads) * cfg_.kda_head_dim *
+                                    cfg_.kda_head_dim * sizeof(float);
+    cuda_check(cudaMemsetAsync(kda_state_ + state_off, 0, state_bytes, stream_), "reset slot kda state");
+  }
+  cuda_check(cudaMemsetAsync(streams_ + static_cast<std::size_t>(slot) * cfg_.hc_mult * H, 0,
+                             static_cast<std::size_t>(cfg_.hc_mult) * H * sizeof(bf16), stream_),
+             "reset slot streams");
+  cuda_check(cudaStreamSynchronize(stream_), "reset slot sync");
+  if (kv_seq_of_slot_[slot] >= 0) kv_cache_->destroy(kv_seq_of_slot_[slot]);
+  const std::uint64_t seed = kv_nvme_backing_ ? kv_hash_seed(slot) : 0;
+  kv_seq_of_slot_[slot] = kv_cache_->open(slot, seed);
+}
+
 void DecodeEngine::reset() {
   std::fill(pos_.begin(), pos_.end(), 0);
   std::fill(restored_kda_chain_.begin(), restored_kda_chain_.end(), 0);

@@ -95,6 +95,8 @@ class DFlash2DraftEngine {
   bool load_prefix_state(kv::NvmePrefixStore& store, const kv::PrefixRecordKey& key,
                          int slot, int position, cudaStream_t stream);
   void copy_prefix_state(int dst_slot, int src_slot, int position, cudaStream_t stream);
+  // Clears one continuous-batching slot without touching other sessions.
+  void reset_slot(int slot, cudaStream_t stream);
 
  private:
   struct Impl;

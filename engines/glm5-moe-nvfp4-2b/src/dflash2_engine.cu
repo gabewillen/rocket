@@ -655,4 +655,17 @@ void DFlash2DraftEngine::copy_prefix_state(int dst_slot, int src_slot, int posit
   ck(cudaStreamSynchronize(s), "dflash2 copy prefix sync");
 }
 
+void DFlash2DraftEngine::reset_slot(int slot, cudaStream_t s) {
+  auto& z = *p_;
+  if (slot < 0 || slot >= z.max_batch) throw std::runtime_error("dflash2 reset slot range");
+  const std::size_t KV = static_cast<std::size_t>(z.w.cfg.num_kv_heads) * z.w.cfg.head_dim;
+  const std::size_t bytes = static_cast<std::size_t>(z.max_tokens) * KV * sizeof(bf16);
+  for (int l = 0; l < z.w.cfg.num_layers; ++l) {
+    const std::size_t off = (static_cast<std::size_t>(l) * z.max_batch + slot) * z.max_tokens * KV;
+    ck(cudaMemsetAsync(z.kv_k + off, 0, bytes, s), "dflash2 reset slot k");
+    ck(cudaMemsetAsync(z.kv_v + off, 0, bytes, s), "dflash2 reset slot v");
+  }
+  ck(cudaStreamSynchronize(s), "dflash2 reset slot sync");
+}
+
 }  // namespace rocket::engine

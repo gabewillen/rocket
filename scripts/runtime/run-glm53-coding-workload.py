@@ -26,6 +26,12 @@ def main():
     runs = []
     for phase in phases:
         selected, prompt_list = materialize_phase(sessions, phase, a.batch, a.out / f"phase-{phase}")
+        replacement = None
+        if a.batch < 16:
+            replacement_session = sessions[phase * 16 + a.batch]
+            replacement = a.out / f"phase-{phase}" / f"replacement-{replacement_session['id']}.txt"
+            replacement.write_text("\n".join(
+                f"<{t['role']}>\n{t['content']}" for t in replacement_session["turns"]))
         token_limit = selected[0]["context_tokens_target"]
         tokens = selected[0]["response_tokens"]
         result = a.out / f"phase-{phase}.json"
@@ -35,6 +41,8 @@ def main():
                    PROMPT_TOKEN_LIMIT=str(token_limit), MAX_TOKENS=str(token_limit + tokens + 128),
                    PROMPT_LIST=str(prompt_list.resolve()), RESULT_JSON=str(result.resolve()),
                    PORT=str(18782 + phase))
+        if replacement:
+            env["REPLACEMENT_PROMPT"] = str(replacement.resolve())
         if not a.dry_run:
             start = time.monotonic()
             subprocess.run(cmd, env=env, check=True)
