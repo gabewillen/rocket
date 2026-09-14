@@ -18,6 +18,7 @@ RESULT_JSON=${RESULT_JSON:-/tmp/glm53-coding-result.json}
 PROMPT_TOKEN_LIMIT=${PROMPT_TOKEN_LIMIT:-0}
 PROMPT_TAIL_TOKENS=${PROMPT_TAIL_TOKENS:-512}
 DECODE_MARKER=${DECODE_MARKER:-}
+CUDA_PROFILE=${CUDA_PROFILE:-0}
 REPLACEMENT_PROMPT=${REPLACEMENT_PROMPT:-}
 PREFIX_CACHE_DIR=${PREFIX_CACHE_DIR-$HOME/.cache/rocket-prefix-cache/glm53-coding}
 PREFIX_CACHE_BYTES=${PREFIX_CACHE_BYTES:-auto}
@@ -62,6 +63,7 @@ common=(--prompt-list "$PROMPT_LIST" --tokens "$TOKENS" --batch "$BATCH" --spec 
 (( PROMPT_TOKEN_LIMIT > 0 )) && common+=(--prompt-token-limit "$PROMPT_TOKEN_LIMIT" --prompt-tail-tokens "$PROMPT_TAIL_TOKENS")
 local_extra=()
 [[ -n $DECODE_MARKER ]] && local_extra+=(--decode-marker "$DECODE_MARKER")
+(( CUDA_PROFILE )) && local_extra+=(--cuda-profile 1)
 [[ -n $REPLACEMENT_PROMPT ]] && common+=(--replacement-prompt "$REPLACEMENT_PROMPT")
 if [[ -n $PREFIX_CACHE_DIR ]]; then
   mkdir -p "$PREFIX_CACHE_DIR"

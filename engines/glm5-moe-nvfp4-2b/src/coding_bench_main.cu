@@ -147,6 +147,7 @@ int main(int argc, char** argv) {
   const char* result_json = arg_value(argc, argv, "--result-json", nullptr);
   const char* replacement_prompt = arg_value(argc, argv, "--replacement-prompt", nullptr);
   const char* decode_marker = arg_value(argc, argv, "--decode-marker", nullptr);
+  const bool cuda_profile = arg_value(argc, argv, "--cuda-profile", "0")[0] == '1';
   const int prompt_token_limit = std::atoi(arg_value(argc, argv, "--prompt-token-limit", "0"));
   const int prompt_tail_tokens = std::atoi(arg_value(argc, argv, "--prompt-tail-tokens", "512"));
   const int n_new = std::atoi(arg_value(argc, argv, "--tokens", "20"));
@@ -479,6 +480,7 @@ int main(int argc, char** argv) {
     std::ofstream marker(decode_marker);
     marker << "start\n";
   }
+  if (cuda_profile) cudaProfilerStart();
   const auto t_decode_total = Clock::now();
   std::vector<std::vector<int>> generated(batch);
   std::vector<double> token_ms;
@@ -688,6 +690,7 @@ int main(int argc, char** argv) {
   }
 
   const double decode_total_ms = ms_since(t_decode_total);
+  if (cuda_profile) cudaProfilerStop();
   if (decode_marker) {
     std::ofstream marker(decode_marker);
     marker << "end\n";
