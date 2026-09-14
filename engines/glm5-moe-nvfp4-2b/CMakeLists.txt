@@ -124,6 +124,11 @@ target_link_libraries(rocket-test-stand PRIVATE rocket_engine)
 add_executable(rocket-decode src/decode_main.cu)
 target_link_libraries(rocket-decode PRIVATE rocket_engine rocket_fuel)
 
+# Distinct-prompt production workload runner. Workload parsing and scheduling
+# remain outside rocket-decode so the serving binary keeps a single-request CLI.
+add_executable(rocket-coding-bench src/coding_bench_main.cu)
+target_link_libraries(rocket-coding-bench PRIVATE rocket_engine rocket_fuel)
+
 add_executable(rocket-teacher-score src/teacher_score_main.cu)
 target_link_libraries(rocket-teacher-score PRIVATE rocket_engine rocket_fuel)
 
