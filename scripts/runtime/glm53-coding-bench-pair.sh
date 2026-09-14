@@ -5,7 +5,7 @@ PEER=${PEER:-${ROCKET_PEER:-192.168.100.11}}
 HEAD=${HEAD:-${ROCKET_HEAD:-192.168.100.10}}
 PORT=${PORT:-${ROCKET_PORT:-18782}}
 BATCH=${BATCH:-8}
-SPEC=${SPEC:-7}
+SPEC=${SPEC:-1}
 LAZY_DROP_BATCH=${LAZY_DROP_BATCH:-8}
 TOKENS=${TOKENS:-512}
 EXPERT_CACHE_GIB=${EXPERT_CACHE_GIB:-90}
@@ -97,7 +97,12 @@ cleanup() {
 ssh -o BatchMode=yes -n "$PEER" "$remote_cmd" >/tmp/glm53-coding-rank1.log 2>&1 &
 peer_pid=$!
 trap cleanup EXIT
-"$BIN" --rank 0 --host "$HEAD" --port "$PORT" --result-json "$RESULT_JSON" "${local_extra[@]}" "${common[@]}"
+local_cmd=("$BIN" --rank 0 --host "$HEAD" --port "$PORT" --result-json "$RESULT_JSON" "${local_extra[@]}" "${common[@]}")
+if [[ -n ${LOCAL_WRAPPER:-} ]]; then
+  "$LOCAL_WRAPPER" "${local_cmd[@]}"
+else
+  "${local_cmd[@]}"
+fi
 wait "$peer_pid"
 ssh -o BatchMode=yes -n "$PEER" "rm -f $(printf %q "$remote_pidfile")" >/dev/null 2>&1 || true
 trap - EXIT
