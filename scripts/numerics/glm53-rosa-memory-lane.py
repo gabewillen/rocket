@@ -156,6 +156,50 @@ def train(capture: pathlib.Path, output: pathlib.Path, rank: int, epochs: int, l
     return report
 
 
+def fit_gate(trace: pathlib.Path, output: pathlib.Path, epochs: int, lr: float,
+             curriculum_negatives: bool = True) -> dict:
+    rows = [json.loads(line) for line in trace.read_text().splitlines() if line.strip()]
+    if not rows:
+        raise ValueError("empty ROSA trace")
+    features = [[1.0, row["confidence"],
+                 np.log1p(row["recency"]) / np.log1p(262144.0),
+                 row["ngram"] / 8.0] for row in rows]
+    labels = [row["accepted_fraction"] for row in rows]
+    positive_rows = len(features)
+    if curriculum_negatives:
+        # Three controls per observed useful-retrieval row implement the
+        # 25/20/15/15/25 curriculum at bounded size. Plausible-wrong retains
+        # the same scalar features on purpose: failure to separate it proves
+        # that hidden-state alignment is needed in the learned token gate.
+        for feature in list(features):
+            features.extend([
+                list(feature),                       # plausible but incorrect
+                [1.0, 0.05, 1.0, 0.375],             # irrelevant retrieval
+                [1.0, 0.0, 0.0, 0.0],                # no retrieval / ordinary code
+            ])
+            labels.extend([0.0, 0.0, 0.0])
+    x = torch.tensor(features, dtype=torch.float32)
+    y = torch.tensor(labels, dtype=torch.float32)
+    weight = nn.Parameter(torch.zeros(4))
+    opt = torch.optim.AdamW([weight], lr=lr, weight_decay=1e-3)
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(x @ weight, y)
+        loss.backward()
+        opt.step()
+    prediction = torch.sigmoid(x @ weight).detach()
+    report = {
+        "trace": str(trace), "rows": len(features), "observed_rows": positive_rows,
+        "curriculum_negatives": curriculum_negatives, "epochs": epochs,
+        "bias": float(weight[0].detach()), "confidence_weight": float(weight[1].detach()),
+        "recency_weight": float(weight[2].detach()), "ngram_weight": float(weight[3].detach()),
+        "label_mean": float(y.mean()), "prediction_mean": float(prediction.mean()),
+        "bce": float(torch.nn.functional.binary_cross_entropy(prediction, y)),
+    }
+    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    return report
+
+
 def self_test() -> None:
     memory = ExactSuffixMemory(max_ngram=4)
     memory.extend([1, 2, 3, 9, 1, 2, 3])
@@ -192,9 +236,18 @@ def main() -> None:
     p.add_argument("--rank", type=int, default=64)
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-3)
+    g = sub.add_parser("fit-gate")
+    g.add_argument("--trace", type=pathlib.Path, required=True)
+    g.add_argument("--output", type=pathlib.Path, required=True)
+    g.add_argument("--epochs", type=int, default=1000)
+    g.add_argument("--lr", type=float, default=0.03)
+    g.add_argument("--no-curriculum-negatives", action="store_true")
     args = parser.parse_args()
     if args.command == "self-test":
         self_test()
+    elif args.command == "fit-gate":
+        print(json.dumps(fit_gate(args.trace, args.output, args.epochs, args.lr,
+                                  not args.no_curriculum_negatives), indent=2))
     else:
         print(json.dumps(train(args.capture, args.output, args.rank, args.epochs, args.lr), indent=2))
 

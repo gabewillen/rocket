@@ -499,6 +499,9 @@ int main(int argc, char** argv) {
   std::vector<long long> drafted_by_stream(batch, 0);
   std::vector<long long> active_rounds_by_stream(batch, 0);
   std::vector<long long> accepted_by_position(std::max(spec_k - 1, 0), 0);
+  std::ofstream rosa_trace;
+  if (const char* path = std::getenv("ROCKET_ROSA_TRACE"); path && rank <= 0)
+    rosa_trace.open(path, std::ios::app);
   double entropy = 0.0;
 
   std::vector<int>* draft_ids = nullptr;
@@ -577,7 +580,8 @@ int main(int argc, char** argv) {
       std::vector<int> dflash_tokens;
       std::vector<int> draft_slots;
       std::vector<std::vector<int>> lookup(batch), rosa_span(batch);
-      std::vector<float> rosa_confidence(batch, 0.0f);
+      std::vector<float> rosa_confidence(batch, 0.0f), rosa_recency(batch, 0.0f);
+      std::vector<int> rosa_ngram(batch, 0);
       if (std::getenv("ROCKET_PROMPT_LOOKUP") && !draft_ids) {
         for (int m = 0; m < batch; ++m) if (active[m]) {
           std::vector<int> history = prompt_ids[m];
@@ -597,13 +601,31 @@ int main(int argc, char** argv) {
                 const std::size_t span_end = std::min(history.size(), at + ngram + K - 1 + 32);
                 rosa_span[m].assign(history.begin() + span_begin, history.begin() + span_end);
                 const float recency = static_cast<float>(suffix - at);
+                rosa_ngram[m] = ngram;
+                rosa_recency[m] = recency;
                 rosa_confidence[m] = (static_cast<float>(ngram) / 8.0f) /
                                      (1.0f + recency / 2048.0f);
+                if (std::getenv("ROCKET_ROSA_GATE_BIAS")) {
+                  const float bias = std::strtof(std::getenv("ROCKET_ROSA_GATE_BIAS"), nullptr);
+                  const float wc = std::getenv("ROCKET_ROSA_GATE_CONF_W")
+                      ? std::strtof(std::getenv("ROCKET_ROSA_GATE_CONF_W"), nullptr) : 0.0f;
+                  const float wr = std::getenv("ROCKET_ROSA_GATE_RECENCY_W")
+                      ? std::strtof(std::getenv("ROCKET_ROSA_GATE_RECENCY_W"), nullptr) : 0.0f;
+                  const float wn = std::getenv("ROCKET_ROSA_GATE_NGRAM_W")
+                      ? std::strtof(std::getenv("ROCKET_ROSA_GATE_NGRAM_W"), nullptr) : 0.0f;
+                  const float z = bias + wc * rosa_confidence[m] +
+                      wr * std::log1p(recency) / std::log1p(262144.0f) + wn * ngram / 8.0f;
+                  rosa_confidence[m] *= 1.0f / (1.0f + std::exp(-z));
+                }
                 break;
               }
             }
           }
         }
+      }
+      if (std::getenv("ROCKET_ROSA_CORRUPT") && batch > 1) {
+        auto wrong = rosa_span;
+        for (int m = 0; m < batch; ++m) rosa_span[m] = wrong[(m + 1) % batch];
       }
       static const float rosa_gate = std::getenv("ROCKET_ROSA_MEMORY_GATE")
           ? std::strtof(std::getenv("ROCKET_ROSA_MEMORY_GATE"), nullptr) : 0.0f;
@@ -703,6 +725,12 @@ int main(int argc, char** argv) {
         }
         accepted_cnt[m] = acc;
         accepted_drafts_by_stream[m] += acc - 1;
+        if (rosa_trace && rosa_ngram[m] > 0)
+          rosa_trace << "{\"stream\":" << m << ",\"ngram\":" << rosa_ngram[m]
+                     << ",\"recency\":" << rosa_recency[m]
+                     << ",\"confidence\":" << rosa_confidence[m]
+                     << ",\"accepted_fraction\":" << static_cast<float>(acc - 1) / (K - 1)
+                     << "}\n";
         for (int j = 0; j < acc - 1; ++j) ++accepted_by_position[j];
         last[m] = verify_out[(acc - 1) * batch + m];
       }
