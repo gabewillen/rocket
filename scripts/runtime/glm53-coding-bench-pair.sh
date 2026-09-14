@@ -36,6 +36,13 @@ export GLM53_ALLOW_LAUNCH=${GLM53_ALLOW_LAUNCH:-1}
 mapfile -t prompts < "$PROMPT_LIST"
 (( ${#prompts[@]} == BATCH )) || { echo "prompt count ${#prompts[@]} != batch $BATCH" >&2; exit 2; }
 rsync -a "$BIN" "$PEER:$BIN"
+{
+  dirname "$PROMPT_LIST"
+  for p in "${prompts[@]}"; do dirname "$p"; done
+} | sort -u | while read -r dir; do
+  quoted_dir=$(printf %q "$dir")
+  ssh -o BatchMode=yes "$PEER" "mkdir -p $quoted_dir"
+done
 rsync -a "$PROMPT_LIST" "$PEER:$PROMPT_LIST"
 for p in "${prompts[@]}"; do rsync -a "$p" "$PEER:$p"; done
 
