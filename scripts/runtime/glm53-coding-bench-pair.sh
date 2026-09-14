@@ -32,8 +32,16 @@ export ROCKET_FUEL_NVFP4_DIR=${ROCKET_FUEL_NVFP4_DIR:-$HOME/.cache/rocket-fuels/
 export ROCKET_PACKED_WEIGHTS=${ROCKET_PACKED_WEIGHTS:-$ROCKET_FUEL_NVFP4_DIR/resident-direct.bin}
 export ROCKET_EXPERT_SLAB_DIR=${ROCKET_EXPERT_SLAB_DIR:-$ROCKET_FUEL_NVFP4_DIR/expert-slabs-v1}
 export ROCKET_DFLASH2_DIR=${ROCKET_DFLASH2_DIR:-$HOME/.cache/rocket-glm53-exl3-host/models/glm-5.3-flash-dflash2}
-export ROCKET_FP8_ATTN_DIR=${ROCKET_FP8_ATTN_DIR:-$HOME/.cache/rocket-fuels/overlays}
-export ROCKET_KDA_QKV_FP8_DIR=${ROCKET_KDA_QKV_FP8_DIR:-$HOME/.cache/rocket-fuels/overlays/kda-qkv-fp8}
+if (( BATCH >= 16 )); then
+  # The native FP8-row path wins at C8 but loses at C16, while repeated
+  # dequantization also loses. Select one serving representation per run:
+  # BF16 at C16, FP8 replacement at C4/C8. No source/additive duplication.
+  export ROCKET_FP8_ATTN_DIR=${ROCKET_FP8_ATTN_DIR:-/nonexistent/rocket-fp8-disabled-c16}
+  export ROCKET_KDA_QKV_FP8_DIR=${ROCKET_KDA_QKV_FP8_DIR:-/nonexistent/rocket-fp8-disabled-c16}
+else
+  export ROCKET_FP8_ATTN_DIR=${ROCKET_FP8_ATTN_DIR:-$HOME/.cache/rocket-fuels/overlays}
+  export ROCKET_KDA_QKV_FP8_DIR=${ROCKET_KDA_QKV_FP8_DIR:-$HOME/.cache/rocket-fuels/overlays/kda-qkv-fp8}
+fi
 export ROCKET_FP8_CUBLAS=${ROCKET_FP8_CUBLAS:-1}
 export ROCKET_PROMPT_LOOKUP=${ROCKET_PROMPT_LOOKUP:-1}
 export ROCKET_RESIDENT_DIRECT=${ROCKET_RESIDENT_DIRECT:-1}
