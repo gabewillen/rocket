@@ -15,6 +15,7 @@ PRELOAD_OWNED=${PRELOAD_OWNED:-1}
 PROMPT_LIST=${PROMPT_LIST:?set PROMPT_LIST to a file containing one prompt path per stream}
 RESULT_JSON=${RESULT_JSON:-/tmp/glm53-coding-result.json}
 PROMPT_TOKEN_LIMIT=${PROMPT_TOKEN_LIMIT:-0}
+PROMPT_TAIL_TOKENS=${PROMPT_TAIL_TOKENS:-512}
 DECODE_MARKER=${DECODE_MARKER:-}
 REPLACEMENT_PROMPT=${REPLACEMENT_PROMPT:-}
 PREFIX_CACHE_DIR=${PREFIX_CACHE_DIR-$HOME/.cache/rocket-prefix-cache/glm53-coding}
@@ -57,7 +58,7 @@ cache_free_bytes() { df -B1 --output=avail "$1" | awk 'NR==2 {print $1}'; }
 common=(--prompt-list "$PROMPT_LIST" --tokens "$TOKENS" --batch "$BATCH" --spec "$SPEC"
   --expert-cache-gib "$EXPERT_CACHE_GIB" --max-tokens "$MAX_TOKENS"
   --prefill-chunk "$PREFILL_CHUNK" --prefill-tail "$PREFILL_TAIL" --preload-owned "$PRELOAD_OWNED")
-(( PROMPT_TOKEN_LIMIT > 0 )) && common+=(--prompt-token-limit "$PROMPT_TOKEN_LIMIT")
+(( PROMPT_TOKEN_LIMIT > 0 )) && common+=(--prompt-token-limit "$PROMPT_TOKEN_LIMIT" --prompt-tail-tokens "$PROMPT_TAIL_TOKENS")
 local_extra=()
 [[ -n $DECODE_MARKER ]] && local_extra+=(--decode-marker "$DECODE_MARKER")
 [[ -n $REPLACEMENT_PROMPT ]] && common+=(--replacement-prompt "$REPLACEMENT_PROMPT")

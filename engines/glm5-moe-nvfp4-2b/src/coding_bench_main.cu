@@ -148,6 +148,7 @@ int main(int argc, char** argv) {
   const char* replacement_prompt = arg_value(argc, argv, "--replacement-prompt", nullptr);
   const char* decode_marker = arg_value(argc, argv, "--decode-marker", nullptr);
   const int prompt_token_limit = std::atoi(arg_value(argc, argv, "--prompt-token-limit", "0"));
+  const int prompt_tail_tokens = std::atoi(arg_value(argc, argv, "--prompt-tail-tokens", "512"));
   const int n_new = std::atoi(arg_value(argc, argv, "--tokens", "20"));
   const double cache_gib = std::atof(arg_value(argc, argv, "--expert-cache-gib", "56"));
   const int max_tokens = std::atoi(arg_value(argc, argv, "--max-tokens", "4096"));
@@ -171,7 +172,8 @@ int main(int argc, char** argv) {
   const char* prefix_staging_bytes = arg_value(argc, argv, "--prefix-cache-staging-bytes", "128MiB");
   const int prefix_queue_depth = std::atoi(arg_value(argc, argv, "--prefix-cache-queue-depth", "4"));
   if (n_new <= 0 || max_tokens <= 0 || cache_gib < 0.0 || batch <= 0 ||
-      prefix_queue_depth <= 0) {
+      prefix_queue_depth <= 0 || prompt_tail_tokens < 0 ||
+      (prompt_token_limit > 0 && prompt_tail_tokens >= prompt_token_limit)) {
     std::fprintf(stderr, "bad sizing: --tokens %d --max-tokens %d --expert-cache-gib %g "
                          "--batch %d --prefix-cache-queue-depth %d\n",
                  n_new, max_tokens, cache_gib, batch, prefix_queue_depth);
@@ -323,11 +325,22 @@ int main(int argc, char** argv) {
   std::size_t common_prompt_tokens = static_cast<std::size_t>(-1);
   for (int m = 0; m < batch; ++m) {
     prompt_ids[m] = tok.encode(prompts[m]);
+    if (prompt_token_limit > 0 && prompt_ids[m].size() > static_cast<std::size_t>(prompt_token_limit)) {
+      const std::size_t tail = std::min<std::size_t>(prompt_tail_tokens, prompt_ids[m].size());
+      std::vector<int> limited;
+      limited.reserve(prompt_token_limit);
+      limited.insert(limited.end(), prompt_ids[m].begin(),
+                     prompt_ids[m].begin() + (prompt_token_limit - tail));
+      limited.insert(limited.end(), prompt_ids[m].end() - tail, prompt_ids[m].end());
+      prompt_ids[m] = std::move(limited);
+    }
     common_prompt_tokens = std::min(common_prompt_tokens, prompt_ids[m].size());
   }
-  if (prompt_token_limit > 0)
-    common_prompt_tokens = std::min(common_prompt_tokens, static_cast<std::size_t>(prompt_token_limit));
   for (auto& ids : prompt_ids) ids.resize(common_prompt_tokens);
+  for (int a = 0; a < batch; ++a)
+    for (int b = a + 1; b < batch; ++b)
+      if (prompt_ids[a] == prompt_ids[b])
+        throw std::runtime_error("tokenized production prompts are replicated");
   const std::size_t max_prompt_tokens = common_prompt_tokens;
   std::string prompt_print = printable(prompts[0]);
   if (prompt_print.size() > 512) prompt_print.resize(512), prompt_print += "...";
