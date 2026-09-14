@@ -78,6 +78,24 @@ set_target_properties(test-kv-radix PROPERTIES
 add_test(NAME kv-radix COMMAND test-kv-radix)
 set_tests_properties(kv-radix PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 
+# Bounded O_DIRECT prefix storage: exact multi-component roundtrip, manifest
+# replay, torn-tail recovery, capacity headroom, and the pinned-memory ceiling.
+add_executable(test-nvme-prefix-store test_nvme_prefix_store.cu)
+target_link_libraries(test-nvme-prefix-store PRIVATE rocket_engine)
+set_target_properties(test-nvme-prefix-store PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME nvme-prefix-store COMMAND test-nvme-prefix-store)
+set_tests_properties(nvme-prefix-store PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+# Exact-byte namespace gate across M=1/M=8/M=16 for target MLA/indexer,
+# FP32 KDA, and DFlash2 trailing-window state.
+add_executable(test-prefix-state-invariance test_prefix_state_invariance.cu)
+target_link_libraries(test-prefix-state-invariance PRIVATE rocket_engine rocket_fuel)
+set_target_properties(test-prefix-state-invariance PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_test(NAME prefix-state-invariance COMMAND test-prefix-state-invariance)
+set_tests_properties(prefix-state-invariance PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 7200)
+
 if(NOT EXISTS "${ROCKET_CUTLASS_DIR}/include/cutlass/cutlass.h")
   message(STATUS
     "test-loader-swizzle skipped: no CUTLASS at ${ROCKET_CUTLASS_DIR}. "

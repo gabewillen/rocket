@@ -149,6 +149,26 @@ void ExpertParallel::sync_draft_tokens(std::vector<int>& tokens) {
   if (rank() == 0) fab_->wait_peer(seq);
 }
 
+void ExpertParallel::sync_prefix_boundary(int& tokens) {
+  auto* control = reinterpret_cast<int*>(stage_);
+  control[rank()] = tokens;
+  const std::uint64_t seq = fab_->next_seq();
+  const std::size_t off = static_cast<std::size_t>(rank()) * sizeof(int);
+  fab_->post_write(0, off, off, sizeof(int));
+  fab_->signal(seq); fab_->flush(); fab_->wait_peer(seq); fab_->flush();
+  const std::uint64_t decision_seq = fab_->next_seq();
+  if (rank() == 0) {
+    control[0] = std::min(control[0], control[1]);
+    fab_->post_write(0, 0, 0, sizeof(int));
+    fab_->signal(decision_seq); fab_->flush(); fab_->wait_peer(decision_seq);
+    tokens = control[0];
+  } else {
+    fab_->wait_peer(decision_seq);
+    tokens = control[0];
+    fab_->signal(decision_seq); fab_->flush();
+  }
+}
+
 void ExpertParallel::sync_round_decision(std::vector<int>& accepted, std::vector<int>& last) {
   if (accepted.size() != last.size()) fail("round decision vector sizes differ");
   const std::size_t n = accepted.size();

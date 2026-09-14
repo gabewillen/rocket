@@ -11,6 +11,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rocket::engine {
@@ -521,6 +522,137 @@ void DFlash2DraftEngine::propose(const std::vector<int>& anchor, const std::vect
                layers,candidates,selector);
   cudaEventDestroy(ev0); cudaEventDestroy(ev1); cudaEventDestroy(ev2); cudaEventDestroy(ev3);
 #endif
+}
+
+std::size_t DFlash2DraftEngine::prefix_state_bytes(int position) const {
+  const auto& z = *p_;
+  const int tokens = std::min(position, z.w.cfg.sliding_window);
+  const std::size_t kv = static_cast<std::size_t>(z.w.cfg.num_kv_heads) * z.w.cfg.head_dim;
+  return static_cast<std::size_t>(z.w.cfg.num_layers) * 2 * tokens * kv * sizeof(bf16);
+}
+
+std::uint64_t DFlash2DraftEngine::prefix_state_digest(int slot, int position) const {
+  const auto& z = *p_;
+  if (slot < 0 || slot >= z.max_batch || position < 0 || position > z.max_tokens)
+    throw std::runtime_error("dflash2 prefix digest range");
+  const int count = std::min(position, z.w.cfg.sliding_window);
+  const int start = position - count;
+  const std::size_t KV = static_cast<std::size_t>(z.w.cfg.num_kv_heads) * z.w.cfg.head_dim;
+  std::vector<bf16> host(static_cast<std::size_t>(count) * KV);
+  std::uint64_t hash = 0xcbf29ce484222325ull;
+  auto add = [&](const bf16* src) {
+    ck(cudaMemcpy(host.data(), src, host.size() * sizeof(bf16), cudaMemcpyDeviceToHost),
+       "dflash2 digest copy");
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(host.data());
+    for (std::size_t i = 0; i < host.size() * sizeof(bf16); ++i) {
+      hash ^= bytes[i]; hash *= 0x100000001b3ull;
+    }
+  };
+  for (int l = 0; l < z.w.cfg.num_layers; ++l) {
+    const std::size_t off = (static_cast<std::size_t>(l) * z.max_batch + slot) * z.max_tokens * KV +
+                            static_cast<std::size_t>(start) * KV;
+    add(z.kv_k + off);
+    add(z.kv_v + off);
+  }
+  return hash;
+}
+
+bool DFlash2DraftEngine::prefix_state_equal(int a, int b, int position) const {
+  const auto& z = *p_;
+  if (a < 0 || b < 0 || a >= z.max_batch || b >= z.max_batch ||
+      position < 0 || position > z.max_tokens)
+    throw std::runtime_error("dflash2 prefix equality range");
+  const int count = std::min(position, z.w.cfg.sliding_window);
+  const int start = position - count;
+  const std::size_t KV = static_cast<std::size_t>(z.w.cfg.num_kv_heads) * z.w.cfg.head_dim;
+  const std::size_t bytes = static_cast<std::size_t>(count) * KV * sizeof(bf16);
+  std::vector<std::uint8_t> first(bytes), second(bytes);
+  for (int l = 0; l < z.w.cfg.num_layers; ++l) {
+    const std::size_t ao = (static_cast<std::size_t>(l) * z.max_batch + a) *
+                               z.max_tokens * KV + static_cast<std::size_t>(start) * KV;
+    const std::size_t bo = (static_cast<std::size_t>(l) * z.max_batch + b) *
+                               z.max_tokens * KV + static_cast<std::size_t>(start) * KV;
+    for (const auto pair : {std::pair{z.kv_k + ao, z.kv_k + bo},
+                            std::pair{z.kv_v + ao, z.kv_v + bo}}) {
+      ck(cudaMemcpy(first.data(), pair.first, bytes, cudaMemcpyDeviceToHost),
+         "dflash2 exact first copy");
+      ck(cudaMemcpy(second.data(), pair.second, bytes, cudaMemcpyDeviceToHost),
+         "dflash2 exact second copy");
+      if (first != second) return false;
+    }
+  }
+  return true;
+}
+
+void DFlash2DraftEngine::save_prefix_state(kv::NvmePrefixStore& store,
+                                           const kv::PrefixRecordKey& key,
+                                           int slot, int position, cudaStream_t s) {
+  auto& z = *p_;
+  if (slot < 0 || slot >= z.max_batch || position < 0 || position > z.max_tokens)
+    throw std::runtime_error("dflash2 save prefix range");
+  const int count = std::min(position, z.w.cfg.sliding_window);
+  const int start = position - count;
+  const std::size_t KV = static_cast<std::size_t>(z.w.cfg.num_kv_heads) * z.w.cfg.head_dim;
+  std::vector<kv::DeviceConstSpan> spans;
+  spans.reserve(static_cast<std::size_t>(z.w.cfg.num_layers) * 2);
+  for (int l = 0; l < z.w.cfg.num_layers; ++l) {
+    const std::size_t off = (static_cast<std::size_t>(l) * z.max_batch + slot) * z.max_tokens * KV +
+                            static_cast<std::size_t>(start) * KV;
+    spans.push_back({static_cast<kv::PrefixComponent>(100 + l * 2), z.kv_k + off,
+                     static_cast<std::size_t>(count) * KV * sizeof(bf16)});
+    spans.push_back({static_cast<kv::PrefixComponent>(101 + l * 2), z.kv_v + off,
+                     static_cast<std::size_t>(count) * KV * sizeof(bf16)});
+  }
+  store.save(key, spans);
+  ck(cudaStreamSynchronize(s), "dflash2 save prefix sync");
+}
+
+bool DFlash2DraftEngine::load_prefix_state(kv::NvmePrefixStore& store,
+                                           const kv::PrefixRecordKey& key,
+                                           int slot, int position, cudaStream_t s) {
+  auto& z = *p_;
+  if (slot < 0 || slot >= z.max_batch || position < 0 || position > z.max_tokens)
+    throw std::runtime_error("dflash2 load prefix range");
+  const int count = std::min(position, z.w.cfg.sliding_window);
+  const int start = position - count;
+  const std::size_t KV = static_cast<std::size_t>(z.w.cfg.num_kv_heads) * z.w.cfg.head_dim;
+  std::vector<kv::DeviceSpan> spans;
+  spans.reserve(static_cast<std::size_t>(z.w.cfg.num_layers) * 2);
+  for (int l = 0; l < z.w.cfg.num_layers; ++l) {
+    const std::size_t off = (static_cast<std::size_t>(l) * z.max_batch + slot) * z.max_tokens * KV +
+                            static_cast<std::size_t>(start) * KV;
+    spans.push_back({static_cast<kv::PrefixComponent>(100 + l * 2), z.kv_k + off,
+                     static_cast<std::size_t>(count) * KV * sizeof(bf16)});
+    spans.push_back({static_cast<kv::PrefixComponent>(101 + l * 2), z.kv_v + off,
+                     static_cast<std::size_t>(count) * KV * sizeof(bf16)});
+  }
+  const bool ok = store.load(key, spans);
+  ck(cudaStreamSynchronize(s), "dflash2 load prefix sync");
+  return ok;
+}
+
+void DFlash2DraftEngine::copy_prefix_state(int dst_slot, int src_slot, int position,
+                                           cudaStream_t s) {
+  auto& z = *p_;
+  if (dst_slot < 0 || dst_slot >= z.max_batch || src_slot < 0 || src_slot >= z.max_batch ||
+      position < 0 || position > z.max_tokens)
+    throw std::runtime_error("dflash2 copy prefix range");
+  if (dst_slot == src_slot) return;
+  const int count = std::min(position, z.w.cfg.sliding_window);
+  const int start = position - count;
+  const std::size_t KV = static_cast<std::size_t>(z.w.cfg.num_kv_heads) * z.w.cfg.head_dim;
+  const std::size_t bytes = static_cast<std::size_t>(count) * KV * sizeof(bf16);
+  for (int l = 0; l < z.w.cfg.num_layers; ++l) {
+    const std::size_t src = (static_cast<std::size_t>(l) * z.max_batch + src_slot) *
+                                z.max_tokens * KV + static_cast<std::size_t>(start) * KV;
+    const std::size_t dst = (static_cast<std::size_t>(l) * z.max_batch + dst_slot) *
+                                z.max_tokens * KV + static_cast<std::size_t>(start) * KV;
+    ck(cudaMemcpyAsync(z.kv_k + dst, z.kv_k + src, bytes,
+                       cudaMemcpyDeviceToDevice, s), "dflash2 copy prefix k");
+    ck(cudaMemcpyAsync(z.kv_v + dst, z.kv_v + src, bytes,
+                       cudaMemcpyDeviceToDevice, s), "dflash2 copy prefix v");
+  }
+  ck(cudaStreamSynchronize(s), "dflash2 copy prefix sync");
 }
 
 }  // namespace rocket::engine

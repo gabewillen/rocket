@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "kv/nvme_prefix_store.h"
+
 namespace rocket::fabric { class ExpertParallel; }
 
 namespace rocket::engine {
@@ -83,6 +85,16 @@ class DFlash2DraftEngine {
   // Produces `draft_tokens` tokens per stream in position-major order.
   void propose(const std::vector<int>& anchor, const std::vector<int>& position, int batch,
                int draft_tokens, std::vector<int>& out, cudaStream_t stream);
+  // The proposal model only attends to its configured trailing window. These
+  // methods persist and restore exactly that rank-local K/V state.
+  std::size_t prefix_state_bytes(int position) const;
+  std::uint64_t prefix_state_digest(int slot, int position) const;
+  bool prefix_state_equal(int a, int b, int position) const;
+  void save_prefix_state(kv::NvmePrefixStore& store, const kv::PrefixRecordKey& key,
+                         int slot, int position, cudaStream_t stream);
+  bool load_prefix_state(kv::NvmePrefixStore& store, const kv::PrefixRecordKey& key,
+                         int slot, int position, cudaStream_t stream);
+  void copy_prefix_state(int dst_slot, int src_slot, int position, cudaStream_t stream);
 
  private:
   struct Impl;

@@ -18,6 +18,12 @@ PREFILL_CHUNK=${PREFILL_CHUNK:-32}
 PREFILL_TAIL=${PREFILL_TAIL:-32}
 PRELOAD_OWNED=${PRELOAD_OWNED:-1}
 PROMPT=${PROMPT:-"Count from 1 to 50: 1, 2, 3,"}
+PROMPT_FILE=${PROMPT_FILE:-}
+PROMPT_TOKEN_LIMIT=${PROMPT_TOKEN_LIMIT:-0}
+PREFIX_CACHE_DIR=${PREFIX_CACHE_DIR:-}
+PREFIX_CACHE_BYTES=${PREFIX_CACHE_BYTES:-128GiB}
+PREFIX_CACHE_STAGING_BYTES=${PREFIX_CACHE_STAGING_BYTES:-128MiB}
+PREFIX_CACHE_QUEUE_DEPTH=${PREFIX_CACHE_QUEUE_DEPTH:-4}
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BIN="$REPO/engines/glm5-moe-nvfp4-2b/build/rocket-decode"
 
@@ -27,6 +33,18 @@ common=(
   --prompt "$PROMPT" --tokens "$TOKENS" --batch "$BATCH" --spec "$SPEC"
   --expert-cache-gib "$EXPERT_CACHE_GIB" --max-tokens "$MAX_TOKENS" --prefill-chunk "$PREFILL_CHUNK" --prefill-tail "$PREFILL_TAIL" --preload-owned "$PRELOAD_OWNED"
 )
+if [[ -n $PROMPT_FILE ]]; then
+  rsync -a "$PROMPT_FILE" "$PEER:$PROMPT_FILE"
+  common+=(--prompt-file "$PROMPT_FILE")
+fi
+if (( PROMPT_TOKEN_LIMIT > 0 )); then common+=(--prompt-token-limit "$PROMPT_TOKEN_LIMIT"); fi
+if [[ -n $PREFIX_CACHE_DIR ]]; then
+  common+=(--prefix-cache-dir "$PREFIX_CACHE_DIR" --prefix-cache-bytes "$PREFIX_CACHE_BYTES"
+           --prefix-cache-staging-bytes "$PREFIX_CACHE_STAGING_BYTES"
+           --prefix-cache-queue-depth "$PREFIX_CACHE_QUEUE_DEPTH")
+  mkdir -p "$PREFIX_CACHE_DIR"
+  ssh -o BatchMode=yes "$PEER" "mkdir -p $(printf %q "$PREFIX_CACHE_DIR")"
+fi
 if [[ -n ${DRAFT_FILE:-} ]]; then
   rsync -a "$DRAFT_FILE" "$PEER:$DRAFT_FILE"
   common+=(--draft-file "$DRAFT_FILE")

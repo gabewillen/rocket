@@ -9,10 +9,13 @@
 #include <cstring>
 #include <cmath>
 #include <numeric>
+#include <optional>
 #include <map>
 #include <memory>
 #include <fstream>
+#include <iterator>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <cuda_profiler_api.h>
@@ -35,6 +38,58 @@ const char* arg_value(int argc, char** argv, const char* key, const char* fallba
   for (int i = 1; i + 1 < argc; ++i)
     if (std::strcmp(argv[i], key) == 0) return argv[i + 1];
   return fallback;
+}
+
+std::uint64_t fnv1a(std::string_view text, std::uint64_t seed = 0) {
+  std::uint64_t h = seed ^ 0xcbf29ce484222325ull;
+  for (unsigned char c : text) { h ^= c; h *= 0x100000001b3ull; }
+  return h;
+}
+
+std::uint64_t fingerprint_file(const std::filesystem::path& path, std::uint64_t seed) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot fingerprint " + path.string());
+  std::uint64_t h = seed;
+  char buf[65536];
+  while (in) {
+    in.read(buf, sizeof(buf));
+    h = fnv1a(std::string_view(buf, static_cast<std::size_t>(in.gcount())), h);
+  }
+  return h;
+}
+
+std::uint64_t fingerprint_tree(const std::filesystem::path& root, std::uint64_t seed) {
+  if (root.empty() || !std::filesystem::exists(root)) return fnv1a("absent", seed);
+  if (std::filesystem::is_regular_file(root)) {
+    const auto size = std::filesystem::file_size(root);
+    const auto stamp = std::filesystem::last_write_time(root).time_since_epoch().count();
+    return fnv1a(root.filename().string() + ":" + std::to_string(size) + ":" +
+                 std::to_string(stamp), seed);
+  }
+  std::vector<std::pair<std::string, std::filesystem::path>> entries;
+  for (const auto& e : std::filesystem::recursive_directory_iterator(root)) {
+    if (!e.is_regular_file()) continue;
+    const auto ext = e.path().extension().string();
+    if (ext != ".u8" && ext != ".f32" && ext != ".f8_e4m3" && ext != ".json" &&
+        ext != ".blake3" && ext != ".safetensors" && ext != ".bin" && ext != ".slab")
+      continue;
+    const auto rel = std::filesystem::relative(e.path(), root).string();
+    const auto size = e.file_size();
+    const auto stamp = e.last_write_time().time_since_epoch().count();
+    entries.push_back({rel + ":" + std::to_string(size) + ":" + std::to_string(stamp),
+                       e.path()});
+  }
+  std::sort(entries.begin(), entries.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+  for (const auto& [entry, path] : entries) {
+    seed = fnv1a(entry, seed);
+    const auto ext = path.extension();
+    // Overlay metadata carries source checksums and the deterministic recipe.
+    // Draft safetensors lack a sidecar checksum, so fingerprint their payload.
+    if (ext == ".json" || ext == ".blake3" || ext == ".safetensors")
+      seed = fingerprint_file(path, seed);
+  }
+  return seed;
 }
 
 std::string printable(const std::string& s) {
@@ -61,7 +116,13 @@ int main(int argc, char** argv) {
     return 77;
   }
 
-  const std::string prompt = arg_value(argc, argv, "--prompt", "The capital of France is");
+  std::string prompt = arg_value(argc, argv, "--prompt", "The capital of France is");
+  if (const char* prompt_file = arg_value(argc, argv, "--prompt-file", nullptr)) {
+    std::ifstream in(prompt_file, std::ios::binary);
+    if (!in) { std::fprintf(stderr, "cannot read --prompt-file %s\n", prompt_file); return 2; }
+    prompt.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  }
+  const int prompt_token_limit = std::atoi(arg_value(argc, argv, "--prompt-token-limit", "0"));
   const int n_new = std::atoi(arg_value(argc, argv, "--tokens", "20"));
   const double cache_gib = std::atof(arg_value(argc, argv, "--expert-cache-gib", "56"));
   const int max_tokens = std::atoi(arg_value(argc, argv, "--max-tokens", "4096"));
@@ -80,10 +141,35 @@ int main(int argc, char** argv) {
   const bool preload_owned = arg_value(argc, argv, "--preload-owned", "0")[0] == '1';
   const char* draft_file = arg_value(argc, argv, "--draft-file", nullptr);
   const bool telemetry = arg_value(argc, argv, "--telemetry", "0")[0] == '1';
-  if (n_new <= 0 || max_tokens <= 0 || cache_gib < 0.0 || batch <= 0) {
+  const char* prefix_cache_dir = arg_value(argc, argv, "--prefix-cache-dir", nullptr);
+  const char* prefix_cache_bytes = arg_value(argc, argv, "--prefix-cache-bytes", "0");
+  const char* prefix_staging_bytes = arg_value(argc, argv, "--prefix-cache-staging-bytes", "128MiB");
+  const int prefix_queue_depth = std::atoi(arg_value(argc, argv, "--prefix-cache-queue-depth", "4"));
+  if (n_new <= 0 || max_tokens <= 0 || cache_gib < 0.0 || batch <= 0 ||
+      prefix_queue_depth <= 0) {
     std::fprintf(stderr, "bad sizing: --tokens %d --max-tokens %d --expert-cache-gib %g "
-                         "--batch %d (all > 0, cache >= 0)\n",
-                 n_new, max_tokens, cache_gib, batch);
+                         "--batch %d --prefix-cache-queue-depth %d\n",
+                 n_new, max_tokens, cache_gib, batch, prefix_queue_depth);
+    return 2;
+  }
+  std::optional<rocket::engine::kv::NvmePrefixOptions> prefix_options;
+  try {
+    if (prefix_cache_dir) {
+      rocket::engine::kv::NvmePrefixOptions po;
+      po.directory = prefix_cache_dir;
+      po.capacity_bytes = rocket::engine::kv::NvmePrefixStore::parse_bytes(prefix_cache_bytes);
+      po.staging_bytes = rocket::engine::kv::NvmePrefixStore::parse_bytes(prefix_staging_bytes);
+      po.queue_depth = prefix_queue_depth;
+      po.rank = std::max(rank, 0);
+      std::filesystem::create_directories(po.directory);
+      const std::uint64_t free = rocket::engine::kv::NvmePrefixStore::available_bytes(po.directory);
+      if (free <= po.free_space_headroom_bytes ||
+          po.capacity_bytes > free - po.free_space_headroom_bytes)
+        throw std::runtime_error("prefix cache capacity exceeds free space after 64GiB headroom");
+      prefix_options = po;
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "prefix cache configuration: %s\n", e.what());
     return 2;
   }
 
@@ -119,6 +205,39 @@ int main(int argc, char** argv) {
                                       static_cast<std::size_t>(cache_gib * (1ull << 30)),
                                       max_tokens, batch, 0, 128, prefill_chunk);
   engine.set_telemetry(telemetry);
+  std::uint64_t prefix_namespace = 0;
+  if (prefix_options) {
+    std::error_code ec;
+    const auto canonical = std::filesystem::weakly_canonical(snapshot, ec);
+    const auto env_or_empty = [](const char* name) {
+      const char* value = std::getenv(name);
+      return value ? std::string(value) : std::string();
+    };
+    const std::string fp8_root = env_or_empty("ROCKET_FP8_ATTN_DIR");
+    const std::string kda_fp8_root = env_or_empty("ROCKET_KDA_QKV_FP8_DIR");
+    const std::string dflash_root = env_or_empty("ROCKET_DFLASH2_DIR");
+    const std::string packed_weights = env_or_empty("ROCKET_PACKED_WEIGHTS");
+    const std::string expert_slabs = env_or_empty("ROCKET_EXPERT_SLAB_DIR");
+    const std::string ns = (ec ? snapshot.string() : canonical.string()) + "|" +
+        attn.string() + "|batch=" + std::to_string(batch) + "|slot-group=8|page=128|nvfp4|fp32-kda|" +
+        env_or_empty("ROCKET_KDA_CUBLAS") + "|" + env_or_empty("ROCKET_CUBLAS_ALL") + "|" +
+        packed_weights + "|" + expert_slabs + "|" + fp8_root + "|" + kda_fp8_root + "|" +
+        dflash_root;
+    prefix_namespace = fnv1a(ns);
+    prefix_namespace = fingerprint_file(snapshot / "checksums.blake3", prefix_namespace);
+    prefix_namespace = fingerprint_file(snapshot / "config.json", prefix_namespace);
+    prefix_namespace = fingerprint_file(snapshot / "tokenizer.json", prefix_namespace);
+    prefix_namespace = fingerprint_file(attn, prefix_namespace);
+    prefix_namespace = fingerprint_tree(packed_weights, prefix_namespace);
+    prefix_namespace = fingerprint_tree(expert_slabs, prefix_namespace);
+    prefix_namespace = fingerprint_tree(fp8_root, prefix_namespace);
+    prefix_namespace = fingerprint_tree(kda_fp8_root, prefix_namespace);
+    prefix_namespace = fingerprint_tree(dflash_root, prefix_namespace);
+    engine.enable_nvme_prefix_cache(std::move(*prefix_options), prefix_namespace);
+    std::printf("prefix    dir=%s capacity=%s staging=%s queue=%d namespace=%016llx\n",
+                prefix_cache_dir, prefix_cache_bytes, prefix_staging_bytes, prefix_queue_depth,
+                static_cast<unsigned long long>(prefix_namespace));
+  }
   if (ep) {
     engine.weights().set_expert_set(ep->owned_experts());
     engine.set_expert_parallel(ep.get());
@@ -155,10 +274,76 @@ int main(int argc, char** argv) {
               engine.weights().expert_slots() * engine.weights().expert_slot_bytes() / 1073741824.0);
   std::printf("load      %.1f s weights, %.1f s tokenizer\n", load_ms / 1000.0, tok_ms / 1000.0);
 
-  const std::vector<int> prompt_ids = tok.encode(prompt);
-  std::printf("prompt    %zu tokens: \"%s\"\n", prompt_ids.size(), printable(prompt).c_str());
+  std::vector<int> prompt_ids = tok.encode(prompt);
+  if (prompt_token_limit > 0 && prompt_ids.size() > static_cast<std::size_t>(prompt_token_limit))
+    prompt_ids.resize(static_cast<std::size_t>(prompt_token_limit));
+  std::string prompt_print = printable(prompt);
+  if (prompt_print.size() > 512) prompt_print.resize(512), prompt_print += "...";
+  std::printf("prompt    %zu tokens: \"%s\"\n", prompt_ids.size(), prompt_print.c_str());
 
   engine.reset();
+  std::vector<int> last(batch, 0);
+  int restored_prefix = 0;
+  const int prefix_page_tokens = 128;
+  if (prefix_cache_dir) {
+    int candidate = static_cast<int>(prompt_ids.size()) / prefix_page_tokens * prefix_page_tokens;
+    for (int m = 0; m < batch; ++m)
+      candidate = std::min(candidate, engine.kv_match_shared(
+          m, prompt_ids.data(), static_cast<int>(prompt_ids.size())));
+    if (dflash) {
+      while (candidate > 0) {
+        bool all_dflash = true;
+        for (int m = 0; m < batch; ++m) {
+          const auto dk = engine.kv_prefix_key(m, prompt_ids.data(), candidate,
+                                               /*record_kind=*/3);
+          all_dflash = engine.kv_nvme_store()->holds(dk) && all_dflash;
+        }
+        if (all_dflash) break;
+        candidate -= prefix_page_tokens;
+      }
+    }
+    if (ep) ep->sync_prefix_boundary(candidate);
+    while (candidate > 0) {
+      int local_boundary = candidate;
+      for (int m = 0; m < batch; ++m) {
+        int cached_next = 0;
+        const int got = engine.kv_open_shared(m, prompt_ids.data(), candidate, &cached_next);
+        if (got != candidate) local_boundary = std::min(local_boundary, got);
+        if (got > 0) last[m] = cached_next;
+      }
+      if (ep) ep->sync_prefix_boundary(local_boundary);
+      if (local_boundary != candidate) {
+        engine.reset();
+        candidate = local_boundary > 0 ? local_boundary : candidate - prefix_page_tokens;
+        continue;
+      }
+      bool dflash_ok = true;
+      if (dflash) {
+        for (int m = 0; m < batch; ++m) {
+          const int source = batch >= 16 ? (m / 8) * 8 : 0;
+          if (m != source) {
+            dflash->copy_prefix_state(m, source, candidate, nullptr);
+            continue;
+          }
+          const auto dk = engine.kv_prefix_key(m, prompt_ids.data(), candidate,
+                                               /*record_kind=*/3);
+          dflash_ok = dflash->load_prefix_state(
+              *engine.kv_nvme_store(), dk, m, candidate, nullptr) && dflash_ok;
+        }
+      }
+      int dflash_boundary = dflash_ok ? candidate : candidate - prefix_page_tokens;
+      if (ep) ep->sync_prefix_boundary(dflash_boundary);
+      if (dflash_boundary != candidate) {
+        engine.reset();
+        candidate = dflash_boundary;
+        continue;
+      }
+      restored_prefix = candidate;
+      break;
+    }
+    std::printf("prefix    restored %d/%zu prompt tokens, %d physical GPU pages at batch %d\n",
+                restored_prefix, prompt_ids.size(), engine.kv_pinned_pages(), batch);
+  }
 
   // Prefill runs the decode path once per prompt token; every stream gets
   // the same prompt so the batch is full from the first step.
@@ -166,10 +351,13 @@ int main(int argc, char** argv) {
   if (profile_prefill) cudaProfilerStart();
   auto t_prefill = Clock::now();
   std::vector<int> next_batch;
-  std::vector<int> last(batch, 0);
-  for (std::size_t begin = 0; begin < prompt_ids.size();) {
+  const int checkpoint_target =
+      static_cast<int>(prompt_ids.size()) / prefix_page_tokens * prefix_page_tokens;
+  for (std::size_t begin = static_cast<std::size_t>(restored_prefix); begin < prompt_ids.size();) {
     const int remaining = static_cast<int>(prompt_ids.size() - begin);
-    const int count = remaining <= prefill_tail ? 1 : std::min(prefill_chunk, remaining - prefill_tail);
+    int count = remaining <= prefill_tail ? 1 : std::min(prefill_chunk, remaining - prefill_tail);
+    if (prefix_cache_dir && static_cast<int>(begin) < checkpoint_target)
+      count = std::min(count, checkpoint_target - static_cast<int>(begin));
     std::vector<int> base(batch);
     for (int m = 0; m < batch; ++m) base[m] = engine.position(m);
     if (count == 1) {
@@ -196,6 +384,21 @@ int main(int argc, char** argv) {
     for (int m = 0; m < batch; ++m)
       last[m] = next_batch[static_cast<std::size_t>(count - 1) * batch + m];
     begin += count;
+    if (prefix_cache_dir && static_cast<int>(begin) == checkpoint_target &&
+        checkpoint_target > restored_prefix) {
+      const int state_groups = batch >= 16 ? (batch + 7) / 8 : 1;
+      for (int group = 0; group < state_groups; ++group) {
+        const int source_slot = group * 8;
+        engine.kv_checkpoint(source_slot, last[source_slot]);
+        if (dflash) {
+          auto dk = engine.kv_prefix_key(source_slot, prompt_ids.data(), checkpoint_target,
+                                         /*record_kind=*/3);
+          dflash->save_prefix_state(*engine.kv_nvme_store(), dk, source_slot,
+                                    checkpoint_target, nullptr);
+        }
+      }
+      std::printf("prefix    checkpointed %d prompt tokens\n", checkpoint_target);
+    }
   }
   const double prefill_ms = ms_since(t_prefill);
   if (profile_prefill) cudaProfilerStop();
@@ -370,9 +573,9 @@ int main(int argc, char** argv) {
 
   std::printf("\n--- output ------------------------------------------------------\n");
   if (batch == 1)
-    std::printf("%s%s\n", prompt.c_str(), tok.decode(generated[0]).c_str());
+    std::printf("%s%s\n", prompt_print.c_str(), tok.decode(generated[0]).c_str());
   else
-    std::printf("batch %d, stream 0: %s%s\n", batch, prompt.c_str(),
+    std::printf("batch %d, stream 0: %s%s\n", batch, prompt_print.c_str(),
                 tok.decode(generated[0]).c_str());
   if (batch == 1 || std::getenv("ROCKET_TOKEN_IDS")) {
     std::printf("--- token ids ---------------------------------------------------\n");
@@ -452,6 +655,19 @@ int main(int argc, char** argv) {
               static_cast<unsigned long long>(engine.weights().expert_hits()),
               static_cast<unsigned long long>(engine.weights().expert_misses()),
               engine.weights().expert_bytes_streamed() / 1073741824.0);
+  if (const auto* ps = engine.kv_nvme_stats()) {
+    std::printf("prefix IO: read %.3f GiB write %.3f GiB record_hits %llu record_misses %llu "
+                "page_hits %llu page_misses %llu restore %.1f ms writeback %.1f ms "
+                "checksum_failures %llu rejected %llu\n",
+                ps->read_bytes / 1073741824.0, ps->write_bytes / 1073741824.0,
+                static_cast<unsigned long long>(ps->hit_records),
+                static_cast<unsigned long long>(ps->miss_records),
+                static_cast<unsigned long long>(ps->hit_pages),
+                static_cast<unsigned long long>(ps->miss_pages), ps->restore_ms,
+                ps->writeback_ms,
+                static_cast<unsigned long long>(ps->checksum_failures),
+                static_cast<unsigned long long>(ps->rejected_records));
+  }
   if (telemetry) {
     std::map<std::string, float> ordered(engine.telemetry_absmax().begin(),
                                          engine.telemetry_absmax().end());

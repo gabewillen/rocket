@@ -183,11 +183,14 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
     kda_store_ = std::make_unique<kv::HostKdaStateStore>(stream_);
     mla_kv_ = kv_arena_->pages();
     kv_seq_of_slot_.assign(MB, -1);
+    restored_kda_chain_.assign(MB, 0);
+    restored_next_token_.assign(MB, 0);
     for (int m = 0; m < MB; ++m) kv_seq_of_slot_[m] = kv_cache_->open(m);
     kda_stage_ = alloc(kda_bytes_per_stream());
   }
 
   tokens_dev_ = I(MB);
+  prefix_token_dev_ = I(1);
   pos_dev_ = I(MB);
   n_tokens_dev_ = I(MB);
   n_pools_dev_ = I(MB);
@@ -590,6 +593,8 @@ void DecodeEngine::commit_positions(const std::vector<int>& accepted) {
 
 void DecodeEngine::reset() {
   std::fill(pos_.begin(), pos_.end(), 0);
+  std::fill(restored_kda_chain_.begin(), restored_kda_chain_.end(), 0);
+  std::fill(restored_next_token_.begin(), restored_next_token_.end(), 0);
   const int H = cfg_.hidden_size;
   const int qkv = cfg_.kda_qkv_dim();
   const int taps = cfg_.conv_state_taps();
@@ -612,7 +617,8 @@ void DecodeEngine::reset() {
   // instead.
   for (int m = 0; m < MB; ++m) {
     if (kv_seq_of_slot_[m] >= 0) kv_cache_->destroy(kv_seq_of_slot_[m]);
-    kv_seq_of_slot_[m] = kv_cache_->open(m);
+    const std::uint64_t seed = kv_nvme_backing_ ? kv_hash_seed(m) : 0;
+    kv_seq_of_slot_[m] = kv_cache_->open(m, seed);
   }
 }
 
@@ -626,6 +632,207 @@ std::size_t DecodeEngine::kda_bytes_per_stream() const {
 }
 
 int DecodeEngine::kv_pinned_pages() const { return kv_pool_->pinned_pages(); }
+
+PrefixStateDigest DecodeEngine::kv_state_digest(int slot) {
+  if (slot < 0 || slot >= max_batch_ || kv_seq_of_slot_[slot] < 0)
+    fail("kv_state_digest: invalid slot");
+  auto hash_bytes = [](std::uint64_t h, const std::uint8_t* p, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 0x100000001b3ull; }
+    return h;
+  };
+  PrefixStateDigest out{0xcbf29ce484222325ull, 0xcbf29ce484222325ull};
+  for (int page : kv_cache_->page_table(kv_seq_of_slot_[slot])) {
+    const auto bytes = kv_arena_->read_page(page);
+    out.target = hash_bytes(out.target, bytes.data(), bytes.size());
+  }
+  kda_pack(slot, kda_stage_);
+  std::vector<std::uint8_t> host(kda_bytes_per_stream());
+  cuda_check(cudaMemcpy(host.data(), kda_stage_, host.size(), cudaMemcpyDeviceToHost),
+             "kv_state_digest KDA");
+  out.kda = hash_bytes(out.kda, host.data(), host.size());
+  return out;
+}
+
+bool DecodeEngine::kv_state_equal(int a, int b) {
+  if (a < 0 || b < 0 || a >= max_batch_ || b >= max_batch_ ||
+      kv_seq_of_slot_[a] < 0 || kv_seq_of_slot_[b] < 0)
+    fail("kv_state_equal: invalid slot");
+  const auto& ap = kv_cache_->page_table(kv_seq_of_slot_[a]);
+  const auto& bp = kv_cache_->page_table(kv_seq_of_slot_[b]);
+  if (ap.size() != bp.size()) return false;
+  for (std::size_t i = 0; i < ap.size(); ++i)
+    if (kv_arena_->read_page(ap[i]) != kv_arena_->read_page(bp[i])) return false;
+  kda_pack(a, kda_stage_);
+  std::vector<std::uint8_t> first(kda_bytes_per_stream());
+  cuda_check(cudaMemcpy(first.data(), kda_stage_, first.size(), cudaMemcpyDeviceToHost),
+             "kv_state_equal first KDA");
+  kda_pack(b, kda_stage_);
+  std::vector<std::uint8_t> second(kda_bytes_per_stream());
+  cuda_check(cudaMemcpy(second.data(), kda_stage_, second.size(), cudaMemcpyDeviceToHost),
+             "kv_state_equal second KDA");
+  return first == second;
+}
+
+void DecodeEngine::enable_nvme_prefix_cache(kv::NvmePrefixOptions options,
+                                             std::uint64_t namespace_hash) {
+  if (kv_nvme_backing_) fail("NVMe prefix cache is already enabled");
+  kv_namespace_hash_ = namespace_hash;
+  const kv::KvGeometry geom = kv_cache_->geometry();
+  kv_nvme_backing_ = std::make_unique<kv::NvmeArenaPageBacking>(
+      kv_arena_.get(), geom, std::move(options), namespace_hash, stream_);
+  kv_cache_->set_backing(kv_nvme_backing_.get());
+  kda_store_ = std::make_unique<kv::NvmeKdaStateStore>(
+      &kv_nvme_backing_->store(), namespace_hash);
+}
+
+const kv::NvmePrefixStats* DecodeEngine::kv_nvme_stats() const {
+  return kv_nvme_backing_ ? &kv_nvme_backing_->store().stats() : nullptr;
+}
+
+kv::NvmePrefixStore* DecodeEngine::kv_nvme_store() {
+  return kv_nvme_backing_ ? &kv_nvme_backing_->store() : nullptr;
+}
+
+std::uint64_t DecodeEngine::kv_hash_seed(int slot) const {
+  if (slot < 0 || slot >= max_batch_) fail("kv hash seed: slot out of range");
+  // M16 has two measured row groups (0..7 and 8..15). Lower shapes have one.
+  const std::uint64_t group = max_batch_ >= 16 ? static_cast<std::uint64_t>(slot / 8) : 0;
+  return kv_namespace_hash_ ^ (group * 0x9e3779b97f4a7c15ull);
+}
+
+kv::PrefixRecordKey DecodeEngine::kv_prefix_key(int slot, const int* tokens, int n_tokens,
+                                                 std::uint32_t record_kind) const {
+  if (!kv_nvme_backing_ || !tokens || n_tokens <= 0 ||
+      n_tokens % kv_cache_->geometry().page_tokens != 0)
+    fail("kv_prefix_key: invalid prefix boundary");
+  const int P = kv_cache_->geometry().page_tokens;
+  std::uint64_t seed = kv_hash_seed(slot), parent_record = 0, chain = 0;
+  for (int at = 0; at < n_tokens; at += P) {
+    chain = kv::PrefixTree::block_hash(seed, tokens + at, P);
+    parent_record = at == 0 ? 0 : seed;
+    seed = chain;
+  }
+  return kv::PrefixRecordKey{kv_namespace_hash_, parent_record, chain,
+      static_cast<std::uint32_t>(kv_nvme_backing_->store().options().rank),
+      static_cast<std::uint32_t>(n_tokens), record_kind, 0};
+}
+
+std::uint64_t DecodeEngine::kv_checkpoint(int slot, int next_token) {
+  if (!kv_nvme_backing_) fail("kv_checkpoint: NVMe prefix cache is disabled");
+  if (slot < 0 || slot >= max_batch_ || kv_seq_of_slot_[slot] < 0)
+    fail("kv_checkpoint: slot holds no sequence");
+  const int seq = kv_seq_of_slot_[slot];
+  const int length = kv_cache_->info(seq).length;
+  const int page_tokens = kv_cache_->geometry().page_tokens;
+  if (length == 0 || length % page_tokens != 0)
+    fail("kv_checkpoint: position must be a non-zero full-page boundary");
+  if (!kv_cache_->persist(seq)) fail("kv_checkpoint: target page persistence failed");
+  const std::uint64_t chain = kv_cache_->hash_at(seq, length);
+  const std::uint64_t parent = length == page_tokens ? 0 :
+      kv_cache_->hash_at(seq, length - page_tokens);
+  kda_pack(slot, kda_stage_);
+  auto* store = dynamic_cast<kv::NvmeKdaStateStore*>(kda_store_.get());
+  if (!store) fail("kv_checkpoint: NVMe KDA store is unavailable");
+  store->save_prefix(parent, chain, length, kda_stage_, kda_bytes_per_stream());
+  cuda_check(cudaMemcpyAsync(prefix_token_dev_, &next_token, sizeof(next_token),
+                             cudaMemcpyHostToDevice, stream_), "prefix token stage");
+  cuda_check(cudaStreamSynchronize(stream_), "prefix token stage sync");
+  const kv::PrefixRecordKey token_key{kv_namespace_hash_, parent, chain,
+      static_cast<std::uint32_t>(kv_nvme_backing_->store().options().rank),
+      static_cast<std::uint32_t>(length), /*record_kind=*/4, 0};
+  kv_nvme_backing_->store().save(
+      token_key, {{kv::PrefixComponent::kNextToken, prefix_token_dev_, sizeof(int)}});
+  return chain;
+}
+
+int DecodeEngine::kv_match_shared(int slot, const int* tokens, int n_tokens) const {
+  if (!kv_nvme_backing_ || !tokens || n_tokens < 0 || slot < 0 || slot >= max_batch_) return 0;
+  auto* state = dynamic_cast<kv::NvmeKdaStateStore*>(kda_store_.get());
+  if (!state) return 0;
+  const int P = kv_cache_->geometry().page_tokens;
+  std::uint64_t seed = kv_hash_seed(slot);
+  int best = 0;
+  for (int at = 0; at + P <= n_tokens; at += P) {
+    const std::uint64_t chain = kv::PrefixTree::block_hash(seed, tokens + at, P);
+    const std::uint64_t parent_record = at == 0 ? 0 : seed;
+    if (!kv_nvme_backing_->holds_page(parent_record, chain, at + P)) break;
+    const kv::PrefixRecordKey token_key{kv_namespace_hash_, parent_record, chain,
+        static_cast<std::uint32_t>(kv_nvme_backing_->store().options().rank),
+        static_cast<std::uint32_t>(at + P), /*record_kind=*/4, 0};
+    if (state->holds_prefix(parent_record, chain, at + P) &&
+        kv_nvme_backing_->store().holds(token_key)) best = at + P;
+    seed = chain;
+  }
+  return best;
+}
+
+int DecodeEngine::kv_open_shared(int slot, const int* tokens, int n_tokens,
+                                 int* next_token_out) {
+  if (!kv_nvme_backing_) fail("kv_open_shared: NVMe prefix cache is disabled");
+  if (slot < 0 || slot >= max_batch_) fail("kv_open_shared: slot out of range");
+  if (!tokens || n_tokens < 0) fail("kv_open_shared: invalid tokens");
+  auto* state = dynamic_cast<kv::NvmeKdaStateStore*>(kda_store_.get());
+  if (!state) fail("kv_open_shared: NVMe KDA store is unavailable");
+  const int P = kv_cache_->geometry().page_tokens;
+  const int best = kv_match_shared(slot, tokens, n_tokens);
+  std::uint64_t seed = kv_hash_seed(slot);
+  std::uint64_t best_parent = 0;
+  std::uint64_t best_chain = 0;
+  for (int at = 0; at < best; at += P) {
+    best_chain = kv::PrefixTree::block_hash(seed, tokens + at, P);
+    best_parent = at == 0 ? 0 : seed;
+    seed = best_chain;
+  }
+  if (kv_seq_of_slot_[slot] >= 0) kv_cache_->destroy(kv_seq_of_slot_[slot]);
+  int matched = 0;
+  const int seq = kv_cache_->open_shared(slot, tokens, best, &matched, kv_hash_seed(slot));
+  kv_seq_of_slot_[slot] = seq;
+  if (matched != best) {
+    kv_cache_->destroy(seq);
+    kv_seq_of_slot_[slot] = kv_cache_->open(slot, kv_hash_seed(slot));
+    kv_arena_->upload_table(slot, {});
+    pos_[slot] = 0;
+    return 0;
+  }
+  if (best > 0) {
+    const int source = max_batch_ >= 16 ? (slot / 8) * 8 : 0;
+    if (source != slot && restored_kda_chain_[source] == best_chain) {
+      kda_copy_slot(slot, source);
+      if (next_token_out) *next_token_out = restored_next_token_[source];
+    } else {
+      if (!state->load_prefix(best_parent, best_chain, best, kda_stage_,
+                              kda_bytes_per_stream())) {
+        kv_cache_->destroy(seq);
+        kv_seq_of_slot_[slot] = kv_cache_->open(slot, kv_hash_seed(slot));
+        kv_arena_->upload_table(slot, {});
+        pos_[slot] = 0;
+        return 0;
+      }
+      kda_unpack(slot, kda_stage_);
+      int cached_next = 0;
+      const kv::PrefixRecordKey token_key{kv_namespace_hash_, best_parent, best_chain,
+          static_cast<std::uint32_t>(kv_nvme_backing_->store().options().rank),
+          static_cast<std::uint32_t>(best), /*record_kind=*/4, 0};
+      if (!kv_nvme_backing_->store().load(
+              token_key, {{kv::PrefixComponent::kNextToken, prefix_token_dev_, sizeof(int)}})) {
+        kv_cache_->destroy(seq);
+        kv_seq_of_slot_[slot] = kv_cache_->open(slot, kv_hash_seed(slot));
+        kv_arena_->upload_table(slot, {});
+        pos_[slot] = 0;
+        return 0;
+      }
+      cuda_check(cudaMemcpyAsync(&cached_next, prefix_token_dev_, sizeof(int),
+                                 cudaMemcpyDeviceToHost, stream_), "prefix token restore");
+      cuda_check(cudaStreamSynchronize(stream_), "prefix token restore sync");
+      restored_kda_chain_[slot] = best_chain;
+      restored_next_token_[slot] = cached_next;
+      if (next_token_out) *next_token_out = cached_next;
+    }
+  }
+  kv_arena_->upload_table(slot, kv_cache_->page_table(seq));
+  pos_[slot] = best;
+  return best;
+}
 
 int DecodeEngine::kv_session_in_slot(int slot) const {
   if (slot < 0 || slot >= max_batch_) return -1;

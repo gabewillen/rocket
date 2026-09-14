@@ -48,6 +48,7 @@ add_library(rocket_engine STATIC
   src/dflash2_draft.cu
   src/dflash2_engine.cu
   src/kv/page_pool.cc
+  src/kv/nvme_prefix_store.cc
   src/kv/kv_arena.cu
 )
 target_include_directories(rocket_engine PUBLIC src)

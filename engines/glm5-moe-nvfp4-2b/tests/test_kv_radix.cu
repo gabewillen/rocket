@@ -34,8 +34,10 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 #include "kernels.h"
 #include "kv/kv_arena.h"
@@ -199,6 +201,35 @@ void test_pool_and_forks() {
   const int victim = pool.lru_victim();
   check("an unreferenced page evicts", victim >= 0 && pool.evict(victim));
 
+  cudaStreamDestroy(s);
+}
+
+void test_execution_namespaces() {
+  std::printf("radix execution namespaces\n");
+  const kv::KvGeometry g = geometry();
+  cudaStream_t s = nullptr;
+  ck(cudaStreamCreate(&s), "stream");
+  kv::KvArena arena(g, 16, 4, 4, s);
+  kv::PagePool pool(16, kPageTokens);
+  kv::PrefixTree tree;
+  kv::KvCache cache(g, &pool, &tree, &arena);
+  const int a = cache.open(0, 0x1111);
+  const int b = cache.open(1, 0x2222);
+  for (int i = 0; i < kPageTokens; ++i) {
+    const int token = i + 7;
+    auto sa = cache.append_token(a, token);
+    auto sb = cache.append_token(b, token);
+    write_token(arena, sa.page, sa.slot, 1, i);
+    write_token(arena, sb.page, sb.slot, 2, i);
+  }
+  check("same tokens in two execution namespaces keep distinct pages",
+        cache.page_table(a)[0] != cache.page_table(b)[0] && tree.live_nodes() == 2);
+  int matched = 0;
+  std::vector<int> tokens(kPageTokens);
+  for (int i = 0; i < kPageTokens; ++i) tokens[i] = i + 7;
+  const int shared = cache.open_shared(2, tokens.data(), tokens.size(), &matched, 0x2222);
+  check("lookup shares only the requested execution namespace",
+        matched == kPageTokens && cache.page_table(shared)[0] == cache.page_table(b)[0]);
   cudaStreamDestroy(s);
 }
 
@@ -400,6 +431,62 @@ void test_forked_read_equals_materialised() {
   cudaStreamDestroy(s);
 }
 
+// ------------------------------------------------------- persistent radix IO
+
+void test_nvme_radix_restart() {
+  std::printf("radix pages survive GPU eviction and process-style restart\n");
+  const kv::KvGeometry g = geometry();
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("rocket-kv-radix-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  cudaStream_t s = nullptr;
+  ck(cudaStreamCreate(&s), "stream");
+  kv::KvArena arena(g, 8, 2, 8, s);
+  kv::NvmePrefixOptions options;
+  options.directory = dir;
+  options.capacity_bytes = 64ull << 20;
+  options.staging_bytes = 4ull << 20;
+  options.segment_bytes = 32ull << 20;
+  options.free_space_headroom_bytes = 0;
+  options.rank = 0;
+  std::vector<int> tokens;
+  {
+    kv::PagePool pool(8, kPageTokens);
+    kv::PrefixTree tree;
+    kv::NvmeArenaPageBacking backing(&arena, g, options, 0x12345678, s);
+    kv::KvCache cache(g, &pool, &tree, &arena, &backing);
+    const int seq = cache.open(0);
+    grow(cache, arena, seq, 41, 2 * kPageTokens);
+    tokens = cache.tokens(seq);
+    check("checkpoint writes every sealed target page", cache.persist(seq));
+    cache.destroy(seq);
+  }
+  // A fresh pool and tree model a new process. open_shared reconstructs the
+  // radix path from chained token hashes and rank-local manifest records.
+  {
+    kv::PagePool pool(8, kPageTokens);
+    kv::PrefixTree tree;
+    kv::NvmeArenaPageBacking backing(&arena, g, options, 0x12345678, s);
+    kv::KvCache cache(g, &pool, &tree, &arena, &backing);
+    int matched = 0;
+    const int seq = cache.open_shared(1, tokens.data(), tokens.size(), &matched);
+    check("fresh radix tree restores the full durable prefix",
+          matched == 2 * kPageTokens && cache.info(seq).pages == 2);
+    bf16 got{};
+    const int page = cache.page_table(seq)[0];
+    const std::size_t base =
+        (static_cast<std::size_t>(page) * kLayers + kLayerSlot) * kPageTokens * kKvLora;
+    ck(cudaMemcpy(&got, arena.pages().latent + base, sizeof(got), cudaMemcpyDeviceToHost),
+       "persistent page readback");
+    const bf16 expected = __float2bfloat16(model_value(41, 0, 0, 0));
+    check("restored final-layout latent bytes are exact",
+          std::memcmp(&got, &expected, sizeof(got)) == 0);
+  }
+  cudaStreamDestroy(s);
+  std::filesystem::remove_all(dir);
+}
+
 // ---------------------------------------------------------------------- 6
 
 // Pulls a scalar out of attention.yaml so an edit there breaks this test
@@ -595,8 +682,10 @@ int main() {
     return 77;
   }
   test_pool_and_forks();
+  test_execution_namespaces();
   test_detach_resume();
   test_forked_read_equals_materialised();
+  test_nvme_radix_restart();
   test_capacity_math();
   test_decode_loop_table_discipline();
   std::printf("%s\n", failures ? "FAILED" : "all ok");

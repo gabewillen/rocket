@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "kernels.h"
+#include "kv/nvme_prefix_store.h"
 #include "kv/page_pool.h"
 
 namespace rocket::engine::kv {
@@ -42,8 +43,9 @@ class KvArena : public PageStore {
   int max_pages_per_stream() const { return max_pages_per_stream_; }
   int num_pages() const { return num_pages_; }
 
-  // Host-visible copy of one slot's uploaded table row, for tests.
+  // Host-visible copies for invariance and persistence tests.
   std::vector<int> read_table(int slot) const;
+  std::vector<std::uint8_t> read_page(int page) const;
 
  private:
   KvGeometry geom_;
@@ -54,6 +56,31 @@ class KvArena : public PageStore {
   cudaStream_t stream_ = nullptr;
   std::size_t bytes_ = 0;
   std::vector<void*> owned_;
+};
+
+// Persists one target radix page in the arena's final latent/key/gate layout.
+// NvmePrefixStore owns the fixed pinned ring; this adapter never allocates
+// page-sized host memory.
+class NvmeArenaPageBacking : public PrefixPageBacking {
+ public:
+  NvmeArenaPageBacking(KvArena* arena, const KvGeometry& geom, NvmePrefixOptions options,
+                       std::uint64_t namespace_hash, cudaStream_t stream);
+
+  bool holds_page(std::uint64_t parent_hash, std::uint64_t chain_hash,
+                  int token_count) const override;
+  bool persist_page(std::uint64_t parent_hash, std::uint64_t chain_hash,
+                    int token_count, int page) override;
+  bool restore_page(std::uint64_t parent_hash, std::uint64_t chain_hash,
+                    int token_count, int page) override;
+  NvmePrefixStore& store() { return store_; }
+
+ private:
+  PrefixRecordKey key(std::uint64_t parent_hash, std::uint64_t chain_hash,
+                      int token_count) const;
+  KvArena* arena_ = nullptr;
+  KvGeometry geom_;
+  std::uint64_t namespace_hash_ = 0;
+  NvmePrefixStore store_;
 };
 
 // KDA recurrent + conv state is per stream, 72.8 MiB at BF16 for this fuel
@@ -76,6 +103,29 @@ class KdaStateStore {
 };
 
 // Pinned host memory. Sized by what is detached, not preallocated.
+class NvmeKdaStateStore : public KdaStateStore {
+ public:
+  NvmeKdaStateStore(NvmePrefixStore* store, std::uint64_t namespace_hash);
+  void save(int session, const void* src, std::size_t bytes) override;
+  void load(int session, void* dst, std::size_t bytes) override;
+  void drop(int session) override;
+  bool holds(int session) const override;
+  std::size_t resident_bytes() const override { return 0; }
+  NvmePrefixStore& store() { return *store_; }
+  void save_prefix(std::uint64_t parent_hash, std::uint64_t chain_hash,
+                   int token_count, const void* src, std::size_t bytes);
+  bool load_prefix(std::uint64_t parent_hash, std::uint64_t chain_hash,
+                   int token_count, void* dst, std::size_t bytes);
+  bool holds_prefix(std::uint64_t parent_hash, std::uint64_t chain_hash,
+                    int token_count) const;
+
+ private:
+  PrefixRecordKey key(int session) const;
+  std::uint64_t namespace_hash_ = 0;
+  NvmePrefixStore* store_ = nullptr;
+  std::unordered_map<int, std::size_t> sizes_;
+};
+
 class HostKdaStateStore : public KdaStateStore {
  public:
   explicit HostKdaStateStore(cudaStream_t stream);

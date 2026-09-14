@@ -101,7 +101,160 @@ std::vector<int> KvArena::read_table(int slot) const {
   return row;
 }
 
+std::vector<std::uint8_t> KvArena::read_page(int page) const {
+  if (page < 0 || page >= num_pages_) throw std::runtime_error("kv: read_page range");
+  const std::size_t slots = static_cast<std::size_t>(geom_.layers) * geom_.page_tokens;
+  const std::size_t lat_bytes = slots * geom_.kv_lora * sizeof(bf16);
+  const std::size_t idx_bytes = slots * geom_.index_head_dim * sizeof(bf16);
+  std::vector<std::uint8_t> out(lat_bytes + 2 * idx_bytes);
+  cuda_check(cudaMemcpy(out.data(), kv_.latent + static_cast<std::size_t>(page) * slots * geom_.kv_lora,
+                        lat_bytes, cudaMemcpyDeviceToHost), "read_page latent");
+  cuda_check(cudaMemcpy(out.data() + lat_bytes,
+                        kv_.key + static_cast<std::size_t>(page) * slots * geom_.index_head_dim,
+                        idx_bytes, cudaMemcpyDeviceToHost), "read_page key");
+  cuda_check(cudaMemcpy(out.data() + lat_bytes + idx_bytes,
+                        kv_.gate + static_cast<std::size_t>(page) * slots * geom_.index_head_dim,
+                        idx_bytes, cudaMemcpyDeviceToHost), "read_page gate");
+  return out;
+}
+
+// --------------------------------------------------------- NVMe page backing
+
+NvmeArenaPageBacking::NvmeArenaPageBacking(KvArena* arena, const KvGeometry& geom,
+                                           NvmePrefixOptions options,
+                                           std::uint64_t namespace_hash,
+                                           cudaStream_t stream)
+    : arena_(arena), geom_(geom), namespace_hash_(namespace_hash),
+      store_(std::move(options), stream) {
+  if (!arena_) throw std::runtime_error("kv: NVMe page backing needs an arena");
+}
+
+PrefixRecordKey NvmeArenaPageBacking::key(std::uint64_t parent_hash,
+                                          std::uint64_t chain_hash,
+                                          int token_count) const {
+  return PrefixRecordKey{namespace_hash_, parent_hash, chain_hash,
+                         static_cast<std::uint32_t>(store_.options().rank),
+                         static_cast<std::uint32_t>(token_count),
+                         /*record_kind=*/1, 0};
+}
+
+bool NvmeArenaPageBacking::holds_page(std::uint64_t parent_hash,
+                                      std::uint64_t chain_hash,
+                                      int token_count) const {
+  const bool hit = store_.holds(key(parent_hash, chain_hash, token_count));
+  store_.note_page_lookup(hit);
+  return hit;
+}
+
+bool NvmeArenaPageBacking::persist_page(std::uint64_t parent_hash,
+                                        std::uint64_t chain_hash,
+                                        int token_count, int page) {
+  try {
+    if (holds_page(parent_hash, chain_hash, token_count)) return true;
+    const std::size_t slots = static_cast<std::size_t>(geom_.layers) * geom_.page_tokens;
+    const std::size_t lat = slots * geom_.kv_lora;
+    const std::size_t idx = slots * geom_.index_head_dim;
+    const KvPages& p = arena_->pages();
+    store_.save(key(parent_hash, chain_hash, token_count), {
+      {PrefixComponent::kTargetLatent, p.latent + static_cast<std::size_t>(page) * lat,
+       lat * sizeof(bf16)},
+      {PrefixComponent::kTargetIndexerKey, p.key + static_cast<std::size_t>(page) * idx,
+       idx * sizeof(bf16)},
+      {PrefixComponent::kTargetIndexerGate, p.gate + static_cast<std::size_t>(page) * idx,
+       idx * sizeof(bf16)},
+    });
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool NvmeArenaPageBacking::restore_page(std::uint64_t parent_hash,
+                                        std::uint64_t chain_hash,
+                                        int token_count, int page) {
+  try {
+    const std::size_t slots = static_cast<std::size_t>(geom_.layers) * geom_.page_tokens;
+    const std::size_t lat = slots * geom_.kv_lora;
+    const std::size_t idx = slots * geom_.index_head_dim;
+    const KvPages& p = arena_->pages();
+    return store_.load(key(parent_hash, chain_hash, token_count), {
+      {PrefixComponent::kTargetLatent, p.latent + static_cast<std::size_t>(page) * lat,
+       lat * sizeof(bf16)},
+      {PrefixComponent::kTargetIndexerKey, const_cast<bf16*>(p.key) + static_cast<std::size_t>(page) * idx,
+       idx * sizeof(bf16)},
+      {PrefixComponent::kTargetIndexerGate, const_cast<bf16*>(p.gate) + static_cast<std::size_t>(page) * idx,
+       idx * sizeof(bf16)},
+    });
+  } catch (...) {
+    return false;
+  }
+}
+
 // ------------------------------------------------------------- KDA state
+
+NvmeKdaStateStore::NvmeKdaStateStore(NvmePrefixStore* store, std::uint64_t namespace_hash)
+    : namespace_hash_(namespace_hash), store_(store) {
+  if (!store_) throw std::runtime_error("kv: NVMe KDA store needs a prefix store");
+}
+
+PrefixRecordKey NvmeKdaStateStore::key(int session) const {
+  return PrefixRecordKey{namespace_hash_, 0, static_cast<std::uint64_t>(session),
+                         static_cast<std::uint32_t>(store_->options().rank), 0,
+                         /*record_kind=*/2, 0};
+}
+
+void NvmeKdaStateStore::save(int session, const void* src, std::size_t bytes) {
+  store_->save(key(session), {{PrefixComponent::kKda, src, bytes}});
+  sizes_[session] = bytes;
+}
+
+void NvmeKdaStateStore::load(int session, void* dst, std::size_t bytes) {
+  const auto it = sizes_.find(session);
+  if (it == sizes_.end() || it->second != bytes ||
+      !store_->load(key(session), {{PrefixComponent::kKda, dst, bytes}}))
+    throw std::runtime_error("kv: NVMe KDA state missing or invalid");
+}
+
+void NvmeKdaStateStore::drop(int session) {
+  store_->drop(key(session));
+  sizes_.erase(session);
+}
+
+bool NvmeKdaStateStore::holds(int session) const {
+  return sizes_.count(session) && store_->holds(key(session));
+}
+
+void NvmeKdaStateStore::save_prefix(std::uint64_t parent_hash,
+                                    std::uint64_t chain_hash, int token_count,
+                                    const void* src, std::size_t bytes) {
+  const PrefixRecordKey k{namespace_hash_, parent_hash, chain_hash,
+                          static_cast<std::uint32_t>(store_->options().rank),
+                          static_cast<std::uint32_t>(token_count),
+                          /*record_kind=*/2, 0};
+  store_->save(k, {{PrefixComponent::kKda, src, bytes}});
+}
+
+bool NvmeKdaStateStore::load_prefix(std::uint64_t parent_hash,
+                                    std::uint64_t chain_hash, int token_count,
+                                    void* dst, std::size_t bytes) {
+  const PrefixRecordKey k{namespace_hash_, parent_hash, chain_hash,
+                          static_cast<std::uint32_t>(store_->options().rank),
+                          static_cast<std::uint32_t>(token_count),
+                          /*record_kind=*/2, 0};
+  return store_->load(k, {{PrefixComponent::kKda, dst, bytes}});
+}
+
+bool NvmeKdaStateStore::holds_prefix(std::uint64_t parent_hash,
+                                     std::uint64_t chain_hash,
+                                     int token_count) const {
+  const PrefixRecordKey k{namespace_hash_, parent_hash, chain_hash,
+                          static_cast<std::uint32_t>(store_->options().rank),
+                          static_cast<std::uint32_t>(token_count),
+                          /*record_kind=*/2, 0};
+  return store_->holds(k);
+}
+
+// ------------------------------------------------------------- host KDA state
 
 HostKdaStateStore::HostKdaStateStore(cudaStream_t stream) : stream_(stream) {}
 

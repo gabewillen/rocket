@@ -132,6 +132,7 @@ int PrefixTree::insert(int node, std::uint64_t h, int page) {
   nodes_[id].parent = node;
   nodes_[id].page = page;
   nodes_[id].hash = h;
+  nodes_[id].depth = nodes_[node].depth + 1;
   nodes_[node].children.emplace(h, id);
   node_of_page_[page] = id;
   ++live_nodes_;
@@ -154,10 +155,30 @@ int PrefixTree::node_of_page(int page) const {
   return it == node_of_page_.end() ? -1 : it->second;
 }
 
+void PrefixTree::set_page(int node, int page) {
+  if (node == kRoot || node < 0 || node >= static_cast<int>(nodes_.size()))
+    fail("set_page: node out of range");
+  if (page < 0) fail("set_page: page must be non-negative");
+  if (nodes_[node].page >= 0) fail("set_page: node already resident");
+  if (node_of_page_.count(page)) fail("set_page: page already belongs to another node");
+  nodes_[node].page = page;
+  node_of_page_[page] = node;
+}
+
+void PrefixTree::clear_page(int node) {
+  if (node == kRoot || node < 0 || node >= static_cast<int>(nodes_.size()))
+    fail("clear_page: node out of range");
+  const int page = nodes_[node].page;
+  if (page < 0) return;
+  node_of_page_.erase(page);
+  nodes_[node].page = -1;
+}
+
 // ------------------------------------------------------------------- KvCache
 
-KvCache::KvCache(const KvGeometry& geom, PagePool* pool, PrefixTree* tree, PageStore* store)
-    : geom_(geom), pool_(pool), tree_(tree), store_(store) {
+KvCache::KvCache(const KvGeometry& geom, PagePool* pool, PrefixTree* tree, PageStore* store,
+                 PrefixPageBacking* backing)
+    : geom_(geom), pool_(pool), tree_(tree), store_(store), backing_(backing) {
   const std::string bad = geom.why_invalid();
   if (!bad.empty()) fail(bad);
   if (!pool || !tree) fail("KvCache needs a pool and a tree");
@@ -175,14 +196,21 @@ int KvCache::take_page() {
     if (victim < 0) return -1;
     const int node = tree_->node_of_page(victim);
     if (node >= 0) {
-      if (tree_->child_count(node) > 0) {
-        // An interior cached page: its descendants must go first. Rotate it
-        // to the back of the LRU and try the next victim.
+      const int parent = tree_->parent_of(node);
+      const std::uint64_t parent_hash = parent == tree_->root() ? 0 : tree_->hash_of(parent);
+      const bool durable = backing_ && backing_->persist_page(
+          parent_hash, tree_->hash_of(node), tree_->depth_of(node) * geom_.page_tokens, victim);
+      if (durable) {
+        // Keep the hash path and descendants. Only GPU residency is released.
+        tree_->clear_page(node);
+      } else if (tree_->child_count(node) > 0) {
+        // Without durable backing an interior page protects its descendants.
         pool_->incref(victim);
         pool_->decref(victim);
         continue;
+      } else {
+        tree_->detach(node);
       }
-      tree_->detach(node);
     }
     if (!pool_->evict(victim)) fail("lru victim refused eviction");
     p = pool_->allocate();
@@ -190,7 +218,7 @@ int KvCache::take_page() {
   }
 }
 
-int KvCache::open(int slot) {
+int KvCache::open(int slot, std::uint64_t hash_seed) {
   int id;
   if (!free_seqs_.empty()) {
     id = free_seqs_.back();
@@ -202,6 +230,7 @@ int KvCache::open(int slot) {
   }
   seqs_[id].live = true;
   seqs_[id].slot = slot;
+  seqs_[id].hash_seed = hash_seed;
   if (slot >= 0) {
     // Same occupancy guard as attach(): silently repointing seq_of_slot_ to a
     // new seq while a live sequence still holds the slot leaves that sequence's
@@ -215,19 +244,44 @@ int KvCache::open(int slot) {
   return id;
 }
 
-int KvCache::open_shared(int slot, const int* tokens, int n_tokens, int* matched_tokens_out) {
-  const int id = open(slot);
+int KvCache::open_shared(int slot, const int* tokens, int n_tokens, int* matched_tokens_out,
+                         std::uint64_t hash_seed) {
+  const int id = open(slot, hash_seed);
   Seq& s = seqs_[id];
   const int P = geom_.page_tokens;
   int node = tree_->root();
-  std::uint64_t seed = 0;
+  std::uint64_t seed = hash_seed;
   int matched = 0;
   while (matched + P <= n_tokens) {
     const std::uint64_t h = PrefixTree::block_hash(seed, tokens + matched, P);
-    const int child = tree_->find(node, h);
-    if (child < 0) break;
-    const int page = tree_->page_of(child);
-    pool_->incref(page);
+    int child = tree_->find(node, h);
+    int page = child < 0 ? -1 : tree_->page_of(child);
+    const std::uint64_t record_parent = matched == 0 ? 0 : seed;
+    if (child < 0) {
+      if (!backing_ || !backing_->holds_page(record_parent, h, matched + P)) break;
+      page = take_page();
+      if (page < 0 || !backing_->restore_page(record_parent, h, matched + P, page)) {
+        if (page >= 0) {
+          pool_->decref(page);
+          pool_->evict(page);
+        }
+        break;
+      }
+      child = tree_->insert(node, h, page);
+    } else if (page < 0) {
+      page = take_page();
+      if (page < 0 || !backing_ ||
+          !backing_->restore_page(record_parent, h, matched + P, page)) {
+        if (page >= 0) {
+          pool_->decref(page);
+          pool_->evict(page);
+        }
+        break;
+      }
+      tree_->set_page(child, page);
+    } else {
+      pool_->incref(page);
+    }
     s.pages.push_back(page);
     s.nodes.push_back(child);
     s.tokens.insert(s.tokens.end(), tokens + matched, tokens + matched + P);
@@ -238,6 +292,35 @@ int KvCache::open_shared(int slot, const int* tokens, int n_tokens, int* matched
   }
   if (matched_tokens_out) *matched_tokens_out = matched;
   return id;
+}
+
+std::uint64_t KvCache::hash_at(int seq, int token_count) const {
+  const Seq& s = seqs_.at(seq);
+  if (!s.live || token_count < 0 || token_count > s.length ||
+      token_count % geom_.page_tokens != 0)
+    fail("hash_at: boundary is not a live full-page prefix");
+  if (token_count == 0) return 0;
+  const int node = s.nodes.at(token_count / geom_.page_tokens - 1);
+  if (node < 0) fail("hash_at: prefix page is not sealed");
+  return tree_->hash_of(node);
+}
+
+bool KvCache::persist(int seq) {
+  if (!backing_) return false;
+  const Seq& s = seqs_.at(seq);
+  if (!s.live) fail("persist: sequence is not live");
+  for (std::size_t i = 0; i < s.nodes.size(); ++i) {
+    const int node = s.nodes[i];
+    if (node < 0) continue;
+    const int page = tree_->page_of(node);
+    if (page < 0) continue;
+    const int parent = tree_->parent_of(node);
+    const std::uint64_t parent_hash = parent == tree_->root() ? 0 : tree_->hash_of(parent);
+    if (!backing_->persist_page(parent_hash, tree_->hash_of(node),
+                                static_cast<int>((i + 1) * geom_.page_tokens), page))
+      return false;
+  }
+  return true;
 }
 
 int KvCache::fork(int parent, int fork_pos, int slot) {
@@ -257,7 +340,7 @@ int KvCache::fork(int parent, int fork_pos, int slot) {
   for (int i = 0; i < n_full; ++i) nodes[i] = seqs_[parent].nodes[i];
   std::vector<int> toks(seqs_[parent].tokens.begin(), seqs_[parent].tokens.begin() + fork_pos);
 
-  const int id = open(slot);
+  const int id = open(slot, seqs_[parent].hash_seed);
   Seq& c = seqs_[id];
   for (const int page : pages) pool_->incref(page);
   c.pages = std::move(pages);
@@ -340,7 +423,8 @@ void KvCache::seal(int seq, int logical_page) {
   const int P = geom_.page_tokens;
   const int parent_node = logical_page == 0 ? tree_->root() : s.nodes[logical_page - 1];
   if (parent_node < 0) return;  // a forked, still-unsealed ancestor: not indexable
-  const std::uint64_t seed = parent_node == tree_->root() ? 0ull : tree_->hash_of(parent_node);
+  const std::uint64_t seed =
+      parent_node == tree_->root() ? s.hash_seed : tree_->hash_of(parent_node);
   const std::uint64_t h =
       PrefixTree::block_hash(seed, s.tokens.data() + static_cast<std::size_t>(logical_page) * P, P);
   const int existing = tree_->find(parent_node, h);
@@ -379,7 +463,9 @@ void KvCache::destroy(int seq) {
   if (seq < 0 || seq >= static_cast<int>(seqs_.size()) || !seqs_[seq].live)
     fail("destroy: not a live sequence");
   Seq& s = seqs_[seq];
-  for (const int p : s.pages) pool_->decref(p);
+  // Release private/generated tail pages first and shared prompt ancestors
+  // last. The LRU therefore evicts output branches before reusable prompts.
+  for (auto it = s.pages.rbegin(); it != s.pages.rend(); ++it) pool_->decref(*it);
   if (s.slot >= 0) seq_of_slot_.erase(s.slot);
   s = Seq{};
   free_seqs_.push_back(seq);

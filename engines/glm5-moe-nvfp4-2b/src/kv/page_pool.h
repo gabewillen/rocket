@@ -141,7 +141,13 @@ class PrefixTree {
 
   int page_of(int node) const { return nodes_[node].page; }
   int parent_of(int node) const { return nodes_[node].parent; }
+  // A disk-backed node remains in the radix tree while its GPU page is -1.
+  // set_page() attaches a freshly restored physical page; clear_page()
+  // removes only the page mapping and preserves the hash path.
+  void set_page(int node, int page);
+  void clear_page(int node);
   int child_count(int node) const { return static_cast<int>(nodes_[node].children.size()); }
+  int depth_of(int node) const { return nodes_[node].depth; }
   int node_of_page(int page) const;
   int live_nodes() const { return live_nodes_; }
 
@@ -156,6 +162,7 @@ class PrefixTree {
     int parent = -1;
     int page = -1;
     std::uint64_t hash = 0;
+    int depth = 0;
     std::unordered_map<std::uint64_t, int> children;
   };
   std::vector<Node> nodes_;
@@ -184,15 +191,30 @@ struct SeqInfo {
   bool live = false;
 };
 
+// Optional persistence seam for a radix page. Implementations receive the
+// exact parent-seeded hash and the final-layout physical page. A successful
+// persist lets KvCache retain the radix node after releasing its GPU page.
+class PrefixPageBacking {
+ public:
+  virtual ~PrefixPageBacking() = default;
+  virtual bool holds_page(std::uint64_t parent_hash, std::uint64_t chain_hash,
+                          int token_count) const = 0;
+  virtual bool persist_page(std::uint64_t parent_hash, std::uint64_t chain_hash,
+                            int token_count, int page) = 0;
+  virtual bool restore_page(std::uint64_t parent_hash, std::uint64_t chain_hash,
+                            int token_count, int page) = 0;
+};
+
 // Sequence manager: the object model.cu holds instead of a table of identity.
 class KvCache {
  public:
   // `store` may be null only when no copy on extend can happen, which is not
   // a case worth special-casing; pass the arena.
-  KvCache(const KvGeometry& geom, PagePool* pool, PrefixTree* tree, PageStore* store);
+  KvCache(const KvGeometry& geom, PagePool* pool, PrefixTree* tree, PageStore* store,
+          PrefixPageBacking* backing = nullptr);
 
   // A fresh empty sequence bound to stream slot `slot` (-1 for detached).
-  int open(int slot);
+  int open(int slot, std::uint64_t hash_seed = 0);
   // A fresh sequence that adopts whatever prefix of `tokens` the tree already
   // holds, then continues as a normal sequence. This is content-addressed
   // reuse across sequences that were computed independently, and it is a
@@ -201,7 +223,13 @@ class KvCache {
   // engine except the grouped-GEMM routed-expert path, whose row grouping
   // depends on the batch it ran in (moe_grouped.h). fork() carries no such
   // condition because it shares the bytes themselves.
-  int open_shared(int slot, const int* tokens, int n_tokens, int* matched_tokens_out);
+  int open_shared(int slot, const int* tokens, int n_tokens, int* matched_tokens_out,
+                  std::uint64_t hash_seed = 0);
+  // Writes every sealed page of a sequence through PrefixPageBacking. Returns
+  // false when no backing is configured or any page fails to persist.
+  bool persist(int seq);
+  // Parent-seeded hash at a full-page token boundary, or 0 at the root.
+  std::uint64_t hash_at(int seq, int token_count) const;
 
   // Child sharing every full page of `parent` below `fork_pos`. The boundary
   // page is shared too and copied by whichever side extends into it first.
@@ -235,6 +263,7 @@ class KvCache {
   // Physical pages currently referenced by at least one live sequence.
   int pinned_pages() const { return pool_->pinned_pages(); }
   const KvGeometry& geometry() const { return geom_; }
+  void set_backing(PrefixPageBacking* backing) { backing_ = backing; }
 
  private:
   int take_page();
@@ -247,12 +276,14 @@ class KvCache {
     int length = 0;
     int slot = -1;
     bool live = false;
+    std::uint64_t hash_seed = 0;
   };
 
   KvGeometry geom_;
   PagePool* pool_ = nullptr;
   PrefixTree* tree_ = nullptr;
   PageStore* store_ = nullptr;
+  PrefixPageBacking* backing_ = nullptr;
   std::vector<Seq> seqs_;
   std::vector<int> free_seqs_;
   std::unordered_map<int, int> seq_of_slot_;

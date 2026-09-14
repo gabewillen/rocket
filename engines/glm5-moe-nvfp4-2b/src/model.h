@@ -29,6 +29,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -76,6 +77,12 @@ struct StageMs {
 };
 
 enum class MoePath { kAuto, kForceGemv, kForceGrouped };
+
+struct PrefixStateDigest {
+  std::uint64_t target = 0;
+  std::uint64_t kda = 0;
+  bool operator==(const PrefixStateDigest&) const = default;
+};
 
 class DecodeEngine {
  public:
@@ -145,6 +152,22 @@ class DecodeEngine {
   // Frees the stream slot and takes its KDA state off the device. The pages
   // stay pinned by the returned session id.
   int kv_detach(int slot);
+  // Installs bounded O_DIRECT persistence for target radix pages and detached
+  // FP32 KDA state. The cache stays disabled unless explicitly configured.
+  void enable_nvme_prefix_cache(kv::NvmePrefixOptions options,
+                                std::uint64_t namespace_hash);
+  // Persists all sealed target pages and the terminal FP32 KDA state at the
+  // current full-page boundary. Returns that boundary's chain hash.
+  std::uint64_t kv_checkpoint(int slot, int next_token);
+  // Opens the longest page-aligned target prefix whose exact terminal KDA
+  // checkpoint is present. Returns matched tokens and binds the slot.
+  int kv_match_shared(int slot, const int* tokens, int n_tokens) const;
+  int kv_open_shared(int slot, const int* tokens, int n_tokens,
+                     int* next_token_out = nullptr);
+  const kv::NvmePrefixStats* kv_nvme_stats() const;
+  kv::NvmePrefixStore* kv_nvme_store();
+  kv::PrefixRecordKey kv_prefix_key(int slot, const int* tokens, int n_tokens,
+                                    std::uint32_t record_kind) const;
   // Reattaches a detached session to a stream slot and restores its KDA
   // state. The slot must be free.
   void kv_resume(int session, int slot);
@@ -155,6 +178,8 @@ class DecodeEngine {
   // One stream's KDA recurrent + conv state. Persistent recurrent state is
   // FP32, so this is attention.yaml's FP32 figure, 147619840 B.
   std::size_t kda_bytes_per_stream() const;
+  PrefixStateDigest kv_state_digest(int slot);
+  bool kv_state_equal(int a, int b);
 
   const StageMs& stages() const { return stages_; }
   // RMS of stream slot 0's hyper-connection stream mean after each layer,
@@ -260,6 +285,7 @@ class DecodeEngine {
   void kda_pack(int slot, void* dst);
   void kda_unpack(int slot, const void* src);
   void kda_copy_slot(int dst_slot, int src_slot);
+  std::uint64_t kv_hash_seed(int slot) const;
   // Advances every active slot's sequence by one token and reuploads the
   // block table of any slot whose table changed. No-op without a pool.
   void kv_advance(const std::vector<int>& tokens, int batch);
@@ -323,9 +349,14 @@ class DecodeEngine {
   std::unique_ptr<kv::PrefixTree> kv_tree_;
   std::unique_ptr<kv::KvArena> kv_arena_;
   std::unique_ptr<kv::KvCache> kv_cache_;
-  std::unique_ptr<kv::HostKdaStateStore> kda_store_;
+  std::unique_ptr<kv::NvmeArenaPageBacking> kv_nvme_backing_;
+  std::unique_ptr<kv::KdaStateStore> kda_store_;
+  std::uint64_t kv_namespace_hash_ = 0;
   std::vector<int> kv_seq_of_slot_;  // [max_batch], -1 when the slot is free
   void* kda_stage_ = nullptr;        // [kda_bytes_per_stream()], detach staging
+  int* prefix_token_dev_ = nullptr;  // one cached next-token scalar
+  std::vector<std::uint64_t> restored_kda_chain_;
+  std::vector<int> restored_next_token_;
 
   // per-step device scratch
   int* tokens_dev_ = nullptr;

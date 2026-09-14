@@ -101,6 +101,9 @@ class ExpertParallel {
   // Rank 0's draft chain is authoritative before target verification, so
   // replicated-draft last-bit differences cannot feed different MoE rows.
   void sync_draft_tokens(std::vector<int>& tokens);
+  // Both ranks propose a locally valid prefix boundary. Rank 0 selects the
+  // minimum and broadcasts it before either rank restores state.
+  void sync_prefix_boundary(int& tokens);
   // Exchanges each rank's local top-16 candidate IDs/scores and returns the
   // peer arrays. Used to split the replicated 1.18 GiB DFlash lm_head read.
   void exchange_draft_candidates(const std::vector<int>& local_ids,
