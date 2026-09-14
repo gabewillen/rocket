@@ -74,12 +74,15 @@ class StageTimer {
 
 DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::path& snapshot_dir,
                            std::size_t expert_cache_bytes, int max_tokens, int max_batch,
-                           int kv_pool_pages, int kv_page_tokens)
+                           int kv_pool_pages, int kv_page_tokens, int max_prefill_chunk)
     : cfg_(cfg),
       w_(cfg, snapshot_dir, expert_cache_bytes),
       max_tokens_(max_tokens),
-      max_batch_(max_batch) {
+      max_batch_(max_batch),
+      max_work_k_(std::max(kSpecMax, max_prefill_chunk)) {
   if (max_batch_ <= 0) fail("max_batch must be positive");
+  if (max_prefill_chunk < 1 || max_prefill_chunk > 64)
+    fail("max_prefill_chunk must be in [1,64]");
   cuda_check(cudaStreamCreate(&stream_), "stream");
 
   const int H = cfg_.hidden_size;
@@ -97,9 +100,10 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   const int big_inter =
       std::max(cfg_.intermediate_size, cfg_.moe_intermediate_size * cfg_.n_shared_experts);
   const int MB = max_batch_;
-  // Verify-width row space: shared activation buffers hold kSpecMax rows per
-  // stream so step_spec can batch B*k positions without reallocating.
-  const int SB = MB * DecodeEngine::kSpecMax;
+  // Work-row space may be wider for prefill, while DFlash2 verification and
+  // its transactional replay rails remain fixed at kSpecMax=8.
+  const int SB = MB * max_work_k_;
+  const int RB = MB * DecodeEngine::kSpecMax;
 
   auto alloc = [&](std::size_t bytes) {
     void* p = nullptr;
@@ -309,11 +313,11 @@ DecodeEngine::DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::
   scratch_f_ = F(SB);
   argmax_i_ = I(SB);
   tokens_spec_dev_ = I(SB);
-  kda_spec_normed_rail_ = A(static_cast<std::size_t>(nk) * SB * H);
-  kda_spec_qkv_rail_ = A(static_cast<std::size_t>(nk) * 3 * SB * qkv);
-  kda_spec_gate_rail_ = A(static_cast<std::size_t>(nk) * SB * qkv);
-  kda_spec_beta_rail_ = A(static_cast<std::size_t>(nk) * SB * heads_kda);
-  kda_spec_on_rail_ = A(static_cast<std::size_t>(nk) * SB * qkv);
+  kda_spec_normed_rail_ = A(static_cast<std::size_t>(nk) * RB * H);
+  kda_spec_qkv_rail_ = A(static_cast<std::size_t>(nk) * 3 * RB * qkv);
+  kda_spec_gate_rail_ = A(static_cast<std::size_t>(nk) * RB * qkv);
+  kda_spec_beta_rail_ = A(static_cast<std::size_t>(nk) * RB * heads_kda);
+  kda_spec_on_rail_ = A(static_cast<std::size_t>(nk) * RB * qkv);
   kda_spec_cut_dev_ = I(MB);
   pos_spec_dev_ = I(SB);
   ntok_spec_dev_ = I(SB);
@@ -490,9 +494,16 @@ void DecodeEngine::print_kda_checksum(int layer, const char* tag) {
 
 void DecodeEngine::commit_positions(const std::vector<int>& accepted) {
   const int k = spec_k_;
+  if (static_cast<int>(accepted.size()) != spec_batch_)
+    fail("commit_positions: accepted size must equal the speculative batch");
   bool any_reject = false;
-  for (int m = 0; m < static_cast<int>(pos_.size()) && m < static_cast<int>(accepted.size()); ++m) {
-    if (accepted[m] < k) any_reject = true;
+  for (int n : accepted) {
+    if (n < 0 || n > k) fail("commit_positions: accepted count out of range");
+    if (n < k) any_reject = true;
+  }
+  if (any_reject && k > kSpecMax)
+    fail("wide prefill transactions must commit every position");
+  for (int m = 0; m < spec_batch_; ++m) {
     pos_[m] += accepted[m];
     const int seq = kv_seq_of_slot_[m];
     if (seq < 0) fail("commit_positions: stream slot holds no KV sequence");
@@ -971,7 +982,8 @@ void DecodeEngine::run_kda_spec_site(int layer, int positions, int batch, const 
   const int taps = cfg_.conv_state_taps();
   const int heads = cfg_.kda_heads;
   const int rows = positions * batch;
-  const int tc_rows = max_batch_ * kSpecMax;
+  const bool wide_prefill = positions > kSpecMax;
+  const int tc_rows = max_batch_ * (wide_prefill ? max_work_k_ : kSpecMax);
   const int MB = max_batch_;
 
   const bool draft = (cut == nullptr);
@@ -988,9 +1000,12 @@ void DecodeEngine::run_kda_spec_site(int layer, int positions, int batch, const 
 
   const std::size_t rail_rows = static_cast<std::size_t>(kSpecMax) * max_batch_;
   const std::size_t rail_qkv = static_cast<std::size_t>(slot) * 3 * rail_rows * qkv;
-  bf16* q_work = draft ? kda_spec_qkv_rail_ + rail_qkv : q_raw_;
-  bf16* k_work = draft ? kda_spec_qkv_rail_ + rail_qkv + rail_rows * qkv : k_raw_;
-  bf16* v_work = draft ? kda_spec_qkv_rail_ + rail_qkv + 2 * rail_rows * qkv : v_raw_;
+  bf16* q_work = wide_prefill ? q_raw_ : (draft ? kda_spec_qkv_rail_ + rail_qkv : q_raw_);
+  bf16* k_work =
+      wide_prefill ? k_raw_ : (draft ? kda_spec_qkv_rail_ + rail_qkv + rail_rows * qkv : k_raw_);
+  bf16* v_work = wide_prefill
+                     ? v_raw_
+                     : (draft ? kda_spec_qkv_rail_ + rail_qkv + 2 * rail_rows * qkv : v_raw_);
 
   static const bool tc_proj = std::getenv("ROCKET_KDA_CUBLAS") != nullptr;
   if (tc_proj) {
@@ -1032,8 +1047,8 @@ void DecodeEngine::run_kda_spec_site(int layer, int positions, int batch, const 
                                    q_work, qkv);
   const std::size_t rail_gate = static_cast<std::size_t>(slot) * rail_rows * qkv;
   const std::size_t rail_beta = static_cast<std::size_t>(slot) * rail_rows * heads;
-  bf16* gate_work = draft ? kda_spec_gate_rail_ + rail_gate : gate_;
-  bf16* beta_work = draft ? kda_spec_beta_rail_ + rail_beta : beta_;
+  bf16* gate_work = wide_prefill ? gate_ : (draft ? kda_spec_gate_rail_ + rail_gate : gate_);
+  bf16* beta_work = wide_prefill ? beta_ : (draft ? kda_spec_beta_rail_ + rail_beta : beta_);
   gemm_bf16(lr_a_, k.f_a, normed_, rows, hd, H, stream_);
   gemm_bf16(lr_b_, k.f_b, lr_a_, rows, qkv, hd, stream_);
   kda_forget_gate(gate_work, lr_b_, k.dt_bias, k.a_log, rows, heads, hd,
@@ -1096,7 +1111,7 @@ void DecodeEngine::run_mla(int layer, int slot, int batch, const int* n_tokens_d
   const int ih = cfg_.index_n_heads;
   const int kpool = cfg_.index_kpool;
   static const bool tc_all = std::getenv("ROCKET_CUBLAS_ALL") != nullptr;
-  const int tc_batch = max_batch_ * kSpecMax;
+  const int tc_batch = max_batch_ * (spec_k_ > kSpecMax ? max_work_k_ : kSpecMax);
 
   if (tc_all)
     gemm_bf16_cublas(q_resid_raw_, m.q_a, normed_, tc_batch, cfg_.q_lora_rank, H, stream_);
@@ -1596,7 +1611,7 @@ void DecodeEngine::run_moe(int layer, int batch) {
     // Sentinel fill BEFORE the gemm: rows still holding 0xA5 bytes after the
     // gemm prove the gemm never wrote them.
     cudaMemsetAsync(router_logits_, 0xA5,
-                    static_cast<std::size_t>(max_batch_ * kSpecMax) * cfg_.n_routed_experts *
+                    static_cast<std::size_t>(max_batch_ * max_work_k_) * cfg_.n_routed_experts *
                         sizeof(float),
                     stream_);
     cudaStreamSynchronize(stream_);
@@ -1619,8 +1634,8 @@ void DecodeEngine::run_moe(int layer, int batch) {
   if (spec_debug) cuda_check(cudaGetLastError(), "spec moe router");
   if (mtrace) {
     static std::vector<float> rl(std::size_t(max_batch_) * cfg_.n_routed_experts, 0.f);
-    static std::vector<bf16> nx(std::size_t(max_batch_ * kSpecMax) * cfg_.hidden_size);
-    static std::vector<bf16> chead_buf(std::size_t(max_batch_ * kSpecMax) * cfg_.hidden_size);
+    static std::vector<bf16> nx(std::size_t(max_batch_ * max_work_k_) * cfg_.hidden_size);
+    static std::vector<bf16> chead_buf(std::size_t(max_batch_ * max_work_k_) * cfg_.hidden_size);
     std::vector<int> tidx(std::size_t(batch) * K);
     std::vector<float> twts(std::size_t(batch) * K);
     cudaMemcpyAsync(rl.data(), router_logits_, rl.size() * sizeof(float), cudaMemcpyDeviceToHost,
@@ -2228,7 +2243,7 @@ void DecodeEngine::step(const std::vector<int>& tokens, std::vector<int>& out_to
       static constexpr int taps[5] = {4, 13, 23, 32, 41};
       for (int ti = 0; ti < 5; ++ti)
         if (l == taps[ti])
-          hc_head_mean(dflash_aux_hidden_ + static_cast<std::size_t>(ti) * kSpecMax * max_batch_ * H,
+          hc_head_mean(dflash_aux_hidden_ + static_cast<std::size_t>(ti) * max_work_k_ * max_batch_ * H,
                        streams_, batch, hc, H, stream_);
     }
     print_streams_checksum(l, "plain-lhc", batch, static_cast<std::size_t>(batch) * hc * H);
@@ -2279,7 +2294,7 @@ void DecodeEngine::step_spec(const std::vector<int>& tokens, int spec_k,
                              std::vector<int>& out_tokens, bool collect_stages) {
   const int batch = static_cast<int>(tokens.size()) / spec_k;
   const int total = batch * spec_k;
-  if (spec_k < 1 || spec_k > kSpecMax) fail("spec_k out of [1, kSpecMax]");
+  if (spec_k < 1 || spec_k > max_work_k_) fail("spec_k out of work-width range");
   if (batch <= 0 || batch > max_batch_) fail("batch out of [1, max_batch] range");
   for (int m = 0; m < batch; ++m)
     if (pos_[m] + spec_k > max_tokens_) fail("spec positions exceed max_tokens");
@@ -2444,7 +2459,7 @@ void DecodeEngine::step_spec(const std::vector<int>& tokens, int spec_k,
       static constexpr int taps[5] = {4, 13, 23, 32, 41};
       for (int ti = 0; ti < 5; ++ti)
         if (l == taps[ti])
-          hc_head_mean(dflash_aux_hidden_ + static_cast<std::size_t>(ti) * kSpecMax * max_batch_ * H,
+          hc_head_mean(dflash_aux_hidden_ + static_cast<std::size_t>(ti) * max_work_k_ * max_batch_ * H,
                        streams_, total, hc, H, stream_);
     }
   }
@@ -2454,7 +2469,8 @@ void DecodeEngine::step_spec(const std::vector<int>& tokens, int spec_k,
     StageTimer t(stream_, &stages_.lm_head, collect_stages, &prof_starts_, &prof_stops_, &prof_sinks_);
     hc_head_mean(hmean_, streams_, total, hc, H, stream_);
     rmsnorm(normed_, hmean_, w_.final_norm(), total, H, cfg_.rms_norm_eps, stream_);
-    gemm_bf16_f32(logits_, w_.lm_head(), normed_, max_batch_ * kSpecMax, cfg_.vocab_size, H, stream_);
+    const int tc_rows = max_batch_ * (spec_k > kSpecMax ? max_work_k_ : kSpecMax);
+    gemm_bf16_f32(logits_, w_.lm_head(), normed_, tc_rows, cfg_.vocab_size, H, stream_);
     argmax_f32(argmax_i_, scratch_f_, logits_, total, cfg_.vocab_size, stream_);
     cudaMemcpyAsync(next.data(), argmax_i_, total * sizeof(int), cudaMemcpyDeviceToHost, stream_);
     cudaStreamSynchronize(stream_);

@@ -96,7 +96,7 @@ class DecodeEngine {
   // tests/test_batch_parity.cu, which now run through it unconditionally.
   DecodeEngine(const fuel::ModelConfig& cfg, const std::filesystem::path& snapshot_dir,
                std::size_t expert_cache_bytes, int max_tokens, int max_batch,
-               int kv_pool_pages = 0, int kv_page_tokens = 128);
+               int kv_pool_pages = 0, int kv_page_tokens = 128, int max_prefill_chunk = 8);
   ~DecodeEngine();
 
   // Runs one batched step. tokens[i] is the input token for stream slot i,
@@ -170,7 +170,7 @@ class DecodeEngine {
   // Five target hidden-state taps consumed by DFlash2, laid out
   // [5][last_step_rows][hidden] in target_layer_ids order.
   const bf16* dflash_aux_hidden() const { return dflash_aux_hidden_; }
-  int dflash_aux_stride_rows() const { return kSpecMax * max_batch_; }
+  int dflash_aux_stride_rows() const { return max_work_k_ * max_batch_; }
 
   // Telemetry: per-projection-site activation absmax, calibration capture
   // stage 1 (fuels/glm-5.3-flash/fuel.yaml, serving_regime.quantization_plan).
@@ -294,9 +294,10 @@ class DecodeEngine {
   cudaStream_t stream_ = nullptr;
   int max_tokens_ = 0;
   int max_batch_ = 0;
+  int max_work_k_ = 8;
   int spec_k_ = 1;  // 1 = no spec, >1 = multi-token verify width
  public:
-  static constexpr int kSpecMax = 8;  // upper bound on verify width; sizes shared activation buffers
+  static constexpr int kSpecMax = 8;  // DFlash2 verify width remains fixed at 8
  private:
   std::vector<int> pos_;  // per stream slot, host
 

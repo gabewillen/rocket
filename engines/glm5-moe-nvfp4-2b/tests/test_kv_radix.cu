@@ -356,13 +356,13 @@ void test_forked_read_equals_materialised() {
 
   const rocket::engine::KvPages& kvp = arena.pages();
   rocket::engine::indexer_pool_keys(pool_keys, kvp, ape, n_pools_d, n_pools, pool_stride, batch,
-                                    kLayerSlot, kKpool, kIhd, s);
+                                    batch, kLayerSlot, kKpool, kIhd, s);
   rocket::engine::indexer_scores(pool_scores, q_idx, pool_keys, head_w, n_pools_d, n_pools,
                                  pool_stride, batch, ih, kIhd, s);
-  rocket::engine::mla_scores(scores, q_abs, kvp, sel, n_sel, n_gather, sel_stride, batch,
+  rocket::engine::mla_scores(scores, q_abs, kvp, sel, n_sel, n_gather, sel_stride, batch, batch,
                              kLayerSlot, heads, kKvLora, 0.0625f, s);
   rocket::engine::mla_softmax(scores, n_sel, sel_stride, batch, heads, s);
-  rocket::engine::mla_context(ctx, scores, kvp, sel, n_sel, n_gather, sel_stride, batch,
+  rocket::engine::mla_context(ctx, scores, kvp, sel, n_sel, n_gather, sel_stride, batch, batch,
                               kLayerSlot, heads, kKvLora, s);
   ck(cudaStreamSynchronize(s), "kernels");
 
@@ -385,7 +385,7 @@ void test_forked_read_equals_materialised() {
   // would have to fail. Point slot 0 at the parent's pages instead, which is
   // the same prefix but the wrong tail, and confirm the gather notices.
   arena.upload_table(0, cache.page_table(parent));
-  rocket::engine::mla_scores(scores, q_abs, kvp, sel, n_sel, n_gather, sel_stride, batch,
+  rocket::engine::mla_scores(scores, q_abs, kvp, sel, n_sel, n_gather, sel_stride, batch, batch,
                              kLayerSlot, heads, kKvLora, 0.0625f, s);
   ck(cudaStreamSynchronize(s), "control");
   {
@@ -567,7 +567,7 @@ void test_decode_loop_table_discipline() {
     ck(cudaMemcpy(n_sel, hn.data(), hn.size() * sizeof(int), cudaMemcpyHostToDevice), "n");
   }
   rocket::engine::mla_scores(scores, q_abs, arena.pages(), sel, n_sel, n_gather, sel_stride, batch,
-                             kLayerSlot, heads, kKvLora, 0.0625f, s);
+                             batch, kLayerSlot, heads, kKvLora, 0.0625f, s);
   ck(cudaStreamSynchronize(s), "kernels");
   {
     const std::size_t per = (std::size_t)heads * sel_stride;

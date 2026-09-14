@@ -216,16 +216,16 @@ Timing run_one(int page_tokens, int ctx, int streams, int iters, bool round_robi
   Timing t;
   t.scan_ms = time_it([&] {
     rocket::engine::indexer_pool_keys(pool_keys, kvp, ape, n_pools_d, n_pools, pool_stride,
-                                      streams, layer_slot, kpool, ihd, s);
+                                      streams, streams, layer_slot, kpool, ihd, s);
     rocket::engine::indexer_scores(pool_scores, q_idx, pool_keys, head_w, n_pools_d, n_pools,
                                    pool_stride, streams, ih, ihd, s);
   });
   t.gather_ms = time_it([&] {
-    rocket::engine::mla_scores(scores, q_abs, kvp, sel, n_sel, topk, sel_stride, streams,
+    rocket::engine::mla_scores(scores, q_abs, kvp, sel, n_sel, topk, sel_stride, streams, streams,
                                layer_slot, heads, kv_lora, 0.0625f, s);
     rocket::engine::mla_softmax(scores, n_sel, sel_stride, streams, heads, s);
     rocket::engine::mla_context(ctxbuf, scores, kvp, sel, n_sel, topk, sel_stride, streams,
-                                layer_slot, heads, kv_lora, s);
+                                streams, layer_slot, heads, kv_lora, s);
   });
 
   cudaEventDestroy(e0); cudaEventDestroy(e1);

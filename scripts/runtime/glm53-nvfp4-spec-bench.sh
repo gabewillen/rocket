@@ -14,6 +14,8 @@ SPEC=${SPEC:-4}
 TOKENS=${TOKENS:-200}
 EXPERT_CACHE_GIB=${EXPERT_CACHE_GIB:-92}
 MAX_TOKENS=${MAX_TOKENS:-4096}
+PREFILL_CHUNK=${PREFILL_CHUNK:-32}
+PREFILL_TAIL=${PREFILL_TAIL:-32}
 PRELOAD_OWNED=${PRELOAD_OWNED:-1}
 PROMPT=${PROMPT:-"Count from 1 to 50: 1, 2, 3,"}
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -23,7 +25,7 @@ rsync -a "$BIN" "$PEER:$BIN" 2>/dev/null || true
 
 common=(
   --prompt "$PROMPT" --tokens "$TOKENS" --batch "$BATCH" --spec "$SPEC"
-  --expert-cache-gib "$EXPERT_CACHE_GIB" --max-tokens "$MAX_TOKENS" --preload-owned "$PRELOAD_OWNED"
+  --expert-cache-gib "$EXPERT_CACHE_GIB" --max-tokens "$MAX_TOKENS" --prefill-chunk "$PREFILL_CHUNK" --prefill-tail "$PREFILL_TAIL" --preload-owned "$PRELOAD_OWNED"
 )
 if [[ -n ${DRAFT_FILE:-} ]]; then
   rsync -a "$DRAFT_FILE" "$PEER:$DRAFT_FILE"

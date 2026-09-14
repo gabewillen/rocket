@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include <cuda_profiler_api.h>
+
 #include "dflash2.h"
 #include "fabric/expert_balance.h"
 #include "fabric/expert_parallel.h"
@@ -63,6 +65,15 @@ int main(int argc, char** argv) {
   const int n_new = std::atoi(arg_value(argc, argv, "--tokens", "20"));
   const double cache_gib = std::atof(arg_value(argc, argv, "--expert-cache-gib", "56"));
   const int max_tokens = std::atoi(arg_value(argc, argv, "--max-tokens", "4096"));
+  // Chunk the body, then run a sequential tail in the production decode shape.
+  // Whole-prompt chunking reduced DFlash2 acceptance; a 32-token tail retained
+  // exact long-prompt output and decode throughput in the measured gates.
+  const int prefill_chunk = std::atoi(arg_value(argc, argv, "--prefill-chunk", "32"));
+  const int prefill_tail = std::atoi(arg_value(argc, argv, "--prefill-tail", "32"));
+  if (prefill_chunk < 1 || prefill_chunk > 64 || prefill_tail < 0) {
+    std::fprintf(stderr, "--prefill-chunk must be in [1,64] and --prefill-tail must be >= 0\n");
+    return 2;
+  }
   const int batch = std::atoi(arg_value(argc, argv, "--batch", "1"));
   const int spec_k = std::atoi(arg_value(argc, argv, "--spec", "1"));
   const int rank = std::atoi(arg_value(argc, argv, "--rank", "-1"));
@@ -96,16 +107,17 @@ int main(int argc, char** argv) {
     fc.bootstrap_port = std::atoi(arg_value(argc, argv, "--port", "18779"));
     const rocket::fabric::ExpertPartition part =
         rocket::fabric::contiguous_partition(cfg.n_routed_experts, {});
-    // Sized for the spec verify width: step_spec routes batch*kSpecMax rows,
-    // each contributing topk selections, into one exchange.
+    // Experimental prefill widths can route more rows than decode's fixed
+    // spec-8 path, so the exchange staging follows the larger width.
     ep = std::make_unique<rocket::fabric::ExpertParallel>(
-        fc, part.owner, batch * rocket::engine::DecodeEngine::kSpecMax * cfg.num_experts_per_tok,
+        fc, part.owner, batch * std::max(rocket::engine::DecodeEngine::kSpecMax, prefill_chunk) *
+                            cfg.num_experts_per_tok,
         cfg.hidden_size);
     std::printf("rank %d: fabric up, %d owned experts\n", ep->rank(), ep->expert_count());
   }
   rocket::engine::DecodeEngine engine(cfg, snapshot,
                                       static_cast<std::size_t>(cache_gib * (1ull << 30)),
-                                      max_tokens, batch);
+                                      max_tokens, batch, 0, 128, prefill_chunk);
   engine.set_telemetry(telemetry);
   if (ep) {
     engine.weights().set_expert_set(ep->owned_experts());
@@ -150,19 +162,43 @@ int main(int argc, char** argv) {
 
   // Prefill runs the decode path once per prompt token; every stream gets
   // the same prompt so the batch is full from the first step.
+  const bool profile_prefill = std::getenv("ROCKET_PROFILE_PREFILL") != nullptr;
+  if (profile_prefill) cudaProfilerStart();
   auto t_prefill = Clock::now();
   std::vector<int> next_batch;
   std::vector<int> last(batch, 0);
-  for (const int id : prompt_ids) {
+  for (std::size_t begin = 0; begin < prompt_ids.size();) {
+    const int remaining = static_cast<int>(prompt_ids.size() - begin);
+    const int count = remaining <= prefill_tail ? 1 : std::min(prefill_chunk, remaining - prefill_tail);
     std::vector<int> base(batch);
     for (int m = 0; m < batch; ++m) base[m] = engine.position(m);
-    engine.step(std::vector<int>(batch, id), next_batch, false);
-    if (dflash)
-      dflash->append_context(engine.dflash_aux_hidden(), engine.dflash_aux_stride_rows(), 1, batch,
-                             base, std::vector<int>(batch, 1), nullptr);
-    for (int m = 0; m < batch; ++m) last[m] = next_batch[m];
+    if (count == 1) {
+      engine.step(std::vector<int>(batch, prompt_ids[begin]), next_batch, false);
+    } else {
+      std::vector<int> chunk(static_cast<std::size_t>(count) * batch);
+      for (int j = 0; j < count; ++j)
+        for (int m = 0; m < batch; ++m)
+          chunk[static_cast<std::size_t>(j) * batch + m] = prompt_ids[begin + j];
+      engine.step_spec(chunk, count, next_batch, false);
+      engine.commit_positions(std::vector<int>(batch, count));
+    }
+    if (dflash) {
+      for (int off = 0; off < count; off += rocket::engine::DecodeEngine::kSpecMax) {
+        const int n = std::min(rocket::engine::DecodeEngine::kSpecMax, count - off);
+        std::vector<int> slice_base(batch);
+        for (int m = 0; m < batch; ++m) slice_base[m] = base[m] + off;
+        const rocket::engine::bf16* aux =
+            engine.dflash_aux_hidden() + static_cast<std::size_t>(off) * batch * cfg.hidden_size;
+        dflash->append_context(aux, engine.dflash_aux_stride_rows(), n, batch, slice_base,
+                               std::vector<int>(batch, n), nullptr);
+      }
+    }
+    for (int m = 0; m < batch; ++m)
+      last[m] = next_batch[static_cast<std::size_t>(count - 1) * batch + m];
+    begin += count;
   }
   const double prefill_ms = ms_since(t_prefill);
+  if (profile_prefill) cudaProfilerStop();
 
   std::vector<std::vector<int>> generated(batch);
   std::vector<double> token_ms;
