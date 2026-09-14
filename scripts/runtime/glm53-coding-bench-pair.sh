@@ -13,6 +13,7 @@ MAX_TOKENS=${MAX_TOKENS:-65536}
 PREFILL_CHUNK=${PREFILL_CHUNK:-32}
 PREFILL_TAIL=${PREFILL_TAIL:-32}
 PRELOAD_OWNED=${PRELOAD_OWNED:-1}
+CUDA_GRAPH=${CUDA_GRAPH:-1}
 PROMPT_LIST=${PROMPT_LIST:?set PROMPT_LIST to a file containing one prompt path per stream}
 RESULT_JSON=${RESULT_JSON:-/tmp/glm53-coding-result.json}
 PROMPT_TOKEN_LIMIT=${PROMPT_TOKEN_LIMIT:-0}
@@ -59,7 +60,8 @@ fi
 cache_free_bytes() { df -B1 --output=avail "$1" | awk 'NR==2 {print $1}'; }
 common=(--prompt-list "$PROMPT_LIST" --tokens "$TOKENS" --batch "$BATCH" --spec "$SPEC" --lazy-drop-batch "$LAZY_DROP_BATCH"
   --expert-cache-gib "$EXPERT_CACHE_GIB" --max-tokens "$MAX_TOKENS"
-  --prefill-chunk "$PREFILL_CHUNK" --prefill-tail "$PREFILL_TAIL" --preload-owned "$PRELOAD_OWNED")
+  --prefill-chunk "$PREFILL_CHUNK" --prefill-tail "$PREFILL_TAIL" --preload-owned "$PRELOAD_OWNED"
+  --cuda-graph "$CUDA_GRAPH")
 (( PROMPT_TOKEN_LIMIT > 0 )) && common+=(--prompt-token-limit "$PROMPT_TOKEN_LIMIT" --prompt-tail-tokens "$PROMPT_TAIL_TOKENS")
 local_extra=()
 [[ -n $DECODE_MARKER ]] && local_extra+=(--decode-marker "$DECODE_MARKER")

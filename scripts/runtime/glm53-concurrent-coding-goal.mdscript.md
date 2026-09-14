@@ -130,7 +130,8 @@ description: Recursively profiles and optimizes the GLM-5.3 CUDA engine for sust
 
 ## Decide Candidate
 
-* accept the candidate only if c8 median useful throughput improves by at least `{{minimum_win}}`
+* retain every reproducibly faster c8 candidate while maximizing throughput
+* use `{{minimum_win}}` only as the convergence threshold, not as an intermediate rejection threshold
 * rank optimization candidates by c8 median useful throughput before parity evaluation
 * retain a faster candidate provisionally if p95 completion latency does not regress by more than five percent
 * retain a faster candidate provisionally if no cache, fabric, or host-stability gate fails
