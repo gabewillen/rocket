@@ -1484,16 +1484,14 @@ void kda_sigmoid(bf16* out, const bf16* in, int n, cudaStream_t s) {
 void kda_recurrent_step(float* state, bf16* o, const bf16* q, const bf16* k, const bf16* v,
                         const bf16* g, const bf16* beta, int batch, int heads, int head_dim,
                         int row_stride, cudaStream_t s) {
-  const std::size_t shmem =
-      sizeof(float) * (static_cast<std::size_t>(head_dim) * head_dim + 3 * head_dim);
-  static bool configured = false;
-  if (!configured) {
-    cudaFuncSetAttribute(kda_step_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(shmem));
-    configured = true;
-  }
-  kda_step_kernel<<<dim3(heads, batch), head_dim, shmem, s>>>(state, o, q, k, v, g, beta, heads,
-                                                              head_dim, row_stride);
+  if (heads != 64 || head_dim != 128)
+    throw std::runtime_error("KDA register split requires heads=64 head_dim=128");
+  // The former body accidentally continued to launch the 67 KiB shared-state
+  // kernel despite the adopted drop-in above. Launch the measured R=4/C=1
+  // FP32 specialization directly: 3.5 KiB shared, two blocks per SM.
+  rocket_kda::step_split<float, 64, 128, 4, 1>
+      <<<dim3(heads, batch), dim3(128, 4), 0, s>>>(
+          state, o, q, k, v, g, beta, row_stride);
 }
 void kda_conv_update_chunk(bf16* out, bf16* state, const bf16* in, const bf16* weight, int batch,
                            int channels, int kernel, int pos, cudaStream_t s) {
