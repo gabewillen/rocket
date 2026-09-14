@@ -1,0 +1,69 @@
+---
+title: "Shared-expert FP4 raises WikiText perplexity 12.1%"
+description: "The shared-expert FP4 fuel additive saves 1.42 GiB and gains 1.4% B1 throughput while raising perplexity 12.1%, so production keeps BF16."
+date: 2026-09-14
+author: "agent"
+categories: [experiment, numerics, runtime, moe]
+verdict: rejected
+rocket: "#numerics"
+---
+
+**Question.** Does the shared-expert FP4 fuel additive preserve BF16 output quality while improving decode throughput?
+
+| setup | |
+| --- | --- |
+| node | head and peer |
+| kernel | 6.17.13-rocket64k, 64 KiB |
+| commit | `17054c6cca37325d17ec7e70c4e80cffa859ff33` |
+| corpus | Salesforce WikiText-2 raw validation, first 8 rows of at least 100 characters |
+| scored tokens | 405 teacher-forced positions |
+
+```bash
+python3 scripts/numerics/prepare-glm53-wikitext.py \
+  --out /tmp/glm53-wikitext-quality.txt --rows 8
+
+ROCKET_FP4_SHARED_DIR= \
+SCORE_TEXT_FILE=/tmp/glm53-wikitext-quality.txt \
+SCORE_OUTPUT=/tmp/glm53-score-bf16-shared-v2.jsonl \
+SCORE_LOGITS=/tmp/glm53-score-bf16-shared-v2.bin \
+SCORE_MAX_TOKENS=64 PRELOAD_OWNED=1 MAX_TOKENS=128 PORT=19177 \
+  scripts/runtime/glm53-nvfp4-spec-bench.sh
+
+ROCKET_FP4_SHARED_DIR=$HOME/.cache/rocket-fuels/overlays/shared-fp4 \
+SCORE_TEXT_FILE=/tmp/glm53-wikitext-quality.txt \
+SCORE_OUTPUT=/tmp/glm53-score-nvfp4-shared-v2.jsonl \
+SCORE_LOGITS=/tmp/glm53-score-nvfp4-shared-v2.bin \
+SCORE_MAX_TOKENS=64 PRELOAD_OWNED=1 MAX_TOKENS=128 PORT=19179 \
+  scripts/runtime/glm53-nvfp4-spec-bench.sh
+
+python3 scripts/numerics/glm53-teacher-score.py \
+  --baseline /tmp/glm53-score-bf16-shared-v2.jsonl \
+  --candidate /tmp/glm53-score-nvfp4-shared-v2.jsonl \
+  --baseline-logits /tmp/glm53-score-bf16-shared-v2.bin \
+  --candidate-logits /tmp/glm53-score-nvfp4-shared-v2.bin
+```
+
+| metric | BF16 shared | FP4 additive | delta |
+| --- | ---: | ---: | ---: |
+| perplexity | 5.1730 | 5.7989 | +12.10% |
+| target top-1 rate | 68.15% | 65.19% | -2.96 points |
+| target top-5 rate | 87.65% | 84.69% | -2.96 points |
+| BF16 top-1 agreement | 100% | 74.07% | -25.93 points |
+| mean top-5 overlap | 100% | 63.11% | -36.89 points |
+| mean KL divergence | 0 | 0.722 | nat/token |
+| centered logit RMS error | 0 | 1.135 | logit |
+| B1 teacher-forced throughput | 8.32 | 8.43 | +1.4% |
+| C8 speculative throughput | 213.91 | 213.03 | -0.4% |
+| resident memory | 106.02 | 104.60 | -1.42 GiB |
+| short-prompt draft acceptance | 100% | 100% | 0 points |
+
+**Verdict.** Reject and remove the shared-expert FP4 additive. C8 throughput did not improve, and 100% draft acceptance on one counting prompt did not predict the 12.1% perplexity increase.
+
+**Next.**
+
+- Use teacher-forced traces for every replacement fuel additive before production admission.
+- Add a broader benchmark suite after a reference backend can emit matching token log probabilities.
+
+**Reopen if.**
+
+- A new source checkpoint revision changes shared-expert activation or weight distributions.
