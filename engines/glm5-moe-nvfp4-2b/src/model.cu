@@ -730,9 +730,12 @@ kv::NvmePrefixStore* DecodeEngine::kv_nvme_store() {
 
 std::uint64_t DecodeEngine::kv_hash_seed(int slot) const {
   if (slot < 0 || slot >= max_batch_) fail("kv hash seed: slot out of range");
-  // M16 has two measured row groups (0..7 and 8..15). Lower shapes have one.
-  const std::uint64_t group = max_batch_ >= 16 ? static_cast<std::uint64_t>(slot / 8) : 0;
-  return kv_namespace_hash_ ^ (group * 0x9e3779b97f4a7c15ull);
+  // Grouped routed-expert accumulation is batch-row dependent. Two slots with
+  // the same token prefix can therefore have different exact KV and KDA bytes.
+  // Keep the slot in the durable namespace; cross-slot content sharing is a
+  // value optimization and cannot precede byte-parity proof.
+  return kv_namespace_hash_ ^ ((static_cast<std::uint64_t>(slot) + 1) *
+                               0x9e3779b97f4a7c15ull);
 }
 
 kv::PrefixRecordKey DecodeEngine::kv_prefix_key(int slot, const int* tokens, int n_tokens,

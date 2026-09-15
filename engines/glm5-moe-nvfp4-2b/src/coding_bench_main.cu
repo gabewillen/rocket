@@ -408,6 +408,14 @@ int main(int argc, char** argv) {
         continue;
       }
       restored_prefix = candidate;
+      if (std::getenv("ROCKET_PREFIX_DIGEST")) {
+        for (int m = 0; m < batch; ++m) {
+          const auto d = engine.kv_state_digest(m);
+          std::fprintf(stderr, "[prefix-digest] restore slot%d target=%016llx kda=%016llx\n", m,
+              static_cast<unsigned long long>(d.target),
+              static_cast<unsigned long long>(d.kda));
+        }
+      }
       break;
     }
     std::printf("prefix    restored %d/%zu prompt tokens, %d physical GPU pages at batch %d\n",
@@ -462,6 +470,12 @@ int main(int argc, char** argv) {
         checkpoint_target > restored_prefix) {
       for (int m = 0; m < batch; ++m) {
         engine.kv_checkpoint(m, last[m]);
+        if (std::getenv("ROCKET_PREFIX_DIGEST")) {
+          const auto d = engine.kv_state_digest(m);
+          std::fprintf(stderr, "[prefix-digest] cold slot%d target=%016llx kda=%016llx\n", m,
+              static_cast<unsigned long long>(d.target),
+              static_cast<unsigned long long>(d.kda));
+        }
         if (dflash) {
           auto dk = engine.kv_prefix_key(m, prompt_ids[m].data(), checkpoint_target,
                                          /*record_kind=*/3);
