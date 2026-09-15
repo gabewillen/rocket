@@ -1,0 +1,76 @@
+---
+title: "A ROSA mHC memory lane needs semantic gating"
+description: "Exact suffix drafting raised C8 throughput 33.8%, but zero-trained, metadata, cosine, and diagonal mHC memory gates failed replication or false-retrieval controls."
+date: 2026-09-15
+author: "agent"
+categories: [experiment, runtime, memory, numerics]
+verdict: rejected
+rocket: "#state"
+---
+
+**Question.** Can exact historical spans improve GLM-5.3-Flash when injected as a gated residual into existing mHC stream four with frozen base weights?
+
+| setup | |
+| --- | --- |
+| node | head and peer |
+| kernel | 6.17.13-rocket64k, 64 KiB |
+| base commit | `5759182` |
+| workload | `scripts/runtime/fixtures/glm53-coding-sessions.jsonl` |
+| injection | `h4 += gate * mean(base_embedding(retrieved_span))` before layer mHC mixing |
+
+```bash
+# Inference-only layer and gate sweep.
+for spec in zero:0:-1 late031:.03125:44 late062:.0625:44 \
+  late125:.125:44 late250:.25:44 mid062:.0625:22 all001:.001:-1; do
+  IFS=: read n g l <<<"$spec"
+  PREFIX_CACHE_DIR= ROCKET_ROSA_MEMORY_GATE=$g ROCKET_ROSA_MEMORY_LAYER=$l \
+    PYTHONPATH=scripts/runtime scripts/runtime/run-glm53-coding-workload.py \
+    --workload scripts/runtime/fixtures/glm53-coding-sessions.jsonl \
+    --batch 8 --spec 8 --phase 0 --out /tmp/glm53-rosa-inference-$n
+done
+
+# Frozen-base trust adapters and false-retrieval controls.
+python3 scripts/numerics/glm53-rosa-memory-lane.py fit-gate \
+  --trace /tmp/glm53-rosa-trust-trace.jsonl \
+  --output /tmp/glm53-rosa-trained-gate-curriculum.json
+python3 scripts/numerics/glm53-rosa-memory-lane.py fit-hidden-gate \
+  --trace /tmp/rosa-hidden-true2.bin --trace /tmp/rosa-hidden-false2.bin \
+  --output /tmp/rosa-hidden-diagonal-heldout.f32 --epochs 2000 --lr .02
+```
+
+| candidate | C8 useful tok/s | result |
+| --- | ---: | --- |
+| DFlash2 K8 | 51.41 | comparison |
+| exact suffix draft plus DFlash2 | 68.80 | accepted serving primitive |
+| inference-only layer 44, gate 0.125 | 84.08 | single-run false positive |
+| replicated zero gate | 63.98 median | SD 14.35 |
+| replicated layer 44, gate 0.125 | 61.34 median | SD 7.07 |
+| metadata-trained gate | 66.96 median | SD 2.57 |
+| full-data diagonal hidden gate, true span | 30.32 | rejected |
+| full-data diagonal hidden gate, wrong span | 46.40 | rejected |
+
+| gate evidence | value |
+| --- | ---: |
+| metadata trace rows | 124 |
+| metadata label mean | 0.9078 |
+| curriculum metadata BCE | 0.3650 |
+| true-span cosine mean | -0.01650 |
+| wrong-span cosine mean | -0.01743 |
+| diagonal gate train BCE | 0.0278 |
+| diagonal gate validation BCE | 1.4116 |
+| validation prediction, true | 0.6501 |
+| validation prediction, wrong | 0.4121 |
+
+The curriculum included useful exact retrieval, rotated plausible-wrong spans, irrelevant metadata, no retrieval, and ordinary coding controls. The zero-gate Python adapter was bit-exact in five tests. The live CUDA zero gate bypassed the injection launch and retained the original graph path.
+
+**Verdict.** Reject the current mHC memory lane. Exact suffix retrieval predicts tokens, but mean token embeddings plus metadata, scalar cosine, or a 4,096-parameter diagonal gate do not provide a calibrated semantic trust signal. The failure is projection and mixing design. It is not evidence against ROSA drafting.
+
+**Next.**
+
+- Keep exact suffix retrieval as a drafting primitive.
+- Train a low-rank projector and token gate against held-out task loss using full hidden-state captures from multiple workload phases.
+- Require false-retrieval suppression before another live injection run.
+
+**Reopen if.**
+
+- An upstream ROSA checkpoint or GLM-compatible trained retrieval adapter becomes available.

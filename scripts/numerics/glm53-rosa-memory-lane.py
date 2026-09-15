@@ -200,6 +200,60 @@ def fit_gate(trace: pathlib.Path, output: pathlib.Path, epochs: int, lr: float,
     return report
 
 
+def _bf16_bits_to_float(bits: np.ndarray) -> np.ndarray:
+    return (bits.astype(np.uint32) << 16).view(np.float32)
+
+
+def fit_hidden_gate(traces: list[pathlib.Path], output: pathlib.Path, hidden: int,
+                    epochs: int, lr: float) -> dict:
+    states, memories, labels = [], [], []
+    record_bytes = 5 * 4 + 2 * hidden * 2
+    for path in traces:
+        raw = path.read_bytes()
+        if len(raw) % record_bytes:
+            raise ValueError(f"{path}: truncated hidden trace")
+        for at in range(0, len(raw), record_bytes):
+            header = np.frombuffer(raw, dtype=np.float32, count=5, offset=at)
+            off = at + 20
+            state = _bf16_bits_to_float(np.frombuffer(raw, dtype=np.uint16, count=hidden, offset=off)).copy()
+            memory = _bf16_bits_to_float(np.frombuffer(raw, dtype=np.uint16, count=hidden, offset=off + 2 * hidden)).copy()
+            states.append(state); memories.append(memory)
+            labels.append(0.0 if header[4] else float(header[0]))
+    state = torch.from_numpy(np.stack(states)); memory = torch.from_numpy(np.stack(memories))
+    state = torch.nn.functional.normalize(state, dim=-1)
+    memory = torch.nn.functional.normalize(memory, dim=-1)
+    product = state * memory
+    y = torch.tensor(labels, dtype=torch.float32)
+    order = torch.arange(len(labels))
+    train_mask = order % 5 != 0
+    valid_mask = ~train_mask
+    diagonal = nn.Parameter(torch.ones(hidden))
+    bias = nn.Parameter(torch.zeros(()))
+    weight = nn.Parameter(torch.tensor(1.0))
+    opt = torch.optim.AdamW([diagonal, bias, weight], lr=lr, weight_decay=1e-3)
+    for _ in range(epochs):
+        opt.zero_grad()
+        score = (product * diagonal).sum(-1)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            (bias + weight * score)[train_mask], y[train_mask])
+        loss.backward(); opt.step()
+    score = (product * diagonal).sum(-1).detach()
+    pred = torch.sigmoid(bias.detach() + weight.detach() * score)
+    valid_bce = torch.nn.functional.binary_cross_entropy(pred[valid_mask], y[valid_mask])
+    output.write_bytes(diagonal.detach().cpu().numpy().astype(np.float32).tobytes())
+    report = {"traces": [str(x) for x in traces], "rows": len(labels), "hidden": hidden,
+              "epochs": epochs, "bias": float(bias.detach()), "alignment_weight": float(weight.detach()),
+              "train_rows": int(train_mask.sum()), "valid_rows": int(valid_mask.sum()),
+              "label_mean": float(y.mean()), "prediction_mean": float(pred.mean()),
+              "train_bce": float(torch.nn.functional.binary_cross_entropy(pred[train_mask], y[train_mask])),
+              "valid_bce": float(valid_bce),
+              "valid_true_prediction": float(pred[valid_mask & (y > 0)].mean()),
+              "valid_false_prediction": float(pred[valid_mask & (y == 0)].mean()),
+              "projection": str(output)}
+    output.with_suffix(".json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    return report
+
+
 def self_test() -> None:
     memory = ExactSuffixMemory(max_ngram=4)
     memory.extend([1, 2, 3, 9, 1, 2, 3])
@@ -242,12 +296,21 @@ def main() -> None:
     g.add_argument("--epochs", type=int, default=1000)
     g.add_argument("--lr", type=float, default=0.03)
     g.add_argument("--no-curriculum-negatives", action="store_true")
+    h = sub.add_parser("fit-hidden-gate")
+    h.add_argument("--trace", type=pathlib.Path, action="append", required=True)
+    h.add_argument("--output", type=pathlib.Path, required=True)
+    h.add_argument("--hidden", type=int, default=4096)
+    h.add_argument("--epochs", type=int, default=1000)
+    h.add_argument("--lr", type=float, default=0.03)
     args = parser.parse_args()
     if args.command == "self-test":
         self_test()
     elif args.command == "fit-gate":
         print(json.dumps(fit_gate(args.trace, args.output, args.epochs, args.lr,
                                   not args.no_curriculum_negatives), indent=2))
+    elif args.command == "fit-hidden-gate":
+        print(json.dumps(fit_hidden_gate(args.trace, args.output, args.hidden,
+                                         args.epochs, args.lr), indent=2))
     else:
         print(json.dumps(train(args.capture, args.output, args.rank, args.epochs, args.lr), indent=2))
 

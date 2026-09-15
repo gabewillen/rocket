@@ -77,10 +77,6 @@ void layernorm(bf16* out, const bf16* x, const bf16* w, const bf16* b, int batch
 // row's token embedding. `tokens` is a device array of `batch` ids.
 void embed_streams(bf16* streams, const bf16* embed, const int* tokens, int batch, int hc,
                    int hidden, cudaStream_t s);
-// Mean-pool each CPU-selected exact-memory span into one hidden vector.
-// ids is [batch,max_span], lengths is [batch], and no row reads past length.
-void rosa_embed_spans(bf16* out, const bf16* embed, const int* ids, const int* lengths,
-                      int batch, int max_span, int hidden, cudaStream_t s);
 
 // --- manifold-constrained hyper-connections --------------------------------
 // mix = fn @ rmsnorm_unweighted(flatten(streams)), then the split into
@@ -88,11 +84,6 @@ void rosa_embed_spans(bf16* out, const bf16* embed, const int* ids, const int* l
 // `mix` is [batch, hc_mix]; `post` is [batch, hc]; `comb` is [batch, hc*hc].
 void hc_mix_gemv(float* mix, const bf16* fn, const bf16* streams, int batch, int hc_mix, int hc,
                  int hidden, float eps, cudaStream_t s);
-// Adds confidence*gate*memory to one existing stream. For speculative rows,
-// row % source_batch selects the causal memory captured before verification.
-void hc_memory_residual(bf16* streams, const bf16* memory, const float* confidence,
-                        int rows, int source_batch, int hc, int hidden, int stream_index,
-                        float gate, cudaStream_t s);
 void hc_split(float* post, float* comb, bf16* collapsed, const float* mix, const float* base,
               const float* scale, const bf16* streams, int batch, int hc, int hidden, float hc_eps,
               int sinkhorn_iters, cudaStream_t s);

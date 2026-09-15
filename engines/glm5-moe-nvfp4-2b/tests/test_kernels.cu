@@ -755,39 +755,6 @@ void test_indexer() {
   if (!all_ok) ++failures;
 }
 
-void test_rosa_memory() {
-  constexpr int B = 2, HC = 4, H = 8, S = 3;
-  std::vector<float> embed(6 * H);
-  for (int t = 0; t < 6; ++t)
-    for (int d = 0; d < H; ++d) embed[t * H + d] = static_cast<float>(10 * t + d);
-  auto de = to_dev(as_bf16(embed));
-  auto di = to_dev(std::vector<int>{1, 3, 5, 2, 4, 0});
-  auto dl = to_dev(std::vector<int>{3, 2});
-  bf16* dm = nullptr;
-  cudaMalloc(&dm, B * H * sizeof(bf16));
-  rocket::engine::rosa_embed_spans(dm, de, di, dl, B, S, H, nullptr);
-  auto mem = as_float(to_host(dm, B * H));
-  bool pool_ok = true;
-  for (int d = 0; d < H; ++d) {
-    pool_ok &= std::fabs(mem[d] - (30.0f + d)) < 0.1f;
-    pool_ok &= std::fabs(mem[H + d] - (30.0f + d)) < 0.1f;
-  }
-  check("ROSA exact-span embedding mean", pool_ok ? 0.0 : 1.0, 0.0);
-
-  auto ds = to_dev(as_bf16(std::vector<float>(B * HC * H, 1.0f)));
-  auto dc = to_dev(std::vector<float>{0.5f, 0.0f});
-  rocket::engine::hc_memory_residual(ds, dm, dc, B, B, HC, H, 3, 0.25f, nullptr);
-  auto streams = as_float(to_host(ds, B * HC * H));
-  bool lane_ok = true;
-  for (int m = 0; m < B; ++m)
-    for (int h = 0; h < HC; ++h)
-      for (int d = 0; d < H; ++d) {
-        const float expected = (m == 0 && h == 3) ? 1.0f + 0.125f * mem[d] : 1.0f;
-        lane_ok &= std::fabs(streams[(m * HC + h) * H + d] - expected) < 0.1f;
-      }
-  check("ROSA residual touches only existing stream four", lane_ok ? 0.0 : 1.0, 0.0);
-}
-
 }  // namespace
 
 int main() {
@@ -798,7 +765,6 @@ int main() {
   }
   std::printf("gemv\n");            test_gemv();
   std::printf("hyper-connections\n"); test_hyperconnection();
-  std::printf("ROSA memory residual\n"); test_rosa_memory();
   std::printf("kda\n");             test_kda();
   std::printf("dflash2\n");         test_dflash2_conv();
   std::printf("moe router\n");      test_router();

@@ -118,15 +118,6 @@ class DecodeEngine {
   void step_spec(const std::vector<int>& tokens, int spec_k,
                  std::vector<int>& out_tokens, bool collect_stages);
   void set_spec_k(int k) { spec_k_ = k; }
-  // Installs one exact historical span per live stream. CPU ROSA retrieval
-  // supplies token ids plus confidence; the device mean-pools the model's own
-  // embeddings. An all-zero layer gate vector is the exact base-model path.
-  // No mHC stream is reserved or replaced.
-  void set_rosa_memory(const std::vector<std::vector<int>>& span_tokens,
-                       const std::vector<float>& confidence,
-                       const std::vector<float>& layer_gates);
-  void clear_rosa_memory();
-  bool rosa_memory_active() const { return rosa_memory_active_; }
   // Advances each stream's logical position by the number of verified tokens.
   // The caller derives this from the acceptance check; step_spec leaves pos_
   // untouched because the advance depends on per-stream acceptance counts.
@@ -378,13 +369,6 @@ class DecodeEngine {
   // per-step device scratch
   int* tokens_dev_ = nullptr;
   int* tokens_spec_dev_ = nullptr;  // batch*spec_k entries, position-major
-  static constexpr int kRosaSpanMax = 64;
-  int* rosa_token_ids_ = nullptr;      // [max_batch][kRosaSpanMax]
-  int* rosa_lengths_ = nullptr;        // [max_batch]
-  bf16* rosa_hidden_ = nullptr;        // [max_batch][hidden]
-  float* rosa_confidence_ = nullptr;   // [max_batch]
-  std::vector<float> rosa_layer_gates_;
-  bool rosa_memory_active_ = false;
   // Per-KDA-layer rails holding the verify's normed rows for the rejection
   // replay: [kda_layers][kSpecMax * max_batch][hidden] bf16.
   bf16* kda_spec_normed_rail_ = nullptr;
